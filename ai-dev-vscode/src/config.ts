@@ -1,6 +1,20 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 
+let aiDevExtensionRootPath: string | undefined;
+
+export function setAiDevExtensionRootPath(extensionRootPath: string): void {
+	aiDevExtensionRootPath = extensionRootPath;
+}
+
+function getBundledAiDevCorePath(): string | undefined {
+	if (!aiDevExtensionRootPath) {
+		return undefined;
+	}
+
+	return path.join(aiDevExtensionRootPath, 'vendor', 'ai-dev-core');
+}
+
 export interface AiDevConfig {
 	raw: string;
 	aiDevCorePathFromYaml?: string;
@@ -46,16 +60,30 @@ export function getYamlNestedValue(rawYaml: string, section: string, key: string
 	return undefined;
 }
 
+function getConfiguredAiDevCorePath(rawYaml: string): string | undefined {
+	return getYamlNestedValue(rawYaml, 'aiDevCore', 'path') ?? getBundledAiDevCorePath();
+}
+
 export async function readAiDevConfig(workspaceRoot: string): Promise<AiDevConfig> {
 	const raw = await fs.readFile(path.join(workspaceRoot, '.ai-dev.yaml'), 'utf8');
 	return {
 		raw,
-		aiDevCorePathFromYaml: getYamlNestedValue(raw, 'aiDevCore', 'path'),
+		aiDevCorePathFromYaml: getConfiguredAiDevCorePath(raw),
 		aiProviderMode: getYamlNestedValue(raw, 'aiProvider', 'mode'),
 		docsDir: getYamlNestedValue(raw, 'documentation', 'docsDir'),
 	};
 }
 
-export function resolveAiDevCorePath(workspaceRoot: string, aiDevCorePathFromYaml: string): string {
-	return path.resolve(workspaceRoot, aiDevCorePathFromYaml);
+export function resolveAiDevCorePath(workspaceRoot: string, aiDevCorePathFromYaml: string | undefined): string {
+	const configuredPath = aiDevCorePathFromYaml?.trim();
+	if (configuredPath) {
+		return path.resolve(workspaceRoot, configuredPath);
+	}
+
+	const bundledCorePath = getBundledAiDevCorePath();
+	if (bundledCorePath) {
+		return bundledCorePath;
+	}
+
+	return path.resolve(workspaceRoot, 'ai-dev-core');
 }

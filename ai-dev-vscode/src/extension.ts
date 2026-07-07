@@ -9,6 +9,7 @@ import {
 	getYamlNestedValue,
 	readAiDevConfig,
 	resolveAiDevCorePath,
+	setAiDevExtensionRootPath,
 } from './config';
 import {
 	existingChangedFilesWithContent,
@@ -3348,6 +3349,7 @@ async function buildReviewFileDocumentationDirectPromptBundle(target: {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+	setAiDevExtensionRootPath(context.extensionPath);
 	registerAiDevActionsView(context);
 	const workflowDetailsProvider = new WorkflowDetailsViewProvider();
 	context.subscriptions.push(

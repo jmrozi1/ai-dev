@@ -19,6 +19,7 @@ rsync -a \
   --exclude ".git" \
   --exclude "node_modules" \
   --exclude "out" \
+  --exclude "out.txt" \
   --exclude "dist" \
   --exclude "artifacts" \
   "$CORE/" \
