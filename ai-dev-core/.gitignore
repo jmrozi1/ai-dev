@@ -1,0 +1,18 @@
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+
+# Local editor settings
+.vscode/
+.idea/
+
+# Environment/secrets
+.env
+.env.*
+
+# Logs
+*.log
+out.txt

@@ -1,0 +1,162 @@
+# Lua Addon Profile
+
+profile:
+  name: lua-addon
+  description: Profile for Lua-based addon projects, including World of Warcraft addons.
+
+documentation:
+  scopeReadme: README.md
+  docsDir: ai-docs
+  summaryFile: ai-docs/summary.md
+  unitDocPattern: ai-docs/{unitName}.md
+
+source:
+  include:
+    - "**/*.lua"
+    - "**/*.toc"
+    - "**/*.xml"
+  exclude:
+    - ".git/**"
+    - "ai-docs/**"
+    - "docs/**"
+    - ".vscode/**"
+    - ".idea/**"
+    - "dist/**"
+    - "build/**"
+    - "vendor/**"
+    - "libs/**"
+    - "Libs/**"
+    - "**/*.min.lua"
+    - "**/*.generated.*"
+
+addonConcepts:
+  lifecycle:
+    - ADDON_LOADED
+    - PLAYER_LOGIN
+    - PLAYER_ENTERING_WORLD
+    - VARIABLES_LOADED
+  ui:
+    - frame
+    - frames
+    - button
+    - panel
+    - options
+    - widget
+    - texture
+    - fontstring
+  commands:
+    - slash command
+    - slash handler
+    - SLASH_
+    - SlashCmdList
+  events:
+    - RegisterEvent
+    - UnregisterEvent
+    - SetScript
+    - OnEvent
+    - event handler
+  data:
+    - SavedVariables
+    - SavedVariablesPerCharacter
+    - database
+    - settings
+    - profile
+  gameplay:
+    - combat
+    - aura
+    - buff
+    - debuff
+    - spell
+    - item
+    - unit
+    - target
+    - player
+
+unitClassification:
+  entryPointIndicators:
+    - toc
+    - ADDON_LOADED
+    - PLAYER_LOGIN
+    - init
+    - initialize
+    - startup
+    - main
+  commandIndicators:
+    - SLASH_
+    - SlashCmdList
+    - slash
+    - command
+  eventIndicators:
+    - RegisterEvent
+    - OnEvent
+    - SetScript
+  uiIndicators:
+    - CreateFrame
+    - frame
+    - panel
+    - options
+    - button
+  configurationIndicators:
+    - SavedVariables
+    - config
+    - settings
+    - defaults
+    - profile
+  helperIndicators:
+    - util
+    - helper
+    - common
+    - shared
+
+aiNavigation:
+  requiredSections:
+    - AI Summary
+    - Capabilities
+    - User intents this may satisfy
+    - Not for
+    - Entry point status
+    - Inputs
+    - Outputs
+    - Main flow
+    - Dependencies
+    - Files, jobs, or scripts called
+    - Called by / upstream dependencies
+    - External systems touched
+    - Failure modes
+    - Operational risks
+    - Examples
+    - Verification notes
+    - Uncertainties
+
+  commonIntentExamples:
+    - "Where do I change slash command behavior?"
+    - "What file handles addon initialization?"
+    - "Where is the UI created?"
+    - "What file controls event handling?"
+    - "Where are saved variables configured?"
+    - "Where should I go to change combat-related behavior?"
+
+review:
+  requireDocsForChangedFiles: true
+  flagStaleDocs: true
+  flagPoorAiRouting: true
+  allowMetadataOnlyVerification: true
+
+git:
+  mainBranch: main
+  compareAgainst: origin/main
+
+# AI provider configuration.
+# See conventions/ai-provider.md for full documentation.
+#
+# Default: prompt-only — assemble the prompt bundle and show it to the user.
+# Switch to command mode once a team-reviewed AI CLI is available.
+#
+# Test example (plumbing only — not a real AI provider):
+#   aiProvider:
+#     mode: "command"
+#     command: "cat"
+#     args: []
+#
+aiProvider:
+  mode: "prompt-only"

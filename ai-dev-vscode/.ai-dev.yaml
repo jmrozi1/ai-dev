@@ -1,0 +1,28 @@
+aiDevCore:
+  path: "../ai-dev-core"
+
+documentation:
+  docsDir: ai-docs
+
+source:
+  exclude:
+    - ".git/**"
+    - "**/.git/**"
+    - ".*"
+    - "**/.*"
+    - "node_modules/**"
+    - "**/node_modules/**"
+    - "dist/**"
+    - "build/**"
+    - "out/**"
+    - "coverage/**"
+    - "vendor/**"
+    - "vendors/**"
+    - "libs/**"
+    - "Libs/**"
+    - "**/*.min.*"
+    - "**/*.generated.*"
+    - "**/*.lock"
+
+aiProvider:
+  mode: "direct-experimental"

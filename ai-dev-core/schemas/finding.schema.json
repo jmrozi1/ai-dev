@@ -1,0 +1,109 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-dev.local/schemas/finding.schema.json",
+  "title": "AI Dev Review Finding",
+  "description": "Schema for structured AI Dev review findings.",
+  "type": "object",
+  "required": [
+    "title",
+    "severity",
+    "category",
+    "evidence",
+    "impact",
+    "suggestedAction"
+  ],
+  "properties": {
+    "title": {
+      "type": "string",
+      "description": "Short finding title."
+    },
+    "severity": {
+      "type": "string",
+      "description": "Finding severity.",
+      "enum": [
+        "High",
+        "Medium",
+        "Low"
+      ]
+    },
+    "category": {
+      "type": "string",
+      "description": "Finding category.",
+      "enum": [
+        "Missing documentation",
+        "Stale documentation",
+        "Weak AI routing",
+        "Metadata issue",
+        "Index update needed",
+        "README update needed",
+        "Uncertainty",
+        "Other"
+      ]
+    },
+    "sourceFile": {
+      "type": ["string", "null"],
+      "description": "Relative path to the affected source file, if applicable."
+    },
+    "documentationFile": {
+      "type": ["string", "null"],
+      "description": "Relative path to the affected documentation file, if applicable."
+    },
+    "relatedFiles": {
+      "type": "array",
+      "description": "Additional related source or documentation files.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "evidence": {
+      "type": "string",
+      "description": "Specific evidence supporting the finding."
+    },
+    "impact": {
+      "type": "string",
+      "description": "Why the finding matters, especially for AI navigation and routing."
+    },
+    "suggestedAction": {
+      "type": "string",
+      "description": "Recommended next action."
+    },
+    "aiGeneratedUpdateAppropriate": {
+      "type": "string",
+      "description": "Whether an AI-generated update is appropriate.",
+      "enum": [
+        "Yes",
+        "No",
+        "Maybe",
+        "Unknown"
+      ],
+      "default": "Unknown"
+    },
+    "uncertainty": {
+      "type": "string",
+      "description": "Known uncertainty in the finding. Use None if there is no meaningful uncertainty."
+    },
+    "metadataOnlyVerificationCandidate": {
+      "type": "boolean",
+      "description": "Whether this finding may be resolved by updating verification metadata only.",
+      "default": false
+    },
+    "suggestedPatchAvailable": {
+      "type": "boolean",
+      "description": "Whether a suggested patch can be generated for this finding.",
+      "default": false
+    },
+    "status": {
+      "type": "string",
+      "description": "Lifecycle state of the finding.",
+      "enum": [
+        "open",
+        "resolved",
+        "dismissed",
+        "unknown"
+      ],
+      "default": "open"
+    }
+  },
+  "additionalProperties": false
+}

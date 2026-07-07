@@ -1,0 +1,162 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://ai-dev.local/schemas/workflow-result.schema.json",
+  "title": "AI Dev Workflow Result",
+  "description": "Schema for structured results returned by AI Dev workflows.",
+  "type": "object",
+  "required": [
+    "workflow",
+    "status",
+    "summary"
+  ],
+  "properties": {
+    "workflow": {
+      "type": "string",
+      "description": "Workflow name.",
+      "enum": [
+        "generate-docs",
+        "review-documentation",
+        "status",
+        "plan",
+        "unknown"
+      ]
+    },
+    "mode": {
+      "type": "string",
+      "description": "Workflow mode or scope.",
+      "enum": [
+        "selected-file",
+        "changed-files",
+        "selected-folder",
+        "entire-project-bootstrap",
+        "working-tree",
+        "branch-comparison",
+        "unknown"
+      ],
+      "default": "unknown"
+    },
+    "status": {
+      "type": "string",
+      "description": "Overall workflow result status.",
+      "enum": [
+        "success",
+        "partial-success",
+        "failed",
+        "cancelled",
+        "needs-review",
+        "unknown"
+      ]
+    },
+    "summary": {
+      "type": "string",
+      "description": "Short human-readable summary of the workflow result."
+    },
+    "repositoryRoot": {
+      "type": ["string", "null"],
+      "description": "Repository root used by the workflow."
+    },
+    "scope": {
+      "type": ["string", "null"],
+      "description": "Scope path used by the workflow, if applicable."
+    },
+    "sourceFilesReviewed": {
+      "type": "array",
+      "description": "Source files reviewed or processed by the workflow.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "filesCreated": {
+      "type": "array",
+      "description": "Files created by the workflow.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "filesUpdated": {
+      "type": "array",
+      "description": "Files updated by the workflow.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "filesSkipped": {
+      "type": "array",
+      "description": "Files skipped by the workflow.",
+      "items": {
+        "type": "object",
+        "required": ["path", "reason"],
+        "properties": {
+          "path": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "default": []
+    },
+    "capabilitiesIdentified": {
+      "type": "array",
+      "description": "Capabilities identified by the workflow.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "entryPointsIdentified": {
+      "type": "array",
+      "description": "Primary or likely entry points identified by the workflow.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "findings": {
+      "type": "array",
+      "description": "Review findings produced by the workflow.",
+      "items": {
+        "$ref": "finding.schema.json"
+      },
+      "default": []
+    },
+    "uncertainties": {
+      "type": "array",
+      "description": "Important uncertainties from the workflow.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "suggestedNextActions": {
+      "type": "array",
+      "description": "Suggested next actions for the user or agent.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "plannedActions": {
+      "type": "array",
+      "description": "Planned actions, useful for preview/plan modes.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    },
+    "errors": {
+      "type": "array",
+      "description": "Errors encountered during workflow execution.",
+      "items": {
+        "type": "string"
+      },
+      "default": []
+    }
+  },
+  "additionalProperties": false
+}

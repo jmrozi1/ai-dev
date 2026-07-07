@@ -1,0 +1,19 @@
+# dependencies
+node_modules/
+
+# VS Code extension build output
+ai-dev-vscode/out/
+ai-dev-vscode/dist/
+ai-dev-vscode/vendor/
+
+# generated deliverables
+artifacts/
+*.vsix
+
+# logs/temp
+out.txt
+*.log
+.DS_Store
+
+# generated command output
+**/out.txt

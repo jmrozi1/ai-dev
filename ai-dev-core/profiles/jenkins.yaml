@@ -1,0 +1,173 @@
+# Jenkins Profile
+
+profile:
+  name: jenkins
+  description: Profile for Jenkins job repositories, Jenkinsfiles, Job DSL, pipeline scripts, and related automation.
+
+documentation:
+  scopeReadme: README.md
+  docsDir: ai-docs
+  summaryFile: ai-docs/summary.md
+  unitDocPattern: ai-docs/{unitName}.md
+
+source:
+  include:
+    - "**/Jenkinsfile"
+    - "**/*.jenkinsfile"
+    - "**/*.groovy"
+    - "**/*.xml"
+    - "**/*.sh"
+    - "**/*.yaml"
+    - "**/*.yml"
+  exclude:
+    - ".git/**"
+    - "ai-docs/**"
+    - "docs/**"
+    - ".vscode/**"
+    - ".idea/**"
+    - "node_modules/**"
+    - "dist/**"
+    - "build/**"
+    - "target/**"
+    - "vendor/**"
+    - "**/*.generated.*"
+
+jenkinsConcepts:
+  jobStructure:
+    - pipeline
+    - stage
+    - step
+    - parameter
+    - environment
+    - agent
+    - node
+    - post
+    - trigger
+  jobRelationships:
+    - upstream job
+    - downstream job
+    - build job
+    - trigger job
+    - shared library
+    - folder
+  operationalCapabilities:
+    - install software
+    - install Kubernetes
+    - provision server
+    - configure server
+    - deploy application
+    - validate inventory
+    - run tests
+    - publish artifact
+    - promote build
+    - rollback
+  externalSystems:
+    - Jenkins
+    - Git
+    - GitHub
+    - GitLab
+    - Nexus
+    - Artifactory
+    - Kubernetes
+    - Ansible
+    - SSH
+    - Docker
+    - registry
+    - vault
+    - credentials store
+
+unitClassification:
+  entryPointIndicators:
+    - pipeline
+    - job
+    - build
+    - parameters
+    - choiceParam
+    - stringParam
+    - booleanParam
+    - Jenkinsfile
+  downstreamIndicators:
+    - build job
+    - build(
+    - trigger
+    - downstream
+    - wait
+    - propagate
+  sharedLibraryIndicators:
+    - library
+    - vars
+    - shared
+    - load
+  scriptIndicators:
+    - sh
+    - shell
+    - bash
+    - powershell
+  configurationIndicators:
+    - config.xml
+    - properties
+    - parameters
+    - environment
+    - credentials
+  riskIndicators:
+    - production
+    - prod
+    - deploy
+    - delete
+    - remove
+    - destroy
+    - credential
+    - secret
+    - sudo
+    - ssh
+    - kubectl
+    - ansible
+
+aiNavigation:
+  requiredSections:
+    - AI Summary
+    - Capabilities
+    - User intents this may satisfy
+    - Not for
+    - Entry point status
+    - Inputs
+    - Outputs
+    - Main flow
+    - Dependencies
+    - Files, jobs, or scripts called
+    - Called by / upstream dependencies
+    - External systems touched
+    - Failure modes
+    - Operational risks
+    - Examples
+    - Verification notes
+    - Uncertainties
+
+  commonIntentExamples:
+    - "What job do I run to install Kubernetes on my box?"
+    - "How do I install software on a server?"
+    - "What job validates a target host?"
+    - "What parameters are required to provision a server?"
+    - "What jobs run after this deployment job?"
+    - "Which jobs touch production?"
+    - "Which job publishes artifacts to Nexus?"
+    - "What job should I use to deploy to test?"
+
+review:
+  requireDocsForChangedFiles: true
+  flagStaleDocs: true
+  flagPoorAiRouting: true
+  allowMetadataOnlyVerification: true
+
+  highSeveritySignals:
+    - required parameter changed
+    - downstream job changed
+    - production behavior changed
+    - credential behavior changed
+    - deployment target changed
+    - destructive operation changed
+    - deleted or renamed job
+
+git:
+  mainBranch: main
+  compareAgainst: origin/main

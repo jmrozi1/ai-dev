@@ -1,0 +1,110 @@
+# Generic Code Profile
+
+profile:
+  name: generic-code
+  description: Default profile for general source code repositories.
+
+documentation:
+  scopeReadme: README.md
+  docsDir: ai-docs
+  summaryFile: ai-docs/summary.md
+  unitDocPattern: ai-docs/{unitName}.md
+
+source:
+  include:
+    - "**/*.c"
+    - "**/*.cpp"
+    - "**/*.cs"
+    - "**/*.go"
+    - "**/*.groovy"
+    - "**/*.java"
+    - "**/*.js"
+    - "**/*.jsx"
+    - "**/*.kt"
+    - "**/*.lua"
+    - "**/*.py"
+    - "**/*.rb"
+    - "**/*.rs"
+    - "**/*.sh"
+    - "**/*.ts"
+    - "**/*.tsx"
+    - "**/*.xml"
+    - "**/*.yaml"
+    - "**/*.yml"
+  exclude:
+    - ".git/**"
+    - "ai-docs/**"
+    - "docs/**"
+    - "node_modules/**"
+    - "dist/**"
+    - "build/**"
+    - "out/**"
+    - "target/**"
+    - "vendor/**"
+    - "coverage/**"
+    - "**/*.min.js"
+    - "**/*.generated.*"
+    - "**/generated/**"
+
+unitClassification:
+  entryPointIndicators:
+    - main
+    - init
+    - start
+    - run
+    - execute
+    - handler
+    - controller
+    - command
+    - route
+  helperIndicators:
+    - util
+    - helper
+    - common
+    - shared
+    - internal
+  configurationIndicators:
+    - config
+    - settings
+    - properties
+    - manifest
+
+aiNavigation:
+  requiredSections:
+    - AI Summary
+    - Capabilities
+    - User intents this may satisfy
+    - Entry point status
+    - Inputs
+    - Outputs
+    - Main flow
+    - Dependencies
+    - Files, jobs, or scripts called
+    - Called by / upstream dependencies
+    - Verification notes
+    - Uncertainties
+
+review:
+  requireDocsForChangedFiles: true
+  flagStaleDocs: true
+  flagPoorAiRouting: true
+  allowMetadataOnlyVerification: true
+
+git:
+  mainBranch: main
+  compareAgainst: origin/main
+
+# AI provider configuration.
+# See conventions/ai-provider.md for full documentation.
+#
+# Default: prompt-only — assemble the prompt bundle and show it to the user.
+# Switch to command mode once a team-reviewed AI CLI is available.
+#
+# Test example (plumbing only — not a real AI provider):
+#   aiProvider:
+#     mode: "command"
+#     command: "cat"
+#     args: []
+#
+aiProvider:
+  mode: "prompt-only"
