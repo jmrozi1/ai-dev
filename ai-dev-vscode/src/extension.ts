@@ -4132,6 +4132,7 @@ export function activate(context: vscode.ExtensionContext) {
 		const aiDevYamlPath = path.join(workspaceRoot, '.ai-dev.yaml');
 		let initialPromptOnly = false;
 		let initialDocsDir = 'ai-docs';
+		let initialBatchInitialSourceGlob = '**/*';
 		let initialSourceExcludeGlobs = [...FALLBACK_BATCH_EXCLUDE_GLOBS];
 		try {
 			const aiDevYamlContents = await fs.readFile(aiDevYamlPath, 'utf8');
@@ -4139,6 +4140,11 @@ export function activate(context: vscode.ExtensionContext) {
 			const configuredDocsDir = getYamlNestedValue(aiDevYamlContents, 'documentation', 'docsDir')?.trim();
 			if (configuredDocsDir) {
 				initialDocsDir = configuredDocsDir;
+			}
+
+			const configuredBatchInitialSourceGlob = getYamlNestedValue(aiDevYamlContents, 'documentation', 'batchInitialSourceGlob')?.trim();
+			if (configuredBatchInitialSourceGlob) {
+				initialBatchInitialSourceGlob = configuredBatchInitialSourceGlob;
 			}
 
 			const configuredSourceExcludeGlobs = parseYamlList(aiDevYamlContents, 'source', 'exclude');
@@ -4156,10 +4162,12 @@ export function activate(context: vscode.ExtensionContext) {
 		openSettingsWebview(context, {
 			initialPromptOnly,
 			initialDocsDir,
+			initialBatchInitialSourceGlob,
 			initialSourceExcludeGlobs,
 			onSave: async (settings: {
 				promptOnly?: boolean;
 				docsDir?: string;
+				batchInitialSourceGlob?: string;
 				sourceExcludeGlobs?: string[];
 			}) => {
 
@@ -4185,6 +4193,11 @@ export function activate(context: vscode.ExtensionContext) {
 				if (typeof settings.docsDir === 'string') {
 					const docsDirValue = settings.docsDir.trim() || 'ai-docs';
 					updatedYaml = updateYamlSectionScalarValue(updatedYaml, 'documentation', 'docsDir', docsDirValue);
+				}
+
+				if (typeof settings.batchInitialSourceGlob === 'string') {
+					const batchInitialSourceGlobValue = settings.batchInitialSourceGlob.trim() || '**/*';
+					updatedYaml = updateYamlSectionScalarValue(updatedYaml, 'documentation', 'batchInitialSourceGlob', batchInitialSourceGlobValue);
 				}
 
 				if (Array.isArray(settings.sourceExcludeGlobs)) {

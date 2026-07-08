@@ -3,10 +3,12 @@ import * as vscode from 'vscode';
 export interface OpenSettingsWebviewOptions {
 	initialPromptOnly: boolean;
 	initialDocsDir: string;
+	initialBatchInitialSourceGlob: string;
 	initialSourceExcludeGlobs: string[];
 	onSave: (settings: {
 		promptOnly?: boolean;
 		docsDir?: string;
+		batchInitialSourceGlob?: string;
 		sourceExcludeGlobs?: string[];
 	}) => Promise<void>;
 }
@@ -22,10 +24,12 @@ function escapeHtmlAttribute(value: string): string {
 function getWebviewHtml(
 	initialPromptOnly: boolean,
 	initialDocsDir: string,
+	initialBatchInitialSourceGlob: string,
 	initialSourceExcludeGlobs: string[]
 ): string {
 	const checkedAttribute = initialPromptOnly ? ' checked' : '';
 	const docsDirValue = escapeHtmlAttribute(initialDocsDir);
+	const batchInitialSourceGlobValue = escapeHtmlAttribute(initialBatchInitialSourceGlob);
 	const ignoredPathsValue = escapeHtmlAttribute(initialSourceExcludeGlobs.join('\n'));
 
 	return `<!DOCTYPE html>
@@ -152,6 +156,14 @@ function getWebviewHtml(
 			</div>
 
 			<div>
+				<label class="label-row" for="batchInitialSourceGlob">Batch initial source glob</label>
+				<div class="setting-description">
+					Default source pattern used when opening Batch Summary Doc Generation.
+				</div>
+				<input id="batchInitialSourceGlob" type="text" value="${batchInitialSourceGlobValue}" />
+			</div>
+
+			<div>
 				<label class="label-row" for="ignoredPaths">Ignored paths</label>
 				<div class="setting-description">
 					Files matching these globs are excluded from AI Dev source discovery. One glob per line.
@@ -169,11 +181,13 @@ function getWebviewHtml(
 		const vscode = acquireVsCodeApi();
 		const promptOnlyInput = document.getElementById('promptOnly');
 		const docsDirInput = document.getElementById('docsDir');
+		const batchInitialSourceGlobInput = document.getElementById('batchInitialSourceGlob');
 		const ignoredPathsInput = document.getElementById('ignoredPaths');
 		const statusElement = document.getElementById('status');
 		let saveInFlight = false;
 		let statusClearTimer = undefined;
 		let lastSavedDocsDir = docsDirInput.value.trim();
+		let lastSavedBatchInitialSourceGlob = batchInitialSourceGlobInput.value.trim();
 		let lastSavedIgnoredPaths = ignoredPathsInput.value;
 
 		function setStatus(message, tone, autoClear) {
@@ -198,6 +212,7 @@ function getWebviewHtml(
 			saveInFlight = inFlight;
 			promptOnlyInput.disabled = inFlight;
 			docsDirInput.disabled = inFlight;
+			batchInitialSourceGlobInput.disabled = inFlight;
 			ignoredPathsInput.disabled = inFlight;
 		}
 
@@ -256,6 +271,32 @@ function getWebviewHtml(
 			saveDocsDirIfChanged();
 		});
 
+		function saveBatchInitialSourceGlobIfChanged() {
+			const trimmedValue = batchInitialSourceGlobInput.value.trim();
+			if (trimmedValue === lastSavedBatchInitialSourceGlob) {
+				return;
+			}
+
+			batchInitialSourceGlobInput.value = trimmedValue;
+			save({
+				setting: 'batchInitialSourceGlob',
+				batchInitialSourceGlob: trimmedValue,
+			});
+		}
+
+		batchInitialSourceGlobInput.addEventListener('blur', () => {
+			saveBatchInitialSourceGlobIfChanged();
+		});
+
+		batchInitialSourceGlobInput.addEventListener('keydown', (event) => {
+			if (event.key !== 'Enter') {
+				return;
+			}
+
+			event.preventDefault();
+			saveBatchInitialSourceGlobIfChanged();
+		});
+
 		function saveIgnoredPathsIfChanged() {
 			if (ignoredPathsInput.value === lastSavedIgnoredPaths) {
 				return;
@@ -281,6 +322,10 @@ function getWebviewHtml(
 				setSaveInFlight(false);
 				if (message.setting === 'docsDir') {
 					lastSavedDocsDir = docsDirInput.value.trim();
+				}
+
+				if (message.setting === 'batchInitialSourceGlob') {
+					lastSavedBatchInitialSourceGlob = batchInitialSourceGlobInput.value.trim();
 				}
 
 				if (message.setting === 'sourceExcludeGlobs') {
@@ -320,6 +365,7 @@ export function openSettingsWebview(
 	panel.webview.html = getWebviewHtml(
 		options.initialPromptOnly,
 		options.initialDocsDir,
+		options.initialBatchInitialSourceGlob,
 		options.initialSourceExcludeGlobs
 	);
 
@@ -328,6 +374,7 @@ export function openSettingsWebview(
 		setting?: string;
 		promptOnly?: boolean;
 		docsDir?: string;
+		batchInitialSourceGlob?: string;
 		sourceExcludeGlobs?: string[];
 	}) => {
 		if (message.type !== 'save') {
@@ -337,6 +384,7 @@ export function openSettingsWebview(
 		const settings: {
 			promptOnly?: boolean;
 			docsDir?: string;
+			batchInitialSourceGlob?: string;
 			sourceExcludeGlobs?: string[];
 		} = {};
 
@@ -346,6 +394,10 @@ export function openSettingsWebview(
 
 		if (typeof message.docsDir === 'string') {
 			settings.docsDir = message.docsDir;
+		}
+
+		if (typeof message.batchInitialSourceGlob === 'string') {
+			settings.batchInitialSourceGlob = message.batchInitialSourceGlob;
 		}
 
 		if (Array.isArray(message.sourceExcludeGlobs)) {
