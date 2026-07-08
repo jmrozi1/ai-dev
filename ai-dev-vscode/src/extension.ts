@@ -1164,7 +1164,7 @@ async function computeBatchUnitDocSelection(params: {
 	const scopedCandidates = formState.selectionMode === 'folder' && normalizedSelectedSourceDirectory
 		? configuredCandidates.filter((sourceAbsolutePath) => {
 			const sourcePath = normalizePathForMarkdown(path.relative(workspaceRoot, sourceAbsolutePath));
-			return getSourceDirectoryPath(sourcePath) === normalizedSelectedSourceDirectory;
+			return sourcePath === normalizedSelectedSourceDirectory || sourcePath.startsWith(`${normalizedSelectedSourceDirectory}/`);
 		})
 		: configuredCandidates;
 
