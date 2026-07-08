@@ -6,10 +6,6 @@ ai-dev-vscode/out/
 ai-dev-vscode/dist/
 ai-dev-vscode/vendor/
 
-# generated deliverables
-artifacts/
-*.vsix
-
 # logs/temp
 out.txt
 *.log
