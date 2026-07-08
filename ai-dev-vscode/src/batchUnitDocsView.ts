@@ -311,7 +311,7 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 			const rawMax = Number.parseInt(String(maxFilesInput.value ?? '').trim(), 10);
 			const safeMax = Number.isFinite(rawMax) ? Math.min(100, Math.max(1, rawMax)) : 25;
 			return {
-				sourceGlob: String(sourceGlobInput.value ?? '').trim() || '**/*.lua',
+				sourceGlob: String(sourceGlobInput.value ?? '').trim() || '**/*',
 				missingDocsOnly: !!missingDocsOnlyInput.checked,
 				resolveOrphanedDocs: !!resolveOrphanedDocsInput.checked,
 				maxFiles: safeMax,
@@ -527,7 +527,7 @@ export async function openBatchUnitDocsWebview(
 		const incomingState = message.state;
 		const normalizedState: BatchUnitDocsFormState | undefined = incomingState
 			? {
-				sourceGlob: incomingState.sourceGlob.trim().length > 0 ? incomingState.sourceGlob.trim() : '**/*.lua',
+				sourceGlob: incomingState.sourceGlob.trim().length > 0 ? incomingState.sourceGlob.trim() : '**/*',
 				missingDocsOnly: Boolean(incomingState.missingDocsOnly),
 				resolveOrphanedDocs: Boolean(incomingState.resolveOrphanedDocs),
 				maxFiles: Number.isFinite(incomingState.maxFiles)

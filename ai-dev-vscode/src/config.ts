@@ -20,6 +20,7 @@ export interface AiDevConfig {
 	aiDevCorePathFromYaml?: string;
 	aiProviderMode?: string;
 	docsDir?: string;
+	batchInitialSourceGlob?: string;
 }
 
 function unquoteYamlValue(value: string): string {
@@ -71,6 +72,7 @@ export async function readAiDevConfig(workspaceRoot: string): Promise<AiDevConfi
 		aiDevCorePathFromYaml: getConfiguredAiDevCorePath(raw),
 		aiProviderMode: getYamlNestedValue(raw, 'aiProvider', 'mode'),
 		docsDir: getYamlNestedValue(raw, 'documentation', 'docsDir'),
+		batchInitialSourceGlob: getYamlNestedValue(raw, 'documentation', 'batchInitialSourceGlob'),
 	};
 }
 

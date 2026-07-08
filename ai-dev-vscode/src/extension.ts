@@ -604,6 +604,16 @@ function matchesAnyGlob(relativePath: string, globs: string[]): boolean {
 	return globs.some((globPattern) => globToRegExp(globPattern).test(normalizedRelativePath));
 }
 
+function getBatchInitialSourceGlob(config: AiDevConfig): string {
+	const configuredGlob = config.batchInitialSourceGlob?.trim();
+	return configuredGlob && configuredGlob.length > 0 ? configuredGlob : '**/*';
+}
+
+function normalizeBatchSourceGlob(sourceGlob: string, config: AiDevConfig): string {
+	const normalizedSourceGlob = sourceGlob.trim();
+	return normalizedSourceGlob.length > 0 ? normalizedSourceGlob : getBatchInitialSourceGlob(config);
+}
+
 function getBatchSourceGlobs(config: AiDevConfig): { excludeGlobs: string[] } {
 	const excludeGlobs = parseYamlList(config.raw, 'source', 'exclude');
 
@@ -1148,7 +1158,7 @@ async function computeBatchUnitDocSelection(params: {
 	const { workspaceRoot, aiDevConfig, formState } = params;
 	const configuredCandidates = await discoverBatchUnitDocCandidates(workspaceRoot, aiDevConfig);
 	const configuredDocsDir = getConfiguredDocsDir(aiDevConfig);
-	const normalizedSourceGlob = formState.sourceGlob.trim().length > 0 ? formState.sourceGlob.trim() : '**/*.lua';
+	const normalizedSourceGlob = normalizeBatchSourceGlob(formState.sourceGlob, aiDevConfig);
 	const normalizedSelectedSourceDirectory = normalizeSelectedSourceDirectory(formState.selectedSourceDirectory);
 	const docsDirAbsolutePath = path.resolve(workspaceRoot, configuredDocsDir);
 	const scopedCandidates = formState.selectionMode === 'folder' && normalizedSelectedSourceDirectory
@@ -2591,7 +2601,7 @@ async function openBatchSummaryGenerationWebview(params: {
 			const timestamp = new Date().toISOString();
 			const reportMarkdown = buildBatchUnitDocReport({
 				timestamp,
-				sourceGlob: formState.sourceGlob.trim().length > 0 ? formState.sourceGlob.trim() : '**/*.lua',
+				sourceGlob: normalizeBatchSourceGlob(formState.sourceGlob, aiDevConfig),
 				missingDocsOnly: formState.missingDocsOnly,
 				resolveOrphanedDocs: formState.resolveOrphanedDocs,
 				docsDir: configuredDocsDir,
@@ -3591,11 +3601,12 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 
 			try {
+				const aiDevConfig = await readAiDevConfig(workspaceRoot);
 				await openBatchSummaryGenerationWebview({
 					context,
 					workspaceRoot,
 					initialState: {
-						sourceGlob: '**/*.lua',
+						sourceGlob: getBatchInitialSourceGlob(aiDevConfig),
 						missingDocsOnly: true,
 						resolveOrphanedDocs: false,
 						maxFiles: DEFAULT_BATCH_UNIT_DOC_PREVIEW_LIMIT,
@@ -3658,7 +3669,7 @@ export function activate(context: vscode.ExtensionContext) {
 					context,
 					workspaceRoot: target.workspaceRoot,
 					initialState: {
-						sourceGlob: '**/*.lua',
+						sourceGlob: getBatchInitialSourceGlob(aiDevConfig),
 						missingDocsOnly: true,
 						resolveOrphanedDocs: false,
 						maxFiles: DEFAULT_BATCH_UNIT_DOC_PREVIEW_LIMIT,
