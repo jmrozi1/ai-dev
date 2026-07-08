@@ -2480,11 +2480,46 @@ async function openBatchSummaryGenerationWebview(params: {
 							}
 
 							if (cleanedResponse.text.trim().length === 0) {
+								const debugTimestamp = new Date().toISOString().replace(/[:.]/g, '-');
+								const debugDirectory = path.join(
+									workspaceRoot,
+									'.ai-dev-debug',
+									'batch-empty-model-response',
+									debugTimestamp
+								);
+								await fs.mkdir(debugDirectory, { recursive: true });
+								await Promise.all([
+									fs.writeFile(path.join(debugDirectory, 'prompt.md'), directPromptMarkdown, 'utf8'),
+									fs.writeFile(path.join(debugDirectory, 'raw-response.txt'), responseText, 'utf8'),
+									fs.writeFile(path.join(debugDirectory, 'cleaned-response.txt'), cleanedResponse.text, 'utf8'),
+									fs.writeFile(
+										path.join(debugDirectory, 'action.json'),
+										JSON.stringify(
+											{
+												docPath,
+												sourcePaths: uniqueSourcePaths,
+												modelDetails,
+												strippedOuterCodeFence: cleanedResponse.stripped,
+												responseLength: responseText.length,
+												cleanedResponseLength: cleanedResponse.text.length,
+												selectedSourceFiles: selectedSourceFiles.map((sourceFile) => ({
+													path: sourceFile.path,
+													contentsLength: sourceFile.contents.length,
+													contentsPreview: sourceFile.contents.slice(0, 500),
+												})),
+											},
+											null,
+											2
+										),
+										'utf8'
+									),
+								]);
+
 								skippedActions.push({
 									actionType: 'generate-doc',
 									docPath,
 									sourcePaths: uniqueSourcePaths,
-									reason: 'empty-model-response',
+									reason: `empty-model-response:debug=${formatRelativePath(workspaceRoot, debugDirectory)}`,
 								});
 								processedCount += 1;
 								continue;
