@@ -223,7 +223,7 @@ export function buildGenerateArchitectureSummaryDirectPromptMarkdown(params: {
 	workflowFileContents: string;
 	templateFilePath: string;
 	templateFileContents: string;
-	aiDevYamlPath: string;
+	aiDevYamlLabel: string;
 	aiDevYamlContents: string;
 	docsDir: string;
 	targetArchitecturePath: string;
@@ -246,7 +246,7 @@ export function buildGenerateArchitectureSummaryDirectPromptMarkdown(params: {
 		workflowFileContents,
 		templateFilePath,
 		templateFileContents,
-		aiDevYamlPath,
+		aiDevYamlLabel,
 		aiDevYamlContents,
 		docsDir,
 		targetArchitecturePath,
@@ -277,7 +277,7 @@ export function buildGenerateArchitectureSummaryDirectPromptMarkdown(params: {
 		'```',
 		'',
 		'.ai-dev.yaml file:',
-		aiDevYamlPath,
+		aiDevYamlLabel,
 		'',
 		'```yaml',
 		aiDevYamlContents,
@@ -452,7 +452,7 @@ export function buildAnswerPromptMarkdown(params: {
 		'',
 		'Instructions:',
 		'Read and follow the workflow file.',
-		'Use .ai-dev.yaml to find the documentation summary file, then start from ai-docs/summary.md when available.',
+		'Use .ai-dev.yaml to find the documentation directory, then start from ai-docs/architecture-summary.md when available. Use ai-docs/summary.md only as a legacy fallback.',
 		'Use summary files to route to relevant docs and source.',
 		'Do not read every source file by default.',
 	].join('\n');
@@ -462,7 +462,7 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 	workspaceRoot: string;
 	workflowFilePath: string;
 	workflowFileContents: string;
-	aiDevYamlPath: string;
+	aiDevYamlLabel: string;
 	aiDevYamlContents: string;
 	rootSummaryPath: string;
 	rootSummaryExists: boolean;
@@ -488,7 +488,7 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		workspaceRoot,
 		workflowFilePath,
 		workflowFileContents,
-		aiDevYamlPath,
+		aiDevYamlLabel,
 		aiDevYamlContents,
 		rootSummaryPath,
 		rootSummaryExists,
@@ -524,7 +524,7 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		'```',
 		'',
 		'.ai-dev.yaml file:',
-		aiDevYamlPath,
+		aiDevYamlLabel,
 		'',
 		'```yaml',
 		aiDevYamlContents,
@@ -537,9 +537,11 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		`- docsDir searched for fallback summaries: ${docsDir}`,
 		`- Discovered fallback summary files: ${discoveredSummaryCount}`,
 		`- Fallback inclusion reason: ${fallbackIncludedReason ?? 'none (root routing was sufficient)'}`,
-		'- Limitation: fallback discovered summaries provide less complete routing than a fully maintained root summary.',
+		rootSummaryExists && !rootSummaryEmpty
+			? '- Limitation: none; primary root architecture/routing context was available.'
+			: '- Limitation: fallback discovered summaries provide less complete routing than a fully maintained root architecture summary.',
 		'',
-		rootSummaryExists ? 'Root summary:' : 'Root summary: not available',
+		rootSummaryExists ? 'Root architecture/routing context:' : 'Root architecture/routing context: not available',
 	];
 
 	if (rootSummaryExists) {
@@ -581,9 +583,10 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		'',
 		'Instructions:',
 		'Answer the user question using only the provided context.',
-		'Treat the root summary as preferred routing, and follow linked child summaries before concluding coverage.',
+		'Treat the root architecture/routing context as preferred routing, and follow linked child summaries before concluding coverage.',
 		'Treat fallback discovered summaries as gapped routing context, not full routing coverage.',
-		'If your answer relies on fallback discovered summaries, state that the root summary was missing or incomplete for this question.',
+		'If a root architecture/routing context was provided, do not warn that ai-docs/summary.md is missing.',
+		'If your answer relies only on fallback discovered summaries, state that the root architecture/routing context was missing or incomplete for this question.',
 		'Cite the summary file(s) you used.',
 		'Verify exact behavior against source files before asserting specific runtime values or mechanics.',
 		'If provided routing context is still insufficient, clearly list the additional files you need.'

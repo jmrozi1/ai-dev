@@ -43,6 +43,32 @@ export interface BatchUnitDocsFormState {
 	selectedSummaryFile?: string;
 }
 
+export const DEFAULT_BATCH_UNIT_DOC_FILES_THIS_PASS = 25;
+export const MAX_BATCH_UNIT_DOC_FILES_THIS_PASS = 10000;
+export const LARGE_BATCH_UNIT_DOC_RUN_WARNING_THRESHOLD = 100;
+export const BATCH_UNIT_DOC_FILES_THIS_PASS_HELP_TEXT =
+	'Limits how many matching source files are included in this generation pass (1-10000). Larger runs can take a while and may hit provider throttling. Generation is sequential and can be cancelled.';
+
+export function normalizeBatchUnitDocFilesThisPass(value: unknown): number {
+	const numericValue = typeof value === 'number' ? value : Number.parseInt(String(value ?? '').trim(), 10);
+	if (!Number.isFinite(numericValue)) {
+		return DEFAULT_BATCH_UNIT_DOC_FILES_THIS_PASS;
+	}
+
+	return Math.min(
+		MAX_BATCH_UNIT_DOC_FILES_THIS_PASS,
+		Math.max(1, Math.floor(numericValue))
+	);
+}
+
+export function shouldShowLargeBatchUnitDocRunWarning(filesThisPass: number): boolean {
+	return filesThisPass > LARGE_BATCH_UNIT_DOC_RUN_WARNING_THRESHOLD;
+}
+
+export function getLargeBatchUnitDocRunWarningMessage(filesThisPass: number): string {
+	return `Large run advisory: ${filesThisPass} files in this pass can take a while and may encounter provider throttling. Processing is sequential and can be cancelled.`;
+}
+
 interface OpenBatchUnitDocsWebviewOptions {
 	workspaceRoot: string;
 	initialState: BatchUnitDocsFormState;
@@ -227,6 +253,16 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 		.pattern-warning.visible {
 			display: block;
 		}
+		.large-run-warning {
+			display: none;
+			margin: 8px 0 10px;
+			padding: 8px 10px;
+			border-left: 3px solid var(--vscode-editorWarning-foreground);
+			background: color-mix(in srgb, var(--vscode-editorWarning-foreground) 12%, transparent);
+		}
+		.large-run-warning.visible {
+			display: block;
+		}
 		@media (max-width: 780px) {
 			th,
 			td {
@@ -258,9 +294,9 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 		<p class="help">Deletes non-summary docs that do not map to the source-to-summary path model. Summary files are never moved or deleted.</p>
 
 		<label class="field">
-			<span>Max files input</span>
-			<input id="maxFiles" type="number" min="1" max="100" value="25" />
-			<span class="help">Preview only limit in this pass (1-100).</span>
+			<span>Files this pass</span>
+			<input id="maxFiles" type="number" min="1" max="10000" value="25" />
+			<span class="help">${escapeHtml(BATCH_UNIT_DOC_FILES_THIS_PASS_HELP_TEXT)}</span>
 		</label>
 	</div>
 
@@ -271,6 +307,7 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 
 	<div id="status" class="status info"></div>
 	<div id="patternWarning" class="pattern-warning"></div>
+	<div id="largeRunWarning" class="large-run-warning"></div>
 	<div id="summary" class="summary"></div>
 	<table>
 		<thead>
@@ -299,6 +336,7 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 		const generateButton = document.getElementById('generateButton');
 		const statusEl = document.getElementById('status');
 		const patternWarningEl = document.getElementById('patternWarning');
+		const largeRunWarningEl = document.getElementById('largeRunWarning');
 		const summaryEl = document.getElementById('summary');
 		const resultsBody = document.getElementById('resultsBody');
 
@@ -307,14 +345,37 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 		resolveOrphanedDocsInput.checked = !!initialState.resolveOrphanedDocs;
 		maxFilesInput.value = String(initialState.maxFiles);
 
+		const normalizeFilesThisPass = (value) => {
+			const parsed = Number.parseInt(String(value ?? '').trim(), 10);
+			if (!Number.isFinite(parsed)) {
+				return ${DEFAULT_BATCH_UNIT_DOC_FILES_THIS_PASS};
+			}
+
+			return Math.min(${MAX_BATCH_UNIT_DOC_FILES_THIS_PASS}, Math.max(1, Math.floor(parsed)));
+		};
+
+		const renderLargeRunWarning = () => {
+			const filesThisPass = normalizeFilesThisPass(maxFilesInput.value);
+			if (String(filesThisPass) !== String(maxFilesInput.value)) {
+				maxFilesInput.value = String(filesThisPass);
+			}
+
+			if (filesThisPass > ${LARGE_BATCH_UNIT_DOC_RUN_WARNING_THRESHOLD}) {
+				largeRunWarningEl.className = 'large-run-warning visible';
+				largeRunWarningEl.textContent = 'Large run advisory: ' + filesThisPass + ' files in this pass can take a while and may encounter provider throttling. Processing is sequential and can be cancelled.';
+			} else {
+				largeRunWarningEl.className = 'large-run-warning';
+				largeRunWarningEl.textContent = '';
+			}
+		};
+
 		const getFormState = () => {
-			const rawMax = Number.parseInt(String(maxFilesInput.value ?? '').trim(), 10);
-			const safeMax = Number.isFinite(rawMax) ? Math.min(100, Math.max(1, rawMax)) : 25;
+			const filesThisPass = normalizeFilesThisPass(maxFilesInput.value);
 			return {
 				sourceGlob: String(sourceGlobInput.value ?? '').trim() || '**/*',
 				missingDocsOnly: !!missingDocsOnlyInput.checked,
 				resolveOrphanedDocs: !!resolveOrphanedDocsInput.checked,
-				maxFiles: safeMax,
+				maxFiles: filesThisPass,
 				selectionMode: initialState.selectionMode === 'folder' ? 'folder' : 'workspace',
 				selectedSourceDirectory: initialState.selectedSourceDirectory,
 				selectedSummaryFile: initialState.selectedSummaryFile,
@@ -458,7 +519,10 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 		sourceGlobInput.addEventListener('input', () => markPreviewStale(true));
 		missingDocsOnlyInput.addEventListener('change', () => markPreviewStale(true));
 		resolveOrphanedDocsInput.addEventListener('change', () => markPreviewStale(true));
-		maxFilesInput.addEventListener('input', () => markPreviewStale(true));
+		maxFilesInput.addEventListener('input', () => {
+			renderLargeRunWarning();
+			markPreviewStale(true);
+		});
 
 		window.addEventListener('message', (event) => {
 			const message = event.data;
@@ -499,6 +563,7 @@ function getWebviewHtml(webview: vscode.Webview, options: OpenBatchUnitDocsWebvi
 		});
 
 		setStatus('Preview to enable generation.', 'info');
+		renderLargeRunWarning();
 		setButtonsDisabled();
 	</script>
 </body>
@@ -530,9 +595,7 @@ export async function openBatchUnitDocsWebview(
 				sourceGlob: incomingState.sourceGlob.trim().length > 0 ? incomingState.sourceGlob.trim() : '**/*',
 				missingDocsOnly: Boolean(incomingState.missingDocsOnly),
 				resolveOrphanedDocs: Boolean(incomingState.resolveOrphanedDocs),
-				maxFiles: Number.isFinite(incomingState.maxFiles)
-					? Math.min(100, Math.max(1, Math.floor(incomingState.maxFiles)))
-					: 25,
+				maxFiles: normalizeBatchUnitDocFilesThisPass(incomingState.maxFiles),
 				selectionMode: incomingState.selectionMode === 'folder' ? 'folder' : 'workspace',
 				selectedSourceDirectory: incomingState.selectedSourceDirectory?.trim() || undefined,
 				selectedSummaryFile: incomingState.selectedSummaryFile?.trim() || undefined,

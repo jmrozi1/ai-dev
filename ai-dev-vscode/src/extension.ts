@@ -37,6 +37,8 @@ import {
 	getSelectedSourcePath,
 } from './workspace';
 import {
+	DEFAULT_BATCH_UNIT_DOC_FILES_THIS_PASS,
+	MAX_BATCH_UNIT_DOC_FILES_THIS_PASS,
 	openBatchUnitDocsWebview,
 	type BatchUnitDocActionType,
 	type BatchUnitDocPreviewItem,
@@ -65,8 +67,6 @@ const SETTINGS_COMMAND = 'aiDev.settings';
 const SET_EXECUTION_MODE_COMMAND = 'aiDev.setExecutionMode';
 const FALLBACK_SUMMARY_FILE = 'ai-docs/summary.md';
 const ARCHITECTURE_SUMMARY_FILE_NAME = 'architecture-summary.md';
-const DEFAULT_BATCH_UNIT_DOC_PREVIEW_LIMIT = 25;
-const MAX_BATCH_UNIT_DOC_PREVIEW_LIMIT = 100;
 const FALLBACK_BATCH_EXCLUDE_GLOBS = [
 	'.git/**',
 	'**/.git/**',
@@ -126,6 +126,12 @@ function getExecutionModeFromConfig(config: AiDevConfig):
 function getRootSummaryFilePath(config: AiDevConfig): string {
 	const configuredDocsDir = config.docsDir?.trim() || 'ai-docs';
 	const normalizedDocsDir = normalizePathForMarkdown(configuredDocsDir).replace(/\/+$/, '');
+	return path.posix.join(normalizedDocsDir, ARCHITECTURE_SUMMARY_FILE_NAME);
+}
+
+function getLegacyRootSummaryFilePath(config: AiDevConfig): string {
+	const configuredDocsDir = config.docsDir?.trim() || 'ai-docs';
+	const normalizedDocsDir = normalizePathForMarkdown(configuredDocsDir).replace(/\/+$/, '');
 	return path.posix.join(normalizedDocsDir, 'summary.md');
 }
 
@@ -141,6 +147,20 @@ function getConfiguredDocsDir(config: AiDevConfig): string {
 	}
 
 	return normalizePathForMarkdown(configuredDocsDir);
+}
+
+function getAiDevYamlPromptSection(config: AiDevConfig): { label: string; contents: string } {
+	if (config.raw.trim().length === 0) {
+		return {
+			label: '.ai-dev.yaml: not present; using generic defaults',
+			contents: '# .ai-dev.yaml not present; using generic defaults',
+		};
+	}
+
+	return {
+		label: '.ai-dev.yaml',
+		contents: config.raw,
+	};
 }
 
 function isPathInsideDirectory(targetPath: string, directoryPath: string): boolean {
@@ -1198,11 +1218,11 @@ async function computeBatchUnitDocSelection(params: {
 
 	afterMissingDocFilter.sort((left, right) => left.sourcePath.localeCompare(right.sourcePath));
 
-	const previewLimit = Math.min(
-		MAX_BATCH_UNIT_DOC_PREVIEW_LIMIT,
-		Math.max(1, Number.isFinite(formState.maxFiles) ? Math.floor(formState.maxFiles) : DEFAULT_BATCH_UNIT_DOC_PREVIEW_LIMIT)
+	const filesThisPassLimit = Math.min(
+		MAX_BATCH_UNIT_DOC_FILES_THIS_PASS,
+		Math.max(1, Number.isFinite(formState.maxFiles) ? Math.floor(formState.maxFiles) : DEFAULT_BATCH_UNIT_DOC_FILES_THIS_PASS)
 	);
-	const limitedCandidates = afterMissingDocFilter.slice(0, previewLimit);
+	const limitedCandidates = afterMissingDocFilter.slice(0, filesThisPassLimit);
 
 	const plannedActions: BatchUnitDocPlanAction[] = limitedCandidates.map((candidate) => ({
 		actionType: 'generate-doc',
@@ -2169,12 +2189,7 @@ async function openBatchSummaryGenerationWebview(params: {
 				| { workflowFilePath: string; workflowFileContents: string; templateFilePath: string; templateFileContents: string }
 				| undefined;
 			if (groupedGenerateActions.size > 0) {
-				if (!aiDevConfig.aiDevCorePathFromYaml) {
-					await vscode.window.showErrorMessage('Missing aiDevCore.path in .ai-dev.yaml.');
-					return;
-				}
-
-				const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePathFromYaml);
+				const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 				const workflowAbsolutePath = path.join(aiDevCorePath, 'workflows/generate-docs/generate-unit-doc.md');
 				const templateAbsolutePath = path.join(aiDevCorePath, 'workflows/generate-docs/templates/unit-doc.md');
 				const [workflowFileContents, templateFileContents] = await Promise.all([
@@ -2702,16 +2717,12 @@ async function openArchitectureSummaryGenerationWebview(params: {
 			}
 
 			const selectedStatusCounts = countArchitectureStatuses(selection.selectedItems);
+			const resolvedAiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 
 			if (modeResolution.mode === 'prompt-only') {
-				if (!aiDevConfig.aiDevCorePathFromYaml) {
-					await vscode.window.showErrorMessage('Missing aiDevCore.path in .ai-dev.yaml.');
-					return;
-				}
-
 				const promptMarkdown = buildGenerateArchitectureSummaryPromptMarkdown({
 					workspaceRoot,
-					aiDevCorePath: aiDevConfig.aiDevCorePathFromYaml,
+					aiDevCorePath: resolvedAiDevCorePath,
 					docsDir,
 					targetArchitecturePath: architectureSummaryPath,
 					selectedDirectories: selection.selectedItems.map((item) => ({
@@ -2733,20 +2744,15 @@ async function openArchitectureSummaryGenerationWebview(params: {
 				return;
 			}
 
-			if (!aiDevConfig.aiDevCorePathFromYaml) {
-				await vscode.window.showErrorMessage('Missing aiDevCore.path in .ai-dev.yaml.');
-				return;
-			}
-
-			const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePathFromYaml);
+			const aiDevCorePath = resolvedAiDevCorePath;
 			const workflowAbsolutePath = path.join(aiDevCorePath, 'workflows/generate-docs/generate-architecture-summary.md');
 			const templateAbsolutePath = path.join(aiDevCorePath, 'workflows/generate-docs/templates/architecture-summary.md');
-			const aiDevYamlPath = path.join(workspaceRoot, '.ai-dev.yaml');
+			const aiDevYamlSection = getAiDevYamlPromptSection(aiDevConfig);
 
 			const [workflowFileContents, templateFileContents, aiDevYamlContents, existingArchitectureSummaryContents] = await Promise.all([
 				fs.readFile(workflowAbsolutePath, 'utf8'),
 				fs.readFile(templateAbsolutePath, 'utf8'),
-				fs.readFile(aiDevYamlPath, 'utf8'),
+				Promise.resolve(aiDevYamlSection.contents),
 				readOptionalTextFile(architectureSummaryAbsolutePath),
 			]);
 
@@ -2770,7 +2776,7 @@ async function openArchitectureSummaryGenerationWebview(params: {
 				workflowFileContents,
 				templateFilePath: formatRelativePath(workspaceRoot, templateAbsolutePath),
 				templateFileContents,
-				aiDevYamlPath: '.ai-dev.yaml',
+				aiDevYamlLabel: aiDevYamlSection.label,
 				aiDevYamlContents,
 				docsDir,
 				targetArchitecturePath: architectureSummaryPath,
@@ -2908,9 +2914,6 @@ async function buildReviewFileDocumentationPromptBundle(target: {
 }): Promise<{ promptMarkdown: string }> {
 	const { activeFileUri, workspaceRoot } = target;
 	const aiDevConfig = await readAiDevConfig(workspaceRoot);
-	if (!aiDevConfig.aiDevCorePathFromYaml) {
-		throw new Error('Missing aiDevCore.path in .ai-dev.yaml.');
-	}
 
 	const configuredDocsDir = getConfiguredDocsDir(aiDevConfig);
 	const selectedSourcePath = getSelectedSourcePath(workspaceRoot, activeFileUri.fsPath);
@@ -2920,10 +2923,11 @@ async function buildReviewFileDocumentationPromptBundle(target: {
 		docsDir: configuredDocsDir,
 	});
 	const summaryFile = getRootSummaryFilePath(aiDevConfig);
+	const resolvedAiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 
 	return {
 		promptMarkdown: buildFileDocumentationReviewPromptMarkdown({
-			aiDevCorePath: aiDevConfig.aiDevCorePathFromYaml,
+			aiDevCorePath: resolvedAiDevCorePath,
 			workspaceRoot,
 			selectedSourcePath,
 			targetSummaryPath: expectedSummaryPath,
@@ -2936,9 +2940,6 @@ async function buildReviewDocumentationPromptBundle(workspaceRoot: string): Prom
 	promptMarkdown: string;
 }> {
 	const aiDevConfig = await readAiDevConfig(workspaceRoot);
-	if (!aiDevConfig.aiDevCorePathFromYaml) {
-		throw new Error('Missing aiDevCore.path in .ai-dev.yaml.');
-	}
 
 	let changedFilePaths: string[];
 	let renameRecords: GitRenameRecord[];
@@ -2961,10 +2962,11 @@ async function buildReviewDocumentationPromptBundle(workspaceRoot: string): Prom
 		renameRecords,
 	});
 	const deterministicFindingsMarkdown = toDeterministicFindingsMarkdown(deterministicFindings);
+	const resolvedAiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 
 	return {
 		promptMarkdown: buildReviewDocumentationPromptMarkdown({
-			aiDevCorePath: aiDevConfig.aiDevCorePathFromYaml,
+			aiDevCorePath: resolvedAiDevCorePath,
 			workspaceRoot,
 			changedFilePaths: changedFilePaths.map((filePath) => normalizePathForMarkdown(filePath)),
 			deterministicFindingsMarkdown,
@@ -2982,9 +2984,7 @@ async function buildGenerateUnitDocDirectPromptBundle(params: {
 	expectedSummaryPath: string;
 }> {
 	const { workspaceRoot, activeFileUri, aiDevConfig } = params;
-	if (!aiDevConfig.aiDevCorePathFromYaml) {
-		throw new Error('Missing aiDevCore.path in .ai-dev.yaml.');
-	}
+	const aiDevYamlSection = getAiDevYamlPromptSection(aiDevConfig);
 
 	const configuredDocsDir = getConfiguredDocsDir(aiDevConfig);
 	const selectedSourcePath = getSelectedSourcePath(workspaceRoot, activeFileUri.fsPath);
@@ -2993,19 +2993,18 @@ async function buildGenerateUnitDocDirectPromptBundle(params: {
 		sourceFilePath: activeFileUri.fsPath,
 		docsDir: configuredDocsDir,
 	});
-	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePathFromYaml);
+	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 	const workflowFilePath = path.join(aiDevCorePath, 'workflows/generate-docs/generate-unit-doc.md');
 	const templateFilePath = path.join(aiDevCorePath, 'workflows/generate-docs/templates/unit-doc.md');
 	const sourceFilePath = activeFileUri.fsPath;
 	const expectedSummaryAbsolutePath = path.resolve(workspaceRoot, expectedSummaryPath);
-	const aiDevYamlPath = path.join(workspaceRoot, '.ai-dev.yaml');
 
 	const [workflowFileContents, templateFileContents, sourceFileContents, expectedSummaryContents, aiDevYamlContents] = await Promise.all([
 		fs.readFile(workflowFilePath, 'utf8'),
 		fs.readFile(templateFilePath, 'utf8'),
 		fs.readFile(sourceFilePath, 'utf8'),
 		readOptionalTextFile(expectedSummaryAbsolutePath),
-		fs.readFile(aiDevYamlPath, 'utf8'),
+		Promise.resolve(aiDevYamlSection.contents),
 	]);
 
 	const directPromptMarkdown = [
@@ -3030,7 +3029,7 @@ async function buildGenerateUnitDocDirectPromptBundle(params: {
 		'```',
 		'',
 		'.ai-dev.yaml:',
-		'.ai-dev.yaml',
+		aiDevYamlSection.label,
 		'',
 		'```yaml',
 		aiDevYamlContents,
@@ -3080,9 +3079,7 @@ async function buildReviewDocumentationDirectPromptBundle(workspaceRoot: string,
 	deterministicFindings: DeterministicDocumentationFinding[];
 	gitDiffs: GitFileDiff[];
 }> {
-	if (!aiDevConfig.aiDevCorePathFromYaml) {
-		throw new Error('Missing aiDevCore.path in .ai-dev.yaml.');
-	}
+	const aiDevYamlSection = getAiDevYamlPromptSection(aiDevConfig);
 
 	let changedFilePaths: string[];
 	let renameRecords: GitRenameRecord[];
@@ -3106,15 +3103,14 @@ async function buildReviewDocumentationDirectPromptBundle(workspaceRoot: string,
 	});
 	const deterministicFindingsMarkdown = toDeterministicFindingsMarkdown(deterministicFindings);
 
-	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePathFromYaml);
+	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 	const workflowFilePath = path.join(aiDevCorePath, 'workflows/review/review-documentation.md');
 	const findingTemplatePath = path.join(aiDevCorePath, 'workflows/review/finding-template.md');
-	const aiDevYamlPath = path.join(workspaceRoot, '.ai-dev.yaml');
 
 	const [workflowFileContents, findingTemplateContents, aiDevYamlContents, changedFilesWithContent, gitDiffs] = await Promise.all([
 		fs.readFile(workflowFilePath, 'utf8'),
 		fs.readFile(findingTemplatePath, 'utf8'),
-		fs.readFile(aiDevYamlPath, 'utf8'),
+		Promise.resolve(aiDevYamlSection.contents),
 		existingChangedFilesWithContent(workspaceRoot, changedFilePaths),
 		getGitDiffForFiles(workspaceRoot, changedFilePaths),
 	]);
@@ -3207,7 +3203,7 @@ async function buildReviewDocumentationDirectPromptBundle(workspaceRoot: string,
 		'```',
 		'',
 		'.ai-dev.yaml:',
-		'.ai-dev.yaml',
+		aiDevYamlSection.label,
 		'',
 		'```yaml',
 		aiDevYamlContents,
@@ -3294,9 +3290,7 @@ async function buildReviewFileDocumentationDirectPromptBundle(target: {
 }> {
 	const { activeFileUri, workspaceRoot } = target;
 	const aiDevConfig = await readAiDevConfig(workspaceRoot);
-	if (!aiDevConfig.aiDevCorePathFromYaml) {
-		throw new Error('Missing aiDevCore.path in .ai-dev.yaml.');
-	}
+	const aiDevYamlSection = getAiDevYamlPromptSection(aiDevConfig);
 
 	const configuredDocsDir = getConfiguredDocsDir(aiDevConfig);
 	const selectedSourcePath = getSelectedSourcePath(workspaceRoot, activeFileUri.fsPath);
@@ -3306,10 +3300,9 @@ async function buildReviewFileDocumentationDirectPromptBundle(target: {
 		docsDir: configuredDocsDir,
 	});
 	const summaryFile = getRootSummaryFilePath(aiDevConfig);
-	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePathFromYaml);
+	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 	const workflowFilePath = path.join(aiDevCorePath, 'workflows/review/review-documentation.md');
 	const findingTemplatePath = path.join(aiDevCorePath, 'workflows/review/finding-template.md');
-	const aiDevYamlPath = path.join(workspaceRoot, '.ai-dev.yaml');
 	const sourceFilePath = activeFileUri.fsPath;
 	const expectedSummaryAbsolutePath = path.resolve(workspaceRoot, expectedSummaryPath);
 	const summaryFileAbsolutePath = path.resolve(workspaceRoot, summaryFile);
@@ -3320,7 +3313,7 @@ async function buildReviewFileDocumentationDirectPromptBundle(target: {
 		fs.readFile(sourceFilePath, 'utf8'),
 		readOptionalTextFile(expectedSummaryAbsolutePath),
 		readOptionalTextFile(summaryFileAbsolutePath),
-		fs.readFile(aiDevYamlPath, 'utf8'),
+		Promise.resolve(aiDevYamlSection.contents),
 	]);
 
 	const directPromptMarkdown = [
@@ -3346,7 +3339,7 @@ async function buildReviewFileDocumentationDirectPromptBundle(target: {
 		'```',
 		'',
 		'.ai-dev.yaml:',
-		'.ai-dev.yaml',
+		aiDevYamlSection.label,
 		'',
 		'```yaml',
 		aiDevYamlContents,
@@ -3445,10 +3438,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 			try {
 				const aiDevConfig = await readAiDevConfig(workspaceRoot);
-				if (!aiDevConfig.aiDevCorePathFromYaml) {
-					await vscode.window.showErrorMessage('Missing aiDevCore.path in .ai-dev.yaml.');
-					return;
-				}
 
 				const modeResolution = getExecutionModeFromConfig(aiDevConfig);
 				if ('errorMessage' in modeResolution) {
@@ -3609,17 +3598,12 @@ export function activate(context: vscode.ExtensionContext) {
 
 				const promptMarkdown = buildUnitDocPromptMarkdown({
 					workspaceRoot,
-					aiDevCorePath: aiDevConfig.aiDevCorePathFromYaml,
+					aiDevCorePath: resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath),
 					selectedSourcePath,
 					targetSummaryPath: expectedSummaryPath,
 				});
 				await openMarkdownPromptAndCopy(promptMarkdown, 'Generated summary instructions and copied them to clipboard.');
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-					await vscode.window.showErrorMessage('Missing .ai-dev.yaml in workspace root.');
-					return;
-				}
-
 				const message = error instanceof Error ? error.message : String(error);
 				await vscode.window.showErrorMessage(`Failed to generate summary: ${message}`);
 			}
@@ -3644,16 +3628,11 @@ export function activate(context: vscode.ExtensionContext) {
 						sourceGlob: getBatchInitialSourceGlob(aiDevConfig),
 						missingDocsOnly: true,
 						resolveOrphanedDocs: false,
-						maxFiles: DEFAULT_BATCH_UNIT_DOC_PREVIEW_LIMIT,
+						maxFiles: DEFAULT_BATCH_UNIT_DOC_FILES_THIS_PASS,
 						selectionMode: 'workspace',
 					},
 				});
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-					await vscode.window.showErrorMessage('Missing .ai-dev.yaml in workspace root.');
-					return;
-				}
-
 				const message = error instanceof Error ? error.message : String(error);
 				await vscode.window.showErrorMessage(`Failed to run batch summary generation: ${message}`);
 			}
@@ -3675,11 +3654,6 @@ export function activate(context: vscode.ExtensionContext) {
 					workspaceRoot,
 				});
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-					await vscode.window.showErrorMessage('Missing .ai-dev.yaml in workspace root.');
-					return;
-				}
-
 				const message = error instanceof Error ? error.message : String(error);
 				await vscode.window.showErrorMessage(`Failed to open architecture summary generation: ${message}`);
 			}
@@ -3707,18 +3681,13 @@ export function activate(context: vscode.ExtensionContext) {
 						sourceGlob: getBatchInitialSourceGlob(aiDevConfig),
 						missingDocsOnly: true,
 						resolveOrphanedDocs: false,
-						maxFiles: DEFAULT_BATCH_UNIT_DOC_PREVIEW_LIMIT,
+						maxFiles: DEFAULT_BATCH_UNIT_DOC_FILES_THIS_PASS,
 						selectionMode: 'folder',
 						selectedSourceDirectory: target.selectedSourceDirectory,
 						selectedSummaryFile,
 					},
 				});
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-					await vscode.window.showErrorMessage('Missing .ai-dev.yaml in workspace root.');
-					return;
-				}
-
 				const message = error instanceof Error ? error.message : String(error);
 				await vscode.window.showErrorMessage(`Failed to open folder summary generation: ${message}`);
 			}
@@ -3736,10 +3705,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 			try {
 				const aiDevConfig = await readAiDevConfig(workspaceRoot);
-				if (!aiDevConfig.aiDevCorePathFromYaml) {
-					await vscode.window.showErrorMessage('Missing aiDevCore.path in .ai-dev.yaml.');
-					return;
-				}
 
 				const modeResolution = getExecutionModeFromConfig(aiDevConfig);
 				if ('errorMessage' in modeResolution) {
@@ -3841,14 +3806,8 @@ export function activate(context: vscode.ExtensionContext) {
 				const { promptMarkdown } = await buildReviewDocumentationPromptBundle(workspaceRoot);
 				await openMarkdownPromptAndCopy(promptMarkdown, 'Generated changed-docs review instructions and copied them to clipboard.');
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-					await vscode.window.showErrorMessage('Missing .ai-dev.yaml in workspace root.');
-					return;
-				}
-
 				const message = error instanceof Error ? error.message : String(error);
 				if (
-					message === 'Missing aiDevCore.path in .ai-dev.yaml.' ||
 					message === 'No changed files found.' ||
 					message.startsWith('Failed to read git changed files:')
 				) {
@@ -3872,10 +3831,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 			try {
 				const aiDevConfig = await readAiDevConfig(target.workspaceRoot);
-				if (!aiDevConfig.aiDevCorePathFromYaml) {
-					await vscode.window.showErrorMessage('Missing aiDevCore.path in .ai-dev.yaml.');
-					return;
-				}
 
 				const docsDir = getConfiguredDocsDir(aiDevConfig);
 				const docsDirAbsolutePath = path.resolve(target.workspaceRoot, docsDir);
@@ -3954,14 +3909,8 @@ export function activate(context: vscode.ExtensionContext) {
 				const { promptMarkdown } = await buildReviewFileDocumentationPromptBundle(target);
 				await openMarkdownPromptAndCopy(promptMarkdown, 'Generated file-docs review instructions and copied them to clipboard.');
 			} catch (error) {
-				if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-					await vscode.window.showErrorMessage('Missing .ai-dev.yaml in workspace root.');
-					return;
-				}
-
 				const message = error instanceof Error ? error.message : String(error);
 				if (
-					message === 'Missing aiDevCore.path in .ai-dev.yaml.' ||
 					message === 'Unsafe documentation summary path resolved.'
 				) {
 					await vscode.window.showErrorMessage(message);
@@ -3992,11 +3941,7 @@ export function activate(context: vscode.ExtensionContext) {
 			}
 
 			const aiDevConfig = await readAiDevConfig(workspaceRoot);
-			if (!aiDevConfig.aiDevCorePathFromYaml) {
-				await vscode.window.showErrorMessage('Missing aiDevCore.path in .ai-dev.yaml.');
-				return;
-			}
-			const aiDevCorePathFromYaml = aiDevConfig.aiDevCorePathFromYaml;
+			const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 
 			const modeResolution = getExecutionModeFromConfig(aiDevConfig);
 			if ('errorMessage' in modeResolution) {
@@ -4008,16 +3953,11 @@ export function activate(context: vscode.ExtensionContext) {
 				try {
 					const promptMarkdown = buildAnswerPromptMarkdown({
 						workspaceRoot,
-						aiDevCorePath: aiDevCorePathFromYaml,
+						aiDevCorePath,
 						userQuestion: userQuestion.trim(),
 					});
 					await openMarkdownPromptAndCopy(promptMarkdown, 'Generated answer instructions and copied them to clipboard.');
 				} catch (error) {
-					if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-						await vscode.window.showErrorMessage('Missing .ai-dev.yaml in workspace root.');
-						return;
-					}
-
 					const message = error instanceof Error ? error.message : String(error);
 					await vscode.window.showErrorMessage(`Failed to generate answer instructions: ${message}`);
 				}
@@ -4027,18 +3967,30 @@ export function activate(context: vscode.ExtensionContext) {
 
 			try {
 				const trimmedUserQuestion = userQuestion.trim();
-				const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevCorePathFromYaml);
+				const aiDevYamlSection = getAiDevYamlPromptSection(aiDevConfig);
 				const workflowFilePath = path.join(aiDevCorePath, 'workflows/answer-docs/answer-from-ai-docs.md');
-				const aiDevYamlPath = path.join(workspaceRoot, '.ai-dev.yaml');
 				const docsDir = getConfiguredDocsDir(aiDevConfig);
 				const docsDirAbsolutePath = path.resolve(workspaceRoot, docsDir);
-				const rootSummaryPath = getRootSummaryFilePath(aiDevConfig);
-				const rootSummaryAbsolutePath = path.resolve(workspaceRoot, rootSummaryPath);
-				const [workflowFileContents, aiDevYamlContents, rootSummaryContents] = await Promise.all([
+				const architectureRootSummaryPath = getRootSummaryFilePath(aiDevConfig);
+				const architectureRootSummaryAbsolutePath = path.resolve(workspaceRoot, architectureRootSummaryPath);
+				const legacyRootSummaryPath = getLegacyRootSummaryFilePath(aiDevConfig);
+				const legacyRootSummaryAbsolutePath = path.resolve(workspaceRoot, legacyRootSummaryPath);
+				const [
+					workflowFileContents,
+					aiDevYamlContents,
+					architectureRootSummaryContents,
+					legacyRootSummaryContents,
+				] = await Promise.all([
 					fs.readFile(workflowFilePath, 'utf8'),
-					fs.readFile(aiDevYamlPath, 'utf8'),
-					readOptionalTextFile(rootSummaryAbsolutePath),
+					Promise.resolve(aiDevYamlSection.contents),
+					readOptionalTextFile(architectureRootSummaryAbsolutePath),
+					readOptionalTextFile(legacyRootSummaryAbsolutePath),
 				]);
+
+				const architectureRootSummaryUsable = architectureRootSummaryContents !== undefined && architectureRootSummaryContents.trim().length > 0;
+				const rootSummaryPath = architectureRootSummaryUsable ? architectureRootSummaryPath : legacyRootSummaryPath;
+				const rootSummaryAbsolutePath = architectureRootSummaryUsable ? architectureRootSummaryAbsolutePath : legacyRootSummaryAbsolutePath;
+				const rootSummaryContents = architectureRootSummaryUsable ? architectureRootSummaryContents : legacyRootSummaryContents;
 				const rootSummaryExists = rootSummaryContents !== undefined;
 				const rootSummaryEmpty = rootSummaryExists && rootSummaryContents.trim().length === 0;
 				const routedDocumentationContext = await collectRoutedDocumentationContextForAnswer({
@@ -4059,6 +4011,8 @@ export function activate(context: vscode.ExtensionContext) {
 				if (rootSummaryExists && !rootSummaryEmpty) {
 					excludeFallbackAbsolutePaths.add(rootSummaryAbsolutePath);
 				}
+				excludeFallbackAbsolutePaths.add(architectureRootSummaryAbsolutePath);
+				excludeFallbackAbsolutePaths.add(legacyRootSummaryAbsolutePath);
 
 				let fallbackIncludedReason: string | undefined;
 				if (!rootSummaryExists) {
@@ -4083,7 +4037,7 @@ export function activate(context: vscode.ExtensionContext) {
 					workspaceRoot,
 					workflowFilePath,
 					workflowFileContents,
-					aiDevYamlPath,
+					aiDevYamlLabel: aiDevYamlSection.label,
 					aiDevYamlContents,
 					rootSummaryPath,
 					rootSummaryExists,

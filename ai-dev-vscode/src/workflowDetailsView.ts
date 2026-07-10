@@ -41,7 +41,7 @@ async function readWorkflowSections(workflow: AiDevWorkflow): Promise<WorkflowDe
 			{
 				label: 'Instructions',
 				pathLabel: 'N/A',
-				content: 'Unable to load workflow instructions. Missing .ai-dev.yaml or aiDevCore.path.',
+				content: 'Unable to load workflow instructions because no workspace is open.',
 				missing: true,
 			},
 		];
@@ -55,24 +55,13 @@ async function readWorkflowSections(workflow: AiDevWorkflow): Promise<WorkflowDe
 			{
 				label: 'Instructions',
 				pathLabel: 'N/A',
-				content: 'Unable to load workflow instructions. Missing .ai-dev.yaml or aiDevCore.path.',
+				content: 'Unable to load workflow instructions due to a configuration read error.',
 				missing: true,
 			},
 		];
 	}
 
-	if (!aiDevConfig.aiDevCorePathFromYaml) {
-		return [
-			{
-				label: 'Instructions',
-				pathLabel: 'N/A',
-				content: 'Unable to load workflow instructions. Missing .ai-dev.yaml or aiDevCore.path.',
-				missing: true,
-			},
-		];
-	}
-
-	const resolvedCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePathFromYaml);
+	const resolvedCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
 	const sections: WorkflowDetailSection[] = [];
 
 	for (const instructionFile of workflow.instructionFiles) {
@@ -90,7 +79,7 @@ async function readWorkflowSections(workflow: AiDevWorkflow): Promise<WorkflowDe
 				sections.push({
 					label: instructionFile.label,
 					pathLabel: instructionFile.relativePath,
-					content: `Missing instruction file: ${instructionFile.relativePath}`,
+					content: `Missing instruction file at resolved path: ${resolvedFilePath}`,
 					missing: true,
 				});
 				continue;
@@ -99,7 +88,7 @@ async function readWorkflowSections(workflow: AiDevWorkflow): Promise<WorkflowDe
 			sections.push({
 				label: instructionFile.label,
 				pathLabel: instructionFile.relativePath,
-				content: `Unable to read instruction file: ${instructionFile.relativePath}`,
+				content: `Unable to read instruction file at resolved path: ${resolvedFilePath}`,
 				missing: true,
 			});
 		}

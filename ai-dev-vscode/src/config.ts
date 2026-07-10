@@ -17,11 +17,15 @@ function getBundledAiDevCorePath(): string | undefined {
 
 export interface AiDevConfig {
 	raw: string;
-	aiDevCorePathFromYaml?: string;
+	aiDevCorePath?: string;
 	aiProviderMode?: string;
 	docsDir?: string;
 	batchInitialSourceGlob?: string;
 }
+
+const DEFAULT_DOCS_DIR = 'ai-docs';
+const DEFAULT_AI_PROVIDER_MODE = 'direct-experimental';
+const DEFAULT_BATCH_INITIAL_SOURCE_GLOB = '**/*';
 
 function unquoteYamlValue(value: string): string {
 	const trimmed = value.trim();
@@ -66,18 +70,26 @@ function getConfiguredAiDevCorePath(rawYaml: string): string | undefined {
 }
 
 export async function readAiDevConfig(workspaceRoot: string): Promise<AiDevConfig> {
-	const raw = await fs.readFile(path.join(workspaceRoot, '.ai-dev.yaml'), 'utf8');
+	let raw = '';
+	try {
+		raw = await fs.readFile(path.join(workspaceRoot, '.ai-dev.yaml'), 'utf8');
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw error;
+		}
+	}
+
 	return {
 		raw,
-		aiDevCorePathFromYaml: getConfiguredAiDevCorePath(raw),
-		aiProviderMode: getYamlNestedValue(raw, 'aiProvider', 'mode'),
-		docsDir: getYamlNestedValue(raw, 'documentation', 'docsDir'),
-		batchInitialSourceGlob: getYamlNestedValue(raw, 'documentation', 'batchInitialSourceGlob'),
+		aiDevCorePath: getConfiguredAiDevCorePath(raw),
+		aiProviderMode: getYamlNestedValue(raw, 'aiProvider', 'mode') ?? DEFAULT_AI_PROVIDER_MODE,
+		docsDir: getYamlNestedValue(raw, 'documentation', 'docsDir') ?? DEFAULT_DOCS_DIR,
+		batchInitialSourceGlob: getYamlNestedValue(raw, 'documentation', 'batchInitialSourceGlob') ?? DEFAULT_BATCH_INITIAL_SOURCE_GLOB,
 	};
 }
 
-export function resolveAiDevCorePath(workspaceRoot: string, aiDevCorePathFromYaml: string | undefined): string {
-	const configuredPath = aiDevCorePathFromYaml?.trim();
+export function resolveAiDevCorePath(workspaceRoot: string, aiDevCorePath: string | undefined): string {
+	const configuredPath = aiDevCorePath?.trim();
 	if (configuredPath) {
 		return path.resolve(workspaceRoot, configuredPath);
 	}

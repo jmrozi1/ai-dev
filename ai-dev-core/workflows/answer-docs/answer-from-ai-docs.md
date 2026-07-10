@@ -20,7 +20,8 @@ Required inputs:
 Optional inputs:
 
 * workspace `.ai-dev.yaml`
-* root `ai-docs/summary.md`
+* root `ai-docs/architecture-summary.md` routing context
+* legacy root `ai-docs/summary.md`, when present
 * scoped `ai-docs/**/summary.md` files
 * `ai-docs/dependency-map.md`, when present
 * root `README.md` or scoped `README.md`, when useful
@@ -55,8 +56,8 @@ Produce a direct answer to the user question with:
 Follow this order unless the repository layout makes a step impossible.
 
 1. Read workspace `.ai-dev.yaml` for profile, source globs, documentation layout, and dependency-map settings.
-2. Read root `ai-docs/summary.md` when present.
-3. Use the root summary to choose the most relevant scoped summary, dependency map, or source file.
+2. Read root `ai-docs/architecture-summary.md` when present; use `ai-docs/summary.md` only as a legacy fallback.
+3. Use the root architecture/routing context to choose the most relevant scoped summary, dependency map, or source file.
 4. If the question routes to a child scope, read that scope’s `summary.md`.
 5. Continue narrowing through scoped summaries until the likely source files are identified.
 6. Read only the minimal source files needed to answer the question.
@@ -128,7 +129,7 @@ Verification procedure:
 
 If the normal route is insufficient, broaden in controlled steps.
 
-1. If `ai-docs/summary.md` is missing, stale, ambiguous, or insufficient, search scoped `summary.md` files.
+1. If `ai-docs/architecture-summary.md` and legacy `ai-docs/summary.md` are missing, stale, ambiguous, or insufficient, search scoped `summary.md` files.
 2. If summaries still do not answer routing, search likely source files directly.
 3. If the question involves implicit dependencies and `dependency-map.md` is missing or insufficient, search manifests, load-order files, globals, and symbol references directly.
 4. If no reliable evidence is found, provide best-effort guidance with explicit uncertainty and next verification targets.
@@ -172,7 +173,7 @@ A high-quality answer should be:
 
 Before finalizing, check:
 
-* Did I use `summary.md` for routing when available?
+* Did I use `architecture-summary.md` or legacy root `summary.md` for routing when available?
 * Did I avoid reading the whole repository by default?
 * Did I use `dependency-map.md` when the question involved load order, globals, or producer/consumer relationships?
 * Did I verify code-level specifics against source?
