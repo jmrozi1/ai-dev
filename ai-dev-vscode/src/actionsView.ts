@@ -20,7 +20,13 @@ interface SettingNode {
 	label: string;
 }
 
-type AiDevWorkflowNode = WorkflowGroupNode | WorkflowNode | SettingNode;
+interface LaunchAssistantNode {
+	type: 'launchAssistant';
+	id: 'launchAssistant';
+	label: string;
+}
+
+type AiDevWorkflowNode = WorkflowGroupNode | WorkflowNode | SettingNode | LaunchAssistantNode;
 
 const WORKFLOW_GROUP: WorkflowGroupNode = {
 	type: 'group',
@@ -33,6 +39,16 @@ const SETTINGS_NODE: SettingNode = {
 	id: 'settings',
 	label: 'Settings',
 };
+
+const LAUNCH_ASSISTANT_NODE: LaunchAssistantNode = {
+	type: 'launchAssistant',
+	id: 'launchAssistant',
+	label: 'Launch Assistant',
+};
+
+export function getAiDevRootNodes(): AiDevWorkflowNode[] {
+	return [LAUNCH_ASSISTANT_NODE, WORKFLOW_GROUP, SETTINGS_NODE];
+}
 
 class AiDevWorkflowTreeItem extends vscode.TreeItem {
 	constructor(node: AiDevWorkflowNode) {
@@ -57,6 +73,16 @@ class AiDevWorkflowTreeItem extends vscode.TreeItem {
 			return;
 		}
 
+		if (node.type === 'launchAssistant') {
+			this.iconPath = new vscode.ThemeIcon('terminal');
+			this.command = {
+				command: 'aiDev.launchAssistant',
+				title: node.label,
+			};
+			this.contextValue = 'aiDevLaunchAssistantItem';
+			return;
+		}
+
 		this.iconPath = new vscode.ThemeIcon('symbol-event');
 		this.command = {
 			command: 'aiDev.selectWorkflow',
@@ -78,7 +104,7 @@ export class AiDevWorkflowsProvider implements vscode.TreeDataProvider<AiDevWork
 
 	getChildren(element?: AiDevWorkflowNode): Thenable<AiDevWorkflowNode[]> {
 		if (!element) {
-			return Promise.resolve([WORKFLOW_GROUP, SETTINGS_NODE]);
+			return Promise.resolve(getAiDevRootNodes());
 		}
 
 		if (element.type === 'group' && element.id === 'workflows') {

@@ -53,6 +53,7 @@ import {
 	type ArchitectureSummaryStatus,
 } from './architectureSummaryView';
 import { openSettingsWebview } from './settingsView';
+import { AiDevAssistantTerminalManager } from './assistantTerminal';
 
 const GENERATE_UNIT_DOC_COMMAND = 'aiDev.generateUnitDocPromptForActiveFile';
 const GENERATE_UNIT_DOCS_BATCH_EXPERIMENTAL_COMMAND = 'aiDev.generateUnitDocsBatchExperimental';
@@ -65,6 +66,7 @@ const COPILOT_TEST_COMMAND = 'aiDev.copilotTest';
 const SELECT_WORKFLOW_COMMAND = 'aiDev.selectWorkflow';
 const SETTINGS_COMMAND = 'aiDev.settings';
 const SET_EXECUTION_MODE_COMMAND = 'aiDev.setExecutionMode';
+const LAUNCH_ASSISTANT_COMMAND = 'aiDev.launchAssistant';
 const FALLBACK_SUMMARY_FILE = 'ai-docs/summary.md';
 const ARCHITECTURE_SUMMARY_FILE_NAME = 'architecture-summary.md';
 const FALLBACK_BATCH_EXCLUDE_GLOBS = [
@@ -3389,9 +3391,18 @@ async function buildReviewFileDocumentationDirectPromptBundle(target: {
 export function activate(context: vscode.ExtensionContext) {
 	setAiDevExtensionRootPath(context.extensionPath);
 	registerAiDevActionsView(context);
+	const assistantTerminalManager = new AiDevAssistantTerminalManager(vscode.window);
+	context.subscriptions.push(assistantTerminalManager);
 	const workflowDetailsProvider = new WorkflowDetailsViewProvider();
 	context.subscriptions.push(
 		vscode.window.registerWebviewViewProvider('aiDev.workflowDetails', workflowDetailsProvider)
+	);
+
+	const launchAssistantCommand = vscode.commands.registerCommand(
+		LAUNCH_ASSISTANT_COMMAND,
+		() => {
+			assistantTerminalManager.launchAssistant();
+		}
 	);
 
 	const selectWorkflowCommand = vscode.commands.registerCommand(
@@ -4354,6 +4365,7 @@ export function activate(context: vscode.ExtensionContext) {
 	);
 
 	context.subscriptions.push(
+		launchAssistantCommand,
 		selectWorkflowCommand,
 		generateUnitDocCommand,
 		generateUnitDocsBatchExperimentalCommand,

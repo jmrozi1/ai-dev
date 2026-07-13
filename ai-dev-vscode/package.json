@@ -41,6 +41,11 @@
     },
     "commands": [
       {
+        "command": "aiDev.launchAssistant",
+        "title": "Launch Assistant",
+        "category": "AI Dev"
+      },
+      {
         "command": "aiDev.generateUnitDocPromptForActiveFile",
         "title": "Generate Summary Doc for Selected File",
         "category": "AI Dev"
@@ -166,6 +171,7 @@
   "activationEvents": [
     "onView:aiDev.workflows",
     "onView:aiDev.workflowDetails",
+    "onCommand:aiDev.launchAssistant",
     "onCommand:aiDev.generateUnitDocPromptForActiveFile",
     "onCommand:aiDev.generateUnitDocsBatchExperimental",
     "onCommand:aiDev.generateArchitectureSummary",
