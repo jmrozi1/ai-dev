@@ -4398,6 +4398,59 @@ async function completeSingleFileSummary(
 	};
 }
 
+async function prepareChangedDocumentationReview(
+	target?: string
+): Promise<{
+	prompt: string;
+	changedFileCount: number;
+	deterministicFindingCount: number;
+	deterministicFindingsMarkdown: string;
+	warnings: string[];
+}> {
+	if (target?.trim()) {
+		throw new Error(
+			'Targeted /review paths are not connected yet. Run /review --docs for changed project documentation.'
+		);
+	}
+
+	const workspaceRoot = getOpenWorkspaceRoot();
+
+	if (!workspaceRoot) {
+		throw new Error('No workspace is open.');
+	}
+
+	const aiDevConfig = await readAiDevConfig(workspaceRoot);
+	const modeResolution = getExecutionModeFromConfig(aiDevConfig);
+
+	if ('errorMessage' in modeResolution) {
+		throw new Error(modeResolution.errorMessage);
+	}
+
+	if (modeResolution.mode !== 'direct-experimental') {
+		throw new Error(
+			'/review in the terminal requires direct-experimental mode.'
+		);
+	}
+
+	const bundle =
+		await buildReviewDocumentationDirectPromptBundle(
+			workspaceRoot,
+			aiDevConfig
+		);
+
+	return {
+		prompt: bundle.directPromptMarkdown,
+		changedFileCount: bundle.changedFilePaths.length,
+		deterministicFindingCount:
+			bundle.deterministicFindings.length,
+		deterministicFindingsMarkdown:
+			toDeterministicFindingsMarkdown(
+				bundle.deterministicFindings
+			),
+		warnings: [],
+	};
+}
+
 async function buildSummaryAnswerRoute(
 	userQuestion: string
 ): Promise<{
@@ -4668,6 +4721,7 @@ export function activate(context: vscode.ExtensionContext) {
 			prepare: prepareSingleFileSummary,
 			complete: completeSingleFileSummary,
 		},
+		prepareChangedDocumentationReview,
 		(report) => {
 			assistantReportStore.setLatest(report);
 			assistantReportPanel.refresh();

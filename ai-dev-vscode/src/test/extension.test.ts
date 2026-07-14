@@ -40,6 +40,7 @@ import {
 	AssistantReportStore,
 	createAssistantReport,
 	parseReportResponse,
+	parseReviewFindings,
 } from '../assistantReport';
 import {
 	buildAssistantReportHtml,
@@ -1143,6 +1144,173 @@ suite('Extension Test Suite', () => {
 		]);
 	});
 
+	test('Review findings parse structured template fields', () => {
+		const findings = parseReviewFindings([
+			'## Finding: Missing routing summary',
+			'',
+			'**Severity:** warning',
+			'',
+			'**Category:** Missing summary',
+			'',
+			'**Source file:**',
+			'`src/example.ts`',
+			'',
+			'**Documentation file:**',
+			'`ai-docs/src/summary.md`',
+			'',
+			'### Evidence',
+			'',
+			'- Source exists.',
+			'- Summary entry is absent.',
+			'',
+			'### Impact',
+			'',
+			'Routing is incomplete.',
+			'',
+			'### Suggested action',
+			'',
+			'Add a routing entry.',
+			'',
+			'### AI-generated update appropriate?',
+			'',
+			'Yes.',
+			'',
+			'### Uncertainty',
+			'',
+			'None.',
+		].join('\n'));
+
+		assert.strictEqual(findings.length, 1);
+		assert.strictEqual(
+			findings[0].title,
+			'Missing routing summary'
+		);
+		assert.strictEqual(findings[0].severity, 'warning');
+		assert.strictEqual(
+			findings[0].sourceFile,
+			'src/example.ts'
+		);
+		assert.strictEqual(
+			findings[0].documentationFile,
+			'ai-docs/src/summary.md'
+		);
+		assert.deepStrictEqual(
+			findings[0].evidence,
+			[
+				'Source exists.',
+				'Summary entry is absent.',
+			]
+		);
+		assert.strictEqual(
+			findings[0].suggestedAction,
+			'Add a routing entry.'
+		);
+	});
+
+	test('Model findings replace matching deterministic findings', () => {
+		const findings = parseReviewFindings([
+			'## Deterministic Documentation Mapping Findings',
+			'',
+			'### Missing expected summary',
+			'',
+			'- Source path: artifacts/example.vsix',
+			'- Expected summary path: ai-docs/artifacts/summary.md',
+			'',
+			'## Model Review Findings',
+			'',
+			'## Finding: Missing expected summary for artifacts',
+			'',
+			'**Severity:** warning',
+			'',
+			'**Category:** Missing summary',
+			'',
+			'**Source file:**',
+			'`artifacts/example.vsix`',
+			'',
+			'**Documentation file:**',
+			'`ai-docs/artifacts/summary.md`',
+			'',
+			'### Evidence',
+			'',
+			'- Summary is absent.',
+			'',
+			'### Impact',
+			'',
+			'Routing is incomplete.',
+			'',
+			'### Suggested action',
+			'',
+			'Add the summary.',
+			'',
+			'### AI-generated update appropriate?',
+			'',
+			'Yes.',
+			'',
+			'### Uncertainty',
+			'',
+			'None.',
+		].join('\n'));
+
+		assert.strictEqual(findings.length, 1);
+		assert.strictEqual(
+			findings[0].origin,
+			'model'
+		);
+		assert.strictEqual(
+			findings[0].sourceFile,
+			'artifacts/example.vsix'
+		);
+	});
+
+	test('Review report HTML uses findings table and bottom inspector', () => {
+		const report = createAssistantReport({
+			route: 'review',
+			title: 'AI Dev Review',
+			rawResponse: [
+				'## Finding: Missing routing summary',
+				'',
+				'**Severity:** warning',
+				'',
+				'**Category:** Missing summary',
+				'',
+				'**Source file:**',
+				'`src/example.ts`',
+				'',
+				'**Documentation file:**',
+				'`ai-docs/src/summary.md`',
+				'',
+				'### Evidence',
+				'',
+				'- Summary entry is absent.',
+				'',
+				'### Impact',
+				'',
+				'Routing is incomplete.',
+				'',
+				'### Suggested action',
+				'',
+				'Add a routing entry.',
+				'',
+				'### AI-generated update appropriate?',
+				'',
+				'Yes.',
+				'',
+				'### Uncertainty',
+				'',
+				'None.',
+			].join('\n'),
+		});
+
+		const html = buildAssistantReportHtml(report);
+
+		assert.match(html, /class="table-shell"/);
+		assert.match(html, /class="finding-row"/);
+		assert.match(html, /id="review-inspector"/);
+		assert.match(html, /class="inspector-resizer"/);
+		assert.match(html, /id="inspector-close"/);
+		assert.doesNotMatch(html, /<nav class="toc"/);
+	});
+
 	test('Report HTML uses a fixed contents navigation layout', () => {
 		const report = createAssistantReport({
 			route: 'summary',
@@ -1469,6 +1637,44 @@ suite('Extension Test Suite', () => {
 		assert.match(
 			source,
 			/Estimated model calls:/
+		);
+	});
+
+	test('/review supports changed-documentation mode', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/submitDocumentationReview/
+		);
+		assert.match(
+			source,
+			/Changed files reviewed:/
+		);
+		assert.match(
+			source,
+			/route: 'review'/
+		);
+	});
+
+	test('/review sends findings to the report panel', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/this\.reportSink\?\.\(report\)/
+		);
+		assert.match(
+			source,
+			/\/showreport for findings/
 		);
 	});
 

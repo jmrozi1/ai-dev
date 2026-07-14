@@ -350,6 +350,18 @@ export interface AssistantSummarizeRoute {
 	): Promise<AssistantSummarizeCompletion>;
 }
 
+export interface AssistantReviewPreparation {
+	prompt: string;
+	changedFileCount: number;
+	deterministicFindingCount: number;
+	deterministicFindingsMarkdown: string;
+	warnings: string[];
+}
+
+export type AssistantReviewRoute = (
+	target?: string
+) => Promise<AssistantReviewPreparation>;
+
 export type AssistantReportSink = (
 	report: AssistantReport
 ) => void;
@@ -379,6 +391,7 @@ export class AiDevAssistantTerminalManager implements vscode.Disposable {
 			() => new VsCodeAssistantChatBackend(),
 		private readonly summaryRoute?: AssistantSummaryRoute,
 		private readonly summarizeRoute?: AssistantSummarizeRoute,
+		private readonly reviewRoute?: AssistantReviewRoute,
 		private readonly reportSink?: AssistantReportSink,
 		private readonly reportOpener?: AssistantReportOpener,
 		private readonly summarizationConfigOpener?:
@@ -405,6 +418,7 @@ export class AiDevAssistantTerminalManager implements vscode.Disposable {
 			this.backendFactory(),
 			this.summaryRoute,
 			this.summarizeRoute,
+			this.reviewRoute,
 			this.reportSink,
 			this.reportOpener,
 			this.summarizationConfigOpener,
@@ -458,6 +472,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 			new VsCodeAssistantChatBackend(),
 		private readonly summaryRoute?: AssistantSummaryRoute,
 		private readonly summarizeRoute?: AssistantSummarizeRoute,
+		private readonly reviewRoute?: AssistantReviewRoute,
 		private readonly reportSink?: AssistantReportSink,
 		private readonly reportOpener?: AssistantReportOpener,
 		private readonly summarizationConfigOpener?:
@@ -945,6 +960,134 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		}
 	}
 
+	private async submitDocumentationReview(
+		target?: string
+	): Promise<void> {
+		const cancellation =
+			new vscode.CancellationTokenSource();
+
+		this.requestCancellation = cancellation;
+		this.requestInFlight = true;
+		this.showEphemeralWithPrompt(
+			'Preparing changed-documentation review...'
+		);
+
+		try {
+			const preparation =
+				await this.reviewRoute!(target);
+
+			if (cancellation.token.isCancellationRequested) {
+				throw new Error('Assistant request cancelled.');
+			}
+
+			this.showEphemeralWithPrompt(
+				`Reviewing ${preparation.changedFileCount} changed file(s)...`
+			);
+
+			const modelResponse =
+				await this.chatBackend.sendIsolatedMessage(
+					preparation.prompt,
+					cancellation.token
+				);
+
+			if (cancellation.token.isCancellationRequested) {
+				throw new Error('Assistant request cancelled.');
+			}
+
+			const modelFindings = modelResponse.trim()
+				? modelResponse
+				: [
+					'No model findings returned.',
+					'',
+					'## Review Status',
+					'',
+					'No additional model findings were produced. Review the deterministic findings above.',
+				].join('\n');
+
+			const warnings = [...preparation.warnings];
+
+			if (!modelResponse.trim()) {
+				warnings.push(
+					'The model returned no review findings.'
+				);
+			}
+
+			const combinedFindings = [
+				preparation.deterministicFindingsMarkdown,
+				'',
+				'## Model Review Findings',
+				'',
+				modelFindings,
+			].join('\n');
+
+			const report = createAssistantReport({
+				route: 'review',
+				title: 'AI Dev Changed Documentation Review',
+				question: target
+					? `Review changed documentation for ${target}`
+					: 'Review changed project documentation',
+				modelName: this.modelName,
+				warnings,
+				rawResponse: combinedFindings,
+			});
+
+			this.reportSink?.(report);
+			this.prepareForPermanentOutput();
+
+			for (const warning of warnings) {
+				this.writePermanentLine(
+					`WARNING ${warning}`,
+					ANSI_YELLOW
+				);
+			}
+
+			this.writePermanentLine(
+				`${BULLET_CHAR} Changed files reviewed: ${preparation.changedFileCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Deterministic findings: ${preparation.deterministicFindingCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Review complete`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				'  /showreport for findings',
+				ANSI_LIGHT_GRAY
+			);
+		} catch (error) {
+			this.prepareForPermanentOutput();
+
+			if (cancellation.token.isCancellationRequested) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Cancelled`,
+					ANSI_LIGHT_GRAY
+				);
+			} else {
+				const message =
+					error instanceof Error
+						? error.message
+						: String(error);
+
+				this.writePermanentLine(
+					`ERROR Review failed: ${message}`,
+					ANSI_RED
+				);
+			}
+		} finally {
+			cancellation.dispose();
+
+			if (this.requestCancellation === cancellation) {
+				this.requestCancellation = undefined;
+			}
+
+			this.requestInFlight = false;
+			this.drawInteractiveArea();
+		}
+	}
+
 	private async submitAutomaticPrompt(
 		question: string
 	): Promise<void> {
@@ -1323,12 +1466,62 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				return false;
 			}
 
-			case 'review':
-				this.writePermanentLine(
-					'WARNING /review is not connected yet.',
-					ANSI_YELLOW
-				);
-				return true;
+			case 'review': {
+				const parsed = parseSlashCommand(command);
+
+				if (
+					parsed.options.includes('--help')
+					|| parsed.options.includes('-h')
+				) {
+					const definition =
+						getAssistantCommandDefinition('/review');
+
+					if (definition) {
+						for (
+							const line of
+							formatAssistantCommandHelp(definition)
+						) {
+							this.writePermanentLine(
+								line || ' ',
+								ANSI_LIGHT_GRAY
+							);
+						}
+					}
+
+					return true;
+				}
+
+				const unsupportedOptions =
+					parsed.options.filter(
+						(option) => ![
+							'--docs',
+							'-d',
+						].includes(option)
+					);
+
+				if (unsupportedOptions.length > 0) {
+					this.writePermanentLine(
+						`WARNING Review mode not connected yet: ${unsupportedOptions.join(', ')}`,
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				if (!this.reviewRoute) {
+					this.writePermanentLine(
+						'WARNING The review route is not connected yet.',
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				const target =
+					parsed.arguments.join(' ').trim()
+					|| undefined;
+
+				await this.submitDocumentationReview(target);
+				return false;
+			}
 
 			case 'showreport':
 				if (!this.reportOpener?.()) {
