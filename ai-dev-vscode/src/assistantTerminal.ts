@@ -302,10 +302,41 @@ export interface AssistantSummarizePreview {
 	warnings: string[];
 }
 
+export interface AssistantSummarizeExecutionProgress {
+	completedModelCalls: number;
+	totalModelCalls: number;
+	outputPath: string;
+}
+
+export interface AssistantSummarizeExecutionResult {
+	matchedSourceCount: number;
+	plannedModelCalls: number;
+	completedModelCalls: number;
+	updatedSummaryPaths: string[];
+	skipped: string[];
+	failed: string[];
+	cancelled: boolean;
+}
+
+export interface AssistantSummarizeExecutionOptions {
+	cancellationToken: vscode.CancellationToken;
+	sendPrompt(
+		prompt: string,
+		cancellationToken: vscode.CancellationToken
+	): Promise<string>;
+	onProgress(
+		progress: AssistantSummarizeExecutionProgress
+	): void;
+}
+
 export interface AssistantSummarizeRoute {
 	preview(
 		target: string
 	): Promise<AssistantSummarizePreview>;
+	execute(
+		target: string,
+		options: AssistantSummarizeExecutionOptions
+	): Promise<AssistantSummarizeExecutionResult>;
 	prepare(
 		target: string
 	): Promise<AssistantSummarizePreparation>;
@@ -663,6 +694,117 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				ANSI_RED
 			);
 		} finally {
+			this.drawInteractiveArea();
+		}
+	}
+
+	private async submitBatchSummarize(
+		target: string
+	): Promise<void> {
+		const cancellation =
+			new vscode.CancellationTokenSource();
+
+		this.requestCancellation = cancellation;
+		this.requestInFlight = true;
+		this.showEphemeralWithPrompt(
+			`Planning summaries for ${target}...`
+		);
+
+		try {
+			const result =
+				await this.summarizeRoute!.execute(
+					target,
+					{
+						cancellationToken: cancellation.token,
+						sendPrompt: (
+							prompt,
+							cancellationToken
+						) =>
+							this.chatBackend.sendIsolatedMessage(
+								prompt,
+								cancellationToken
+							),
+						onProgress: (progress) => {
+							this.showEphemeralWithPrompt(
+								`${progress.completedModelCalls + 1}/${progress.totalModelCalls} Updating ${progress.outputPath}...`
+							);
+						},
+					}
+				);
+
+			this.prepareForPermanentOutput();
+
+			for (const skipped of result.skipped) {
+				this.writePermanentLine(
+					`WARNING Skipped ${skipped}`,
+					ANSI_YELLOW
+				);
+			}
+
+			for (const failed of result.failed) {
+				this.writePermanentLine(
+					`ERROR ${failed}`,
+					ANSI_RED
+				);
+			}
+
+			for (
+				let index = 0;
+				index < result.updatedSummaryPaths.length;
+				index += 1
+			) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} ${index + 1}/${result.plannedModelCalls} Updated ${result.updatedSummaryPaths[index]}`,
+					ANSI_LIGHT_GRAY
+				);
+			}
+
+			this.writePermanentLine(
+				`${BULLET_CHAR} Updated summaries: ${result.updatedSummaryPaths.length}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Source files summarized: ${result.matchedSourceCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Model calls completed: ${result.completedModelCalls}/${result.plannedModelCalls}`,
+				ANSI_LIGHT_GRAY
+			);
+
+			if (result.cancelled) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Cancelled`,
+					ANSI_LIGHT_GRAY
+				);
+			}
+		} catch (error) {
+			this.prepareForPermanentOutput();
+
+			if (cancellation.token.isCancellationRequested) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Cancelled`,
+					ANSI_LIGHT_GRAY
+				);
+			} else {
+				const message =
+					error instanceof Error
+						? error.message
+						: String(error);
+
+				this.writePermanentLine(
+					`ERROR Batch summarization failed: ${message}`,
+					ANSI_RED
+				);
+			}
+		} finally {
+			cancellation.dispose();
+
+			if (this.requestCancellation === cancellation) {
+				this.requestCancellation = undefined;
+			}
+
+			this.requestInFlight = false;
 			this.drawInteractiveArea();
 		}
 	}
@@ -1123,14 +1265,6 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					return true;
 				}
 
-				if (/[*?\[\]{}]/.test(target)) {
-					this.writePermanentLine(
-						'WARNING Glob summarization is not connected yet.',
-						ANSI_YELLOW
-					);
-					return true;
-				}
-
 				if (!this.summarizeRoute) {
 					this.writePermanentLine(
 						'WARNING The summarize route is not connected yet.',
@@ -1139,7 +1273,15 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					return true;
 				}
 
-				await this.submitSummarizePrompt(target);
+				const isGlobTarget =
+					/[*?\[\]{}]/.test(target);
+
+				if (isGlobTarget) {
+					await this.submitBatchSummarize(target);
+				} else {
+					await this.submitSummarizePrompt(target);
+				}
+
 				return false;
 			}
 

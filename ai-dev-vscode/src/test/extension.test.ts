@@ -1383,6 +1383,40 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(state.tabPressCount, 0);
 	});
 
+	test('Glob summarize targets use grouped execution', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/const isGlobTarget =\s*\/\[\*\?/
+		);
+		assert.match(
+			source,
+			/await this\.submitBatchSummarize\(target\)/
+		);
+	});
+
+	test('Batch summarize execution uses isolated model requests', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/chatBackend\.sendIsolatedMessage/
+		);
+		assert.match(
+			source,
+			/Model calls completed:/
+		);
+	});
+
 	test('Summarize smoke test uses preview without model execution', async () => {
 		const sourcePath = path.resolve(
 			__dirname,

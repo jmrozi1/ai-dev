@@ -3547,6 +3547,397 @@ async function previewSummarizationTarget(
 	};
 }
 
+async function executeSummarizationTarget(
+	target: string,
+	options: {
+		cancellationToken: vscode.CancellationToken;
+		sendPrompt(
+			prompt: string,
+			cancellationToken: vscode.CancellationToken
+		): Promise<string>;
+		onProgress(progress: {
+			completedModelCalls: number;
+			totalModelCalls: number;
+			outputPath: string;
+		}): void;
+	}
+): Promise<{
+	matchedSourceCount: number;
+	plannedModelCalls: number;
+	completedModelCalls: number;
+	updatedSummaryPaths: string[];
+	skipped: string[];
+	failed: string[];
+	cancelled: boolean;
+}> {
+	const workspaceRoot = getOpenWorkspaceRoot();
+
+	if (!workspaceRoot) {
+		throw new Error('No workspace is open.');
+	}
+
+	const aiDevConfig = await readAiDevConfig(workspaceRoot);
+	const modeResolution = getExecutionModeFromConfig(aiDevConfig);
+
+	if ('errorMessage' in modeResolution) {
+		throw new Error(modeResolution.errorMessage);
+	}
+
+	if (modeResolution.mode !== 'direct-experimental') {
+		throw new Error(
+			'/summarize in the terminal requires direct-experimental mode.'
+		);
+	}
+
+	const selection = await computeBatchUnitDocSelection({
+		workspaceRoot,
+		aiDevConfig,
+		formState: {
+			sourceGlob: target,
+			missingDocsOnly: false,
+			resolveOrphanedDocs: false,
+			maxFiles: MAX_BATCH_UNIT_DOC_FILES_THIS_PASS,
+			selectionMode: 'workspace',
+		},
+	});
+
+	const generateActions = selection.plannedActions.filter(
+		(action) =>
+			action.actionType === 'generate-doc'
+			&& typeof action.sourcePath === 'string'
+	);
+
+	const groupedActions = new Map<
+		string,
+		BatchUnitDocPlanAction[]
+	>();
+
+	for (const action of generateActions) {
+		const existing = groupedActions.get(action.docPath);
+
+		if (existing) {
+			existing.push(action);
+		} else {
+			groupedActions.set(action.docPath, [action]);
+		}
+	}
+
+	const result = {
+		matchedSourceCount: selection.counts.afterGlobFilter,
+		plannedModelCalls: groupedActions.size,
+		completedModelCalls: 0,
+		updatedSummaryPaths: [] as string[],
+		skipped: [] as string[],
+		failed: [] as string[],
+		cancelled: false,
+	};
+
+	if (groupedActions.size === 0) {
+		return result;
+	}
+
+	let shouldWrite = allowDocsDirWritesForSession;
+
+	if (!shouldWrite) {
+		const writeChoice = await vscode.window.showInformationMessage(
+			`Generate and write ${groupedActions.size} summary file(s)?`,
+			{ modal: true },
+			'Write Once',
+			'Allow docsDir writes this session',
+			'Cancel'
+		);
+
+		if (writeChoice === 'Write Once') {
+			shouldWrite = true;
+		} else if (
+			writeChoice === 'Allow docsDir writes this session'
+		) {
+			allowDocsDirWritesForSession = true;
+			shouldWrite = true;
+		}
+	}
+
+	if (!shouldWrite) {
+		result.cancelled = true;
+		return result;
+	}
+
+	const configuredDocsDir = getConfiguredDocsDir(aiDevConfig);
+	const docsDirAbsolutePath = path.resolve(
+		workspaceRoot,
+		configuredDocsDir
+	);
+	const aiDevCorePath = resolveAiDevCorePath(
+		workspaceRoot,
+		aiDevConfig.aiDevCorePath
+	);
+	const workflowAbsolutePath = path.join(
+		aiDevCorePath,
+		'workflows/generate-docs/generate-unit-doc.md'
+	);
+	const templateAbsolutePath = path.join(
+		aiDevCorePath,
+		'workflows/generate-docs/templates/unit-doc.md'
+	);
+
+	const [
+		workflowFileContents,
+		templateFileContents,
+		summarizationConfig,
+	] = await Promise.all([
+		fs.readFile(workflowAbsolutePath, 'utf8'),
+		fs.readFile(templateAbsolutePath, 'utf8'),
+		readSummarizationConfig(workspaceRoot),
+	]);
+
+	const workflowFilePath = formatRelativePath(
+		workspaceRoot,
+		workflowAbsolutePath
+	);
+	const templateFilePath = formatRelativePath(
+		workspaceRoot,
+		templateAbsolutePath
+	);
+
+	let modelCallNumber = 0;
+
+	for (const [docPath, actions] of groupedActions) {
+		if (options.cancellationToken.isCancellationRequested) {
+			result.cancelled = true;
+			break;
+		}
+
+		modelCallNumber += 1;
+
+		options.onProgress({
+			completedModelCalls: modelCallNumber - 1,
+			totalModelCalls: groupedActions.size,
+			outputPath: docPath,
+		});
+
+		const sourcePaths = [
+			...new Set(
+				actions
+					.map((action) => action.sourcePath)
+					.filter(
+						(sourcePath): sourcePath is string =>
+							typeof sourcePath === 'string'
+							&& sourcePath.trim().length > 0
+					)
+					.map((sourcePath) =>
+						normalizePathForMarkdown(sourcePath)
+					)
+			),
+		].sort((left, right) => left.localeCompare(right));
+
+		if (sourcePaths.length === 0) {
+			result.skipped.push(
+				`${docPath}: no source files were selected`
+			);
+			continue;
+		}
+
+		const outputAbsolutePath = path.resolve(
+			workspaceRoot,
+			docPath
+		);
+
+		if (
+			!isPathInsideDirectory(
+				outputAbsolutePath,
+				docsDirAbsolutePath
+			)
+		) {
+			result.skipped.push(
+				`${docPath}: output is outside documentation.docsDir`
+			);
+			continue;
+		}
+
+		try {
+			const selectedSourceFiles: Array<{
+				path: string;
+				contents: string;
+			}> = [];
+
+			for (const sourcePath of sourcePaths) {
+				const sourceAbsolutePath = path.resolve(
+					workspaceRoot,
+					sourcePath
+				);
+
+				const expectedSummaryPath =
+					getExpectedDirectorySummaryPath({
+						workspaceRoot,
+						sourceFilePath: sourceAbsolutePath,
+						docsDir: configuredDocsDir,
+					});
+
+				if (expectedSummaryPath !== docPath) {
+					throw new Error(
+						`Expected ${sourcePath} to map to ${expectedSummaryPath}, not ${docPath}.`
+					);
+				}
+
+				const sourceContents = await fs.readFile(
+					sourceAbsolutePath,
+					'utf8'
+				);
+
+				selectedSourceFiles.push({
+					path: sourcePath,
+					contents: truncateText(
+						sourceContents,
+						MAX_DIRECT_FILE_CHARS
+					),
+				});
+			}
+
+			const existingSummaryContents =
+				await readOptionalTextFile(outputAbsolutePath);
+
+			const basePrompt =
+				buildGroupedGenerateUnitDocDirectPromptMarkdown({
+					workspaceRoot,
+					workflowFilePath,
+					workflowFileContents,
+					templateFilePath,
+					templateFileContents,
+					targetSummaryPath: docPath,
+					existingSummaryContents:
+						existingSummaryContents
+							? truncateText(
+								existingSummaryContents,
+								MAX_DIRECT_FILE_CHARS
+							)
+							: undefined,
+					selectedSourceFiles,
+				});
+
+			const resolvedBySource = sourcePaths.map(
+				(sourcePath) =>
+					resolveSummarizationInstructions(
+						summarizationConfig,
+						sourcePath
+					)
+			);
+
+			const generalInstructions =
+				resolvedBySource[0]?.generalInstructions ?? '';
+
+			const matchingRules = [
+				...new Map(
+					resolvedBySource
+						.flatMap(
+							(resolved) =>
+								resolved.matchingRules
+						)
+						.map((rule) => [
+							JSON.stringify(rule),
+							rule,
+						])
+				).values(),
+			];
+
+			const specializedInstructionSections = [
+				...new Set(
+					resolvedBySource
+						.map((resolved) => {
+							const combined =
+								resolved.combinedInstructions.trim();
+							const general =
+								resolved.generalInstructions.trim();
+
+							if (
+								general
+								&& combined.startsWith(general)
+							) {
+								return combined
+									.slice(general.length)
+									.trim();
+							}
+
+							return combined;
+						})
+						.filter(
+							(instructions) =>
+								instructions.length > 0
+						)
+				),
+			];
+
+			const resolvedInstructions = {
+				generalInstructions,
+				matchingRules,
+				combinedInstructions: [
+					generalInstructions.trim(),
+					...specializedInstructionSections,
+				]
+					.filter(
+						(instructions) =>
+							instructions.length > 0
+					)
+					.join('\n\n'),
+			};
+
+			const prompt = injectSummarizationInstructions(
+				basePrompt,
+				resolvedInstructions
+			);
+
+			const rawResponse = await options.sendPrompt(
+				prompt,
+				options.cancellationToken
+			);
+
+			if (
+				options.cancellationToken.isCancellationRequested
+			) {
+				result.cancelled = true;
+				break;
+			}
+
+			const cleanedResponse =
+				stripSingleOuterCodeFence(rawResponse);
+
+			if (!cleanedResponse.text.trim()) {
+				result.skipped.push(
+					`${docPath}: model returned an empty response`
+				);
+				continue;
+			}
+
+			await fs.mkdir(
+				path.dirname(outputAbsolutePath),
+				{ recursive: true }
+			);
+			await writeTextFileAtomicish(
+				outputAbsolutePath,
+				cleanedResponse.text
+			);
+
+			result.completedModelCalls += 1;
+			result.updatedSummaryPaths.push(docPath);
+		} catch (error) {
+			if (
+				options.cancellationToken.isCancellationRequested
+			) {
+				result.cancelled = true;
+				break;
+			}
+
+			const message =
+				error instanceof Error
+					? error.message
+					: String(error);
+
+			result.failed.push(`${docPath}: ${message}`);
+		}
+	}
+
+	return result;
+}
+
 async function prepareSingleFileSummary(
 	target: string
 ): Promise<{
@@ -3997,6 +4388,7 @@ export function activate(context: vscode.ExtensionContext) {
 		buildSummaryAnswerRoute,
 		{
 			preview: previewSummarizationTarget,
+			execute: executeSummarizationTarget,
 			prepare: prepareSingleFileSummary,
 			complete: completeSingleFileSummary,
 		},
