@@ -313,6 +313,10 @@ export interface AssistantSummarizeExecutionResult {
 	plannedModelCalls: number;
 	completedModelCalls: number;
 	updatedSummaryPaths: string[];
+	architectureSummaryPath?: string;
+	architectureUpdated: boolean;
+	architectureSkipped?: string;
+	architectureFailed?: string;
 	skipped: string[];
 	failed: string[];
 	cancelled: boolean;
@@ -656,10 +660,24 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				`${BULLET_CHAR} Planned summary targets: ${preview.plannedSummaryTargets.length}`,
 				ANSI_LIGHT_GRAY
 			);
+			const estimatedModelCalls =
+				preview.plannedSummaryTargets.length
+				+ (
+					preview.plannedSummaryTargets.length > 0
+						? 1
+						: 0
+				);
+
 			this.writePermanentLine(
-				`${BULLET_CHAR} Estimated model calls: ${preview.plannedSummaryTargets.length}`,
+				`${BULLET_CHAR} Estimated model calls: ${estimatedModelCalls}`,
 				ANSI_LIGHT_GRAY
 			);
+			if (preview.plannedSummaryTargets.length > 0) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Architecture refresh: planned`,
+					ANSI_LIGHT_GRAY
+				);
+			}
 
 			if (preview.previewSourcePaths.length > 0) {
 				this.writePermanentLine(
@@ -756,6 +774,26 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				this.writePermanentLine(
 					`${BULLET_CHAR} ${index + 1}/${result.plannedModelCalls} Updated ${result.updatedSummaryPaths[index]}`,
 					ANSI_LIGHT_GRAY
+				);
+			}
+
+			if (
+				result.architectureUpdated
+				&& result.architectureSummaryPath
+			) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Updated architecture summary: ${result.architectureSummaryPath}`,
+					ANSI_LIGHT_GRAY
+				);
+			} else if (result.architectureFailed) {
+				this.writePermanentLine(
+					`ERROR Architecture refresh failed: ${result.architectureFailed}`,
+					ANSI_RED
+				);
+			} else if (result.architectureSkipped) {
+				this.writePermanentLine(
+					`WARNING Architecture refresh skipped: ${result.architectureSkipped}`,
+					ANSI_YELLOW
 				);
 			}
 

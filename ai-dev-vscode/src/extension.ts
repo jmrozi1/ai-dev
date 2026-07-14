@@ -3547,6 +3547,222 @@ async function previewSummarizationTarget(
 	};
 }
 
+async function refreshArchitectureSummary(params: {
+	workspaceRoot: string;
+	aiDevConfig: AiDevConfig;
+	cancellationToken: vscode.CancellationToken;
+	sendPrompt(
+		prompt: string,
+		cancellationToken: vscode.CancellationToken
+	): Promise<string>;
+}): Promise<{
+	path: string;
+	updated: boolean;
+	skipped?: string;
+	failed?: string;
+}> {
+	const {
+		workspaceRoot,
+		aiDevConfig,
+		cancellationToken,
+		sendPrompt,
+	} = params;
+
+	const docsDir = getConfiguredDocsDir(aiDevConfig);
+	const docsDirAbsolutePath = path.resolve(
+		workspaceRoot,
+		docsDir
+	);
+	const architectureSummaryPath =
+		getArchitectureSummaryPath(aiDevConfig);
+	const architectureSummaryAbsolutePath = path.resolve(
+		workspaceRoot,
+		architectureSummaryPath
+	);
+
+	if (
+		!isPathInsideDirectory(
+			architectureSummaryAbsolutePath,
+			docsDirAbsolutePath
+		)
+	) {
+		return {
+			path: architectureSummaryPath,
+			updated: false,
+			skipped:
+				'architecture summary is outside documentation.docsDir',
+		};
+	}
+
+	if (cancellationToken.isCancellationRequested) {
+		return {
+			path: architectureSummaryPath,
+			updated: false,
+			skipped: 'cancelled before architecture refresh',
+		};
+	}
+
+	try {
+		const preview = await discoverArchitectureSummaryPreview({
+			workspaceRoot,
+			aiDevConfig,
+		});
+
+		const selectedItems = preview.items.filter(
+			(item) => item.status !== 'missing'
+		);
+
+		if (selectedItems.length === 0) {
+			return {
+				path: architectureSummaryPath,
+				updated: false,
+				skipped:
+					'no directory summaries are available for architecture refresh',
+			};
+		}
+
+		const aiDevCorePath = resolveAiDevCorePath(
+			workspaceRoot,
+			aiDevConfig.aiDevCorePath
+		);
+		const workflowAbsolutePath = path.join(
+			aiDevCorePath,
+			'workflows/generate-docs/generate-architecture-summary.md'
+		);
+		const templateAbsolutePath = path.join(
+			aiDevCorePath,
+			'workflows/generate-docs/templates/architecture-summary.md'
+		);
+		const aiDevYamlSection =
+			getAiDevYamlPromptSection(aiDevConfig);
+
+		const [
+			workflowFileContents,
+			templateFileContents,
+			existingArchitectureSummaryContents,
+		] = await Promise.all([
+			fs.readFile(workflowAbsolutePath, 'utf8'),
+			fs.readFile(templateAbsolutePath, 'utf8'),
+			readOptionalTextFile(
+				architectureSummaryAbsolutePath
+			),
+		]);
+
+		const selectedDirectories = await Promise.all(
+			selectedItems.map(async (item) => {
+				const summaryAbsolutePath = path.resolve(
+					workspaceRoot,
+					item.summaryPath
+				);
+				const summaryContents =
+					await readOptionalTextFile(
+						summaryAbsolutePath
+					);
+
+				return {
+					sourceDirectory: item.sourceDirectory,
+					summaryPath: item.summaryPath,
+					summaryStatus: item.status,
+					summaryContents:
+						summaryContents !== undefined
+							? truncateText(
+								summaryContents,
+								MAX_DIRECT_FILE_CHARS
+							)
+							: undefined,
+				};
+			})
+		);
+
+		const prompt =
+			buildGenerateArchitectureSummaryDirectPromptMarkdown({
+				workspaceRoot,
+				workflowFilePath: formatRelativePath(
+					workspaceRoot,
+					workflowAbsolutePath
+				),
+				workflowFileContents,
+				templateFilePath: formatRelativePath(
+					workspaceRoot,
+					templateAbsolutePath
+				),
+				templateFileContents,
+				aiDevYamlLabel: aiDevYamlSection.label,
+				aiDevYamlContents: aiDevYamlSection.contents,
+				docsDir,
+				targetArchitecturePath:
+					architectureSummaryPath,
+				existingArchitectureSummaryContents:
+					existingArchitectureSummaryContents
+						? truncateText(
+							existingArchitectureSummaryContents,
+							MAX_DIRECT_FILE_CHARS
+						)
+						: undefined,
+				selectedDirectories,
+				omittedDirectories: preview.items
+					.filter(
+						(item) => item.status === 'missing'
+					)
+					.map((item) => ({
+						sourceDirectory:
+							item.sourceDirectory,
+						summaryPath: item.summaryPath,
+						summaryStatus: item.status,
+					})),
+			});
+
+		const rawResponse = await sendPrompt(
+			prompt,
+			cancellationToken
+		);
+
+		if (cancellationToken.isCancellationRequested) {
+			return {
+				path: architectureSummaryPath,
+				updated: false,
+				skipped:
+					'cancelled during architecture refresh',
+			};
+		}
+
+		const cleanedResponse =
+			stripSingleOuterCodeFence(rawResponse);
+
+		if (!cleanedResponse.text.trim()) {
+			return {
+				path: architectureSummaryPath,
+				updated: false,
+				skipped:
+					'architecture model returned an empty response',
+			};
+		}
+
+		await fs.mkdir(
+			path.dirname(architectureSummaryAbsolutePath),
+			{ recursive: true }
+		);
+		await writeTextFileAtomicish(
+			architectureSummaryAbsolutePath,
+			cleanedResponse.text
+		);
+
+		return {
+			path: architectureSummaryPath,
+			updated: true,
+		};
+	} catch (error) {
+		return {
+			path: architectureSummaryPath,
+			updated: false,
+			failed:
+				error instanceof Error
+					? error.message
+					: String(error),
+		};
+	}
+}
+
 async function executeSummarizationTarget(
 	target: string,
 	options: {
@@ -3566,6 +3782,10 @@ async function executeSummarizationTarget(
 	plannedModelCalls: number;
 	completedModelCalls: number;
 	updatedSummaryPaths: string[];
+	architectureSummaryPath?: string;
+	architectureUpdated: boolean;
+	architectureSkipped?: string;
+	architectureFailed?: string;
 	skipped: string[];
 	failed: string[];
 	cancelled: boolean;
@@ -3622,11 +3842,26 @@ async function executeSummarizationTarget(
 		}
 	}
 
+	const architectureRefreshPlanned =
+		groupedActions.size > 0;
+
 	const result = {
 		matchedSourceCount: selection.counts.afterGlobFilter,
-		plannedModelCalls: groupedActions.size,
+		plannedModelCalls:
+			groupedActions.size
+			+ (architectureRefreshPlanned ? 1 : 0),
 		completedModelCalls: 0,
 		updatedSummaryPaths: [] as string[],
+		architectureSummaryPath: undefined as
+			| string
+			| undefined,
+		architectureUpdated: false,
+		architectureSkipped: undefined as
+			| string
+			| undefined,
+		architectureFailed: undefined as
+			| string
+			| undefined,
 		skipped: [] as string[],
 		failed: [] as string[],
 		cancelled: false,
@@ -3711,7 +3946,7 @@ async function executeSummarizationTarget(
 
 		options.onProgress({
 			completedModelCalls: modelCallNumber - 1,
-			totalModelCalls: groupedActions.size,
+			totalModelCalls: result.plannedModelCalls,
 			outputPath: docPath,
 		});
 
@@ -3933,6 +4168,47 @@ async function executeSummarizationTarget(
 
 			result.failed.push(`${docPath}: ${message}`);
 		}
+	}
+
+	if (
+		result.updatedSummaryPaths.length > 0
+		&& !result.cancelled
+		&& !options.cancellationToken.isCancellationRequested
+	) {
+		options.onProgress({
+			completedModelCalls: groupedActions.size,
+			totalModelCalls: result.plannedModelCalls,
+			outputPath:
+				getArchitectureSummaryPath(aiDevConfig),
+		});
+
+		const architecture =
+			await refreshArchitectureSummary({
+				workspaceRoot,
+				aiDevConfig,
+				cancellationToken:
+					options.cancellationToken,
+				sendPrompt: options.sendPrompt,
+			});
+
+		result.architectureSummaryPath =
+			architecture.path;
+		result.architectureUpdated =
+			architecture.updated;
+		result.architectureSkipped =
+			architecture.skipped;
+		result.architectureFailed =
+			architecture.failed;
+
+		if (architecture.updated) {
+			result.completedModelCalls += 1;
+		}
+	} else if (
+		architectureRefreshPlanned
+		&& result.updatedSummaryPaths.length === 0
+	) {
+		result.architectureSkipped =
+			'no directory summaries were updated';
 	}
 
 	return result;

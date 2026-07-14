@@ -1400,6 +1400,44 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('Grouped summarization refreshes architecture after writes', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/extension.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/async function refreshArchitectureSummary/
+		);
+		assert.match(
+			source,
+			/result\.updatedSummaryPaths\.length > 0/
+		);
+		assert.match(
+			source,
+			/buildGenerateArchitectureSummaryDirectPromptMarkdown/
+		);
+	});
+
+	test('Architecture refresh failure does not erase grouped results', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/extension.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/architectureFailed/
+		);
+		assert.match(
+			source,
+			/return result;/
+		);
+	});
+
 	test('Batch summarize execution uses isolated model requests', async () => {
 		const sourcePath = path.resolve(
 			__dirname,
