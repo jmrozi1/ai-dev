@@ -108,6 +108,36 @@ suite('Extension Test Suite', () => {
 		assert.doesNotMatch(BATCH_UNIT_DOC_FILES_THIS_PASS_HELP_TEXT, /preview only/i);
 	});
 
+	test('Packaged binaries are mandatory source exclusions', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/extension.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/const NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS/
+		);
+		assert.match(source, /'\*\.vsix'/);
+		assert.match(source, /'\*\*\/\*\.vsix'/);
+		assert.match(source, /'\*\*\/\*\.dll'/);
+		assert.match(source, /'\*\*\/\*\.zip'/);
+	});
+
+	test('Mandatory artifact exclusions are merged with project excludes', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/extension.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/\.\.\.projectExcludeGlobs,\s*\.\.\.NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS/
+		);
+	});
+
 	test('Missing .ai-dev.yaml returns usable defaults', async () => {
 		const workspaceRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'ai-dev-config-defaults-'));
 
@@ -1637,6 +1667,48 @@ suite('Extension Test Suite', () => {
 		assert.match(
 			source,
 			/Estimated model calls:/
+		);
+	});
+
+	test('Changed-doc review filters packaged artifacts before model input', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/extension.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/const reviewableChangedFilePaths = changedFilePaths\.filter/
+		);
+		assert.match(
+			source,
+			/NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS/
+		);
+		assert.match(
+			source,
+			/existingChangedFilesWithContent\(\s*workspaceRoot,\s*reviewableChangedFilePaths/
+		);
+		assert.match(
+			source,
+			/getGitDiffForFiles\(\s*workspaceRoot,\s*reviewableChangedFilePaths/
+		);
+	});
+
+	test('Changed-doc review reports ignored artifact count without listing artifacts', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/extension.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/Ignored non-source artifact changes:/
+		);
+		assert.match(
+			source,
+			/changedFilePaths: reviewableChangedFilePaths/
 		);
 	});
 

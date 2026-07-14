@@ -97,6 +97,41 @@ const FALLBACK_BATCH_EXCLUDE_GLOBS = [
 	'**/*.generated.*',
 	'**/*.lock',
 ];
+
+const NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS = [
+	'*.vsix',
+	'**/*.vsix',
+	'*.zip',
+	'**/*.zip',
+	'*.7z',
+	'**/*.7z',
+	'*.rar',
+	'**/*.rar',
+	'*.tar',
+	'**/*.tar',
+	'*.tgz',
+	'**/*.tgz',
+	'*.gz',
+	'**/*.gz',
+	'*.exe',
+	'**/*.exe',
+	'*.dll',
+	'**/*.dll',
+	'*.so',
+	'**/*.so',
+	'*.dylib',
+	'**/*.dylib',
+	'*.bin',
+	'**/*.bin',
+	'*.class',
+	'**/*.class',
+	'*.jar',
+	'**/*.jar',
+	'*.war',
+	'**/*.war',
+	'*.pdb',
+	'**/*.pdb',
+];
 const MAX_DIRECT_INDEX_UNIT_DOCS = 20;
 const MAX_DIRECT_CHANGED_FILE_CONTENTS = 12;
 const MAX_DIRECT_FILE_CHARS = 12000;
@@ -646,10 +681,21 @@ function normalizeBatchSourceGlob(sourceGlob: string, config: AiDevConfig): stri
 }
 
 function getBatchSourceGlobs(config: AiDevConfig): { excludeGlobs: string[] } {
-	const excludeGlobs = parseYamlList(config.raw, 'source', 'exclude');
+	const configuredExcludeGlobs =
+		parseYamlList(config.raw, 'source', 'exclude');
+
+	const projectExcludeGlobs =
+		configuredExcludeGlobs.length > 0
+			? configuredExcludeGlobs
+			: FALLBACK_BATCH_EXCLUDE_GLOBS;
 
 	return {
-		excludeGlobs: excludeGlobs.length > 0 ? excludeGlobs : FALLBACK_BATCH_EXCLUDE_GLOBS,
+		excludeGlobs: [
+			...new Set([
+				...projectExcludeGlobs,
+				...NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS,
+			]),
+		],
 	};
 }
 
@@ -3106,24 +3152,68 @@ async function buildReviewDocumentationDirectPromptBundle(workspaceRoot: string,
 		throw new Error('No changed files found.');
 	}
 
-	const deterministicFindings = await collectDeterministicDocumentationFindings({
+	const reviewableChangedFilePaths = changedFilePaths.filter(
+		(filePath) =>
+			!matchesAnyGlob(
+				normalizePathForMarkdown(filePath),
+				NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS
+			)
+	);
+
+	if (reviewableChangedFilePaths.length === 0) {
+		throw new Error(
+			'No reviewable changed files found after excluding packaged binaries and non-source artifacts.'
+		);
+	}
+
+	const ignoredArtifactChangeCount =
+		changedFilePaths.length
+		- reviewableChangedFilePaths.length;
+
+	const deterministicFindings =
+		await collectDeterministicDocumentationFindings({
+			workspaceRoot,
+			aiDevConfig,
+			changedFilePaths: reviewableChangedFilePaths,
+			renameRecords,
+		});
+
+	const deterministicFindingsMarkdown =
+		toDeterministicFindingsMarkdown(
+			deterministicFindings
+		);
+
+	const aiDevCorePath = resolveAiDevCorePath(
 		workspaceRoot,
-		aiDevConfig,
-		changedFilePaths,
-		renameRecords,
-	});
-	const deterministicFindingsMarkdown = toDeterministicFindingsMarkdown(deterministicFindings);
+		aiDevConfig.aiDevCorePath
+	);
+	const workflowFilePath = path.join(
+		aiDevCorePath,
+		'workflows/review/review-documentation.md'
+	);
+	const findingTemplatePath = path.join(
+		aiDevCorePath,
+		'workflows/review/finding-template.md'
+	);
 
-	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
-	const workflowFilePath = path.join(aiDevCorePath, 'workflows/review/review-documentation.md');
-	const findingTemplatePath = path.join(aiDevCorePath, 'workflows/review/finding-template.md');
-
-	const [workflowFileContents, findingTemplateContents, aiDevYamlContents, changedFilesWithContent, gitDiffs] = await Promise.all([
+	const [
+		workflowFileContents,
+		findingTemplateContents,
+		aiDevYamlContents,
+		changedFilesWithContent,
+		gitDiffs,
+	] = await Promise.all([
 		fs.readFile(workflowFilePath, 'utf8'),
 		fs.readFile(findingTemplatePath, 'utf8'),
 		Promise.resolve(aiDevYamlSection.contents),
-		existingChangedFilesWithContent(workspaceRoot, changedFilePaths),
-		getGitDiffForFiles(workspaceRoot, changedFilePaths),
+		existingChangedFilesWithContent(
+			workspaceRoot,
+			reviewableChangedFilePaths
+		),
+		getGitDiffForFiles(
+			workspaceRoot,
+			reviewableChangedFilePaths
+		),
 	]);
 
 	const boundedChangedFilesWithContent = changedFilesWithContent
@@ -3133,7 +3223,11 @@ async function buildReviewDocumentationDirectPromptBundle(workspaceRoot: string,
 			contents: truncateText(file.contents, MAX_DIRECT_FILE_CHARS),
 		}));
 
-	const normalizedChangedFilePaths = changedFilePaths.map((filePath) => normalizePathForMarkdown(filePath));
+	const normalizedChangedFilePaths =
+		reviewableChangedFilePaths.map(
+			(filePath) =>
+				normalizePathForMarkdown(filePath)
+		);
 	const boundedGitDiffs = gitDiffs
 		.slice(0, MAX_DIRECT_DIFF_SAMPLE_FILES)
 		.map((item) => ({
@@ -3197,6 +3291,8 @@ async function buildReviewDocumentationDirectPromptBundle(workspaceRoot: string,
 		'AI Dev direct task: review-changed-docs',
 		'',
 		`Workspace: ${normalizePathForMarkdown(workspaceRoot)}`,
+		`Reviewable changed files: ${normalizedChangedFilePaths.length}`,
+		`Ignored non-source artifact changes: ${ignoredArtifactChangeCount}`,
 		`Deterministic findings count: ${deterministicFindings.length}`,
 		'',
 		'Workflow file:',
