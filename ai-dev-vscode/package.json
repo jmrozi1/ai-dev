@@ -29,13 +29,8 @@
     "views": {
       "aiDev": [
         {
-          "id": "aiDev.workflows",
-          "name": "Workflows"
-        },
-        {
-          "type": "webview",
-          "id": "aiDev.workflowDetails",
-          "name": "Workflow Details"
+          "id": "aiDev.launcher",
+          "name": "Assistant"
         }
       ]
     },
@@ -169,8 +164,6 @@
   },
   "publisher": "jmrozi1",
   "activationEvents": [
-    "onView:aiDev.workflows",
-    "onView:aiDev.workflowDetails",
     "onCommand:aiDev.launchAssistant",
     "onCommand:aiDev.generateUnitDocPromptForActiveFile",
     "onCommand:aiDev.generateUnitDocsBatchExperimental",

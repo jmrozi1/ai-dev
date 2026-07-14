@@ -9,6 +9,7 @@ import {
 	handleHistoryDown,
 	handleHistoryUp,
 	parseSlashCommand,
+	resolveAskCommand,
 	submitInput,
 	type AssistantInputState,
 	type SubmitKind,
@@ -17,6 +18,20 @@ import {
 	type AssistantChatBackend,
 	VsCodeAssistantChatBackend,
 } from './assistantChatBackend';
+import {
+	createAssistantReport,
+	type AssistantReport,
+} from './assistantReport';
+import {
+	getAssistantCommandDefinition,
+	getAssistantCommandNames,
+	formatAssistantCommandHelp,
+	getAssistantLookupItems,
+	type AssistantLookupItem,
+} from './assistantCommands';
+import {
+	chooseAutomaticAssistantRoute,
+} from './assistantRouting';
 
 const ANSI_RESET = '\x1b[0m';
 const ANSI_LIGHT_GRAY = '\x1b[90m';
@@ -24,8 +39,10 @@ const ANSI_CYAN = '\x1b[96m';
 const ANSI_YELLOW = '\x1b[33m';
 const ANSI_RED = '\x1b[31m';
 const ANSI_WHITE = '\x1b[37m';
+const ANSI_BRIGHT_WHITE = '\x1b[97m';
+const ANSI_COMPLETION = '\x1b[38;2;156;220;254m';
 const ANSI_BG_DARK_GRAY = '\x1b[100m';
-const ANSI_LAVENDER = '\x1b[38;2;238;238;255m';
+const ANSI_LAVENDER = '\x1b[38;2;221;221;255m';
 
 const SEPARATOR_CHAR = '─';
 const BULLET_CHAR = '•';
@@ -33,7 +50,7 @@ export const MODEL_RESPONSE_MARKER = '◆';
 const SPINNER_FRAMES = ['◐', '◓', '◑', '◒'];
 
 const ASSISTANT_TERMINAL_NAME = 'AI Dev';
-const ASSISTANT_COMMANDS = ['/help', '/exit'];
+const ASSISTANT_COMMANDS = getAssistantCommandNames();
 
 export function createSeparatorLine(width: number): string {
 	return SEPARATOR_CHAR.repeat(Math.max(1, width));
@@ -58,7 +75,13 @@ export function getMatchingAssistantCommands(
 	query: string,
 	commands: string[] = ASSISTANT_COMMANDS
 ): string[] {
-	const normalizedQuery = query.replace(/^\//, '').trim().toLowerCase();
+	const commandInput = query.replace(/^\//, '');
+
+	if (/\s/.test(commandInput)) {
+		return [];
+	}
+
+	const normalizedQuery = commandInput.trim().toLowerCase();
 
 	if (!normalizedQuery) {
 		return [...commands];
@@ -100,6 +123,137 @@ export function formatCommandLookupLine(command: string, query: string): string 
 	].join('');
 }
 
+export function formatOptionLookupLine(
+	display: string,
+	query: string
+): string {
+	const activeToken = query.trim().split(/\s+/).pop() ?? '';
+	const normalizedQuery = activeToken.toLowerCase();
+
+	if (!normalizedQuery || normalizedQuery === '-') {
+		return `${ANSI_LIGHT_GRAY}${display}${ANSI_RESET}`;
+	}
+
+	const lowerDisplay = display.toLowerCase();
+	const matchIndex = lowerDisplay.indexOf(normalizedQuery);
+
+	if (matchIndex < 0) {
+		return `${ANSI_LIGHT_GRAY}${display}${ANSI_RESET}`;
+	}
+
+	const before = display.slice(0, matchIndex);
+	const match = display.slice(
+		matchIndex,
+		matchIndex + activeToken.length
+	);
+	const after = display.slice(matchIndex + activeToken.length);
+
+	return [
+		ANSI_LIGHT_GRAY,
+		before,
+		ANSI_LAVENDER,
+		match,
+		ANSI_LIGHT_GRAY,
+		after,
+		ANSI_RESET,
+	].join('');
+}
+
+export function getCommonPrefix(values: string[]): string {
+	if (values.length === 0) {
+		return '';
+	}
+
+	let prefix = values[0];
+
+	for (const value of values.slice(1)) {
+		while (prefix && !value.startsWith(prefix)) {
+			prefix = prefix.slice(0, -1);
+		}
+	}
+
+	return prefix;
+}
+
+export function formatItemsInColumns(
+	items: string[],
+	width: number
+): string[] {
+	if (items.length === 0) {
+		return [];
+	}
+
+	const longest = Math.max(
+		...items.map((item) => item.length)
+	);
+	const columnWidth = longest + 2;
+	const columnCount = Math.max(
+		1,
+		Math.floor(Math.max(1, width) / columnWidth)
+	);
+
+	const lines: string[] = [];
+
+	for (
+		let index = 0;
+		index < items.length;
+		index += columnCount
+	) {
+		const row = items.slice(
+			index,
+			index + columnCount
+		);
+
+		lines.push(
+			row
+				.map((item, itemIndex) =>
+					itemIndex === row.length - 1
+						? item
+						: item.padEnd(columnWidth)
+				)
+				.join('')
+				.trimEnd()
+		);
+	}
+
+	return lines;
+}
+
+export interface PathCompletionContext {
+	partialPath: string;
+	beforePath: string;
+	quote: '"' | "'" | '';
+}
+
+export function getPathCompletionContext(
+	input: string
+): PathCompletionContext | undefined {
+	const match = input.match(
+		/^(\s*summarize\s+)(["']?)([^"']*)$/
+	);
+
+	if (!match) {
+		return undefined;
+	}
+
+	const beforePath = match[1];
+	const quote = (match[2] ?? '') as '"' | "'" | '';
+	const partialPath = match[3] ?? '';
+
+	if (
+		partialPath.startsWith('-')
+		|| /[*?\[\]{}]/.test(partialPath)
+	) {
+		return undefined;
+	}
+
+	return {
+		partialPath,
+		beforePath,
+		quote,
+	};
+}
+
 export function formatModelResponseLines(
 	modelName: string,
 	responseText: string
@@ -112,10 +266,71 @@ export function formatModelResponseLines(
 
 	return normalized.split('\n').map((line, index) =>
 		index === 0
-			? `${MODEL_RESPONSE_MARKER} ${modelName}: ${line}`
-			: `  ${line}`
+			? `${ANSI_LAVENDER}${MODEL_RESPONSE_MARKER} ${modelName}:${ANSI_RESET} ${ANSI_BRIGHT_WHITE}${line}${ANSI_RESET}`
+			: `${ANSI_BRIGHT_WHITE}  ${line}${ANSI_RESET}`
 	);
 }
+
+export interface AssistantSummaryRouteResult {
+	prompt: string;
+	warnings: string[];
+}
+
+export type AssistantSummaryRoute = (
+	question: string
+) => Promise<AssistantSummaryRouteResult>;
+
+export interface AssistantSummarizePreparation {
+	prompt: string;
+	sourcePath: string;
+	outputPath: string;
+	warnings: string[];
+}
+
+export interface AssistantSummarizeCompletion {
+	written: boolean;
+	outputPath: string;
+	warnings: string[];
+}
+
+export interface AssistantSummarizePreview {
+	target: string;
+	matchedSourceCount: number;
+	plannedSummaryTargets: string[];
+	previewSourcePaths: string[];
+	omittedSourceCount: number;
+	warnings: string[];
+}
+
+export interface AssistantSummarizeRoute {
+	preview(
+		target: string
+	): Promise<AssistantSummarizePreview>;
+	prepare(
+		target: string
+	): Promise<AssistantSummarizePreparation>;
+	complete(
+		preparation: AssistantSummarizePreparation,
+		responseText: string
+	): Promise<AssistantSummarizeCompletion>;
+}
+
+export type AssistantReportSink = (
+	report: AssistantReport
+) => void;
+
+export type AssistantReportOpener = () => boolean;
+
+export type AssistantSummarizationConfigOpener =
+	() => Promise<void>;
+
+export interface AssistantPathCompletionResult {
+	matches: string[];
+}
+
+export type AssistantPathCompleter = (
+	partialPath: string
+) => Promise<AssistantPathCompletionResult>;
 
 type TerminalWindowApi = Pick<typeof vscode.window, 'createTerminal' | 'onDidCloseTerminal'>;
 
@@ -126,7 +341,14 @@ export class AiDevAssistantTerminalManager implements vscode.Disposable {
 	constructor(
 		private readonly windowApi: TerminalWindowApi,
 		private readonly backendFactory: () => AssistantChatBackend =
-			() => new VsCodeAssistantChatBackend()
+			() => new VsCodeAssistantChatBackend(),
+		private readonly summaryRoute?: AssistantSummaryRoute,
+		private readonly summarizeRoute?: AssistantSummarizeRoute,
+		private readonly reportSink?: AssistantReportSink,
+		private readonly reportOpener?: AssistantReportOpener,
+		private readonly summarizationConfigOpener?:
+			AssistantSummarizationConfigOpener,
+		private readonly pathCompleter?: AssistantPathCompleter
 	) {
 		this.closeSubscription = this.windowApi.onDidCloseTerminal((closedTerminal) => {
 			if (closedTerminal === this.terminal) {
@@ -145,7 +367,13 @@ export class AiDevAssistantTerminalManager implements vscode.Disposable {
 			() => {
 				this.terminal?.dispose();
 			},
-			this.backendFactory()
+			this.backendFactory(),
+			this.summaryRoute,
+			this.summarizeRoute,
+			this.reportSink,
+			this.reportOpener,
+			this.summarizationConfigOpener,
+			this.pathCompleter
 		);
 
 		const terminal = this.windowApi.createTerminal({
@@ -180,6 +408,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 	private ephemeralVisible = false;
 	private promptVisible = false;
 	private commandLookupLineCount = 0;
+	private tabCompletionLineCount = 0;
 	private requestInFlight = false;
 	private isReady = false;
 	private modelName = 'AI Dev';
@@ -191,7 +420,14 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 	constructor(
 		private readonly onExitRequested: () => void,
 		private readonly chatBackend: AssistantChatBackend =
-			new VsCodeAssistantChatBackend()
+			new VsCodeAssistantChatBackend(),
+		private readonly summaryRoute?: AssistantSummaryRoute,
+		private readonly summarizeRoute?: AssistantSummarizeRoute,
+		private readonly reportSink?: AssistantReportSink,
+		private readonly reportOpener?: AssistantReportOpener,
+		private readonly summarizationConfigOpener?:
+			AssistantSummarizationConfigOpener,
+		private readonly pathCompleter?: AssistantPathCompleter
 	) {}
 
 	open(initialDimensions: vscode.TerminalDimensions | undefined): void {
@@ -255,7 +491,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					return;
 
 				case '\t':
-					this.handleTab();
+					void this.handleTab();
 					return;
 
 				default:
@@ -305,7 +541,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				ANSI_LIGHT_GRAY
 			);
 			this.writePermanentLine(
-				`${BULLET_CHAR} Type /help for commands`,
+				`${BULLET_CHAR} Type / for commands · Esc returns to chat`,
 				ANSI_LIGHT_GRAY
 			);
 		} catch (error) {
@@ -347,7 +583,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		this.writeBlankLine();
 
 		if (submitResult.submittedKind === 'command') {
-			const shouldRedraw = this.handleSubmittedCommand(
+			const shouldRedraw = await this.handleSubmittedCommand(
 				submitResult.submittedText
 			);
 
@@ -358,6 +594,286 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 			return;
 		}
 
+		await this.submitAutomaticPrompt(submitResult.submittedText);
+	}
+
+	private async runSummarizeSmokeTest(
+		target: string
+	): Promise<void> {
+		this.showEphemeralWithPrompt(
+			`Resolving ${target}...`
+		);
+
+		try {
+			const preview =
+				await this.summarizeRoute!.preview(target);
+
+			this.prepareForPermanentOutput();
+
+			for (const warning of preview.warnings) {
+				this.writePermanentLine(
+					`WARNING ${warning}`,
+					ANSI_YELLOW
+				);
+			}
+
+			this.writePermanentLine(
+				`${BULLET_CHAR} Matched source files: ${preview.matchedSourceCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Planned summary targets: ${preview.plannedSummaryTargets.length}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Estimated model calls: ${preview.plannedSummaryTargets.length}`,
+				ANSI_LIGHT_GRAY
+			);
+
+			if (preview.previewSourcePaths.length > 0) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} First ${preview.previewSourcePaths.length} matched files:`,
+					ANSI_LIGHT_GRAY
+				);
+
+				for (const sourcePath of preview.previewSourcePaths) {
+					this.writePermanentLine(
+						`  ${sourcePath}`,
+						ANSI_LIGHT_GRAY
+					);
+				}
+			}
+
+			if (preview.omittedSourceCount > 0) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} ${preview.omittedSourceCount} additional files omitted`,
+					ANSI_LIGHT_GRAY
+				);
+			}
+		} catch (error) {
+			this.prepareForPermanentOutput();
+
+			const message =
+				error instanceof Error
+					? error.message
+					: String(error);
+
+			this.writePermanentLine(
+				`ERROR Summarization smoke test failed: ${message}`,
+				ANSI_RED
+			);
+		} finally {
+			this.drawInteractiveArea();
+		}
+	}
+
+	private async submitSummarizePrompt(
+		target: string
+	): Promise<void> {
+		const cancellation = new vscode.CancellationTokenSource();
+		this.requestCancellation = cancellation;
+		this.requestInFlight = true;
+		this.showEphemeralWithPrompt(
+			`Preparing summary for ${target}...`
+		);
+
+		try {
+			const preparation =
+				await this.summarizeRoute!.prepare(target);
+
+			if (cancellation.token.isCancellationRequested) {
+				throw new Error('Assistant request cancelled.');
+			}
+
+			this.showEphemeralWithPrompt(
+				`Summarizing ${preparation.sourcePath}...`
+			);
+
+			const responseText =
+				await this.chatBackend.sendIsolatedMessage(
+					preparation.prompt,
+					cancellation.token
+				);
+
+			if (cancellation.token.isCancellationRequested) {
+				throw new Error('Assistant request cancelled.');
+			}
+
+			this.showEphemeralWithPrompt(
+				`Finalizing ${preparation.outputPath}...`
+			);
+
+			const completion =
+				await this.summarizeRoute!.complete(
+					preparation,
+					responseText
+				);
+
+			this.prepareForPermanentOutput();
+
+			const warnings = [
+				...preparation.warnings,
+				...completion.warnings,
+			];
+
+			for (const warning of warnings) {
+				this.writePermanentLine(
+					`WARNING ${warning}`,
+					ANSI_YELLOW
+				);
+			}
+
+			if (completion.written) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Updated ${completion.outputPath}`,
+					ANSI_LIGHT_GRAY
+				);
+			} else {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Previewed ${completion.outputPath}; no file written`,
+					ANSI_LIGHT_GRAY
+				);
+			}
+		} catch (error) {
+			this.prepareForPermanentOutput();
+
+			if (cancellation.token.isCancellationRequested) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Cancelled`,
+					ANSI_LIGHT_GRAY
+				);
+			} else {
+				const message =
+					error instanceof Error
+						? error.message
+						: String(error);
+
+				this.writePermanentLine(
+					`ERROR Summarization failed: ${message}`,
+					ANSI_RED
+				);
+			}
+		} finally {
+			cancellation.dispose();
+
+			if (this.requestCancellation === cancellation) {
+				this.requestCancellation = undefined;
+			}
+
+			this.requestInFlight = false;
+			this.drawInteractiveArea();
+		}
+	}
+
+	private async submitAutomaticPrompt(
+		question: string
+	): Promise<void> {
+		const route = chooseAutomaticAssistantRoute(question);
+
+		if (route === 'summary' && this.summaryRoute) {
+			await this.submitSummaryPrompt(question);
+			return;
+		}
+
+		await this.submitChatPrompt(question);
+	}
+
+	private async submitSummaryPrompt(question: string): Promise<void> {
+		const cancellation = new vscode.CancellationTokenSource();
+		this.requestCancellation = cancellation;
+		this.requestInFlight = true;
+		this.showEphemeralWithPrompt('Routing through summary documentation...');
+
+		try {
+			const routeResult = await this.summaryRoute!(question);
+
+			if (cancellation.token.isCancellationRequested) {
+				throw new Error('Assistant request cancelled.');
+			}
+
+			const responseText = await this.chatBackend.sendIsolatedMessage(
+				routeResult.prompt,
+				cancellation.token
+			);
+
+			this.prepareForPermanentOutput();
+
+			const reportWarnings = [...routeResult.warnings];
+
+			if (!responseText.trim()) {
+				reportWarnings.push(
+					'The model returned an empty response.'
+				);
+			}
+
+			const report = createAssistantReport({
+				route: 'summary',
+				title: 'AI Dev Summary Answer',
+				question,
+				modelName: this.modelName,
+				warnings: reportWarnings,
+				rawResponse: responseText,
+			});
+
+			this.reportSink?.(report);
+
+			for (const warning of reportWarnings) {
+				this.writePermanentLine(
+					`WARNING ${warning}`,
+					ANSI_YELLOW
+				);
+			}
+
+			if (reportWarnings.length > 0) {
+				this.writePermanentLine(
+					'  /showreport for details',
+					ANSI_LIGHT_GRAY
+				);
+			}
+
+			if (cancellation.token.isCancellationRequested) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Cancelled`,
+					ANSI_LIGHT_GRAY
+				);
+			} else if (report.answer.trim()) {
+				for (const line of formatModelResponseLines(
+					this.modelName,
+					report.answer
+				)) {
+					this.writePermanentLine(line, '');
+				}
+			}
+		} catch (error) {
+			this.prepareForPermanentOutput();
+
+			if (cancellation.token.isCancellationRequested) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} Cancelled`,
+					ANSI_LIGHT_GRAY
+				);
+			} else {
+				const message =
+					error instanceof Error ? error.message : String(error);
+
+				this.writePermanentLine(
+					`ERROR Summary route failed: ${message}`,
+					ANSI_RED
+				);
+			}
+		} finally {
+			cancellation.dispose();
+
+			if (this.requestCancellation === cancellation) {
+				this.requestCancellation = undefined;
+			}
+
+			this.requestInFlight = false;
+			this.drawInteractiveArea();
+		}
+	}
+
+	private async submitChatPrompt(prompt: string): Promise<void> {
 		const cancellation = new vscode.CancellationTokenSource();
 		this.requestCancellation = cancellation;
 		this.requestInFlight = true;
@@ -365,7 +881,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 
 		try {
 			const responseText = await this.chatBackend.sendMessage(
-				submitResult.submittedText,
+				prompt,
 				cancellation.token
 			);
 
@@ -386,7 +902,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					this.modelName,
 					responseText
 				)) {
-					this.writePermanentLine(line, ANSI_LIGHT_GRAY);
+					this.writePermanentLine(line, '');
 				}
 			}
 		} catch (error) {
@@ -418,11 +934,15 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		}
 	}
 
-	private handleSubmittedCommand(command: string): boolean {
-		switch (parseSlashCommand(command)) {
+	private async handleSubmittedCommand(command: string): Promise<boolean> {
+		switch (parseSlashCommand(command).name) {
 			case 'help':
 				this.writePermanentLine(
-					`${BULLET_CHAR} Available commands: /help, /exit`,
+					`${BULLET_CHAR} Available commands: /ask, /summarize, /review, /settings, /showreport, /exit`,
+					ANSI_LIGHT_GRAY
+				);
+				this.writePermanentLine(
+					`${BULLET_CHAR} Type / to discover commands`,
 					ANSI_LIGHT_GRAY
 				);
 				this.writePermanentLine(
@@ -434,13 +954,209 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					ANSI_LIGHT_GRAY
 				);
 				this.writePermanentLine(
-					`${BULLET_CHAR} Escape leaves command mode`,
+					`${BULLET_CHAR} Escape returns to chat`,
 					ANSI_LIGHT_GRAY
 				);
 				this.writePermanentLine(
 					`${BULLET_CHAR} Up/Down navigate history`,
 					ANSI_LIGHT_GRAY
 				);
+				return true;
+
+			case 'settings':
+				void vscode.commands.executeCommand('aiDev.settings');
+				this.writePermanentLine(
+					`${BULLET_CHAR} Opened AI Dev settings`,
+					ANSI_LIGHT_GRAY
+				);
+				return true;
+
+			case 'ask': {
+				const parsed = parseSlashCommand(command);
+
+				if (
+					parsed.options.includes('--help')
+					|| parsed.options.includes('-h')
+				) {
+					const definition = getAssistantCommandDefinition('/ask');
+
+					if (definition) {
+						for (const line of formatAssistantCommandHelp(definition)) {
+							this.writePermanentLine(
+								line || ' ',
+								ANSI_LIGHT_GRAY
+							);
+						}
+					}
+
+					return true;
+				}
+
+				const resolved = resolveAskCommand(parsed);
+
+				if (!resolved.ok) {
+					this.writePermanentLine(
+						`WARNING ${resolved.error}`,
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				if (resolved.route === 'knowledgebase') {
+					this.writePermanentLine(
+						'WARNING The knowledgebase route is not connected yet.',
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				if (resolved.route === 'summary') {
+					if (!this.summaryRoute) {
+						this.writePermanentLine(
+							'WARNING The summary route is not connected yet.',
+							ANSI_YELLOW
+						);
+						return true;
+					}
+
+					await this.submitSummaryPrompt(resolved.question);
+					return false;
+				}
+
+				if (resolved.route === 'auto') {
+					await this.submitAutomaticPrompt(resolved.question);
+					return false;
+				}
+
+				await this.submitChatPrompt(resolved.question);
+				return false;
+			}
+
+			case 'summarize': {
+				const parsed = parseSlashCommand(command);
+
+				if (
+					parsed.options.includes('--help')
+					|| parsed.options.includes('-h')
+				) {
+					const definition =
+						getAssistantCommandDefinition('/summarize');
+
+					if (definition) {
+						for (
+							const line of
+							formatAssistantCommandHelp(definition)
+						) {
+							this.writePermanentLine(
+								line || ' ',
+								ANSI_LIGHT_GRAY
+							);
+						}
+					}
+
+					return true;
+				}
+
+				if (
+					parsed.options.includes('--config')
+					|| parsed.options.includes('-c')
+				) {
+					if (!this.summarizationConfigOpener) {
+						this.writePermanentLine(
+							'WARNING Summarization configuration is unavailable.',
+							ANSI_YELLOW
+						);
+						return true;
+					}
+
+					await this.summarizationConfigOpener();
+					this.writePermanentLine(
+						`${BULLET_CHAR} Opened summarization configuration`,
+						ANSI_LIGHT_GRAY
+					);
+					return true;
+				}
+
+				const unknownOptions = parsed.options.filter(
+					(option) => ![
+						'--help',
+						'-h',
+						'--config',
+						'-c',
+						'--smoketest',
+						'-s',
+					].includes(option)
+				);
+
+				if (unknownOptions.length > 0) {
+					this.writePermanentLine(
+						`WARNING Unknown /summarize option: ${unknownOptions.join(', ')}`,
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				const target = parsed.arguments.join(' ').trim();
+
+				if (!target) {
+					this.writePermanentLine(
+						'WARNING Usage: /summarize <file-path>',
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				const smokeTestRequested =
+					parsed.options.includes('--smoketest')
+					|| parsed.options.includes('-s');
+
+				if (smokeTestRequested) {
+					if (!this.summarizeRoute) {
+						this.writePermanentLine(
+							'WARNING The summarize route is not connected yet.',
+							ANSI_YELLOW
+						);
+						return true;
+					}
+
+					await this.runSummarizeSmokeTest(target);
+					return true;
+				}
+
+				if (/[*?\[\]{}]/.test(target)) {
+					this.writePermanentLine(
+						'WARNING Glob summarization is not connected yet.',
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				if (!this.summarizeRoute) {
+					this.writePermanentLine(
+						'WARNING The summarize route is not connected yet.',
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				await this.submitSummarizePrompt(target);
+				return false;
+			}
+
+			case 'review':
+				this.writePermanentLine(
+					'WARNING /review is not connected yet.',
+					ANSI_YELLOW
+				);
+				return true;
+
+			case 'showreport':
+				if (!this.reportOpener?.()) {
+					this.writePermanentLine(
+						'WARNING No report is available for this session yet.',
+						ANSI_YELLOW
+					);
+				}
 				return true;
 
 			case 'exit':
@@ -461,27 +1177,132 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		}
 	}
 
-	private handleTab(): void {
-		const tabResult = handleCommandTab(this.state, ASSISTANT_COMMANDS);
-		this.state = tabResult.state;
+	private async handleTab(): Promise<void> {
+		if (this.state.mode !== 'command') {
+			return;
+		}
 
-		if (!tabResult.listMatches) {
+		this.clearTabCompletionLines();
+
+		const pathContext =
+			getPathCompletionContext(this.state.input);
+
+		if (pathContext && this.pathCompleter) {
+			await this.handlePathTab(pathContext);
+			return;
+		}
+
+		const matches = getAssistantLookupItems(this.state.input);
+		const prefixMatches = matches.filter(
+			(match) => match.matchKind === 'prefix'
+		);
+
+		const completionMatch =
+			prefixMatches.length === 1
+				? prefixMatches[0]
+				: matches.length === 1
+					? matches[0]
+					: undefined;
+
+		if (completionMatch) {
+			this.state = {
+				...this.state,
+				input: completionMatch.value,
+				tabPressCount: 0,
+			};
 			this.refreshInteractiveArea();
 			return;
 		}
 
-		this.clearInteractiveArea();
-
-		if (tabResult.listMatches.length === 0) {
-			this.writePermanentLine('WARNING No matching commands.', ANSI_YELLOW);
-		} else {
-			this.writePermanentLine(
-				`${BULLET_CHAR} ${tabResult.listMatches.join('  ')}`,
-				ANSI_LIGHT_GRAY
-			);
+		if (this.state.tabPressCount !== 1) {
+			this.state = {
+				...this.state,
+				tabPressCount: 1,
+			};
+			this.refreshInteractiveArea();
+			return;
 		}
 
-		this.drawInteractiveArea();
+		this.state = {
+			...this.state,
+			tabPressCount: 0,
+		};
+
+		this.clearInteractiveArea();
+		this.drawPromptArea();
+
+		const completionLines = matches.length === 0
+			? ['No matching commands or options.']
+			: matches.map((match) => match.display);
+
+		this.showTabCompletionLines(completionLines);
+	}
+
+	private async handlePathTab(
+		context: PathCompletionContext
+	): Promise<void> {
+		const result = await this.pathCompleter!(
+			context.partialPath
+		);
+		const matches = result.matches;
+
+		if (matches.length === 1) {
+			const completed = matches[0];
+			const closingQuote =
+				context.quote && !completed.endsWith('/')
+					? context.quote
+					: '';
+
+			this.state = {
+				...this.state,
+				input:
+					`${context.beforePath}${context.quote}`
+					+ `${completed}${closingQuote}`,
+				tabPressCount: 0,
+			};
+			this.refreshInteractiveArea();
+			return;
+		}
+
+		const commonPrefix = getCommonPrefix(matches);
+
+		if (
+			commonPrefix
+			&& commonPrefix.length > context.partialPath.length
+		) {
+			this.state = {
+				...this.state,
+				input:
+					`${context.beforePath}${context.quote}`
+					+ commonPrefix,
+				tabPressCount: 0,
+			};
+			this.refreshInteractiveArea();
+			return;
+		}
+
+		if (this.state.tabPressCount !== 1) {
+			this.state = {
+				...this.state,
+				tabPressCount: 1,
+			};
+			this.refreshInteractiveArea();
+			return;
+		}
+
+		this.state = {
+			...this.state,
+			tabPressCount: 0,
+		};
+
+		this.clearInteractiveArea();
+		this.drawPromptArea();
+
+		const completionLines = matches.length === 0
+			? ['No matching paths.']
+			: formatItemsInColumns(matches, this.width);
+
+		this.showTabCompletionLines(completionLines);
 	}
 
 	private handleCtrlC(): void {
@@ -512,26 +1333,86 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 	}
 
 	private drawCommandLookupBelowPrompt(): void {
-		const matches = getMatchingAssistantCommands(this.state.input);
+		const matches = getAssistantLookupItems(this.state.input);
 		this.commandLookupLineCount = matches.length;
 
 		if (matches.length === 0) {
 			return;
 		}
 
-		// Preserve the editable cursor, move below the bottom rule,
-		// render ephemeral command matches, then restore the cursor.
 		this.writeRaw('\x1b7');
 		this.writeRaw('\x1b[2B\r');
 
-		for (const command of matches) {
-			this.writeRaw(`${formatCommandLookupLine(command, this.state.input)}\r\n`);
+		for (const match of matches) {
+			this.writeRaw(
+				`${this.formatLookupItem(match)}\r\n`
+			);
 		}
 
 		this.writeRaw('\x1b8');
 	}
 
+	private formatLookupItem(
+		item: AssistantLookupItem
+	): string {
+		if (item.kind === 'command') {
+			return formatCommandLookupLine(
+				item.display,
+				this.state.input
+			);
+		}
+
+		return formatOptionLookupLine(
+			item.display,
+			this.state.input
+		);
+	}
+
+	private showTabCompletionLines(
+		lines: string[]
+	): void {
+		this.tabCompletionLineCount = lines.length;
+
+		if (lines.length === 0 || !this.promptVisible) {
+			return;
+		}
+
+		// Preserve the editable cursor, move beneath the prompt frame,
+		// render ephemeral completion results, then restore the cursor.
+		this.writeRaw('\x1b7');
+		this.writeRaw('\x1b[2B\r');
+
+		for (const line of lines) {
+			this.writeRaw(
+				`${ANSI_COMPLETION}${line}${ANSI_RESET}\r\n`
+			);
+		}
+
+		this.writeRaw('\x1b8');
+	}
+
+	private clearTabCompletionLines(): void {
+		if (
+			this.tabCompletionLineCount === 0
+			|| !this.promptVisible
+		) {
+			this.tabCompletionLineCount = 0;
+			return;
+		}
+
+		this.writeRaw('\x1b7');
+		this.writeRaw('\x1b[2B\r');
+		this.writeRaw(
+			`\x1b[${this.tabCompletionLineCount}M`
+		);
+		this.writeRaw('\x1b8');
+
+		this.tabCompletionLineCount = 0;
+	}
+
 	private clearInteractiveArea(): void {
+		this.clearTabCompletionLines();
+
 		if (this.commandLookupLineCount > 0 && this.promptVisible) {
 			// Remove command suggestions below the prompt without moving
 			// the editable cursor permanently.

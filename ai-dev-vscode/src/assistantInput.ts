@@ -262,19 +262,127 @@ export function handleCommandTab(state: AssistantInputState, commands: string[])
 	};
 }
 
-export type SlashCommand = 'help' | 'exit' | 'unknown';
+export type SlashCommandName =
+	| 'help'
+	| 'ask'
+	| 'summarize'
+	| 'review'
+	| 'settings'
+	| 'showreport'
+	| 'exit'
+	| 'unknown';
 
-export function parseSlashCommand(input: string): SlashCommand {
-	const trimmed = input.trim();
-	const [command] = trimmed.split(/\s+/, 1);
+export interface ParsedSlashCommand {
+	name: SlashCommandName;
+	raw: string;
+	arguments: string[];
+	options: string[];
+}
 
-	if (command === '/help') {
-		return 'help';
+function tokenizeSlashCommand(input: string): string[] {
+	const tokens: string[] = [];
+	const tokenPattern = /"([^"]*)"|'([^']*)'|[^\s]+/g;
+
+	for (const match of input.matchAll(tokenPattern)) {
+		tokens.push(match[1] ?? match[2] ?? match[0]);
 	}
 
-	if (command === '/exit') {
-		return 'exit';
+	return tokens;
+}
+
+export function parseSlashCommand(input: string): ParsedSlashCommand {
+	const raw = input.trim();
+	const tokens = tokenizeSlashCommand(raw);
+	const commandToken = tokens.shift() ?? '';
+
+	const commandName = commandToken.startsWith('/')
+		? commandToken.slice(1).toLowerCase()
+		: commandToken.toLowerCase();
+
+	const knownCommands: SlashCommandName[] = [
+		'help',
+		'ask',
+		'summarize',
+		'review',
+		'settings',
+		'showreport',
+		'exit',
+	];
+
+	const name = knownCommands.includes(commandName as SlashCommandName)
+		? commandName as SlashCommandName
+		: 'unknown';
+
+	return {
+		name,
+		raw,
+		arguments: tokens.filter((token) => !token.startsWith('-')),
+		options: tokens.filter((token) => token.startsWith('-')),
+	};
+}
+
+export type AskRoute = 'auto' | 'summary' | 'knowledgebase' | 'chat';
+
+export type AskCommandResolution =
+	| {
+		ok: true;
+		route: AskRoute;
+		question: string;
+	}
+	| {
+		ok: false;
+		error: string;
+	};
+
+const ASK_ROUTE_OPTIONS: Record<string, AskRoute> = {
+	'--auto': 'auto',
+	'-a': 'auto',
+	'--summary': 'summary',
+	'-s': 'summary',
+	'--knowledgebase': 'knowledgebase',
+	'-k': 'knowledgebase',
+	'--chat': 'chat',
+	'-c': 'chat',
+};
+
+export function resolveAskCommand(
+	parsed: ParsedSlashCommand
+): AskCommandResolution {
+	const unknownOptions = parsed.options.filter(
+		(option) => !(option in ASK_ROUTE_OPTIONS)
+	);
+
+	if (unknownOptions.length > 0) {
+		return {
+			ok: false,
+			error: `Unknown /ask option: ${unknownOptions.join(', ')}`,
+		};
 	}
 
-	return 'unknown';
+	const requestedRoutes = [
+		...new Set(
+			parsed.options.map((option) => ASK_ROUTE_OPTIONS[option])
+		),
+	];
+
+	if (requestedRoutes.length > 1) {
+		return {
+			ok: false,
+			error: 'Choose only one /ask route.',
+		};
+	}
+
+	const question = parsed.arguments.join(' ').trim();
+	if (!question) {
+		return {
+			ok: false,
+			error: 'Usage: /ask [--auto | --summary | --knowledgebase | --chat] <question>',
+		};
+	}
+
+	return {
+		ok: true,
+		route: requestedRoutes[0] ?? 'auto',
+		question,
+	};
 }

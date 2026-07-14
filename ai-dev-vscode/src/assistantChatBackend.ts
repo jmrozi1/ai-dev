@@ -7,6 +7,10 @@ export interface AssistantChatSessionInfo {
 export interface AssistantChatBackend extends vscode.Disposable {
 	startSession(token: vscode.CancellationToken): Promise<AssistantChatSessionInfo>;
 	sendMessage(text: string, token: vscode.CancellationToken): Promise<string>;
+	sendIsolatedMessage(
+		text: string,
+		token: vscode.CancellationToken
+	): Promise<string>;
 }
 
 interface ModelMetadata {
@@ -127,6 +131,42 @@ export class VsCodeAssistantChatBackend implements AssistantChatBackend {
 				...requestMessages,
 				vscode.LanguageModelChatMessage.Assistant(responseText),
 			];
+		}
+
+		return responseText;
+	}
+
+	async sendIsolatedMessage(
+		text: string,
+		token: vscode.CancellationToken
+	): Promise<string> {
+		const requestMessages = [
+			vscode.LanguageModelChatMessage.User(text),
+		];
+
+		let model = await this.selectModel();
+
+		if (token.isCancellationRequested) {
+			throw new Error('Assistant request cancelled.');
+		}
+
+		let responseText = await collectResponse(
+			model,
+			requestMessages,
+			token
+		);
+
+		if (!responseText.trim() && !token.isCancellationRequested) {
+			model = await this.selectModel();
+			responseText = await collectResponse(
+				model,
+				requestMessages,
+				token
+			);
+		}
+
+		if (token.isCancellationRequested) {
+			throw new Error('Assistant request cancelled.');
 		}
 
 		return responseText;

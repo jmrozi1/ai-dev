@@ -3,7 +3,6 @@ import * as fs from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
 import * as path from 'node:path';
 import { registerAiDevActionsView } from './actionsView';
-import { WorkflowDetailsViewProvider } from './workflowDetailsView';
 import {
 	AiDevConfig,
 	getYamlNestedValue,
@@ -54,6 +53,17 @@ import {
 } from './architectureSummaryView';
 import { openSettingsWebview } from './settingsView';
 import { AiDevAssistantTerminalManager } from './assistantTerminal';
+import { AssistantReportStore } from './assistantReport';
+import { AssistantReportPanel } from './assistantReportPanel';
+import {
+	injectSummarizationInstructions,
+	readSummarizationConfig,
+	resolveSummarizationInstructions,
+	writeSummarizationConfig,
+} from './summarizationConfig';
+import {
+	SummarizationConfigPanel,
+} from './summarizationConfigPanel';
 
 const GENERATE_UNIT_DOC_COMMAND = 'aiDev.generateUnitDocPromptForActiveFile';
 const GENERATE_UNIT_DOCS_BATCH_EXPERIMENTAL_COMMAND = 'aiDev.generateUnitDocsBatchExperimental';
@@ -63,7 +73,6 @@ const REVIEW_DOCUMENTATION_COMMAND = 'aiDev.reviewChangedDocsPrompt';
 const REVIEW_FILE_DOCUMENTATION_COMMAND = 'aiDev.reviewFileDocsPrompt';
 const ANSWER_FROM_AI_DOCS_COMMAND = 'aiDev.answerFromAiDocsPrompt';
 const COPILOT_TEST_COMMAND = 'aiDev.copilotTest';
-const SELECT_WORKFLOW_COMMAND = 'aiDev.selectWorkflow';
 const SETTINGS_COMMAND = 'aiDev.settings';
 const SET_EXECUTION_MODE_COMMAND = 'aiDev.setExecutionMode';
 const LAUNCH_ASSISTANT_COMMAND = 'aiDev.launchAssistant';
@@ -3388,15 +3397,629 @@ async function buildReviewFileDocumentationDirectPromptBundle(target: {
 	};
 }
 
+const PATH_COMPLETION_EXCLUDED_NAMES = new Set([
+	'.git',
+	'node_modules',
+	'out',
+	'dist',
+	'build',
+	'coverage',
+	'.vscode-test',
+]);
+
+async function completeWorkspacePath(
+	partialPath: string
+): Promise<{ matches: string[] }> {
+	const workspaceRoot = getOpenWorkspaceRoot();
+
+	if (!workspaceRoot) {
+		return { matches: [] };
+	}
+
+	const normalizedPartial =
+		normalizePathForMarkdown(partialPath);
+	const slashIndex = normalizedPartial.lastIndexOf('/');
+
+	const directoryPart =
+		slashIndex >= 0
+			? normalizedPartial.slice(0, slashIndex + 1)
+			: '';
+
+	const namePrefix =
+		slashIndex >= 0
+			? normalizedPartial.slice(slashIndex + 1)
+			: normalizedPartial;
+
+	const directoryAbsolutePath = path.resolve(
+		workspaceRoot,
+		directoryPart || '.'
+	);
+
+	if (
+		!isPathInsideDirectory(
+			directoryAbsolutePath,
+			workspaceRoot
+		)
+	) {
+		return { matches: [] };
+	}
+
+	let entries;
+
+	try {
+		entries = await fs.readdir(
+			directoryAbsolutePath,
+			{ withFileTypes: true }
+		);
+	} catch {
+		return { matches: [] };
+	}
+
+	const matches = entries
+		.filter(
+			(entry) =>
+				!PATH_COMPLETION_EXCLUDED_NAMES.has(entry.name)
+				&& entry.name.startsWith(namePrefix)
+		)
+		.map((entry) =>
+			`${directoryPart}${entry.name}`
+			+ (entry.isDirectory() ? '/' : '')
+		)
+		.sort((left, right) =>
+			left.localeCompare(right)
+		);
+
+	return { matches };
+}
+
+async function previewSummarizationTarget(
+	target: string
+): Promise<{
+	target: string;
+	matchedSourceCount: number;
+	plannedSummaryTargets: string[];
+	previewSourcePaths: string[];
+	omittedSourceCount: number;
+	warnings: string[];
+}> {
+	const workspaceRoot = getOpenWorkspaceRoot();
+
+	if (!workspaceRoot) {
+		throw new Error('No workspace is open.');
+	}
+
+	const aiDevConfig = await readAiDevConfig(workspaceRoot);
+
+	const selection = await computeBatchUnitDocSelection({
+		workspaceRoot,
+		aiDevConfig,
+		formState: {
+			sourceGlob: target,
+			missingDocsOnly: false,
+			resolveOrphanedDocs: false,
+			maxFiles: MAX_BATCH_UNIT_DOC_FILES_THIS_PASS,
+			selectionMode: 'workspace',
+		},
+	});
+
+	const sourcePaths = selection.plannedActions
+		.filter(
+			(action) =>
+				action.actionType === 'generate-doc'
+				&& typeof action.sourcePath === 'string'
+		)
+		.map((action) => action.sourcePath as string)
+		.sort((left, right) => left.localeCompare(right));
+
+	const plannedSummaryTargets = [
+		...new Set(
+			selection.plannedActions
+				.filter(
+					(action) =>
+						action.actionType === 'generate-doc'
+				)
+				.map((action) => action.docPath)
+		),
+	].sort((left, right) => left.localeCompare(right));
+
+	const warnings: string[] = [];
+
+	if (
+		selection.counts.afterGlobFilter
+		> MAX_BATCH_UNIT_DOC_FILES_THIS_PASS
+	) {
+		warnings.push(
+			`Preview was capped at ${MAX_BATCH_UNIT_DOC_FILES_THIS_PASS} source files.`
+		);
+	}
+
+	return {
+		target: selection.normalizedSourceGlob,
+		matchedSourceCount:
+			selection.counts.afterGlobFilter,
+		plannedSummaryTargets,
+		previewSourcePaths: sourcePaths.slice(0, 10),
+		omittedSourceCount: Math.max(
+			0,
+			selection.counts.afterGlobFilter - 10
+		),
+		warnings,
+	};
+}
+
+async function prepareSingleFileSummary(
+	target: string
+): Promise<{
+	prompt: string;
+	sourcePath: string;
+	outputPath: string;
+	warnings: string[];
+}> {
+	const workspaceRoot = getOpenWorkspaceRoot();
+	if (!workspaceRoot) {
+		throw new Error('No workspace is open.');
+	}
+
+	const sourceAbsolutePath = path.resolve(
+		workspaceRoot,
+		target
+	);
+
+	if (!isPathInsideDirectory(sourceAbsolutePath, workspaceRoot)) {
+		throw new Error(
+			'The summarize target must be inside the open workspace.'
+		);
+	}
+
+	let sourceStat;
+	try {
+		sourceStat = await fs.stat(sourceAbsolutePath);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			throw new Error(`Source file not found: ${target}`);
+		}
+
+		throw error;
+	}
+
+	if (!sourceStat.isFile()) {
+		throw new Error(
+			`Single-file summarization requires a file: ${target}`
+		);
+	}
+
+	const aiDevConfig = await readAiDevConfig(workspaceRoot);
+	const modeResolution = getExecutionModeFromConfig(aiDevConfig);
+
+	if ('errorMessage' in modeResolution) {
+		throw new Error(modeResolution.errorMessage);
+	}
+
+	if (modeResolution.mode !== 'direct-experimental') {
+		throw new Error(
+			'/summarize in the terminal requires direct-experimental mode.'
+		);
+	}
+
+	const bundle = await buildGenerateUnitDocDirectPromptBundle({
+		workspaceRoot,
+		activeFileUri: vscode.Uri.file(sourceAbsolutePath),
+		aiDevConfig,
+	});
+
+	const summarizationConfig =
+		await readSummarizationConfig(workspaceRoot);
+	const resolvedInstructions =
+		resolveSummarizationInstructions(
+			summarizationConfig,
+			bundle.selectedSourcePath
+		);
+
+	return {
+		prompt: injectSummarizationInstructions(
+			bundle.directPromptMarkdown,
+			resolvedInstructions
+		),
+		sourcePath: bundle.selectedSourcePath,
+		outputPath: bundle.expectedSummaryPath,
+		warnings: [],
+	};
+}
+
+async function completeSingleFileSummary(
+	preparation: {
+		prompt: string;
+		sourcePath: string;
+		outputPath: string;
+		warnings: string[];
+	},
+	rawResponseText: string
+): Promise<{
+	written: boolean;
+	outputPath: string;
+	warnings: string[];
+}> {
+	const workspaceRoot = getOpenWorkspaceRoot();
+	if (!workspaceRoot) {
+		throw new Error('No workspace is open.');
+	}
+
+	const aiDevConfig = await readAiDevConfig(workspaceRoot);
+	const configuredDocsDir = getConfiguredDocsDir(aiDevConfig);
+	const docsDirAbsolutePath = path.resolve(
+		workspaceRoot,
+		configuredDocsDir
+	);
+	const outputAbsolutePath = path.resolve(
+		workspaceRoot,
+		preparation.outputPath
+	);
+
+	if (
+		!isPathInsideDirectory(
+			outputAbsolutePath,
+			docsDirAbsolutePath
+		)
+	) {
+		throw new Error(
+			`Expected output ${preparation.outputPath} is outside documentation.docsDir (${configuredDocsDir}).`
+		);
+	}
+
+	const cleanedResponse =
+		stripSingleOuterCodeFence(rawResponseText);
+	const responseText = cleanedResponse.text;
+
+	if (!responseText.trim()) {
+		return {
+			written: false,
+			outputPath: preparation.outputPath,
+			warnings: [
+				'The model returned an empty response; no file was written.',
+			],
+		};
+	}
+
+	let shouldWrite = allowDocsDirWritesForSession;
+
+	if (!allowDocsDirWritesForSession) {
+		const writeChoice =
+			await vscode.window.showInformationMessage(
+				`Write generated documentation to ${preparation.outputPath}?`,
+				{ modal: true },
+				'Write Once',
+				'Allow docsDir writes this session',
+				'Preview Only'
+			);
+
+		if (writeChoice === 'Write Once') {
+			shouldWrite = true;
+		} else if (
+			writeChoice
+			=== 'Allow docsDir writes this session'
+		) {
+			allowDocsDirWritesForSession = true;
+			shouldWrite = true;
+		}
+	}
+
+	if (!shouldWrite) {
+		return {
+			written: false,
+			outputPath: preparation.outputPath,
+			warnings: cleanedResponse.stripped
+				? ['Removed an outer Markdown code fence from the model response.']
+				: [],
+		};
+	}
+
+	await fs.mkdir(
+		path.dirname(outputAbsolutePath),
+		{ recursive: true }
+	);
+	await writeTextFileAtomicish(
+		outputAbsolutePath,
+		responseText
+	);
+
+	return {
+		written: true,
+		outputPath: preparation.outputPath,
+		warnings: cleanedResponse.stripped
+			? ['Removed an outer Markdown code fence from the model response.']
+			: [],
+	};
+}
+
+async function buildSummaryAnswerRoute(
+	userQuestion: string
+): Promise<{
+	prompt: string;
+	warnings: string[];
+}> {
+	const workspaceRoot = getOpenWorkspaceRoot();
+	if (!workspaceRoot) {
+		throw new Error('No workspace is open.');
+	}
+
+	const trimmedUserQuestion = userQuestion.trim();
+	if (!trimmedUserQuestion) {
+		throw new Error('A question is required.');
+	}
+
+	const aiDevConfig = await readAiDevConfig(workspaceRoot);
+	const aiDevCorePath = resolveAiDevCorePath(
+		workspaceRoot,
+		aiDevConfig.aiDevCorePath
+	);
+	const aiDevYamlSection = getAiDevYamlPromptSection(aiDevConfig);
+	const workflowFilePath = path.join(
+		aiDevCorePath,
+		'workflows/answer-docs/answer-from-ai-docs.md'
+	);
+	const docsDir = getConfiguredDocsDir(aiDevConfig);
+	const docsDirAbsolutePath = path.resolve(workspaceRoot, docsDir);
+	const architectureRootSummaryPath = getRootSummaryFilePath(aiDevConfig);
+	const architectureRootSummaryAbsolutePath = path.resolve(
+		workspaceRoot,
+		architectureRootSummaryPath
+	);
+	const legacyRootSummaryPath = getLegacyRootSummaryFilePath(aiDevConfig);
+	const legacyRootSummaryAbsolutePath = path.resolve(
+		workspaceRoot,
+		legacyRootSummaryPath
+	);
+
+	const [
+		workflowFileContents,
+		architectureRootSummaryContents,
+		legacyRootSummaryContents,
+	] = await Promise.all([
+		fs.readFile(workflowFilePath, 'utf8'),
+		readOptionalTextFile(architectureRootSummaryAbsolutePath),
+		readOptionalTextFile(legacyRootSummaryAbsolutePath),
+	]);
+
+	const architectureRootSummaryUsable =
+		architectureRootSummaryContents !== undefined
+		&& architectureRootSummaryContents.trim().length > 0;
+
+	const rootSummaryPath = architectureRootSummaryUsable
+		? architectureRootSummaryPath
+		: legacyRootSummaryPath;
+	const rootSummaryAbsolutePath = architectureRootSummaryUsable
+		? architectureRootSummaryAbsolutePath
+		: legacyRootSummaryAbsolutePath;
+	const rootSummaryContents = architectureRootSummaryUsable
+		? architectureRootSummaryContents
+		: legacyRootSummaryContents;
+
+	const rootSummaryExists = rootSummaryContents !== undefined;
+	const rootSummaryEmpty =
+		rootSummaryExists
+		&& rootSummaryContents.trim().length === 0;
+
+	const routedDocumentationContext =
+		await collectRoutedDocumentationContextForAnswer({
+			workspaceRoot,
+			docsDirAbsolutePath,
+			rootSummaryPath: rootSummaryAbsolutePath,
+			userQuestion: trimmedUserQuestion,
+		});
+
+	const discoveredSummaryPaths =
+		await discoverSummaryFilesRecursively(docsDirAbsolutePath);
+	const discoveredSummaryCount = discoveredSummaryPaths.length;
+
+	const routedSummaryAbsolutePaths = new Set(
+		routedDocumentationContext.routedFiles
+			.filter((file) => file.kind === 'summary')
+			.map((file) => path.resolve(workspaceRoot, file.path))
+	);
+
+	const excludeFallbackAbsolutePaths = new Set<string>(
+		routedSummaryAbsolutePaths
+	);
+
+	if (rootSummaryExists && !rootSummaryEmpty) {
+		excludeFallbackAbsolutePaths.add(rootSummaryAbsolutePath);
+	}
+
+	excludeFallbackAbsolutePaths.add(
+		architectureRootSummaryAbsolutePath
+	);
+	excludeFallbackAbsolutePaths.add(legacyRootSummaryAbsolutePath);
+
+	let fallbackIncludedReason: string | undefined;
+
+	if (!rootSummaryExists) {
+		fallbackIncludedReason = 'Root summary file is missing.';
+	} else if (rootSummaryEmpty) {
+		fallbackIncludedReason = 'Root summary file is empty.';
+	} else if (
+		routedDocumentationContext.routedFiles.length === 0
+	) {
+		fallbackIncludedReason =
+			'Root summary routing returned no additional context for this question.';
+	}
+
+	const fallbackDiscoveredSummaries = fallbackIncludedReason
+		? await selectFallbackDiscoveredSummaries({
+			workspaceRoot,
+			discoveredSummaryPaths,
+			excludeAbsolutePaths: excludeFallbackAbsolutePaths,
+			userQuestion: trimmedUserQuestion,
+			maxSummaries: MAX_FALLBACK_DISCOVERED_SUMMARIES,
+		})
+		: [];
+
+	const prompt = buildAnswerFromAiDocsDirectPromptMarkdown({
+		workspaceRoot,
+		workflowFilePath,
+		workflowFileContents,
+		aiDevYamlLabel: aiDevYamlSection.label,
+		aiDevYamlContents: aiDevYamlSection.contents,
+		rootSummaryPath,
+		rootSummaryExists,
+		rootSummaryEmpty,
+		rootSummaryContents,
+		docsDir,
+		discoveredSummaryCount,
+		fallbackIncludedReason,
+		routedDocumentationFiles:
+			routedDocumentationContext.routedFiles,
+		fallbackDiscoveredSummaries:
+			fallbackDiscoveredSummaries.map((summary) => ({
+				path: summary.relativePath,
+				contents: truncateText(
+					summary.contents,
+					MAX_ROUTED_DOC_FILE_CHARS
+				),
+				score: summary.score,
+			})),
+		missingDocumentationPaths:
+			routedDocumentationContext.missingPaths,
+		userQuestion: trimmedUserQuestion,
+	});
+
+	const warnings: string[] = [];
+
+	if (!rootSummaryExists) {
+		warnings.push(
+			`Root summary was not found at ${rootSummaryPath}; fallback discovery was used.`
+		);
+	} else if (rootSummaryEmpty) {
+		warnings.push(
+			`Root summary at ${rootSummaryPath} is empty; fallback discovery was used.`
+		);
+	}
+
+	if (routedDocumentationContext.missingPaths.length > 0) {
+		warnings.push(
+			`Missing routed documentation: ${routedDocumentationContext.missingPaths.join(', ')}`
+		);
+	}
+
+	if (
+		rootSummaryExists
+		&& !rootSummaryEmpty
+		&& routedDocumentationContext.routedFiles.length === 0
+	) {
+		warnings.push(
+			'Routing documentation did not identify additional context; fallback summaries were used.'
+		);
+	}
+
+	return {
+		prompt,
+		warnings,
+	};
+}
+
 export function activate(context: vscode.ExtensionContext) {
 	setAiDevExtensionRootPath(context.extensionPath);
 	registerAiDevActionsView(context);
-	const assistantTerminalManager = new AiDevAssistantTerminalManager(vscode.window);
-	context.subscriptions.push(assistantTerminalManager);
-	const workflowDetailsProvider = new WorkflowDetailsViewProvider();
+
+	const assistantReportStore = new AssistantReportStore();
+	const assistantReportPanel = new AssistantReportPanel();
+	const summarizationConfigPanel =
+		new SummarizationConfigPanel({
+			load: async () => {
+				const workspaceRoot = getOpenWorkspaceRoot();
+
+				if (!workspaceRoot) {
+					throw new Error('No workspace is open.');
+				}
+
+				return readSummarizationConfig(workspaceRoot);
+			},
+			save: async (config) => {
+				const workspaceRoot = getOpenWorkspaceRoot();
+
+				if (!workspaceRoot) {
+					throw new Error('No workspace is open.');
+				}
+
+				await writeSummarizationConfig(
+					workspaceRoot,
+					config
+				);
+			},
+			testPattern: async (glob) => {
+				const workspaceRoot = getOpenWorkspaceRoot();
+
+				if (!workspaceRoot) {
+					throw new Error('No workspace is open.');
+				}
+
+				const aiDevConfig =
+					await readAiDevConfig(workspaceRoot);
+				const candidates =
+					await discoverBatchUnitDocCandidates(
+						workspaceRoot,
+						aiDevConfig
+					);
+
+				const matcher = globToRegExp(glob);
+				const matchingPaths = candidates
+					.map((absolutePath) =>
+						normalizePathForMarkdown(
+							path.relative(
+								workspaceRoot,
+								absolutePath
+							)
+						)
+					)
+					.filter((relativePath) =>
+						matcher.test(relativePath)
+					)
+					.sort((left, right) =>
+						left.localeCompare(right)
+					);
+
+				return {
+					totalMatches: matchingPaths.length,
+					previewPaths: matchingPaths.slice(0, 10),
+					omittedCount:
+						Math.max(0, matchingPaths.length - 10),
+				};
+			},
+		});
+
 	context.subscriptions.push(
-		vscode.window.registerWebviewViewProvider('aiDev.workflowDetails', workflowDetailsProvider)
+		assistantReportPanel,
+		summarizationConfigPanel
 	);
+
+	const assistantTerminalManager = new AiDevAssistantTerminalManager(
+		vscode.window,
+		undefined,
+		buildSummaryAnswerRoute,
+		{
+			preview: previewSummarizationTarget,
+			prepare: prepareSingleFileSummary,
+			complete: completeSingleFileSummary,
+		},
+		(report) => {
+			assistantReportStore.setLatest(report);
+			assistantReportPanel.refresh();
+		},
+		() => {
+			const report = assistantReportStore.getLatest();
+			if (!report) {
+				return false;
+			}
+
+			assistantReportPanel.show(report);
+			return true;
+		},
+		async () => {
+			await summarizationConfigPanel.show();
+		},
+		completeWorkspacePath
+	);
+
+	context.subscriptions.push(assistantTerminalManager);
 
 	const launchAssistantCommand = vscode.commands.registerCommand(
 		LAUNCH_ASSISTANT_COMMAND,
@@ -3405,17 +4028,6 @@ export function activate(context: vscode.ExtensionContext) {
 		}
 	);
 
-	const selectWorkflowCommand = vscode.commands.registerCommand(
-		SELECT_WORKFLOW_COMMAND,
-		async (workflowId: string) => {
-			await workflowDetailsProvider.setActiveWorkflow(workflowId);
-			try {
-				await vscode.commands.executeCommand('aiDev.workflowDetails.focus');
-			} catch {
-				// If focus command is unavailable, keep the selection change only.
-			}
-		}
-	);
 
 	const generateUnitDocCommand = vscode.commands.registerCommand(
 		GENERATE_UNIT_DOC_COMMAND,
@@ -4366,7 +4978,6 @@ export function activate(context: vscode.ExtensionContext) {
 
 	context.subscriptions.push(
 		launchAssistantCommand,
-		selectWorkflowCommand,
 		generateUnitDocCommand,
 		generateUnitDocsBatchExperimentalCommand,
 		generateArchitectureSummaryCommand,

@@ -24,14 +24,52 @@ import {
 	handleHistoryDown,
 	handleHistoryUp,
 	parseSlashCommand,
+	resolveAskCommand,
 	submitInput,
 } from '../assistantInput';
 import {
 	AiDevAssistantTerminalManager,
+	getCommonPrefix,
+	getMatchingAssistantCommands,
+	getPathCompletionContext,
+	formatItemsInColumns,
 	MODEL_RESPONSE_MARKER,
 	formatModelResponseLines,
 } from '../assistantTerminal';
-import { getAiDevRootNodes } from '../actionsView';
+import {
+	AssistantReportStore,
+	createAssistantReport,
+	parseReportResponse,
+} from '../assistantReport';
+import {
+	buildAssistantReportHtml,
+} from '../assistantReportPanel';
+import {
+	ASSISTANT_COMMAND_DEFINITIONS,
+	formatAssistantCommandHelp,
+	formatAssistantCommandSummary,
+	getAssistantCommandDefinition,
+	getAssistantCommandNames,
+	getAssistantLookupItems,
+} from '../assistantCommands';
+import {
+	chooseAutomaticAssistantRoute,
+} from '../assistantRouting';
+import {
+	DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS,
+	createDefaultSummarizationConfig,
+	injectSummarizationInstructions,
+	matchesSummarizationGlob,
+	normalizeSummarizationConfig,
+	readSummarizationConfig,
+	resolveSummarizationInstructions,
+	validateSummarizationConfig,
+	validateSummarizationGlobSyntax,
+	writeSummarizationConfig,
+} from '../summarizationConfig';
+import {
+	buildSummarizationConfigHtml,
+} from '../summarizationConfigPanel';
 // import * as myExtension from '../../extension';
 
 suite('Extension Test Suite', () => {
@@ -146,15 +184,19 @@ suite('Extension Test Suite', () => {
 
 	test('Mandatory .ai-dev.yaml terminology is removed from extension and workflow details', async () => {
 		const extensionSourcePath = path.resolve(__dirname, '../../src/extension.ts');
-		const workflowDetailsSourcePath = path.resolve(__dirname, '../../src/workflowDetailsView.ts');
-		const [extensionSource, workflowDetailsSource] = await Promise.all([
-			fs.readFile(extensionSourcePath, 'utf8'),
-			fs.readFile(workflowDetailsSourcePath, 'utf8'),
-		]);
+		const extensionSource = await fs.readFile(
+			extensionSourcePath,
+			'utf8'
+		);
 
-		assert.doesNotMatch(extensionSource, /Missing aiDevCore\.path in \.ai-dev\.yaml\./);
-		assert.doesNotMatch(extensionSource, /Missing \.ai-dev\.yaml in workspace root\./);
-		assert.doesNotMatch(workflowDetailsSource, /Missing \.ai-dev\.yaml or aiDevCore\.path/);
+		assert.doesNotMatch(
+			extensionSource,
+			/Missing aiDevCore\.path in \.ai-dev\.yaml\./
+		);
+		assert.doesNotMatch(
+			extensionSource,
+			/Missing \.ai-dev\.yaml in workspace root\./
+		);
 	});
 
 	test('Assistant input defaults to chat mode', () => {
@@ -188,14 +230,740 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(twoBackspaces.input, '');
 	});
 
-	test('/help and /exit are recognized slash commands', () => {
-		assert.strictEqual(parseSlashCommand('/help'), 'help');
-		assert.strictEqual(parseSlashCommand('/help details'), 'help');
-		assert.strictEqual(parseSlashCommand('/exit'), 'exit');
+	test('Consolidated slash commands are recognized', () => {
+		assert.strictEqual(parseSlashCommand('/help').name, 'help');
+		assert.strictEqual(parseSlashCommand('/ask question').name, 'ask');
+		assert.strictEqual(parseSlashCommand('/summarize src/*.ts').name, 'summarize');
+		assert.strictEqual(parseSlashCommand('/review').name, 'review');
+		assert.strictEqual(parseSlashCommand('/settings').name, 'settings');
+		assert.strictEqual(parseSlashCommand('/showreport').name, 'showreport');
+		assert.strictEqual(parseSlashCommand('/exit').name, 'exit');
+	});
+
+	test('Slash command parser separates arguments and options', () => {
+		const parsed = parseSlashCommand(
+			'/ask --summary "Where is billing deployed?"'
+		);
+
+		assert.strictEqual(parsed.name, 'ask');
+		assert.deepStrictEqual(parsed.arguments, ['Where is billing deployed?']);
+		assert.deepStrictEqual(parsed.options, ['--summary']);
+	});
+
+	test('Slash command parser supports short options', () => {
+		const parsed = parseSlashCommand('/ask -k release approvals');
+
+		assert.strictEqual(parsed.name, 'ask');
+		assert.deepStrictEqual(parsed.arguments, ['release', 'approvals']);
+		assert.deepStrictEqual(parsed.options, ['-k']);
+	});
+
+	test('Slash command parser preserves quoted glob targets', () => {
+		const parsed = parseSlashCommand(
+			'/summarize "./lib/*.jenkins" --smoketest'
+		);
+
+		assert.strictEqual(parsed.name, 'summarize');
+		assert.deepStrictEqual(parsed.arguments, ['./lib/*.jenkins']);
+		assert.deepStrictEqual(parsed.options, ['--smoketest']);
 	});
 
 	test('Unknown slash command is handled as unknown', () => {
-		assert.strictEqual(parseSlashCommand('/unknown'), 'unknown');
+		assert.strictEqual(parseSlashCommand('/unknown').name, 'unknown');
+	});
+
+	test('Automatic routing uses summaries for project-relative questions', () => {
+		const projectQuestions = [
+			'What does this plugin do?',
+			'Where do we deploy the billing service?',
+			'How does our Jenkins pipeline work?',
+			'What is defined in src/extension.ts?',
+			'Explain the architecture of this repository.',
+		];
+
+		for (const question of projectQuestions) {
+			assert.strictEqual(
+				chooseAutomaticAssistantRoute(question),
+				'summary',
+				question
+			);
+		}
+	});
+
+	test('Automatic routing keeps general questions in chat', () => {
+		const generalQuestions = [
+			'What is eventual consistency?',
+			'Explain JavaScript closures.',
+			'How does photosynthesis work?',
+			'Tell me a joke.',
+		];
+
+		for (const question of generalQuestions) {
+			assert.strictEqual(
+				chooseAutomaticAssistantRoute(question),
+				'chat',
+				question
+			);
+		}
+	});
+
+	test('/ask defaults to auto routing', () => {
+		const resolved = resolveAskCommand(
+			parseSlashCommand('/ask Where is billing deployed?')
+		);
+
+		assert.deepStrictEqual(resolved, {
+			ok: true,
+			route: 'auto',
+			question: 'Where is billing deployed?',
+		});
+	});
+
+	test('/ask supports auto and chat short aliases', () => {
+		assert.deepStrictEqual(
+			resolveAskCommand(
+				parseSlashCommand('/ask -a What does this do?')
+			),
+			{
+				ok: true,
+				route: 'auto',
+				question: 'What does this do?',
+			}
+		);
+
+		assert.deepStrictEqual(
+			resolveAskCommand(
+				parseSlashCommand('/ask -c Explain closures')
+			),
+			{
+				ok: true,
+				route: 'chat',
+				question: 'Explain closures',
+			}
+		);
+	});
+
+	test('/ask supports summary route aliases', () => {
+		for (const option of ['--summary', '-s']) {
+			const resolved = resolveAskCommand(
+				parseSlashCommand(`/ask ${option} Where is billing deployed?`)
+			);
+
+			assert.deepStrictEqual(resolved, {
+				ok: true,
+				route: 'summary',
+				question: 'Where is billing deployed?',
+			});
+		}
+	});
+
+	test('/ask supports knowledgebase route aliases', () => {
+		for (const option of ['--knowledgebase', '-k']) {
+			const resolved = resolveAskCommand(
+				parseSlashCommand(`/ask ${option} What is the release process?`)
+			);
+
+			assert.deepStrictEqual(resolved, {
+				ok: true,
+				route: 'knowledgebase',
+				question: 'What is the release process?',
+			});
+		}
+	});
+
+	test('/ask supports explicit chat routing', () => {
+		const resolved = resolveAskCommand(
+			parseSlashCommand('/ask --chat Explain closures')
+		);
+
+		assert.deepStrictEqual(resolved, {
+			ok: true,
+			route: 'chat',
+			question: 'Explain closures',
+		});
+	});
+
+	test('/ask rejects conflicting routes', () => {
+		const resolved = resolveAskCommand(
+			parseSlashCommand('/ask --summary --chat Explain billing')
+		);
+
+		assert.deepStrictEqual(resolved, {
+			ok: false,
+			error: 'Choose only one /ask route.',
+		});
+	});
+
+	test('/ask rejects unknown options', () => {
+		const resolved = resolveAskCommand(
+			parseSlashCommand('/ask --banana Explain billing')
+		);
+
+		assert.deepStrictEqual(resolved, {
+			ok: false,
+			error: 'Unknown /ask option: --banana',
+		});
+	});
+
+	test('/ask requires a question', () => {
+		const resolved = resolveAskCommand(
+			parseSlashCommand('/ask --summary')
+		);
+
+		assert.strictEqual(resolved.ok, false);
+		if (!resolved.ok) {
+			assert.match(resolved.error, /^Usage: \/ask/);
+		}
+	});
+
+	test('Summarization config HTML renders the general row and rule table', () => {
+		const config = createDefaultSummarizationConfig();
+
+		config.rules.push({
+			id: 'jenkins',
+			name: 'Jenkins job config',
+			glob: '**/jobs/**/config.xml',
+			priority: 100,
+			enabled: true,
+			instructions: 'Focus on build steps.',
+		});
+
+		const html = buildSummarizationConfigHtml(config);
+
+		assert.match(html, /Summarization Configuration/);
+		assert.match(html, /General summarization/);
+		assert.match(html, /Add rule/);
+		assert.match(html, /dblclick/);
+		assert.match(html, /ruleDialog/);
+		assert.match(
+			html,
+			/Jenkins job config/
+		);
+	});
+
+	test('Summarization config HTML includes live inline pattern testing', () => {
+		const html = buildSummarizationConfigHtml(
+			createDefaultSummarizationConfig()
+		);
+
+		assert.match(html, /testPatternEnabled/);
+		assert.match(html, /patternTestSummary/);
+		assert.match(html, /togglePatternMatches/);
+		assert.match(html, /schedulePatternTest/);
+		assert.match(html, /setTimeout\(run, 350\)/);
+		assert.match(html, /requestId/);
+		assert.doesNotMatch(
+			html,
+			/id="testPatternButton"/
+		);
+	});
+
+	test('Summarization config HTML safely serializes script-like instructions', () => {
+		const config = createDefaultSummarizationConfig();
+		config.generalInstructions =
+			'</script><script>alert(1)</script>';
+
+		const html = buildSummarizationConfigHtml(config);
+
+		assert.doesNotMatch(
+			html,
+			/<\/script><script>alert\(1\)<\/script>/
+		);
+		assert.match(html, /\\u003c\/script\\u003e/);
+	});
+
+	test('Missing summarization config returns general defaults', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-summary-config-')
+		);
+
+		const config = await readSummarizationConfig(
+			workspaceRoot
+		);
+
+		assert.strictEqual(config.version, 1);
+		assert.strictEqual(
+			config.generalInstructions,
+			DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS
+		);
+		assert.deepStrictEqual(config.rules, []);
+	});
+
+	test('Summarization config round-trips specialized rules', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-summary-config-')
+		);
+		const config = createDefaultSummarizationConfig();
+
+		config.rules.push({
+			id: 'jenkins-config',
+			name: 'Jenkins job config',
+			glob: '**/jobs/**/config.xml',
+			priority: 100,
+			enabled: true,
+			instructions:
+				'Focus on build steps and disabled state.',
+		});
+
+		await writeSummarizationConfig(
+			workspaceRoot,
+			config
+		);
+
+		assert.deepStrictEqual(
+			await readSummarizationConfig(workspaceRoot),
+			config
+		);
+	});
+
+	test('Summarization glob supports recursive path matching', () => {
+		assert.strictEqual(
+			matchesSummarizationGlob(
+				'jenkins/jobs/billing/config.xml',
+				'**/jobs/**/config.xml'
+			),
+			true
+		);
+		assert.strictEqual(
+			matchesSummarizationGlob(
+				'jenkins/jobs/billing/Jenkinsfile',
+				'**/jobs/**/config.xml'
+			),
+			false
+		);
+	});
+
+	test('General instructions precede matching specialized rules', () => {
+		const config = normalizeSummarizationConfig({
+			version: 1,
+			generalInstructions: 'General guidance.',
+			rules: [
+				{
+					id: 'high',
+					name: 'Higher priority',
+					glob: '**/config.xml',
+					priority: 100,
+					enabled: true,
+					instructions: 'High-priority guidance.',
+				},
+				{
+					id: 'low',
+					name: 'Lower priority',
+					glob: '**/*.xml',
+					priority: 10,
+					enabled: true,
+					instructions: 'Low-priority guidance.',
+				},
+				{
+					id: 'disabled',
+					name: 'Disabled',
+					glob: '**/*.xml',
+					priority: 1,
+					enabled: false,
+					instructions: 'Should not appear.',
+				},
+			],
+		});
+
+		const resolved = resolveSummarizationInstructions(
+			config,
+			'jobs/billing/config.xml'
+		);
+
+		assert.deepStrictEqual(
+			resolved.matchingRules.map((rule) => rule.id),
+			['low', 'high']
+		);
+		assert.ok(
+			resolved.combinedInstructions.indexOf(
+				'General guidance.'
+			)
+			< resolved.combinedInstructions.indexOf(
+				'Low-priority guidance.'
+			)
+		);
+		assert.ok(
+			resolved.combinedInstructions.indexOf(
+				'Low-priority guidance.'
+			)
+			< resolved.combinedInstructions.indexOf(
+				'High-priority guidance.'
+			)
+		);
+		assert.doesNotMatch(
+			resolved.combinedInstructions,
+			/Should not appear/
+		);
+	});
+
+	test('Configured summarization guidance is injected before final task instructions', () => {
+		const config = normalizeSummarizationConfig({
+			version: 1,
+			generalInstructions:
+				'Summarize behavior, not syntax.',
+			rules: [
+				{
+					id: 'jenkins',
+					name: 'Jenkins job config',
+					glob: '**/jobs/**/config.xml',
+					priority: 100,
+					enabled: true,
+					instructions: [
+						'Include whether the job is disabled.',
+						'Focus on build steps.',
+					].join('\n'),
+				},
+			],
+		});
+
+		const resolved = resolveSummarizationInstructions(
+			config,
+			'jenkins/jobs/billing/config.xml'
+		);
+
+		const prompt = injectSummarizationInstructions(
+			[
+				'Source file contents:',
+				'<xml />',
+				'',
+				'Instructions:',
+				'Return raw Markdown only.',
+			].join('\n'),
+			resolved
+		);
+
+		assert.match(
+			prompt,
+			/Configured summarization guidance:/
+		);
+		assert.match(
+			prompt,
+			/Summarize behavior, not syntax\./
+		);
+		assert.match(
+			prompt,
+			/Rule: Jenkins job config/
+		);
+		assert.match(
+			prompt,
+			/Include whether the job is disabled\./
+		);
+
+		assert.ok(
+			prompt.indexOf(
+				'Configured summarization guidance:'
+			)
+			< prompt.indexOf('Instructions:')
+		);
+	});
+
+	test('Prompt injection excludes unmatched summarization rules', () => {
+		const config = normalizeSummarizationConfig({
+			version: 1,
+			generalInstructions: 'General guidance.',
+			rules: [
+				{
+					id: 'jenkins',
+					name: 'Jenkins',
+					glob: '**/config.xml',
+					priority: 100,
+					enabled: true,
+					instructions: 'Jenkins-only guidance.',
+				},
+			],
+		});
+
+		const resolved = resolveSummarizationInstructions(
+			config,
+			'src/example.ts'
+		);
+		const prompt = injectSummarizationInstructions(
+			'Instructions:\nSummarize the file.',
+			resolved
+		);
+
+		assert.match(prompt, /General guidance\./);
+		assert.doesNotMatch(
+			prompt,
+			/Jenkins-only guidance/
+		);
+	});
+
+	test('Summarization glob validation detects unmatched delimiters', () => {
+		assert.strictEqual(
+			validateSummarizationGlobSyntax(
+				'**/jobs/[broken/config.xml'
+			),
+			'Unmatched "[" in glob pattern.'
+		);
+
+		assert.strictEqual(
+			validateSummarizationGlobSyntax(
+				'**/jobs/{broken/config.xml'
+			),
+			'Unmatched "{" in glob pattern.'
+		);
+
+		assert.strictEqual(
+			validateSummarizationGlobSyntax(
+				'**/jobs/**/config.xml'
+			),
+			undefined
+		);
+	});
+
+	test('Summarization config validates incomplete rules', () => {
+		const config = normalizeSummarizationConfig({
+			version: 1,
+			generalInstructions: 'General guidance.',
+			rules: [
+				{
+					id: '',
+					name: '',
+					glob: '',
+					priority: 0,
+					enabled: true,
+					instructions: '',
+				},
+			],
+		});
+
+		assert.ok(
+			validateSummarizationConfig(config).length >= 3
+		);
+	});
+
+	test('/summarize parser preserves a quoted file path', () => {
+		const parsed = parseSlashCommand(
+			'/summarize "src/path with spaces/example.ts"'
+		);
+
+		assert.strictEqual(parsed.name, 'summarize');
+		assert.deepStrictEqual(
+			parsed.arguments,
+			['src/path with spaces/example.ts']
+		);
+		assert.deepStrictEqual(parsed.options, []);
+	});
+
+	test('/summarize smoketest preserves the target glob', () => {
+		const parsed = parseSlashCommand(
+			'/summarize "ai-dev-vscode/src/**/*.ts" --smoketest'
+		);
+
+		assert.strictEqual(parsed.name, 'summarize');
+		assert.deepStrictEqual(
+			parsed.arguments,
+			['ai-dev-vscode/src/**/*.ts']
+		);
+		assert.deepStrictEqual(
+			parsed.options,
+			['--smoketest']
+		);
+	});
+
+	test('/summarize parser recognizes deterministic options', () => {
+		for (
+			const option of [
+				'--smoketest',
+				'-s',
+				'--config',
+				'-c',
+				'--help',
+				'-h',
+			]
+		) {
+			const parsed = parseSlashCommand(
+				`/summarize src/example.ts ${option}`
+			);
+
+			assert.ok(
+				parsed.options.includes(option),
+				option
+			);
+		}
+	});
+
+	test('Command definitions provide one-line summaries', () => {
+		const ask = getAssistantCommandDefinition('/ask');
+
+		assert.ok(ask);
+		assert.strictEqual(
+			formatAssistantCommandSummary(ask),
+			'/ask - Ask the assistant a question'
+		);
+	});
+
+	test('Command names are derived from centralized metadata', () => {
+		assert.deepStrictEqual(
+			getAssistantCommandNames(),
+			ASSISTANT_COMMAND_DEFINITIONS.map(
+				(command) => command.name
+			)
+		);
+	});
+
+	test('/ask help includes usage and all short aliases', () => {
+		const ask = getAssistantCommandDefinition('/ask');
+
+		assert.ok(ask);
+
+		const help = formatAssistantCommandHelp(ask).join('\n');
+
+		assert.match(help, /\/ask - Ask the assistant a question/);
+		assert.match(help, /Usage:/);
+		assert.match(help, /--auto, -a/);
+		assert.match(help, /--summary, -s/);
+		assert.match(help, /--knowledgebase, -k/);
+		assert.match(help, /--chat, -c/);
+		assert.match(help, /--help, -h/);
+	});
+
+	test('Common path prefix extends multiple matches', () => {
+		assert.strictEqual(
+			getCommonPrefix([
+				'ai-dev-vscode/',
+				'ai-dev-vscode-old/',
+			]),
+			'ai-dev-vscode'
+		);
+	});
+
+	test('Tab completion results use a dedicated ephemeral region', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/tabCompletionLineCount/
+		);
+		assert.match(
+			source,
+			/showTabCompletionLines/
+		);
+		assert.match(
+			source,
+			/clearTabCompletionLines/
+		);
+		assert.match(
+			source,
+			/38;2;156;220;254/
+		);
+	});
+
+	test('Path listings render aligned columns', () => {
+		assert.deepStrictEqual(
+			formatItemsInColumns(
+				['alpha/', 'beta.ts', 'gamma/'],
+				30
+			),
+			['alpha/   beta.ts  gamma/']
+		);
+	});
+
+	test('Summarize path context preserves quoted paths', () => {
+		assert.deepStrictEqual(
+			getPathCompletionContext(
+				'summarize "ai-dev-vscode/src/assi'
+			),
+			{
+				partialPath: 'ai-dev-vscode/src/assi',
+				beforePath: 'summarize ',
+				quote: '"',
+			}
+		);
+	});
+
+	test('Path completion is disabled for glob input', () => {
+		assert.strictEqual(
+			getPathCompletionContext(
+				'summarize ai-dev-vscode/src/*.ts'
+			),
+			undefined
+		);
+	});
+
+	test('A unique command prefix wins over substring matches', () => {
+		const lookup = getAssistantLookupItems('e');
+		const prefixMatches = lookup.filter(
+			(item) => item.matchKind === 'prefix'
+		);
+
+		assert.deepStrictEqual(
+			prefixMatches.map((item) => item.value),
+			['exit']
+		);
+		assert.ok(
+			lookup.some(
+				(item) =>
+					item.value === 'review'
+					&& item.matchKind === 'substring'
+			)
+		);
+	});
+
+	test('Command lookup includes descriptions', () => {
+		const lookup = getAssistantLookupItems('');
+
+		assert.ok(
+			lookup.some(
+				(item) =>
+					item.display
+					=== '/ask - Ask the assistant a question'
+			)
+		);
+	});
+
+	test('/ask space lists route and help options', () => {
+		const lookup = getAssistantLookupItems('ask ');
+
+		assert.deepStrictEqual(
+			lookup.map((item) => item.display),
+			[
+				'--auto, -a - Choose the best route',
+				'--summary, -s - Use summary documentation only',
+				'--knowledgebase, -k - Use the knowledge base only',
+				'--chat, -c - Bypass project routing',
+				'--help, -h - Show command help',
+			]
+		);
+	});
+
+	test('Option lookup filters the active option token', () => {
+		const lookup = getAssistantLookupItems('ask --s');
+
+		assert.deepStrictEqual(
+			lookup.map((item) => item.value),
+			['ask --summary']
+		);
+	});
+
+	test('Option lookup supports short aliases', () => {
+		const lookup = getAssistantLookupItems('ask -k');
+
+		assert.deepStrictEqual(
+			lookup.map((item) => item.value),
+			['ask --knowledgebase']
+		);
+	});
+
+	test('Option lookup hides route alternatives after a route', () => {
+		const lookup = getAssistantLookupItems('ask --summary ');
+
+		assert.deepStrictEqual(
+			lookup.map((item) => item.value),
+			['ask --summary --help']
+		);
+	});
+
+	test('Option lookup disappears after positional text begins', () => {
+		assert.deepStrictEqual(
+			getAssistantLookupItems('ask What does this do?'),
+			[]
+		);
 	});
 
 	test('Single-match tab completion completes command', () => {
@@ -213,6 +981,25 @@ suite('Extension Test Suite', () => {
 
 		assert.deepStrictEqual(secondTab.listMatches, ['/help', '/exit']);
 	});
+
+	test('Command lookup disappears after command arguments begin', () => {
+		assert.deepStrictEqual(
+			getMatchingAssistantCommands('ask '),
+			[]
+		);
+		assert.deepStrictEqual(
+			getMatchingAssistantCommands('ask question'),
+			[]
+		);
+	});
+
+	test('Command lookup remains visible while editing command name', () => {
+		assert.deepStrictEqual(
+			getMatchingAssistantCommands('ask'),
+			['/ask']
+		);
+	});
+
 
 	test('Recalling /help restores command mode and editable input without slash', () => {
 		const commandState = applyTextInput(createAssistantInputState(), '/help');
@@ -262,6 +1049,167 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(restoredDraft.input, 'draft question');
 	});
 
+	test('Report parser extracts the concise answer section', () => {
+		const parsed = parseReportResponse([
+			'# Answer',
+			'',
+			'The plugin provides an AI assistant.',
+			'',
+			'## Evidence',
+			'',
+			'- package.json',
+		].join('\n'));
+
+		assert.strictEqual(
+			parsed.answer,
+			'The plugin provides an AI assistant.'
+		);
+		assert.deepStrictEqual(
+			parsed.sections.map((section) => section.title),
+			['Answer', 'Evidence']
+		);
+	});
+
+	test('Report parser recognizes bold section labels', () => {
+		const parsed = parseReportResponse([
+			'**Answer:** The plugin provides an AI assistant.',
+			'',
+			'**Evidence:**',
+			'- package.json',
+			'',
+			'**Verification status:** Not verified against source.',
+			'',
+			'**Additional files needed:**',
+			'- README.md',
+		].join('\n'));
+
+		assert.strictEqual(
+			parsed.answer,
+			'The plugin provides an AI assistant.'
+		);
+
+		assert.deepStrictEqual(
+			parsed.sections.map((section) => section.title),
+			[
+				'Answer',
+				'Evidence',
+				'Verification status',
+				'Additional files needed',
+			]
+		);
+	});
+
+	test('Report parser falls back to the first section', () => {
+		const parsed = parseReportResponse([
+			'## Result',
+			'',
+			'The operation completed.',
+		].join('\n'));
+
+		assert.strictEqual(parsed.answer, 'The operation completed.');
+	});
+
+	test('Report parser preserves detailed report sections', () => {
+		const parsed = parseReportResponse([
+			'# Answer',
+			'',
+			'Concise answer.',
+			'',
+			'## Verification Status',
+			'',
+			'Partially verified.',
+			'',
+			'## Uncertainty & Additional Files Needed',
+			'',
+			'- README.md',
+		].join('\n'));
+
+		assert.deepStrictEqual(parsed.sections, [
+			{
+				id: 'answer',
+				title: 'Answer',
+				content: 'Concise answer.',
+			},
+			{
+				id: 'verification-status',
+				title: 'Verification Status',
+				content: 'Partially verified.',
+			},
+			{
+				id: 'uncertainty-additional-files-needed',
+				title: 'Uncertainty & Additional Files Needed',
+				content: '- README.md',
+			},
+		]);
+	});
+
+	test('Report HTML uses a fixed contents navigation layout', () => {
+		const report = createAssistantReport({
+			route: 'summary',
+			title: 'AI Dev Report',
+			question: 'What does this plugin do?',
+			modelName: 'Auto',
+			warnings: ['Root summary was not found.'],
+			rawResponse: [
+				'# Answer',
+				'',
+				'The plugin provides an AI assistant.',
+				'',
+				'## Evidence',
+				'',
+				'- package.json',
+			].join('\n'),
+		});
+
+		const html = buildAssistantReportHtml(report);
+
+		assert.match(html, /<nav class="toc"/);
+		assert.match(html, /position: sticky/);
+		assert.match(html, /href="#warnings"/);
+		assert.match(html, /href="#answer"/);
+		assert.match(html, /href="#evidence"/);
+		assert.match(html, /id="raw-response"/);
+	});
+
+	test('Report HTML escapes unsafe report content', () => {
+		const report = createAssistantReport({
+			route: 'summary',
+			title: '<script>alert(1)</script>',
+			rawResponse: '# Answer\n\n<script>alert(2)</script>',
+		});
+
+		const html = buildAssistantReportHtml(report);
+
+		assert.doesNotMatch(html, /<script>alert\(1\)<\/script>/);
+		assert.doesNotMatch(html, /<script>alert\(2\)<\/script>/);
+		assert.match(html, /&lt;script&gt;alert\(1\)&lt;\/script&gt;/);
+		assert.match(html, /&lt;script&gt;alert\(2\)&lt;\/script&gt;/);
+	});
+
+	test('Assistant report store retains the latest report', () => {
+		const store = new AssistantReportStore();
+
+		const first = createAssistantReport({
+			route: 'summary',
+			title: 'First report',
+			rawResponse: '# Answer\n\nFirst answer.',
+			now: new Date('2026-07-13T12:00:00.000Z'),
+		});
+
+		const second = createAssistantReport({
+			route: 'summary',
+			title: 'Second report',
+			rawResponse: '# Answer\n\nSecond answer.',
+			now: new Date('2026-07-13T12:01:00.000Z'),
+		});
+
+		store.setLatest(first);
+		store.setLatest(second);
+
+		assert.strictEqual(store.getLatest(), second);
+		assert.strictEqual(store.getLatest()?.answer, 'Second answer.');
+	});
+
 	test('Terminal manager reuses active AI Dev terminal and recreates after close', () => {
 		type CloseListener = (terminal: { name: string; show: () => void; dispose: () => void }) => void;
 		const closeListeners: CloseListener[] = [];
@@ -308,12 +1256,33 @@ suite('Extension Test Suite', () => {
 		manager.dispose();
 	});
 
-	test('Launch Assistant is first root item in AI Dev activity view', async () => {
-		const rootNodes = getAiDevRootNodes();
+	test('AI Dev Activity Bar item directly launches the assistant', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/actionsView.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
 
-		assert.ok(rootNodes.length > 0);
-		assert.strictEqual(rootNodes[0].type, 'launchAssistant');
-		assert.strictEqual(rootNodes[0].label, 'Launch Assistant');
+		assert.match(
+			source,
+			/createTreeView\(/
+		);
+		assert.match(
+			source,
+			/onDidChangeVisibility/
+		);
+		assert.match(
+			source,
+			/'aiDev\.launchAssistant'/
+		);
+		assert.match(
+			source,
+			/'workbench\.action\.toggleSidebarVisibility'/
+		);
+		assert.doesNotMatch(
+			source,
+			/Open AI Dev Assistant/
+		);
 	});
 
 	test('Terminal renders Unicode separator character', () => {
@@ -378,10 +1347,11 @@ suite('Extension Test Suite', () => {
 	test('Help output uses bullet markers with no blank lines', () => {
 		// Verify help text structure: each item uses bullet, no blank lines between
 		const helpItems = [
-			'• Available commands: /help, /exit',
+			'• Available commands: /ask, /summarize, /review, /settings, /showreport, /exit',
+			'• Type / to discover commands',
 			'• Tab completes commands',
 			'• Tab twice lists commands',
-			'• Escape leaves command mode',
+			'• Escape returns to chat',
 			'• Up/Down navigate history',
 		];
 		
@@ -413,13 +1383,72 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(state.tabPressCount, 0);
 	});
 
+	test('Summarize smoke test uses preview without model execution', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/await this\.summarizeRoute!\.preview\(target\)/
+		);
+		assert.match(
+			source,
+			/Estimated model calls:/
+		);
+	});
+
+	test('Plain assistant input uses automatic routing', async () => {
+		const sourcePath = path.join(
+			__dirname,
+			'..',
+			'..',
+			'src',
+			'assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/await this\.submitAutomaticPrompt\(submitResult\.submittedText\)/
+		);
+	});
+
+	test('Assistant terminal shares one chat request lifecycle', async () => {
+		const sourcePath = path.join(
+			__dirname,
+			'..',
+			'..',
+			'src',
+			'assistantTerminal.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		assert.match(
+			source,
+			/private async submitChatPrompt\(prompt: string\): Promise<void>/
+		);
+		assert.strictEqual(
+			(source.match(/chatBackend\.sendMessage\(/g) ?? []).length,
+			1
+		);
+	});
+
 	test('Model responses use the large response marker', () => {
 		assert.strictEqual(MODEL_RESPONSE_MARKER, '◆');
 	});
 
 	test('Model response formatting labels and indents lines', () => {
+		const stripAnsi = (value: string): string =>
+			value.replace(/\x1b\[[0-9;]*m/g, '');
+
 		assert.deepStrictEqual(
-			formatModelResponseLines('Test Model', 'First\nSecond'),
+			formatModelResponseLines(
+				'Test Model',
+				'First\nSecond'
+			).map(stripAnsi),
 			[
 				'◆ Test Model: First',
 				'  Second',
