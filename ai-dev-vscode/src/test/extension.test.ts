@@ -93,6 +93,16 @@ import {
 	buildGroupedGenerateUnitDocDirectPromptMarkdown,
 } from '../promptBuilder';
 import {
+	normalizePathForMarkdown,
+} from '../workspace';
+import {
+	createEmptyDependencyMap,
+	findOutgoingDependencyEdges,
+	readDependencyMap,
+	validateDependencyMap,
+	writeDependencyMap,
+} from '../dependencyMap';
+import {
 	selectQuestionRelevantSummaryExcerpt,
 } from '../summaryAnswerRouting';
 // import * as myExtension from '../../extension';
@@ -562,6 +572,220 @@ suite('Extension Test Suite', () => {
 			/<\/script><script>alert\(1\)<\/script>/
 		);
 		assert.match(html, /\\u003c\/script\\u003e/);
+	});
+
+	test('Markdown path normalization accepts either slash style', () => {
+		assert.strictEqual(
+			normalizePathForMarkdown(
+				'jobs\\billing\\config.xml'
+			),
+			'jobs/billing/config.xml'
+		);
+		assert.strictEqual(
+			normalizePathForMarkdown(
+				'jobs/billing/config.xml'
+			),
+			'jobs/billing/config.xml'
+		);
+	});
+
+	test('Missing dependency map returns an empty versioned map', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-dependency-map-')
+		);
+		const config = await readAiDevConfig(
+			workspaceRoot
+		);
+
+		assert.deepStrictEqual(
+			await readDependencyMap(
+				workspaceRoot,
+				config
+			),
+			createEmptyDependencyMap()
+		);
+	});
+
+	test('Dependency map round-trips with deterministic edge ordering', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-dependency-map-')
+		);
+		const config = await readAiDevConfig(
+			workspaceRoot
+		);
+
+		await writeDependencyMap(
+			workspaceRoot,
+			config,
+			{
+				version: 1,
+				edges: [
+					{
+						sourcePath:
+							'jenkins\\jobs\\billing\\config.xml',
+						targetPath:
+							'pipelines/billing/Jenkinsfile',
+						kind:
+							'jenkins-pipeline-script',
+						resolution: 'inferred',
+						evidence: [
+							{
+								kind: 'name-match',
+								detail:
+									'Matched the billing job name.',
+							},
+						],
+					},
+					{
+						sourcePath:
+							'jenkins/jobs/billing/config.xml',
+						targetPath:
+							'pipelines/billing/Jenkinsfile',
+						kind:
+							'jenkins-pipeline-script',
+						resolution: 'exact',
+						evidence: [
+							{
+								kind: 'config-value',
+								detail:
+									'Resolved from scriptPath.',
+							},
+						],
+					},
+				],
+			}
+		);
+
+		const dependencyMap =
+			await readDependencyMap(
+				workspaceRoot,
+				config
+			);
+
+		assert.strictEqual(
+			dependencyMap.edges[0].resolution,
+			'exact'
+		);
+		assert.strictEqual(
+			dependencyMap.edges[1].resolution,
+			'inferred'
+		);
+		assert.strictEqual(
+			dependencyMap.edges[0].sourcePath,
+			'jenkins/jobs/billing/config.xml'
+		);
+	});
+
+	test('Dependency map validation rejects unsupported resolved edges', () => {
+		const issues = validateDependencyMap({
+			version: 1,
+			edges: [
+				{
+					sourcePath:
+						'jenkins/jobs/billing/config.xml',
+					kind:
+						'jenkins-pipeline-script',
+					resolution: 'exact',
+					evidence: [],
+				},
+			],
+		});
+
+		assert.ok(
+			issues.some(
+				(issue) =>
+					issue.field === 'targetPath'
+			)
+		);
+		assert.ok(
+			issues.some(
+				(issue) =>
+					issue.field === 'evidence'
+			)
+		);
+	});
+
+	test('Outgoing dependency queries prefer exact edges and support filters', () => {
+		const dependencyMap = {
+			version: 1 as const,
+			edges: [
+				{
+					sourcePath: 'jobs/billing/config.xml',
+					targetPath:
+						'pipelines/other/Jenkinsfile',
+					kind:
+						'jenkins-pipeline-script',
+					resolution:
+						'inferred' as const,
+					evidence: [
+						{
+							kind: 'name-match',
+							detail: 'Possible match.',
+						},
+					],
+				},
+				{
+					sourcePath: 'jobs/billing/config.xml',
+					targetPath:
+						'pipelines/billing/Jenkinsfile',
+					kind:
+						'jenkins-pipeline-script',
+					resolution: 'exact' as const,
+					evidence: [
+						{
+							kind: 'config-value',
+							detail: 'Exact scriptPath.',
+						},
+					],
+				},
+				{
+					sourcePath: 'jobs/billing/config.xml',
+					kind: 'jenkins-shared-library',
+					resolution: 'unresolved' as const,
+					evidence: [
+						{
+							kind: 'library-call',
+							detail:
+								'Library name was present.',
+						},
+					],
+				},
+			],
+		};
+
+		const exactOnly =
+			findOutgoingDependencyEdges(
+				dependencyMap,
+				'jobs\\billing\\config.xml',
+				{
+					kinds: [
+						'jenkins-pipeline-script',
+					],
+					includeInferred: false,
+				}
+			);
+
+		assert.strictEqual(
+			exactOnly.length,
+			1
+		);
+		assert.strictEqual(
+			exactOnly[0].resolution,
+			'exact'
+		);
+
+		const withInferred =
+			findOutgoingDependencyEdges(
+				dependencyMap,
+				'jobs/billing/config.xml'
+			);
+
+		assert.deepStrictEqual(
+			withInferred.map(
+				(edge) => edge.resolution
+			),
+			['exact', 'inferred']
+		);
 	});
 
 	test('Missing summarization config returns general defaults', async () => {

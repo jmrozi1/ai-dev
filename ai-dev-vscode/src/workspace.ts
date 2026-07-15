@@ -15,7 +15,10 @@ interface ExpectedDocumentationPathOptions {
 const DEFAULT_DOCS_DIR = 'ai-docs';
 
 export function normalizePathForMarkdown(filePath: string): string {
-	return filePath.split(path.sep).join('/');
+	return filePath
+		.replace(/\\/g, '/')
+		.split(path.sep)
+		.join('/');
 }
 
 export function getSelectedSourcePath(workspaceRoot: string, activeFilePath: string): string {
