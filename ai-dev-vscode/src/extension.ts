@@ -9,7 +9,14 @@ import {
 	truncateText,
 } from './fileUtilities';
 import {
+	ARCHITECTURE_SUMMARY_FILE_NAME,
 	AiDevConfig,
+	type AiProviderMode,
+	getAiDevYamlPromptSection,
+	getArchitectureSummaryPath,
+	getExecutionModeFromConfig,
+	getLegacyRootSummaryFilePath,
+	getRootSummaryFilePath,
 	getYamlNestedValue,
 	readAiDevConfig,
 	resolveAiDevCorePath,
@@ -89,7 +96,6 @@ import {
 const SETTINGS_COMMAND = 'aiDev.settings';
 const LAUNCH_ASSISTANT_COMMAND = 'aiDev.launchAssistant';
 const FALLBACK_SUMMARY_FILE = 'ai-docs/summary.md';
-const ARCHITECTURE_SUMMARY_FILE_NAME = 'architecture-summary.md';
 const MAX_DIRECT_INDEX_UNIT_DOCS = 20;
 const MAX_DIRECT_CHANGED_FILE_CONTENTS = 12;
 const MAX_DIRECT_FILE_CHARS = 12000;
@@ -103,60 +109,6 @@ const MAX_ROUTED_DOC_FILE_CHARS = 6000;
 const MAX_ROUTED_DOC_TOTAL_CHARS = 90000;
 const MAX_FALLBACK_DISCOVERED_SUMMARIES = 6;
 let allowDocsDirWritesForSession = false;
-
-type AiProviderMode = 'prompt-only' | 'direct-experimental';
-
-function isSupportedExecutionMode(value: string): value is AiProviderMode {
-	return value === 'prompt-only' || value === 'direct-experimental';
-}
-
-function getExecutionModeFromConfig(config: AiDevConfig):
-	| { mode: AiProviderMode }
-	| { errorMessage: string } {
-	const trimmedMode = config.aiProviderMode?.trim();
-	if (!trimmedMode) {
-		return { mode: 'direct-experimental' };
-	}
-
-	if (!isSupportedExecutionMode(trimmedMode)) {
-		return {
-			errorMessage: 'Unsupported aiProvider.mode in .ai-dev.yaml. Supported values: prompt-only, direct-experimental.',
-		};
-	}
-
-	return { mode: trimmedMode };
-}
-
-function getRootSummaryFilePath(config: AiDevConfig): string {
-	const configuredDocsDir = config.docsDir?.trim() || 'ai-docs';
-	const normalizedDocsDir = normalizePathForMarkdown(configuredDocsDir).replace(/\/+$/, '');
-	return path.posix.join(normalizedDocsDir, ARCHITECTURE_SUMMARY_FILE_NAME);
-}
-
-function getLegacyRootSummaryFilePath(config: AiDevConfig): string {
-	const configuredDocsDir = config.docsDir?.trim() || 'ai-docs';
-	const normalizedDocsDir = normalizePathForMarkdown(configuredDocsDir).replace(/\/+$/, '');
-	return path.posix.join(normalizedDocsDir, 'summary.md');
-}
-
-function getArchitectureSummaryPath(config: AiDevConfig): string {
-	const configuredDocsDir = getConfiguredDocsDir(config).replace(/\/+$/, '');
-	return path.posix.join(configuredDocsDir, ARCHITECTURE_SUMMARY_FILE_NAME);
-}
-
-function getAiDevYamlPromptSection(config: AiDevConfig): { label: string; contents: string } {
-	if (config.raw.trim().length === 0) {
-		return {
-			label: '.ai-dev.yaml: not present; using generic defaults',
-			contents: '# .ai-dev.yaml not present; using generic defaults',
-		};
-	}
-
-	return {
-		label: '.ai-dev.yaml',
-		contents: config.raw,
-	};
-}
 
 function getIndentation(line: string): string {
 	const match = line.match(/^[ \t]*/);
