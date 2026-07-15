@@ -1729,7 +1729,7 @@ suite('Extension Test Suite', () => {
 	test('Grouped summarization refreshes architecture after writes', async () => {
 		const sourcePath = path.resolve(
 			__dirname,
-			'../../src/extension.ts'
+			'../../src/summarizationWorkflow.ts'
 		);
 		const source = await fs.readFile(sourcePath, 'utf8');
 
@@ -1750,7 +1750,7 @@ suite('Extension Test Suite', () => {
 	test('Architecture refresh failure does not erase grouped results', async () => {
 		const sourcePath = path.resolve(
 			__dirname,
-			'../../src/extension.ts'
+			'../../src/summarizationWorkflow.ts'
 		);
 		const source = await fs.readFile(sourcePath, 'utf8');
 
