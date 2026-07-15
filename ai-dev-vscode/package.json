@@ -20,12 +20,6 @@
         }
       ]
     },
-    "submenus": [
-      {
-        "id": "aiDev.menu",
-        "label": "AI Dev"
-      }
-    ],
     "views": {
       "aiDev": [
         {
@@ -41,102 +35,11 @@
         "category": "AI Dev"
       },
       {
-        "command": "aiDev.generateUnitDocPromptForActiveFile",
-        "title": "Generate Summary Doc for Selected File",
-        "category": "AI Dev"
-      },
-      {
-        "command": "aiDev.generateUnitDocsBatchExperimental",
-        "title": "Batch Summary Doc Generation",
-        "category": "AI Dev"
-      },
-      {
-        "command": "aiDev.generateArchitectureSummary",
-        "title": "Generate Architecture Summary",
-        "category": "AI Dev"
-      },
-      {
-        "command": "aiDev.updateFolderSummary",
-        "title": "Batch Summary Doc Generation",
-        "category": "AI Dev"
-      },
-      {
-        "command": "aiDev.reviewChangedDocsPrompt",
-        "title": "Review Summary Docs",
-        "category": "AI Dev",
-        "icon": "$(checklist)"
-      },
-      {
-        "command": "aiDev.reviewFileDocsPrompt",
-        "title": "Review Summary Doc for Selected File",
-        "category": "AI Dev",
-        "icon": "$(checklist)"
-      },
-      {
-        "command": "aiDev.answerFromAiDocsPrompt",
-        "title": "Answer From Summary Docs",
-        "category": "AI Dev",
-        "icon": "$(comment-discussion)"
-      },
-      {
-        "command": "aiDev.copilotTest",
-        "title": "Copilot Test",
-        "category": "AI Dev"
-      },
-      {
         "command": "aiDev.settings",
         "title": "Settings",
         "category": "AI Dev"
       }
-    ],
-    "menus": {
-      "aiDev.menu": [
-        {
-          "command": "aiDev.generateUnitDocPromptForActiveFile",
-          "group": "1_generateUnitDoc"
-        },
-        {
-          "command": "aiDev.updateFolderSummary",
-          "group": "1b_updateFolderSummary"
-        },
-        {
-          "command": "aiDev.generateArchitectureSummary",
-          "group": "1c_generateArchitectureSummary"
-        },
-        {
-          "command": "aiDev.reviewChangedDocsPrompt",
-          "group": "2_reviewChangedDocs"
-        },
-        {
-          "command": "aiDev.reviewFileDocsPrompt",
-          "group": "3_reviewFileDocs"
-        },
-        {
-          "command": "aiDev.answerFromAiDocsPrompt",
-          "group": "4_answerFromDocs"
-        }
-      ],
-      "explorer/context": [
-        {
-          "submenu": "aiDev.menu",
-          "when": "resourceScheme == file && !explorerResourceReadonly",
-          "group": "navigation@50"
-        }
-      ],
-      "editor/context": [
-        {
-          "submenu": "aiDev.menu",
-          "when": "resourceScheme == file",
-          "group": "navigation@50"
-        }
-      ],
-      "scm/title": [
-        {
-          "submenu": "aiDev.menu",
-          "group": "navigation@50"
-        }
-      ]
-    }
+    ]
   },
   "scripts": {
     "vscode:prepublish": "npm run compile",
@@ -165,14 +68,6 @@
   "publisher": "jmrozi1",
   "activationEvents": [
     "onCommand:aiDev.launchAssistant",
-    "onCommand:aiDev.generateUnitDocPromptForActiveFile",
-    "onCommand:aiDev.generateUnitDocsBatchExperimental",
-    "onCommand:aiDev.generateArchitectureSummary",
-    "onCommand:aiDev.updateFolderSummary",
-    "onCommand:aiDev.reviewChangedDocsPrompt",
-    "onCommand:aiDev.reviewFileDocsPrompt",
-    "onCommand:aiDev.answerFromAiDocsPrompt",
-    "onCommand:aiDev.copilotTest",
     "onCommand:aiDev.settings"
   ],
   "files": [

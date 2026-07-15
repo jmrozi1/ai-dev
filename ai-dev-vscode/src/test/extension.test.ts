@@ -1482,6 +1482,79 @@ suite('Extension Test Suite', () => {
 		manager.dispose();
 	});
 
+	test('Only launcher and settings remain public commands', async () => {
+		const packagePath = path.resolve(
+			__dirname,
+			'../../package.json'
+		);
+		const packageJson = JSON.parse(
+			await fs.readFile(packagePath, 'utf8')
+		) as {
+			contributes?: {
+				commands?: Array<{ command?: string }>;
+				menus?: unknown;
+				submenus?: unknown;
+			};
+			activationEvents?: string[];
+		};
+
+		assert.deepStrictEqual(
+			packageJson.contributes?.commands?.map(
+				(command) => command.command
+			),
+			[
+				'aiDev.launchAssistant',
+				'aiDev.settings',
+			]
+		);
+		assert.strictEqual(
+			packageJson.contributes?.menus,
+			undefined
+		);
+		assert.strictEqual(
+			packageJson.contributes?.submenus,
+			undefined
+		);
+		assert.deepStrictEqual(
+			packageJson.activationEvents,
+			[
+				'onCommand:aiDev.launchAssistant',
+				'onCommand:aiDev.settings',
+			]
+		);
+	});
+
+	test('Extension registers only launcher and settings commands', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/extension.ts'
+		);
+		const source = await fs.readFile(sourcePath, 'utf8');
+
+		const registrations =
+			source.match(
+				/vscode\.commands\.registerCommand\(/g
+			) ?? [];
+
+		assert.strictEqual(registrations.length, 2);
+		assert.match(
+			source,
+			/LAUNCH_ASSISTANT_COMMAND/
+		);
+		assert.match(
+			source,
+			/SETTINGS_COMMAND/
+		);
+		assert.doesNotMatch(
+			source,
+			/aiDev\.copilotTest/
+		);
+		assert.doesNotMatch(
+			source,
+			/aiDev\.setExecutionMode/
+		);
+	});
+
 	test('AI Dev Activity Bar item directly launches the assistant', async () => {
 		const sourcePath = path.resolve(
 			__dirname,
