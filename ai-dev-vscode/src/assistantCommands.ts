@@ -97,6 +97,16 @@ export const ASSISTANT_COMMAND_DEFINITIONS: AssistantCommandDefinition[] = [
 				description: 'Review tests',
 			},
 			{
+				long: '--all',
+				short: '-a',
+				description: 'Include unchanged files matching the target',
+			},
+			{
+				long: '--smoketest',
+				short: '-s',
+				description: 'Preview the review scope without calling the model',
+			},
+			{
 				long: '--ticket',
 				short: '-i',
 				description: 'Review a ticket',

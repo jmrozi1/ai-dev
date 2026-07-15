@@ -365,10 +365,34 @@ export interface AssistantReviewPreparation {
 	warnings: string[];
 }
 
-export type AssistantReviewRoute = (
-	mode: AssistantReviewMode,
-	target?: string
-) => Promise<AssistantReviewPreparation>;
+export interface AssistantReviewRequest {
+	mode: AssistantReviewMode;
+	target?: string;
+	includeAllMatches: boolean;
+	smokeTest: boolean;
+}
+
+export interface AssistantReviewPreview {
+	mode: AssistantReviewMode;
+	target?: string;
+	includeAllMatches: boolean;
+	implementationFileCount: number;
+	testFileCount: number;
+	selectedFileCount: number;
+	changedFileCount: number;
+	previewFilePaths: string[];
+	omittedFileCount: number;
+	warnings: string[];
+}
+
+export interface AssistantReviewRoute {
+	preview(
+		request: AssistantReviewRequest
+	): Promise<AssistantReviewPreview>;
+	prepare(
+		request: AssistantReviewRequest
+	): Promise<AssistantReviewPreparation>;
+}
 
 export type ReviewModeResolution =
 	| {
@@ -390,6 +414,10 @@ export function resolveReviewMode(
 		'-c',
 		'--tests',
 		'-t',
+		'--all',
+		'-a',
+		'--smoketest',
+		'-s',
 	];
 
 	const unsupportedOptions = options.filter(
@@ -438,6 +466,43 @@ export function resolveReviewMode(
 	return {
 		ok: true,
 		mode: requestedModes[0] ?? 'docs',
+	};
+}
+
+export type ReviewRequestResolution =
+	| {
+		ok: true;
+		request: AssistantReviewRequest;
+	}
+	| {
+		ok: false;
+		error: string;
+	};
+
+export function resolveReviewRequest(
+	options: string[],
+	arguments_: string[]
+): ReviewRequestResolution {
+	const modeResolution = resolveReviewMode(options);
+
+	if (!modeResolution.ok) {
+		return modeResolution;
+	}
+
+	const target = arguments_.join(' ').trim() || undefined;
+
+	return {
+		ok: true,
+		request: {
+			mode: modeResolution.mode,
+			target,
+			includeAllMatches:
+				options.includes('--all')
+				|| options.includes('-a'),
+			smokeTest:
+				options.includes('--smoketest')
+				|| options.includes('-s'),
+		},
 	};
 }
 
@@ -1088,10 +1153,112 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		}
 	}
 
-	private async submitReview(
-		mode: AssistantReviewMode,
-		target?: string
+	private async runReviewSmokeTest(
+		request: AssistantReviewRequest
 	): Promise<void> {
+		const targetLabel =
+			request.target
+				? request.target
+				: 'entire project';
+
+		this.showEphemeralWithPrompt(
+			`Resolving review scope for ${targetLabel}...`
+		);
+
+		try {
+			const preview =
+				await this.reviewRoute!.preview(request);
+
+			this.prepareForPermanentOutput();
+
+			for (const warning of preview.warnings) {
+				this.writePermanentLine(
+					`WARNING ${warning}`,
+					ANSI_YELLOW
+				);
+			}
+
+			this.writePermanentLine(
+				`${BULLET_CHAR} Review mode: ${preview.mode}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Candidate source: ${
+					preview.includeAllMatches
+						? 'all project files'
+						: 'changed files'
+				}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Target: ${
+					preview.target ?? 'entire project'
+				}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Implementation files: ${preview.implementationFileCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Test files: ${preview.testFileCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Total files selected: ${preview.selectedFileCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Changed files in scope: ${preview.changedFileCount}`,
+				ANSI_LIGHT_GRAY
+			);
+
+			if (preview.previewFilePaths.length > 0) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} First ${preview.previewFilePaths.length} selected files:`,
+					ANSI_LIGHT_GRAY
+				);
+
+				for (const filePath of preview.previewFilePaths) {
+					this.writePermanentLine(
+						`  ${filePath}`,
+						ANSI_LIGHT_GRAY
+					);
+				}
+			}
+
+			if (preview.omittedFileCount > 0) {
+				this.writePermanentLine(
+					`${BULLET_CHAR} ${preview.omittedFileCount} additional files omitted`,
+					ANSI_LIGHT_GRAY
+				);
+			}
+		} catch (error) {
+			this.prepareForPermanentOutput();
+
+			const message =
+				error instanceof Error
+					? error.message
+					: String(error);
+
+			this.writePermanentLine(
+				`ERROR Review smoke test failed: ${message}`,
+				ANSI_RED
+			);
+		} finally {
+			this.drawInteractiveArea();
+		}
+	}
+
+	private async submitReview(
+		request: AssistantReviewRequest
+	): Promise<void> {
+		const {
+			mode,
+			target,
+			includeAllMatches,
+		} = request;
+
 		const cancellation =
 			new vscode.CancellationTokenSource();
 
@@ -1110,7 +1277,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 
 		try {
 			const preparation =
-				await this.reviewRoute!(mode, target);
+				await this.reviewRoute!.prepare(request);
 
 			if (cancellation.token.isCancellationRequested) {
 				throw new Error('Assistant request cancelled.');
@@ -1172,8 +1339,12 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 
 			const reviewQuestion =
 				target
-					? `Review ${preparation.mode} changes for ${target}`
-					: `Review changed project ${preparation.mode}`;
+					? includeAllMatches
+						? `Review all ${preparation.mode} files matching ${target}`
+						: `Review changed ${preparation.mode} files matching ${target}`
+					: includeAllMatches
+						? `Review all project ${preparation.mode}`
+						: `Review changed project ${preparation.mode}`;
 
 			const report = createAssistantReport({
 				route: 'review',
@@ -1195,7 +1366,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 			}
 
 			this.writePermanentLine(
-				`${BULLET_CHAR} Changed files reviewed: ${preparation.changedFileCount}`,
+				`${BULLET_CHAR} Files reviewed: ${preparation.changedFileCount}`,
 				ANSI_LIGHT_GRAY
 			);
 			this.writePermanentLine(
@@ -1644,18 +1815,19 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					return true;
 				}
 
-				const modeResolution =
-					resolveReviewMode(parsed.options);
+				const requestResolution =
+					resolveReviewRequest(
+						parsed.options,
+						parsed.arguments
+					);
 
-				if (!modeResolution.ok) {
+				if (!requestResolution.ok) {
 					this.writePermanentLine(
-						`WARNING ${modeResolution.error}`,
+						`WARNING ${requestResolution.error}`,
 						ANSI_YELLOW
 					);
 					return true;
 				}
-
-				const reviewMode = modeResolution.mode;
 
 				if (!this.reviewRoute) {
 					this.writePermanentLine(
@@ -1665,13 +1837,15 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					return true;
 				}
 
-				const target =
-					parsed.arguments.join(' ').trim()
-					|| undefined;
+				if (requestResolution.request.smokeTest) {
+					await this.runReviewSmokeTest(
+						requestResolution.request
+					);
+					return true;
+				}
 
 				await this.submitReview(
-					reviewMode,
-					target
+					requestResolution.request
 				);
 				return false;
 			}

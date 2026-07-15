@@ -38,6 +38,7 @@ import {
 	MODEL_RESPONSE_MARKER,
 	formatModelResponseLines,
 	resolveReviewMode,
+	resolveReviewRequest,
 } from '../assistantTerminal';
 import {
 	AssistantReportStore,
@@ -49,7 +50,9 @@ import {
 	buildAssistantReportHtml,
 } from '../assistantReportPanel';
 import {
+	matchesReviewTarget,
 	selectChangedReviewFiles,
+	selectReviewFiles,
 } from '../extension';
 import type {
 	AssistantChatBackend,
@@ -1855,6 +1858,77 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
+	test('Review request resolves target and all-matches option', () => {
+		assert.deepStrictEqual(
+			resolveReviewRequest(
+				['--code', '--all'],
+				['src/**/*.ts']
+			),
+			{
+				ok: true,
+				request: {
+					mode: 'code',
+					target: 'src/**/*.ts',
+					includeAllMatches: true,
+					smokeTest: false,
+				},
+			}
+		);
+	});
+
+	test('Review targets match files, directories, and globs', () => {
+		assert.strictEqual(
+			matchesReviewTarget(
+				'src/assistantTerminal.ts',
+				'src/assistantTerminal.ts'
+			),
+			true
+		);
+		assert.strictEqual(
+			matchesReviewTarget(
+				'src/test/extension.test.ts',
+				'src'
+			),
+			true
+		);
+		assert.strictEqual(
+			matchesReviewTarget(
+				'src/test/extension.test.ts',
+				'src/**/*.test.ts'
+			),
+			true
+		);
+		assert.strictEqual(
+			matchesReviewTarget(
+				'README.md',
+				'src'
+			),
+			false
+		);
+	});
+
+	test('Review file selection applies target before mode filtering', () => {
+		const selection = selectReviewFiles({
+			mode: 'code',
+			docsDir: 'ai-docs',
+			target: 'src/assistant*.ts',
+			candidateFilePaths: [
+				'src/assistantTerminal.ts',
+				'src/assistantInput.ts',
+				'src/test/assistantTerminal.test.ts',
+				'src/extension.ts',
+			],
+		});
+
+		assert.deepStrictEqual(
+			selection.selectedPaths,
+			[
+				'src/assistantTerminal.ts',
+				'src/assistantInput.ts',
+			]
+		);
+	});
+
 	test('Code review file selection excludes tests, docs, and artifacts', () => {
 		const selection = selectChangedReviewFiles({
 			mode: 'code',
@@ -1923,6 +1997,107 @@ suite('Extension Test Suite', () => {
 	});
 
 
+	test('Review smoke test previews scope without model execution', async () => {
+		const outputChunks: string[] = [];
+		let prepareCalled = false;
+		let isolatedMessageCalled = false;
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'Review Preview Model',
+			}),
+			sendMessage: async () => '',
+			sendIsolatedMessage: async () => {
+				isolatedMessageCalled = true;
+				return '';
+			},
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend,
+			undefined,
+			undefined,
+			{
+				preview: async (request) => ({
+					mode: request.mode,
+					target: request.target,
+					includeAllMatches:
+						request.includeAllMatches,
+					implementationFileCount: 8,
+					testFileCount: 2,
+					selectedFileCount: 10,
+					changedFileCount: 3,
+					previewFilePaths: [
+						'src/extension.ts',
+					],
+					omittedFileCount: 9,
+					warnings: [
+						'Included unchanged files across the project.',
+					],
+				}),
+				prepare: async () => {
+					prepareCalled = true;
+					throw new Error(
+						'prepare should not be called'
+					);
+				},
+			}
+		);
+
+		const writeSubscription =
+			pty.onDidWrite((chunk) => {
+				outputChunks.push(chunk);
+			});
+
+		pty.open({ columns: 120, rows: 30 });
+
+		await waitForCondition(() =>
+			outputChunks.join('').includes(
+				'Launched Review Preview Model'
+			)
+		);
+
+		pty.handleInput(
+			'/review --tests --all --smoketest'
+		);
+		pty.handleInput('\r');
+
+		await waitForCondition(() =>
+			outputChunks.join('').includes(
+				'Total files selected: 10'
+			)
+		);
+
+		const output = outputChunks.join('');
+
+		assert.strictEqual(prepareCalled, false);
+		assert.strictEqual(
+			isolatedMessageCalled,
+			false
+		);
+		assert.match(
+			output,
+			/Implementation files: 8/
+		);
+		assert.match(
+			output,
+			/Test files: 2/
+		);
+		assert.match(
+			output,
+			/Changed files in scope: 3/
+		);
+		assert.match(
+			output,
+			/9 additional files omitted/
+		);
+
+		writeSubscription.dispose();
+		pty.close();
+	});
+
 	test('PTY routes test review and reports structured fallback', async () => {
 		const reviewModes: string[] = [];
 		const outputChunks: string[] = [];
@@ -1949,21 +2124,36 @@ suite('Extension Test Suite', () => {
 			backend,
 			undefined,
 			undefined,
-			async (mode) => {
-				reviewModes.push(mode);
-
-				return {
-					mode,
-					prompt: 'embedded review prompt',
+			{
+				preview: async (request) => ({
+					mode: request.mode,
+					target: request.target,
+					includeAllMatches:
+						request.includeAllMatches,
+					implementationFileCount: 1,
+					testFileCount: 1,
+					selectedFileCount: 2,
 					changedFileCount: 2,
-					deterministicFindingCount: 0,
-					deterministicFindingsMarkdown: [
-						'## Deterministic Documentation Mapping Findings',
-						'',
-						'- not applicable',
-					].join('\n'),
+					previewFilePaths: [],
+					omittedFileCount: 0,
 					warnings: [],
-				};
+				}),
+				prepare: async (request) => {
+					reviewModes.push(request.mode);
+
+					return {
+						mode: request.mode,
+						prompt: 'embedded review prompt',
+						changedFileCount: 2,
+						deterministicFindingCount: 0,
+						deterministicFindingsMarkdown: [
+							'## Deterministic Documentation Mapping Findings',
+							'',
+							'- not applicable',
+						].join('\n'),
+						warnings: [],
+					};
+				},
 			},
 			(report) => {
 				reports.push(report);
@@ -2037,7 +2227,7 @@ suite('Extension Test Suite', () => {
 		);
 		assert.match(
 			source,
-			/Changed files reviewed:/
+			/Files reviewed:/
 		);
 		assert.match(
 			source,
