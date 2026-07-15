@@ -10,7 +10,6 @@ import {
 } from './config';
 import {
 	readOptionalTextFile,
-	truncateText,
 } from './fileUtilities';
 import {
 	buildAnswerFromAiDocsDirectPromptMarkdown,
@@ -122,6 +121,85 @@ function scoreDiscoveredSummaryRelevance(summaryPath: string, summaryContents: s
 	}
 
 	return score;
+}
+
+export function selectQuestionRelevantSummaryExcerpt(
+	contents: string,
+	userQuestion: string,
+	maxChars: number
+): string {
+	if (contents.length <= maxChars) {
+		return contents;
+	}
+
+	const questionTokens =
+		tokenizeQuestionForRouting(userQuestion);
+
+	if (questionTokens.length === 0) {
+		return contents.slice(0, maxChars);
+	}
+
+	const scoredLines = contents
+		.split(/\r?\n/)
+		.map((line, index) => ({
+			line,
+			index,
+			score: scoreLinkRelevance(
+				'',
+				line,
+				questionTokens
+			),
+		}))
+		.filter((item) => item.score > 0)
+		.sort((left, right) => {
+			if (left.score !== right.score) {
+				return right.score - left.score;
+			}
+
+			return left.index - right.index;
+		});
+
+	if (scoredLines.length === 0) {
+		return contents.slice(0, maxChars);
+	}
+
+	const selectedLines: Array<{
+		line: string;
+		index: number;
+	}> = [];
+	let selectedChars = 0;
+
+	for (const item of scoredLines) {
+		const addedChars =
+			item.line.length
+			+ (selectedLines.length > 0 ? 1 : 0);
+
+		if (
+			selectedLines.length > 0
+			&& selectedChars + addedChars > maxChars
+		) {
+			continue;
+		}
+
+		selectedLines.push({
+			line: item.line,
+			index: item.index,
+		});
+		selectedChars += addedChars;
+
+		if (selectedChars >= maxChars) {
+			break;
+		}
+	}
+
+	selectedLines.sort(
+		(left, right) => left.index - right.index
+	);
+
+	return selectedLines
+		.map((item) => item.line)
+		.join('\n')
+		.slice(0, maxChars);
 }
 
 async function discoverSummaryFilesRecursively(docsDirAbsolutePath: string): Promise<string[]> {
@@ -274,7 +352,17 @@ async function collectRoutedDocumentationContextForAnswer(params: {
 			return false;
 		}
 
-		const clippedContents = contents.slice(0, Math.min(MAX_ROUTED_DOC_FILE_CHARS, remainingChars));
+		const maxChars = Math.min(
+			MAX_ROUTED_DOC_FILE_CHARS,
+			remainingChars
+		);
+		const clippedContents = kind === 'summary'
+			? selectQuestionRelevantSummaryExcerpt(
+				contents,
+				params.userQuestion,
+				maxChars
+			)
+			: contents.slice(0, maxChars);
 		totalChars += clippedContents.length;
 		routedFiles.push({
 			path: normalizePathForMarkdown(path.relative(params.workspaceRoot, absolutePath)),
@@ -524,10 +612,12 @@ export async function buildSummaryAnswerRoute(
 		fallbackDiscoveredSummaries:
 			fallbackDiscoveredSummaries.map((summary) => ({
 				path: summary.relativePath,
-				contents: truncateText(
-					summary.contents,
-					MAX_ROUTED_DOC_FILE_CHARS
-				),
+				contents:
+					selectQuestionRelevantSummaryExcerpt(
+						summary.contents,
+						trimmedUserQuestion,
+						MAX_ROUTED_DOC_FILE_CHARS
+					),
 				score: summary.score,
 			})),
 		missingDocumentationPaths:

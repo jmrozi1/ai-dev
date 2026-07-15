@@ -92,6 +92,9 @@ import {
 import {
 	buildGroupedGenerateUnitDocDirectPromptMarkdown,
 } from '../promptBuilder';
+import {
+	selectQuestionRelevantSummaryExcerpt,
+} from '../summaryAnswerRouting';
 // import * as myExtension from '../../extension';
 
 async function waitForCondition(
@@ -619,6 +622,61 @@ suite('Extension Test Suite', () => {
 				'**/jobs/**/config.xml'
 			),
 			false
+		);
+	});
+
+	test('Summary routing keeps relevant entries beyond the character cutoff', () => {
+		const prefix = Array.from(
+			{ length: 80 },
+			(_, index) =>
+				`- unrelated module ${index}: ${'x'.repeat(80)}`
+		).join('\n');
+
+		const relevantEntry = [
+			'- `src/summarizationWorkflow.ts` — ',
+			'Grouped summarization writes directory summaries first, ',
+			'then refreshes the architecture summary.',
+		].join('');
+
+		const contents = [
+			prefix,
+			relevantEntry,
+		].join('\n');
+
+		assert.ok(
+			contents.indexOf(relevantEntry) > 6000
+		);
+
+		const excerpt =
+			selectQuestionRelevantSummaryExcerpt(
+				contents,
+				'How does grouped summarization refresh the architecture summary?',
+				6000
+			);
+
+		assert.match(
+			excerpt,
+			/summarizationWorkflow\.ts/
+		);
+		assert.match(
+			excerpt,
+			/writes directory summaries first/
+		);
+	});
+
+	test('Summary routing preserves small summaries unchanged', () => {
+		const contents = [
+			'- `src/a.ts` — Handles feature A.',
+			'- `src/b.ts` — Handles feature B.',
+		].join('\n');
+
+		assert.strictEqual(
+			selectQuestionRelevantSummaryExcerpt(
+				contents,
+				'How does feature B work?',
+				6000
+			),
+			contents
 		);
 	});
 
