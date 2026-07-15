@@ -1801,7 +1801,7 @@ suite('Extension Test Suite', () => {
 	test('Changed-doc review filters packaged artifacts before model input', async () => {
 		const sourcePath = path.resolve(
 			__dirname,
-			'../../src/extension.ts'
+			'../../src/projectReview.ts'
 		);
 		const source = await fs.readFile(sourcePath, 'utf8');
 
@@ -1826,7 +1826,7 @@ suite('Extension Test Suite', () => {
 	test('Changed-doc review reports ignored artifact count without listing artifacts', async () => {
 		const sourcePath = path.resolve(
 			__dirname,
-			'../../src/extension.ts'
+			'../../src/projectReview.ts'
 		);
 		const source = await fs.readFile(sourcePath, 'utf8');
 
