@@ -29,12 +29,14 @@ import {
 } from '../assistantInput';
 import {
 	AiDevAssistantTerminalManager,
+	buildUnstructuredReviewFallback,
 	getCommonPrefix,
 	getMatchingAssistantCommands,
 	getPathCompletionContext,
 	formatItemsInColumns,
 	MODEL_RESPONSE_MARKER,
 	formatModelResponseLines,
+	resolveReviewMode,
 } from '../assistantTerminal';
 import {
 	AssistantReportStore,
@@ -45,6 +47,9 @@ import {
 import {
 	buildAssistantReportHtml,
 } from '../assistantReportPanel';
+import {
+	selectChangedReviewFiles,
+} from '../extension';
 import {
 	ASSISTANT_COMMAND_DEFINITIONS,
 	formatAssistantCommandHelp,
@@ -1712,6 +1717,116 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('Review mode resolution defaults to docs', () => {
+		assert.deepStrictEqual(
+			resolveReviewMode([]),
+			{
+				ok: true,
+				mode: 'docs',
+			}
+		);
+	});
+
+	test('Review mode resolution supports code and tests aliases', () => {
+		assert.deepStrictEqual(
+			resolveReviewMode(['--code']),
+			{
+				ok: true,
+				mode: 'code',
+			}
+		);
+		assert.deepStrictEqual(
+			resolveReviewMode(['-t']),
+			{
+				ok: true,
+				mode: 'tests',
+			}
+		);
+	});
+
+	test('Review mode resolution rejects conflicting modes', () => {
+		const result = resolveReviewMode([
+			'--code',
+			'--tests',
+		]);
+
+		assert.strictEqual(result.ok, false);
+		if (!result.ok) {
+			assert.match(
+				result.error,
+				/Choose only one review mode/
+			);
+		}
+	});
+
+	test('Code review file selection excludes tests, docs, and artifacts', () => {
+		const selection = selectChangedReviewFiles({
+			mode: 'code',
+			docsDir: 'ai-docs',
+			changedFilePaths: [
+				'src/extension.ts',
+				'src/test/extension.test.ts',
+				'ai-docs/src/summary.md',
+				'artifacts/plugin.vsix',
+			],
+		});
+
+		assert.deepStrictEqual(
+			selection.implementationPaths,
+			['src/extension.ts']
+		);
+		assert.deepStrictEqual(
+			selection.testPaths,
+			['src/test/extension.test.ts']
+		);
+		assert.deepStrictEqual(
+			selection.selectedPaths,
+			['src/extension.ts']
+		);
+	});
+
+	test('Test review file selection includes implementation and tests', () => {
+		const selection = selectChangedReviewFiles({
+			mode: 'tests',
+			docsDir: 'ai-docs',
+			changedFilePaths: [
+				'src/extension.ts',
+				'src/test/extension.test.ts',
+				'ai-docs/src/summary.md',
+				'artifacts/plugin.vsix',
+			],
+		});
+
+		assert.deepStrictEqual(
+			selection.selectedPaths,
+			[
+				'src/extension.ts',
+				'src/test/extension.test.ts',
+			]
+		);
+	});
+
+	test('Unstructured review fallback is a parseable warning finding', () => {
+		const markdown =
+			buildUnstructuredReviewFallback('tests');
+		const findings = parseReviewFindings(markdown);
+
+		assert.strictEqual(findings.length, 1);
+		assert.strictEqual(
+			findings[0].title,
+			'Review returned no structured assessment'
+		);
+		assert.strictEqual(
+			findings[0].severity,
+			'warning'
+		);
+		assert.strictEqual(
+			findings[0].category,
+			'Test coverage'
+		);
+	});
+
+
 	test('/review supports changed-documentation mode', async () => {
 		const sourcePath = path.resolve(
 			__dirname,
@@ -1721,7 +1836,7 @@ suite('Extension Test Suite', () => {
 
 		assert.match(
 			source,
-			/submitDocumentationReview/
+			/submitReview/
 		);
 		assert.match(
 			source,

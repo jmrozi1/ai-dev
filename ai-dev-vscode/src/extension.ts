@@ -4494,9 +4494,237 @@ async function completeSingleFileSummary(
 	};
 }
 
-async function prepareChangedDocumentationReview(
+function isTestFilePath(filePath: string): boolean {
+	const normalized = normalizePathForMarkdown(filePath).toLowerCase();
+
+	return (
+		normalized.includes('/test/')
+		|| normalized.includes('/tests/')
+		|| normalized.includes('/__tests__/')
+		|| normalized.includes('.test.')
+		|| normalized.includes('.spec.')
+	);
+}
+
+export function selectChangedReviewFiles(params: {
+	changedFilePaths: string[];
+	mode: 'code' | 'tests';
+	docsDir: string;
+	artifactExcludeGlobs?: string[];
+}): {
+	implementationPaths: string[];
+	testPaths: string[];
+	selectedPaths: string[];
+} {
+	const normalizedDocsDir =
+		normalizePathForMarkdown(params.docsDir)
+			.replace(/\/+$/, '');
+
+	const artifactExcludeGlobs =
+		params.artifactExcludeGlobs
+		?? NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS;
+
+	const reviewablePaths = [
+		...new Set(
+			params.changedFilePaths
+				.map((filePath) =>
+					normalizePathForMarkdown(filePath)
+				)
+				.filter(
+					(filePath) =>
+						filePath !== normalizedDocsDir
+						&& !filePath.startsWith(
+							`${normalizedDocsDir}/`
+						)
+						&& !matchesAnyGlob(
+							filePath,
+							artifactExcludeGlobs
+						)
+				)
+		),
+	];
+
+	const implementationPaths =
+		reviewablePaths.filter(
+			(filePath) => !isTestFilePath(filePath)
+		);
+
+	const testPaths =
+		reviewablePaths.filter(isTestFilePath);
+
+	return {
+		implementationPaths,
+		testPaths,
+		selectedPaths:
+			params.mode === 'code'
+				? implementationPaths
+				: reviewablePaths,
+	};
+}
+
+async function buildChangedCodeReviewPrompt(params: {
+	workspaceRoot: string;
+	mode: 'code' | 'tests';
+}): Promise<{
+	prompt: string;
+	changedFilePaths: string[];
+	warnings: string[];
+}> {
+	const { workspaceRoot, mode } = params;
+	const aiDevConfig = await readAiDevConfig(workspaceRoot);
+	const docsDir = getConfiguredDocsDir(aiDevConfig);
+	const changedFilePaths =
+		await getGitChangedFiles(workspaceRoot);
+
+	const selection = selectChangedReviewFiles({
+		changedFilePaths,
+		mode,
+		docsDir,
+	});
+
+	const {
+		implementationPaths,
+		testPaths: changedTestPaths,
+		selectedPaths,
+	} = selection;
+
+	if (selectedPaths.length === 0) {
+		throw new Error(
+			mode === 'code'
+				? 'No changed implementation files found.'
+				: 'No changed implementation or test files found.'
+		);
+	}
+
+	const [
+		changedFilesWithContent,
+		gitDiffs,
+		findingTemplateContents,
+	] = await Promise.all([
+		existingChangedFilesWithContent(
+			workspaceRoot,
+			selectedPaths
+		),
+		getGitDiffForFiles(
+			workspaceRoot,
+			selectedPaths
+		),
+		fs.readFile(
+			path.join(
+				resolveAiDevCorePath(
+					workspaceRoot,
+					aiDevConfig.aiDevCorePath
+				),
+				'workflows/review/finding-template.md'
+			),
+			'utf8'
+		),
+	]);
+
+	const boundedFiles = changedFilesWithContent
+		.slice(0, MAX_DIRECT_CHANGED_FILE_CONTENTS)
+		.map((file) => ({
+			relativePath: file.relativePath,
+			contents: truncateText(
+				file.contents,
+				MAX_DIRECT_FILE_CHARS
+			),
+		}));
+
+	const boundedDiffs = gitDiffs
+		.slice(0, MAX_DIRECT_DIFF_SAMPLE_FILES)
+		.map((item) => ({
+			relativePath:
+				normalizePathForMarkdown(item.relativePath),
+			diff: truncateText(
+				item.diff,
+				MAX_DIRECT_DIFF_CHARS
+			),
+		}));
+
+	const codeInstructions = [
+		'Review changed implementation for correctness defects, unsafe edge cases, broken lifecycle behavior, regressions, misleading state transitions, and maintainability risks.',
+		'Prioritize concrete defects supported by the diff and source.',
+		'Do not create findings for style preferences or speculative redesigns.',
+		'Use blocking only for issues likely to cause severe breakage or data loss.',
+		'Use warning for credible defects or meaningful regression risks.',
+		'Use info sparingly for actionable low-risk observations.',
+	];
+
+	const testInstructions = [
+		'Review whether changed implementation has adequate regression coverage.',
+		'Identify missing, weak, misleading, or obsolete tests.',
+		'Check important success, failure, cancellation, parsing, and state-transition paths.',
+		'Do not request tests for trivial formatting-only or type-only changes.',
+		'Use the Source file field for the implementation file.',
+		'Use the Documentation file field for the relevant test file, or none when a test is missing.',
+		'All available changed paths, source contents, test contents, and diffs are embedded below.',
+		'Do not ask the user to open files, attach files, paste code, select an editor, or provide additional context.',
+		'Assess the supplied material directly.',
+		'When no changed test file exists, determine whether the implementation change needs new or updated regression coverage.',
+		'Return at least one structured finding using the provided template.',
+	];
+
+	const modeInstructions =
+		mode === 'code'
+			? codeInstructions
+			: testInstructions;
+
+	const prompt = [
+		`AI Dev direct task: review-changed-${mode}`,
+		'',
+		`Workspace: ${normalizePathForMarkdown(workspaceRoot)}`,
+		`Changed implementation files: ${implementationPaths.length}`,
+		`Changed test files: ${changedTestPaths.length}`,
+		'',
+		'Finding template:',
+		'```markdown',
+		findingTemplateContents,
+		'```',
+		'',
+		'Changed file paths:',
+		...selectedPaths.map(
+			(filePath) => `- ${filePath}`
+		),
+		'',
+		'Git diff samples:',
+		...boundedDiffs.flatMap((item) => [
+			'',
+			`File: ${item.relativePath}`,
+			'```diff',
+			item.diff || '[no diff output available]',
+			'```',
+		]),
+		'',
+		'Changed file contents:',
+		...boundedFiles.flatMap((file) => [
+			'',
+			`File: ${file.relativePath}`,
+			'```text',
+			file.contents,
+			'```',
+		]),
+		'',
+		'Instructions:',
+		...modeInstructions,
+		'Return findings only.',
+		'Use the provided finding structure exactly.',
+		'For non-documentation reviews, Category may be Correctness, Reliability, Maintainability, Security, Performance, or Test coverage.',
+		'If no actionable issue is found, return one info-severity finding explaining that no changes are required.',
+	].join('\n');
+
+	return {
+		prompt,
+		changedFilePaths: selectedPaths,
+		warnings: [],
+	};
+}
+
+async function prepareProjectReview(
+	mode: 'docs' | 'code' | 'tests',
 	target?: string
 ): Promise<{
+	mode: 'docs' | 'code' | 'tests';
 	prompt: string;
 	changedFileCount: number;
 	deterministicFindingCount: number;
@@ -4505,7 +4733,7 @@ async function prepareChangedDocumentationReview(
 }> {
 	if (target?.trim()) {
 		throw new Error(
-			'Targeted /review paths are not connected yet. Run /review --docs for changed project documentation.'
+			'Targeted /review paths are not connected yet.'
 		);
 	}
 
@@ -4528,24 +4756,46 @@ async function prepareChangedDocumentationReview(
 		);
 	}
 
-	const bundle =
-		await buildReviewDocumentationDirectPromptBundle(
-			workspaceRoot,
-			aiDevConfig
-		);
+	if (mode === 'docs') {
+		const bundle =
+			await buildReviewDocumentationDirectPromptBundle(
+				workspaceRoot,
+				aiDevConfig
+			);
+
+		return {
+			mode,
+			prompt: bundle.directPromptMarkdown,
+			changedFileCount: bundle.changedFilePaths.length,
+			deterministicFindingCount:
+				bundle.deterministicFindings.length,
+			deterministicFindingsMarkdown:
+				toDeterministicFindingsMarkdown(
+					bundle.deterministicFindings
+				),
+			warnings: [],
+		};
+	}
+
+	const bundle = await buildChangedCodeReviewPrompt({
+		workspaceRoot,
+		mode,
+	});
 
 	return {
-		prompt: bundle.directPromptMarkdown,
+		mode,
+		prompt: bundle.prompt,
 		changedFileCount: bundle.changedFilePaths.length,
-		deterministicFindingCount:
-			bundle.deterministicFindings.length,
-		deterministicFindingsMarkdown:
-			toDeterministicFindingsMarkdown(
-				bundle.deterministicFindings
-			),
-		warnings: [],
+		deterministicFindingCount: 0,
+		deterministicFindingsMarkdown: [
+			'## Deterministic Documentation Mapping Findings',
+			'',
+			'- not applicable',
+		].join('\n'),
+		warnings: bundle.warnings,
 	};
 }
+
 
 async function buildSummaryAnswerRoute(
 	userQuestion: string
@@ -4817,7 +5067,7 @@ export function activate(context: vscode.ExtensionContext) {
 			prepare: prepareSingleFileSummary,
 			complete: completeSingleFileSummary,
 		},
-		prepareChangedDocumentationReview,
+		prepareProjectReview,
 		(report) => {
 			assistantReportStore.setLatest(report);
 			assistantReportPanel.refresh();

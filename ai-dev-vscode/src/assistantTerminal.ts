@@ -20,6 +20,7 @@ import {
 } from './assistantChatBackend';
 import {
 	createAssistantReport,
+	parseReviewFindings,
 	type AssistantReport,
 } from './assistantReport';
 import {
@@ -350,7 +351,13 @@ export interface AssistantSummarizeRoute {
 	): Promise<AssistantSummarizeCompletion>;
 }
 
+export type AssistantReviewMode =
+	| 'docs'
+	| 'code'
+	| 'tests';
+
 export interface AssistantReviewPreparation {
+	mode: AssistantReviewMode;
 	prompt: string;
 	changedFileCount: number;
 	deterministicFindingCount: number;
@@ -359,8 +366,129 @@ export interface AssistantReviewPreparation {
 }
 
 export type AssistantReviewRoute = (
+	mode: AssistantReviewMode,
 	target?: string
 ) => Promise<AssistantReviewPreparation>;
+
+export type ReviewModeResolution =
+	| {
+		ok: true;
+		mode: AssistantReviewMode;
+	}
+	| {
+		ok: false;
+		error: string;
+	};
+
+export function resolveReviewMode(
+	options: string[]
+): ReviewModeResolution {
+	const supportedModeOptions = [
+		'--docs',
+		'-d',
+		'--code',
+		'-c',
+		'--tests',
+		'-t',
+	];
+
+	const unsupportedOptions = options.filter(
+		(option) => !supportedModeOptions.includes(option)
+	);
+
+	if (unsupportedOptions.length > 0) {
+		return {
+			ok: false,
+			error:
+				`Unknown /review option: ${unsupportedOptions.join(', ')}`,
+		};
+	}
+
+	const requestedModes: AssistantReviewMode[] = [];
+
+	if (
+		options.includes('--docs')
+		|| options.includes('-d')
+	) {
+		requestedModes.push('docs');
+	}
+
+	if (
+		options.includes('--code')
+		|| options.includes('-c')
+	) {
+		requestedModes.push('code');
+	}
+
+	if (
+		options.includes('--tests')
+		|| options.includes('-t')
+	) {
+		requestedModes.push('tests');
+	}
+
+	if (requestedModes.length > 1) {
+		return {
+			ok: false,
+			error:
+				'Choose only one review mode: --docs, --code, or --tests.',
+		};
+	}
+
+	return {
+		ok: true,
+		mode: requestedModes[0] ?? 'docs',
+	};
+}
+
+export function buildUnstructuredReviewFallback(
+	mode: AssistantReviewMode
+): string {
+	const category =
+		mode === 'tests'
+			? 'Test coverage'
+			: mode === 'code'
+				? 'Reliability'
+				: 'Uncertainty';
+
+	return [
+		'## Finding: Review returned no structured assessment',
+		'',
+		'**Severity:** warning',
+		'',
+		`**Category:** ${category}`,
+		'',
+		'**Source file:**',
+		'`none`',
+		'',
+		'**Documentation file:**',
+		'`none`',
+		'',
+		'### Evidence',
+		'',
+		'- The model response did not follow the required structured finding template.',
+		'- The supplied review context could not be converted into actionable findings.',
+		'',
+		'### Impact',
+		'',
+		'The review result cannot be reliably sorted, inspected, or acted upon.',
+		'',
+		'### Suggested action',
+		'',
+		'Retry the review. If the response remains unstructured, inspect the prompt and model availability.',
+		'',
+		'### AI-generated update appropriate?',
+		'',
+		'No.',
+		'',
+		'This finding describes a failed review response rather than a source change.',
+		'',
+		'### Uncertainty',
+		'',
+		'The model may have ignored the review instructions or lacked sufficient usable context.',
+	].join('\n');
+}
+
 
 export type AssistantReportSink = (
 	report: AssistantReport
@@ -960,7 +1088,8 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		}
 	}
 
-	private async submitDocumentationReview(
+	private async submitReview(
+		mode: AssistantReviewMode,
 		target?: string
 	): Promise<void> {
 		const cancellation =
@@ -968,20 +1097,27 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 
 		this.requestCancellation = cancellation;
 		this.requestInFlight = true;
+		const modeLabel =
+			mode === 'docs'
+				? 'documentation'
+				: mode === 'code'
+					? 'code'
+					: 'test coverage';
+
 		this.showEphemeralWithPrompt(
-			'Preparing changed-documentation review...'
+			`Preparing changed-${modeLabel} review...`
 		);
 
 		try {
 			const preparation =
-				await this.reviewRoute!(target);
+				await this.reviewRoute!(mode, target);
 
 			if (cancellation.token.isCancellationRequested) {
 				throw new Error('Assistant request cancelled.');
 			}
 
 			this.showEphemeralWithPrompt(
-				`Reviewing ${preparation.changedFileCount} changed file(s)...`
+				`Reviewing ${preparation.changedFileCount} changed file(s) for ${modeLabel} issues...`
 			);
 
 			const modelResponse =
@@ -994,21 +1130,28 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				throw new Error('Assistant request cancelled.');
 			}
 
-			const modelFindings = modelResponse.trim()
-				? modelResponse
-				: [
-					'No model findings returned.',
-					'',
-					'## Review Status',
-					'',
-					'No additional model findings were produced. Review the deterministic findings above.',
-				].join('\n');
+			const parsedModelFindings =
+				parseReviewFindings(modelResponse);
+
+			const modelResponseIsStructured =
+				parsedModelFindings.length > 0;
+
+			const modelFindings =
+				modelResponseIsStructured
+					? modelResponse
+					: buildUnstructuredReviewFallback(
+						preparation.mode
+					);
 
 			const warnings = [...preparation.warnings];
 
 			if (!modelResponse.trim()) {
 				warnings.push(
 					'The model returned no review findings.'
+				);
+			} else if (!modelResponseIsStructured) {
+				warnings.push(
+					'The model returned an unstructured review response; a fallback finding was created.'
 				);
 			}
 
@@ -1020,12 +1163,22 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				modelFindings,
 			].join('\n');
 
+			const reviewTitle =
+				preparation.mode === 'docs'
+					? 'AI Dev Changed Documentation Review'
+					: preparation.mode === 'code'
+						? 'AI Dev Changed Code Review'
+						: 'AI Dev Test Coverage Review';
+
+			const reviewQuestion =
+				target
+					? `Review ${preparation.mode} changes for ${target}`
+					: `Review changed project ${preparation.mode}`;
+
 			const report = createAssistantReport({
 				route: 'review',
-				title: 'AI Dev Changed Documentation Review',
-				question: target
-					? `Review changed documentation for ${target}`
-					: 'Review changed project documentation',
+				title: reviewTitle,
+				question: reviewQuestion,
 				modelName: this.modelName,
 				warnings,
 				rawResponse: combinedFindings,
@@ -1491,21 +1644,18 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					return true;
 				}
 
-				const unsupportedOptions =
-					parsed.options.filter(
-						(option) => ![
-							'--docs',
-							'-d',
-						].includes(option)
-					);
+				const modeResolution =
+					resolveReviewMode(parsed.options);
 
-				if (unsupportedOptions.length > 0) {
+				if (!modeResolution.ok) {
 					this.writePermanentLine(
-						`WARNING Review mode not connected yet: ${unsupportedOptions.join(', ')}`,
+						`WARNING ${modeResolution.error}`,
 						ANSI_YELLOW
 					);
 					return true;
 				}
+
+				const reviewMode = modeResolution.mode;
 
 				if (!this.reviewRoute) {
 					this.writePermanentLine(
@@ -1519,7 +1669,10 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					parsed.arguments.join(' ').trim()
 					|| undefined;
 
-				await this.submitDocumentationReview(target);
+				await this.submitReview(
+					reviewMode,
+					target
+				);
 				return false;
 			}
 
