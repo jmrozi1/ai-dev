@@ -57,6 +57,9 @@ import {
 import {
 	NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS,
 } from '../pathMatching';
+import {
+	getBatchSourceGlobs,
+} from '../sourceDiscovery';
 import type {
 	AssistantChatBackend,
 } from '../assistantChatBackend';
@@ -164,17 +167,30 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
-	test('Mandatory artifact exclusions are merged with project excludes', async () => {
-		const sourcePath = path.resolve(
-			__dirname,
-			'../../src/extension.ts'
-		);
-		const source = await fs.readFile(sourcePath, 'utf8');
+	test('Mandatory artifact exclusions are merged with project excludes', () => {
+		const result = getBatchSourceGlobs({
+			raw: [
+				'source:',
+				'  exclude:',
+				'    - custom/**',
+			].join('\n'),
+		});
 
-		assert.match(
-			source,
-			/\.\.\.projectExcludeGlobs,\s*\.\.\.NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS/
+		assert.ok(
+			result.excludeGlobs.includes('custom/**')
 		);
+
+		for (const artifactGlob of [
+			'*.vsix',
+			'**/*.vsix',
+			'*.zip',
+			'**/*.zip',
+		]) {
+			assert.ok(
+				result.excludeGlobs.includes(artifactGlob),
+				`Missing merged artifact exclusion: ${artifactGlob}`
+			);
+		}
 	});
 
 	test('Missing .ai-dev.yaml returns usable defaults', async () => {
