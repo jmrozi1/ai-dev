@@ -318,6 +318,8 @@ export interface AssistantSummarizeExecutionResult {
 	architectureUpdated: boolean;
 	architectureSkipped?: string;
 	architectureFailed?: string;
+	dependencyMapRefreshed: boolean;
+	dependencyMapRefreshWarnings: string[];
 	dependencyFilesIncluded: number;
 	dependencyWarnings: string[];
 	skipped: string[];
@@ -962,6 +964,16 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 
 			this.prepareForPermanentOutput();
 
+			for (
+				const warning
+				of result.dependencyMapRefreshWarnings
+			) {
+				this.writePermanentLine(
+					`WARNING ${warning}`,
+					ANSI_YELLOW
+				);
+			}
+
 			for (const warning of result.dependencyWarnings) {
 				this.writePermanentLine(
 					`WARNING ${warning}`,
@@ -1020,6 +1032,14 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 			);
 			this.writePermanentLine(
 				`${BULLET_CHAR} Source files summarized: ${result.matchedSourceCount}`,
+				ANSI_LIGHT_GRAY
+			);
+			this.writePermanentLine(
+				`${BULLET_CHAR} Dependency map refreshed: ${
+					result.dependencyMapRefreshed
+						? 'yes'
+						: 'no'
+				}`,
 				ANSI_LIGHT_GRAY
 			);
 			this.writePermanentLine(

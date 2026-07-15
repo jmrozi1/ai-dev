@@ -34,12 +34,25 @@ export interface DependencyMapRefreshResult {
 	warnings: string[];
 }
 
-function isJenkinsConfigPath(
+export interface DependencyMapPreflightResult {
+	refreshed: boolean;
+	warnings: string[];
+}
+
+export function isJenkinsConfigPath(
 	relativePath: string
 ): boolean {
 	return path.posix.basename(
 		normalizePathForMarkdown(relativePath)
 	).toLowerCase() === 'config.xml';
+}
+
+export function shouldRefreshJenkinsDependencyMap(
+	sourcePaths: string[]
+): boolean {
+	return sourcePaths.some((sourcePath) =>
+		isJenkinsConfigPath(sourcePath)
+	);
 }
 
 export async function refreshJenkinsDependencyMap(
@@ -187,4 +200,46 @@ export async function refreshJenkinsDependencyMap(
 		failedCount,
 		warnings,
 	};
+}
+
+
+export async function refreshJenkinsDependencyMapForSummarization(
+	workspaceRoot: string,
+	sourcePaths: string[],
+	refresh: (
+		workspaceRoot: string
+	) => Promise<DependencyMapRefreshResult> =
+		refreshJenkinsDependencyMap
+): Promise<DependencyMapPreflightResult> {
+	if (
+		!shouldRefreshJenkinsDependencyMap(
+			sourcePaths
+		)
+	) {
+		return {
+			refreshed: false,
+			warnings: [],
+		};
+	}
+
+	try {
+		const result = await refresh(workspaceRoot);
+
+		return {
+			refreshed: true,
+			warnings: result.warnings,
+		};
+	} catch (error) {
+		const message =
+			error instanceof Error
+				? error.message
+				: String(error);
+
+		return {
+			refreshed: false,
+			warnings: [
+				`Dependency map refresh failed: ${message}`,
+			],
+		};
+	}
 }

@@ -108,6 +108,8 @@ import {
 } from '../jenkinsDependencyResolver';
 import {
 	refreshJenkinsDependencyMap,
+	refreshJenkinsDependencyMapForSummarization,
+	shouldRefreshJenkinsDependencyMap,
 } from '../dependencyMapWorkflow';
 import {
 	hydrateSummarizationDependencyContext,
@@ -927,6 +929,87 @@ suite('Extension Test Suite', () => {
 			}),
 			undefined
 		);
+	});
+
+	test('Jenkins dependency preflight only runs for selected config.xml files', async () => {
+		let refreshCalls = 0;
+
+		const result =
+			await refreshJenkinsDependencyMapForSummarization(
+				'/workspace',
+				[
+					'pipelines/Jenkinsfile',
+					'src/index.ts',
+				],
+				async () => {
+					refreshCalls += 1;
+					throw new Error(
+						'Refresh should not run.'
+					);
+				}
+			);
+
+		assert.strictEqual(refreshCalls, 0);
+		assert.deepStrictEqual(result, {
+			refreshed: false,
+			warnings: [],
+		});
+		assert.strictEqual(
+			shouldRefreshJenkinsDependencyMap([
+				'jobs/billing/CONFIG.XML',
+			]),
+			true
+		);
+	});
+
+	test('Jenkins dependency preflight propagates refresh warnings', async () => {
+		const result =
+			await refreshJenkinsDependencyMapForSummarization(
+				'/workspace',
+				['jobs/billing/config.xml'],
+				async () => ({
+					dependencyMapPath:
+						'ai-docs/dependency-map.json',
+					scannedConfigCount: 1,
+					resolvedEdgeCount: 1,
+					exactCount: 0,
+					inferredCount: 0,
+					ambiguousCount: 0,
+					unresolvedCount: 1,
+					skippedCount: 0,
+					failedCount: 0,
+					warnings: [
+						'jobs/billing/config.xml: no Jenkinsfile matched.',
+					],
+				})
+			);
+
+		assert.deepStrictEqual(result, {
+			refreshed: true,
+			warnings: [
+				'jobs/billing/config.xml: no Jenkinsfile matched.',
+			],
+		});
+	});
+
+	test('Jenkins dependency preflight converts refresh failure into a warning', async () => {
+		const result =
+			await refreshJenkinsDependencyMapForSummarization(
+				'/workspace',
+				['jobs/billing/config.xml'],
+				async () => {
+					throw new Error(
+						'Dependency map is read-only.'
+					);
+				}
+			);
+
+		assert.deepStrictEqual(result, {
+			refreshed: false,
+			warnings: [
+				'Dependency map refresh failed: Dependency map is read-only.',
+			],
+		});
 	});
 
 	test('Jenkins dependency refresh persists resolved edges and preserves unrelated edges', async () => {

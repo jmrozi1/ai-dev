@@ -21,6 +21,9 @@ import {
 	hydrateSummarizationDependencyContext,
 } from './summarizationDependencyContext';
 import {
+	refreshJenkinsDependencyMapForSummarization,
+} from './dependencyMapWorkflow';
+import {
 	MAX_DIRECT_FILE_CHARS,
 } from './modelContextLimits';
 import {
@@ -880,6 +883,8 @@ export async function executeSummarizationTarget(
 	architectureUpdated: boolean;
 	architectureSkipped?: string;
 	architectureFailed?: string;
+	dependencyMapRefreshed: boolean;
+	dependencyMapRefreshWarnings: string[];
 	dependencyFilesIncluded: number;
 	dependencyWarnings: string[];
 	skipped: string[];
@@ -921,6 +926,23 @@ export async function executeSummarizationTarget(
 		(action) =>
 			action.actionType === 'generate-doc'
 			&& typeof action.sourcePath === 'string'
+	);
+
+	const selectedSourcePaths = [
+		...new Set(
+			generateActions
+				.map((action) => action.sourcePath)
+				.filter(
+					(sourcePath): sourcePath is string =>
+						typeof sourcePath === 'string'
+						&& sourcePath.trim().length > 0
+				)
+				.map((sourcePath) =>
+					normalizePathForMarkdown(sourcePath)
+				)
+		),
+	].sort((left, right) =>
+		left.localeCompare(right)
 	);
 
 	const groupedActions = new Map<
@@ -997,6 +1019,8 @@ export async function executeSummarizationTarget(
 		architectureFailed: undefined as
 			| string
 			| undefined,
+		dependencyMapRefreshed: false,
+		dependencyMapRefreshWarnings: [] as string[],
 		dependencyFilesIncluded: 0,
 		dependencyWarnings: [] as string[],
 		skipped: [] as string[],
@@ -1056,13 +1080,28 @@ export async function executeSummarizationTarget(
 		workflowFileContents,
 		templateFileContents,
 		summarizationConfig,
-		dependencyMap,
 	] = await Promise.all([
 		fs.readFile(workflowAbsolutePath, 'utf8'),
 		fs.readFile(templateAbsolutePath, 'utf8'),
 		readSummarizationConfig(workspaceRoot),
-		readDependencyMap(workspaceRoot, aiDevConfig),
 	]);
+
+	const dependencyMapPreflight =
+		await refreshJenkinsDependencyMapForSummarization(
+			workspaceRoot,
+			selectedSourcePaths
+		);
+
+	result.dependencyMapRefreshed =
+		dependencyMapPreflight.refreshed;
+	result.dependencyMapRefreshWarnings.push(
+		...dependencyMapPreflight.warnings
+	);
+
+	const dependencyMap = await readDependencyMap(
+		workspaceRoot,
+		aiDevConfig
+	);
 
 	const workflowFilePath = formatRelativePath(
 		workspaceRoot,
