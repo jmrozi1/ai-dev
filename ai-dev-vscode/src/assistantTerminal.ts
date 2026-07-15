@@ -1610,13 +1610,63 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				);
 				return true;
 
-			case 'settings':
-				void vscode.commands.executeCommand('aiDev.settings');
+			case 'settings': {
+				const parsed = parseSlashCommand(command);
+
+				if (
+					parsed.options.includes('--help')
+					|| parsed.options.includes('-h')
+				) {
+					const definition =
+						getAssistantCommandDefinition('/settings');
+
+					if (definition) {
+						for (
+							const line of
+							formatAssistantCommandHelp(definition)
+						) {
+							this.writePermanentLine(
+								line || ' ',
+								ANSI_LIGHT_GRAY
+							);
+						}
+					}
+
+					return true;
+				}
+
+				const unknownOptions = parsed.options.filter(
+					(option) => ![
+						'--config',
+						'-c',
+					].includes(option)
+				);
+
+				if (unknownOptions.length > 0) {
+					this.writePermanentLine(
+						`WARNING Unknown /settings option: ${unknownOptions.join(', ')}`,
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				if (parsed.arguments.length > 0) {
+					this.writePermanentLine(
+						'WARNING Usage: /settings [--config] [--help]',
+						ANSI_YELLOW
+					);
+					return true;
+				}
+
+				void vscode.commands.executeCommand(
+					'aiDev.settings'
+				);
 				this.writePermanentLine(
 					`${BULLET_CHAR} Opened AI Dev settings`,
 					ANSI_LIGHT_GRAY
 				);
 				return true;
+			}
 
 			case 'ask': {
 				const parsed = parseSlashCommand(command);

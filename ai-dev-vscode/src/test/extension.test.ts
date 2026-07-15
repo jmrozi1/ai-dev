@@ -1997,6 +1997,62 @@ suite('Extension Test Suite', () => {
 	});
 
 
+	test('Settings help is deterministic and does not open settings', async () => {
+		const outputChunks: string[] = [];
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'Settings Test Model',
+			}),
+			sendMessage: async () => '',
+			sendIsolatedMessage: async () => '',
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend
+		);
+
+		const writeSubscription =
+			pty.onDidWrite((chunk) => {
+				outputChunks.push(chunk);
+			});
+
+		try {
+			pty.open({ columns: 120, rows: 30 });
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes(
+					'Launched Settings Test Model'
+				)
+			);
+
+			pty.handleInput('/settings --help');
+			pty.handleInput('\r');
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes(
+					'/settings [options]'
+				)
+			);
+
+			const output = outputChunks.join('');
+
+			assert.match(output, /--config/);
+			assert.match(output, /-c/);
+			assert.match(output, /--help/);
+			assert.match(output, /-h/);
+			assert.doesNotMatch(
+				output,
+				/Opened AI Dev settings/
+			);
+		} finally {
+			writeSubscription.dispose();
+			pty.close();
+		}
+	});
+
 	test('Review smoke test previews scope without model execution', async () => {
 		const outputChunks: string[] = [];
 		let prepareCalled = false;
