@@ -28,6 +28,7 @@ import {
 	submitInput,
 } from '../assistantInput';
 import {
+	AiDevAssistantPseudoterminal,
 	AiDevAssistantTerminalManager,
 	buildUnstructuredReviewFallback,
 	getCommonPrefix,
@@ -50,6 +51,9 @@ import {
 import {
 	selectChangedReviewFiles,
 } from '../extension';
+import type {
+	AssistantChatBackend,
+} from '../assistantChatBackend';
 import {
 	ASSISTANT_COMMAND_DEFINITIONS,
 	formatAssistantCommandHelp,
@@ -77,6 +81,25 @@ import {
 	buildSummarizationConfigHtml,
 } from '../summarizationConfigPanel';
 // import * as myExtension from '../../extension';
+
+async function waitForCondition(
+	predicate: () => boolean,
+	timeoutMs = 3000
+): Promise<void> {
+	const deadline = Date.now() + timeoutMs;
+
+	while (!predicate()) {
+		if (Date.now() >= deadline) {
+			throw new Error(
+				`Timed out after ${timeoutMs}ms waiting for condition.`
+			);
+		}
+
+		await new Promise<void>((resolve) =>
+			setTimeout(resolve, 10)
+		);
+	}
+}
 
 suite('Extension Test Suite', () => {
 	vscode.window.showInformationMessage('Start all tests.');
@@ -1826,6 +1849,107 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+
+	test('PTY routes test review and reports structured fallback', async () => {
+		const reviewModes: string[] = [];
+		const outputChunks: string[] = [];
+		const reports: Array<ReturnType<typeof createAssistantReport>> = [];
+		let isolatedPrompt = '';
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'Test Model',
+			}),
+			sendMessage: async () => '',
+			sendIsolatedMessage: async (prompt) => {
+				isolatedPrompt = prompt;
+				return [
+					'I do not see any test files.',
+					'Please open or attach the files to review.',
+				].join('\n');
+			},
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend,
+			undefined,
+			undefined,
+			async (mode) => {
+				reviewModes.push(mode);
+
+				return {
+					mode,
+					prompt: 'embedded review prompt',
+					changedFileCount: 2,
+					deterministicFindingCount: 0,
+					deterministicFindingsMarkdown: [
+						'## Deterministic Documentation Mapping Findings',
+						'',
+						'- not applicable',
+					].join('\n'),
+					warnings: [],
+				};
+			},
+			(report) => {
+				reports.push(report);
+			}
+		);
+
+		const writeSubscription = pty.onDidWrite((chunk) => {
+			outputChunks.push(chunk);
+		});
+
+		pty.open({ columns: 120, rows: 30 });
+
+		await waitForCondition(() =>
+			outputChunks.join('').includes('Launched Test Model')
+		);
+
+		pty.handleInput('/review --tests');
+		pty.handleInput('\r');
+
+		await waitForCondition(() => reports.length === 1);
+
+		assert.deepStrictEqual(reviewModes, ['tests']);
+		assert.strictEqual(
+			isolatedPrompt,
+			'embedded review prompt'
+		);
+
+		const findings = parseReviewFindings(
+			reports[0].rawResponse
+		);
+
+		assert.strictEqual(findings.length, 1);
+		assert.strictEqual(
+			findings[0].title,
+			'Review returned no structured assessment'
+		);
+		assert.strictEqual(
+			findings[0].severity,
+			'warning'
+		);
+		assert.strictEqual(
+			findings[0].category,
+			'Test coverage'
+		);
+
+		const terminalOutput = outputChunks.join('');
+
+		assert.match(
+			terminalOutput,
+			/unstructured review response/
+		);
+		assert.match(
+			terminalOutput,
+			/\/showreport for findings/
+		);
+
+		writeSubscription.dispose();
+		pty.close();
+	});
 
 	test('/review supports changed-documentation mode', async () => {
 		const sourcePath = path.resolve(
