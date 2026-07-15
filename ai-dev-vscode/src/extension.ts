@@ -4,6 +4,11 @@ import type { Dirent } from 'node:fs';
 import * as path from 'node:path';
 import { registerAiDevActionsView } from './actionsView';
 import {
+	fileExists,
+	readOptionalTextFile,
+	truncateText,
+} from './fileUtilities';
+import {
 	AiDevConfig,
 	getYamlNestedValue,
 	readAiDevConfig,
@@ -404,14 +409,6 @@ function updateYamlSectionListValue(yamlContent: string, section: string, key: s
 
 function formatRelativePath(workspaceRoot: string, absolutePath: string): string {
 	return normalizePathForMarkdown(path.relative(workspaceRoot, absolutePath));
-}
-
-function truncateText(content: string, maxChars: number): string {
-	if (content.length <= maxChars) {
-		return content;
-	}
-
-	return `${content.slice(0, maxChars)}\n...[truncated]`;
 }
 
 async function listMarkdownFilesRecursively(rootDirectory: string, maxFiles: number): Promise<string[]> {
@@ -939,27 +936,6 @@ async function computeBatchUnitDocSelection(params: {
 		})),
 		plannedActions,
 	};
-}
-
-async function fileExists(filePath: string): Promise<boolean> {
-	try {
-		await fs.access(filePath);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function readOptionalTextFile(filePath: string): Promise<string | undefined> {
-	try {
-		return await fs.readFile(filePath, 'utf8');
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
-			return undefined;
-		}
-
-		throw error;
-	}
 }
 
 function extractFirstNonMetaDiffHunk(diff: string): string | undefined {
