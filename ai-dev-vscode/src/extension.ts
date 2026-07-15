@@ -452,24 +452,6 @@ function updateYamlSectionListValue(yamlContent: string, section: string, key: s
 	return withOriginalLineEnding(yamlContent, `${base}${suffix}`);
 }
 
-async function openMarkdownPromptAndCopy(content: string, message: string): Promise<void> {
-	const doc = await vscode.workspace.openTextDocument({
-		language: 'markdown',
-		content,
-	});
-	await vscode.window.showTextDocument(doc, { preview: false });
-	await vscode.env.clipboard.writeText(content);
-	await vscode.window.showInformationMessage(message);
-}
-
-async function openMarkdownDocument(content: string): Promise<void> {
-	const doc = await vscode.workspace.openTextDocument({
-		language: 'markdown',
-		content,
-	});
-	await vscode.window.showTextDocument(doc, { preview: false });
-}
-
 function formatRelativePath(workspaceRoot: string, absolutePath: string): string {
 	return normalizePathForMarkdown(path.relative(workspaceRoot, absolutePath));
 }
@@ -708,27 +690,6 @@ function isConfiguredSourceCandidatePath(relativePath: string, docsDir: string, 
 	return isConfiguredSourcePath(normalizedRelativePath, excludeGlobs);
 }
 
-function getPathWithoutExtension(relativePath: string): string {
-	const extension = path.posix.extname(relativePath);
-	if (!extension) {
-		return relativePath;
-	}
-
-	return relativePath.slice(0, -extension.length);
-}
-
-function inferSourceExtensionsFromSourcePaths(sourcePaths: string[]): string[] {
-	const discovered = new Set<string>();
-	for (const sourcePath of sourcePaths) {
-		const extensionName = path.posix.extname(sourcePath).trim().toLowerCase();
-		if (extensionName) {
-			discovered.add(extensionName);
-		}
-	}
-
-	return [...discovered].sort((left, right) => left.localeCompare(right));
-}
-
 function toDeterministicFindingsMarkdown(findings: DeterministicDocumentationFinding[]): string {
 	if (findings.length === 0) {
 		return [
@@ -928,27 +889,6 @@ interface BatchUnitDocSelectionResult {
 	plannedActions: BatchUnitDocPlanAction[];
 }
 
-interface BatchGeneratedSummaryWrite {
-	docPath: string;
-	sourcePaths: string[];
-}
-
-interface BatchSkippedAction {
-	actionType: BatchUnitDocActionType;
-	docPath: string;
-	sourcePath?: string;
-	sourcePaths?: string[];
-	reason: string;
-}
-
-interface BatchFailedAction {
-	actionType: BatchUnitDocActionType;
-	docPath: string;
-	sourcePath?: string;
-	sourcePaths?: string[];
-	error: string;
-}
-
 interface ArchitectureSummaryDirectoryCandidate {
 	sourceDirectory: string;
 	summaryPath: string;
@@ -956,12 +896,6 @@ interface ArchitectureSummaryDirectoryCandidate {
 	status: ArchitectureSummaryStatus;
 	notes: string;
 	applyByDefault: boolean;
-}
-
-interface ArchitectureSummaryDirectorySelection {
-	allItems: ArchitectureSummaryPreviewItem[];
-	selectedItems: ArchitectureSummaryPreviewItem[];
-	omittedItems: ArchitectureSummaryPreviewItem[];
 }
 
 function getBatchActionLabel(actionType: BatchUnitDocActionType): BatchUnitDocPreviewItem['actionLabel'] {
@@ -999,13 +933,6 @@ function normalizeSelectedSourceDirectory(selectedSourceDirectory: string | unde
 function getSourceDirectoryPath(sourcePath: string): string {
 	const directoryPath = normalizePathForMarkdown(path.posix.dirname(sourcePath));
 	return directoryPath === '' ? '.' : directoryPath;
-}
-
-function getSelectedDirectorySummaryFile(selectedSourceDirectory: string | undefined, docsDir: string): string {
-	const normalizedDirectory = normalizeSelectedSourceDirectory(selectedSourceDirectory);
-	return normalizedDirectory && normalizedDirectory !== '.'
-		? path.posix.join(docsDir, normalizedDirectory, 'summary.md')
-		: path.posix.join(docsDir, 'summary.md');
 }
 
 function getDocStatusForExistingContent(existingContent: string | undefined): BatchUnitDocStatus {
@@ -1065,28 +992,6 @@ function countArchitectureStatuses(items: ArchitectureSummaryPreviewItem[]): {
 	}
 
 	return { existingCount, missingCount, emptyCount };
-}
-
-function selectArchitecturePreviewItems(previewPlan: ArchitectureSummaryPreviewResult): ArchitectureSummaryDirectorySelection {
-	const allItems = Array.isArray(previewPlan.items)
-		? previewPlan.items
-			.map((item) => ({
-				apply: Boolean(item.apply),
-				sourceDirectory: String(item.sourceDirectory ?? '').trim(),
-				summaryPath: String(item.summaryPath ?? '').trim(),
-				status: item.status,
-				notes: String(item.notes ?? '').trim(),
-			}))
-			.filter((item): item is ArchitectureSummaryPreviewItem => (
-				item.sourceDirectory.length > 0
-				&& item.summaryPath.length > 0
-				&& (item.status === 'exists' || item.status === 'missing' || item.status === 'empty')
-			))
-		: [];
-
-	const selectedItems = allItems.filter((item) => item.apply);
-	const omittedItems = allItems.filter((item) => !item.apply);
-	return { allItems, selectedItems, omittedItems };
 }
 
 async function discoverArchitectureSummaryPreview(params: {
@@ -1156,53 +1061,6 @@ async function discoverArchitectureSummaryPreview(params: {
 		},
 		items,
 	};
-}
-
-function buildArchitectureSummaryReport(params: {
-	timestamp: string;
-	targetPath: string;
-	docsDir: string;
-	modelDetails?: DirectAnswerModelDetails;
-	selectedCount: number;
-	existingCount: number;
-	missingCount: number;
-	emptyCount: number;
-	responseLength: number;
-	fenceStripped: boolean;
-	writeStatus: string;
-	fileWritten: boolean;
-	writtenFilePath?: string;
-	skipped: string[];
-	failed: string[];
-}): string {
-	return [
-		'# AI Dev Generate Architecture Summary Report',
-		'',
-		`- Timestamp: ${params.timestamp}`,
-		'- Execution mode: direct-experimental',
-		`- docsDir: ${params.docsDir}`,
-		`- Target path: ${params.targetPath}`,
-		`- Selected directory count: ${params.selectedCount}`,
-		`- Existing summaries count: ${params.existingCount}`,
-		`- Missing summaries count: ${params.missingCount}`,
-		`- Empty summaries count: ${params.emptyCount}`,
-		`- Write status: ${params.writeStatus}`,
-		`- File written: ${params.fileWritten}`,
-		`- Written file path: ${params.writtenFilePath ?? 'n/a'}`,
-		`- Response length: ${params.responseLength}`,
-		`- Response fence stripped: ${params.fenceStripped}`,
-		'- Selected model info:',
-		`  - id: ${params.modelDetails?.id ?? 'n/a'}`,
-		`  - name: ${params.modelDetails?.name ?? 'n/a'}`,
-		`  - vendor: ${params.modelDetails?.vendor ?? 'n/a'}`,
-		`  - family: ${params.modelDetails?.family ?? 'n/a'}`,
-		'',
-		'## Skipped',
-		...(params.skipped.length > 0 ? params.skipped.map((item) => `- ${item}`) : ['- none']),
-		'',
-		'## Failed',
-		...(params.failed.length > 0 ? params.failed.map((item) => `- ${item}`) : ['- none']),
-	].join('\n');
 }
 
 function summaryContainsSourceEntry(summaryContents: string | undefined, sourcePath: string): boolean {
@@ -1339,90 +1197,6 @@ async function computeBatchUnitDocSelection(params: {
 	};
 }
 
-function buildBatchUnitDocReport(params: {
-	timestamp: string;
-	sourceGlob: string;
-	missingDocsOnly: boolean;
-	resolveOrphanedDocs: boolean;
-	docsDir: string;
-	totalCandidates: number;
-	maxFiles: number;
-	plannedActionCount: number;
-	modelDetails?: DirectAnswerModelDetails;
-	processedCount: number;
-	generatedDocs: BatchGeneratedSummaryWrite[];
-	movedDocs: Array<{ from: string; to: string }>;
-	deletedDocs: string[];
-	skippedActions: BatchSkippedAction[];
-	failedActions: BatchFailedAction[];
-	cancelled: boolean;
-}): string {
-	return [
-		'# AI Dev Batch Summary Generation Report',
-		'',
-		`- Timestamp: ${params.timestamp}`,
-		'- Execution mode: direct-experimental',
-		`- Source glob: ${params.sourceGlob}`,
-		`- Missing or empty summaries only: ${params.missingDocsOnly}`,
-		`- Resolve orphaned docs: ${params.resolveOrphanedDocs}`,
-		`- docsDir: ${params.docsDir}`,
-		`- Total candidates: ${params.totalCandidates}`,
-		`- Max files: ${params.maxFiles}`,
-		`- Planned actions: ${params.plannedActionCount}`,
-		`- Processed count: ${params.processedCount}`,
-		`- Updated Summary Files: ${params.generatedDocs.length}`,
-		`- Moved orphan docs: ${params.movedDocs.length}`,
-		`- Deleted orphan docs: ${params.deletedDocs.length}`,
-		`- Skipped actions: ${params.skippedActions.length}`,
-		`- Failed actions: ${params.failedActions.length}`,
-		`- Cancelled: ${params.cancelled}`,
-		'- Selected model info:',
-		`  - id: ${params.modelDetails?.id ?? 'n/a'}`,
-		`  - name: ${params.modelDetails?.name ?? 'n/a'}`,
-		`  - vendor: ${params.modelDetails?.vendor ?? 'n/a'}`,
-		`  - family: ${params.modelDetails?.family ?? 'n/a'}`,
-		'',
-		'## Updated Summary Files',
-		...(params.generatedDocs.length > 0
-			? params.generatedDocs.map((item) => `- ${item.docPath}${item.sourcePaths.length > 0 ? ` | selected source files: ${item.sourcePaths.join(', ')}` : ''}`)
-			: ['- none']),
-		'',
-		'## Moved Orphan Docs',
-		...(params.movedDocs.length > 0 ? params.movedDocs.map((item) => `- ${item.from} -> ${item.to}`) : ['- none']),
-		'',
-		'## Deleted Orphan Docs',
-		...(params.deletedDocs.length > 0 ? params.deletedDocs.map((filePath) => `- ${filePath}`) : ['- none']),
-		'',
-		'## Skipped Actions',
-		...(params.skippedActions.length > 0
-			? params.skippedActions.map((item) => {
-				const sourceSegment = item.sourcePath
-					? ` | source=${item.sourcePath}`
-					: item.sourcePaths && item.sourcePaths.length > 0
-						? ` | sources=${item.sourcePaths.join(', ')}`
-						: '';
-				return `- ${item.actionType} | doc=${item.docPath}${sourceSegment}: ${item.reason}`;
-			})
-			: ['- none']),
-		'',
-		'## Failed Actions',
-		...(params.failedActions.length > 0
-			? params.failedActions.map((item) => {
-				const sourceSegment = item.sourcePath
-					? ` | source=${item.sourcePath}`
-					: item.sourcePaths && item.sourcePaths.length > 0
-						? ` | sources=${item.sourcePaths.join(', ')}`
-						: '';
-				return `- ${item.actionType} | doc=${item.docPath}${sourceSegment}: ${item.error}`;
-			})
-			: ['- none']),
-	].join('\n');
-}
-
-function normalizeRelativeDocPath(relativePath: string): string {
-	return normalizePathForMarkdown(relativePath).replace(/^\.\//, '').replace(/\/+$/, '');
-}
-
 async function fileExists(filePath: string): Promise<boolean> {
 	try {
 		await fs.access(filePath);
@@ -1520,28 +1294,6 @@ function getScopedSummaryPathCandidatesForExpectedDoc(params: {
 	}
 
 	return [...candidates];
-}
-
-function buildNoDocumentationChangesRequiredFinding(params: {
-	changedFilePaths: string[];
-	gitDiffs: GitFileDiff[];
-}): string {
-	const commentOnlyDiff = params.gitDiffs.find((item) => isLikelyCommentOnlyDiff(item.diff));
-	const fileForEvidence = commentOnlyDiff?.relativePath ?? params.changedFilePaths[0] ?? 'n/a';
-	const diffEvidence = commentOnlyDiff
-		? (extractFirstNonMetaDiffHunk(commentOnlyDiff.diff) ?? 'No diff hunk available.')
-		: 'No comment-only diff detected from available diff samples.';
-
-	return [
-		'### No documentation changes required',
-		'',
-		'- Severity: info',
-		'- Finding: Source change appears comment-only or otherwise non-semantic, so documentation regeneration is not required.',
-		'- Recommended action: No documentation regeneration required.',
-		'- Evidence:',
-		`  - Changed source file: ${fileForEvidence}`,
-		`  - Diff sample: ${diffEvidence}`,
-	].join('\n');
 }
 
 interface RoutedDocumentationFile {
@@ -1895,12 +1647,6 @@ async function collectRoutedDocumentationContextForAnswer(params: {
 	};
 }
 
-function getErrorDetails(error: unknown): { message: string; stack: string } {
-	const message = error instanceof Error ? error.message : String(error);
-	const stack = error instanceof Error && typeof error.stack === 'string' ? error.stack : 'n/a';
-	return { message, stack };
-}
-
 function stripSingleOuterCodeFence(text: string): { text: string; stripped: boolean } {
 	const trimmed = text.trim();
 	const fencedBlockMatch = trimmed.match(/^```[^\r\n]*\r?\n([\s\S]*?)\r?\n```$/);
@@ -1909,183 +1655,6 @@ function stripSingleOuterCodeFence(text: string): { text: string; stripped: bool
 	}
 
 	return { text: fencedBlockMatch[1], stripped: true };
-}
-
-function getModelDetails(model: vscode.LanguageModelChat): {
-	id: string;
-	name: string;
-	vendor: string;
-	family: string;
-} {
-	const modelMetadata = model as unknown as {
-		id?: unknown;
-		name?: unknown;
-		vendor?: unknown;
-		family?: unknown;
-	};
-
-	return {
-		id: typeof modelMetadata.id === 'string' ? modelMetadata.id : 'n/a',
-		name: typeof modelMetadata.name === 'string' ? modelMetadata.name : 'n/a',
-		vendor: typeof modelMetadata.vendor === 'string' ? modelMetadata.vendor : 'n/a',
-		family: typeof modelMetadata.family === 'string' ? modelMetadata.family : 'n/a',
-	};
-}
-
-type DirectAnswerModelDetails = ReturnType<typeof getModelDetails>;
-
-type DirectModelCallProgressResult =
-	| {
-		status: 'completed';
-		responseText: string;
-		timestamp: string;
-		modelDetails: DirectAnswerModelDetails;
-	}
-	| { status: 'cancelled' }
-	| { status: 'handled-error' };
-
-interface DirectModelCallOptions {
-	title: string;
-	diagnosticTitle: string;
-	buildPrompt: (progress: vscode.Progress<{ message?: string }>, token: vscode.CancellationToken) => Promise<string>;
-}
-
-async function collectModelResponseText(
-	model: vscode.LanguageModelChat,
-	prompt: string,
-	cancellationToken?: vscode.CancellationToken
-): Promise<string> {
-	const cancellation = cancellationToken ? undefined : new vscode.CancellationTokenSource();
-	const token = cancellationToken ?? cancellation!.token;
-	try {
-		const response = await model.sendRequest(
-			[
-				vscode.LanguageModelChatMessage.User(prompt),
-			],
-			{},
-			token
-		);
-
-		let responseText = '';
-		for await (const chunk of response.text) {
-			if (token.isCancellationRequested) {
-				break;
-			}
-
-			responseText += chunk;
-		}
-
-		return responseText;
-	} finally {
-		cancellation?.dispose();
-	}
-}
-
-async function runDirectModelCallWithProgress(options: DirectModelCallOptions): Promise<DirectModelCallProgressResult> {
-	return vscode.window.withProgress<DirectModelCallProgressResult>(
-		{
-			location: vscode.ProgressLocation.Notification,
-			title: options.title,
-			cancellable: true,
-		},
-		async (progress, token) => {
-			progress.report({ message: 'Reading workflow context' });
-			const directPromptMarkdown = await options.buildPrompt(progress, token);
-			if (token.isCancellationRequested) {
-				return { status: 'cancelled' };
-			}
-
-			progress.report({ message: 'Selecting language model' });
-			const models = await vscode.lm.selectChatModels();
-			if (models.length === 0) {
-				const timestamp = new Date().toISOString();
-				const diagnosticMarkdown = [
-					`# ${options.diagnosticTitle}`,
-					'',
-					`- Timestamp: ${timestamp}`,
-					'- Error: No models were returned by vscode.lm.selectChatModels().',
-					'',
-					'## Direct request payload',
-					'',
-					'```markdown',
-					directPromptMarkdown,
-					'```',
-				].join('\n');
-
-				await vscode.window.showErrorMessage('No VS Code language model is available. Make sure a chat model is installed and enabled.');
-				await openMarkdownDocument(diagnosticMarkdown);
-				return { status: 'handled-error' };
-			}
-
-			if (token.isCancellationRequested) {
-				return { status: 'cancelled' };
-			}
-
-			const [model] = models;
-			const modelDetails = getModelDetails(model);
-
-			progress.report({ message: 'Awaiting model response' });
-			let responseText: string;
-			try {
-				responseText = await collectModelResponseText(model, directPromptMarkdown, token);
-			} catch (error) {
-				if (token.isCancellationRequested) {
-					return { status: 'cancelled' };
-				}
-
-				throw error;
-			}
-
-			if (token.isCancellationRequested) {
-				return { status: 'cancelled' };
-			}
-
-			return {
-				status: 'completed',
-				responseText,
-				timestamp: new Date().toISOString(),
-				modelDetails,
-			};
-		}
-	);
-}
-
-async function openDirectResultMarkdown(params: {
-	title: string;
-	timestamp: string;
-	modelDetails: DirectAnswerModelDetails;
-	metadataLines?: string[];
-	previewOnlyNote?: string;
-	responseHeading?: string;
-	responseText: string;
-}): Promise<void> {
-	const markdown = [
-		`# ${params.title}`,
-		'',
-		`- Timestamp: ${params.timestamp}`,
-		'- Selected model info:',
-		`  - id: ${params.modelDetails.id}`,
-		`  - name: ${params.modelDetails.name}`,
-		`  - vendor: ${params.modelDetails.vendor}`,
-		`  - family: ${params.modelDetails.family}`,
-		...(params.metadataLines ?? []),
-		...(params.previewOnlyNote
-			? [
-				'',
-				'## Note',
-				'',
-				params.previewOnlyNote,
-			]
-			: []),
-		'',
-		`## ${params.responseHeading ?? 'Response'}`,
-		'',
-		'```markdown',
-		params.responseText,
-		'```',
-	].join('\n');
-
-	await openMarkdownDocument(markdown);
 }
 
 async function writeTextFileAtomicish(targetAbsolutePath: string, content: string): Promise<void> {
@@ -2463,112 +2032,6 @@ async function buildReviewDocumentationDirectPromptBundle(workspaceRoot: string,
 		changedFilePaths: normalizedChangedFilePaths,
 		deterministicFindings,
 		gitDiffs: boundedGitDiffs,
-	};
-}
-
-async function buildReviewFileDocumentationDirectPromptBundle(target: {
-	activeFileUri: vscode.Uri;
-	workspaceRoot: string;
-}): Promise<{
-	directPromptMarkdown: string;
-	selectedSourcePath: string;
-	expectedSummaryPath: string;
-}> {
-	const { activeFileUri, workspaceRoot } = target;
-	const aiDevConfig = await readAiDevConfig(workspaceRoot);
-	const aiDevYamlSection = getAiDevYamlPromptSection(aiDevConfig);
-
-	const configuredDocsDir = getConfiguredDocsDir(aiDevConfig);
-	const selectedSourcePath = getSelectedSourcePath(workspaceRoot, activeFileUri.fsPath);
-	const expectedSummaryPath = getExpectedDirectorySummaryPath({
-		workspaceRoot,
-		sourceFilePath: activeFileUri.fsPath,
-		docsDir: configuredDocsDir,
-	});
-	const summaryFile = getRootSummaryFilePath(aiDevConfig);
-	const aiDevCorePath = resolveAiDevCorePath(workspaceRoot, aiDevConfig.aiDevCorePath);
-	const workflowFilePath = path.join(aiDevCorePath, 'workflows/review/review-documentation.md');
-	const findingTemplatePath = path.join(aiDevCorePath, 'workflows/review/finding-template.md');
-	const sourceFilePath = activeFileUri.fsPath;
-	const expectedSummaryAbsolutePath = path.resolve(workspaceRoot, expectedSummaryPath);
-	const summaryFileAbsolutePath = path.resolve(workspaceRoot, summaryFile);
-
-	const [workflowFileContents, findingTemplateContents, sourceFileContents, expectedSummaryContents, summaryFileContents, aiDevYamlContents] = await Promise.all([
-		fs.readFile(workflowFilePath, 'utf8'),
-		fs.readFile(findingTemplatePath, 'utf8'),
-		fs.readFile(sourceFilePath, 'utf8'),
-		readOptionalTextFile(expectedSummaryAbsolutePath),
-		readOptionalTextFile(summaryFileAbsolutePath),
-		Promise.resolve(aiDevYamlSection.contents),
-	]);
-
-	const directPromptMarkdown = [
-		'AI Dev direct task: review-file-docs',
-		'',
-		`Workspace: ${normalizePathForMarkdown(workspaceRoot)}`,
-		`Source file path: ${selectedSourcePath}`,
-		`Target summary file path: ${expectedSummaryPath}`,
-		`Summary file path: ${summaryFile}`,
-		'',
-		'Workflow file:',
-		formatRelativePath(workspaceRoot, workflowFilePath),
-		'',
-		'```markdown',
-		workflowFileContents,
-		'```',
-		'',
-		'Finding template:',
-		formatRelativePath(workspaceRoot, findingTemplatePath),
-		'',
-		'```markdown',
-		findingTemplateContents,
-		'```',
-		'',
-		'.ai-dev.yaml:',
-		aiDevYamlSection.label,
-		'',
-		'```yaml',
-		aiDevYamlContents,
-		'```',
-		'',
-		'Source file contents:',
-		selectedSourcePath,
-		'',
-		'```text',
-		sourceFileContents,
-		'```',
-		'',
-		expectedSummaryContents ? 'Target summary file contents:' : 'Target summary file contents: not found',
-		expectedSummaryContents ? expectedSummaryPath : '',
-		...(expectedSummaryContents
-			? [
-				'',
-				'```markdown',
-				expectedSummaryContents,
-				'```',
-			]
-			: []),
-		'',
-		summaryFileContents ? 'Summary file contents:' : 'Summary file contents: not found',
-		summaryFileContents ? summaryFile : '',
-		...(summaryFileContents
-			? [
-				'',
-				'```markdown',
-				summaryFileContents,
-				'```',
-			]
-			: []),
-		'',
-		'Instructions:',
-		'Review source against the target summary file and summary routing artifacts for mismatches, stale docs, and missing routed documentation.',
-		'Return findings in markdown using the provided finding template style.',
-	].join('\n');
-
-	return {
-		directPromptMarkdown,
-		selectedSourcePath,
-		expectedSummaryPath,
 	};
 }
 
