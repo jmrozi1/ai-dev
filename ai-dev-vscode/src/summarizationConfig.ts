@@ -8,6 +8,7 @@ export const DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS = [
 	'Summarize behavior and purpose rather than merely describing syntax.',
 	'Identify important inputs, outputs, side effects, configuration, and dependencies.',
 	'Explain how the file participates in the larger system when that can be determined.',
+	'For orchestration files, capture the ordered execution lifecycle, gating conditions, writes and downstream refreshes, cancellation behavior, and which completed work remains valid when later steps fail.',
 	'Ignore repetitive boilerplate unless it materially affects behavior.',
 	'Treat source and executable configuration as final authority.',
 	'Flag unresolved or missing dependencies instead of silently guessing.',

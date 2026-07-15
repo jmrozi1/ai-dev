@@ -619,6 +619,28 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('Default summarization guidance captures orchestration lifecycle behavior', () => {
+		assert.match(
+			DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS,
+			/ordered execution lifecycle/
+		);
+		assert.match(
+			DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS,
+			/gating conditions/
+		);
+		assert.match(
+			DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS,
+			/writes and downstream refreshes/
+		);
+		assert.match(
+			DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS,
+			/cancellation behavior/
+		);
+		assert.match(
+			DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS,
+			/which completed work remains valid when later steps fail/
+		);
+	});
 	test('General instructions precede matching specialized rules', () => {
 		const config = normalizeSummarizationConfig({
 			version: 1,
