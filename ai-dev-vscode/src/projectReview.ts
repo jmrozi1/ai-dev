@@ -1,114 +1,14 @@
-import * as path from 'node:path';
-
-const NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS = [
-	'**/*.vsix',
-	'**/*.zip',
-	'**/*.tar',
-	'**/*.tar.gz',
-	'**/*.tgz',
-	'**/*.jar',
-	'**/*.war',
-	'**/*.ear',
-	'**/*.dll',
-	'**/*.exe',
-	'**/*.bin',
-	'**/*.class',
-	'**/*.pyc',
-	'**/*.pyo',
-	'**/*.so',
-	'**/*.dylib',
-	'**/*.a',
-	'**/*.lib',
-	'**/*.o',
-	'**/*.obj',
-];
-
+import {
+	NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS,
+	globToRegExp,
+	matchesAnyGlob,
+} from './pathMatching';
+import {
+	normalizePathForMarkdown,
+} from './workspace';
 function normalizePathForReview(filePath: string): string {
-	return filePath
-		.replaceAll(path.sep, '/')
+	return normalizePathForMarkdown(filePath)
 		.replace(/^\.\//, '');
-}
-
-function globToRegExp(glob: string): RegExp {
-	const normalized = normalizePathForReview(glob);
-	let expression = '^';
-
-	for (let index = 0; index < normalized.length; index += 1) {
-		const character = normalized[index];
-
-		if (character === '*') {
-			if (normalized[index + 1] === '*') {
-				const followedBySlash =
-					normalized[index + 2] === '/';
-
-				expression += followedBySlash
-					? '(?:.*/)?'
-					: '.*';
-
-				index += followedBySlash ? 2 : 1;
-			} else {
-				expression += '[^/]*';
-			}
-
-			continue;
-		}
-
-		if (character === '?') {
-			expression += '[^/]';
-			continue;
-		}
-
-		if (character === '[') {
-			const closingIndex =
-				normalized.indexOf(']', index + 1);
-
-			if (closingIndex >= 0) {
-				expression += normalized.slice(
-					index,
-					closingIndex + 1
-				);
-				index = closingIndex;
-				continue;
-			}
-		}
-
-		if (character === '{') {
-			const closingIndex =
-				normalized.indexOf('}', index + 1);
-
-			if (closingIndex >= 0) {
-				const alternatives = normalized
-					.slice(index + 1, closingIndex)
-					.split(',')
-					.map((value) =>
-						value.replace(
-							/[.*+?^${}()|[\]\\]/g,
-							'\\$&'
-						)
-					);
-
-				expression += `(?:${alternatives.join('|')})`;
-				index = closingIndex;
-				continue;
-			}
-		}
-
-		expression += character.replace(
-			/[.*+?^${}()|[\]\\]/g,
-			'\\$&'
-		);
-	}
-
-	return new RegExp(`${expression}$`);
-}
-
-function matchesAnyGlob(
-	filePath: string,
-	globs: string[]
-): boolean {
-	return globs.some((glob) =>
-		globToRegExp(glob).test(filePath)
-	);
 }
 
 function isTestFilePath(filePath: string): boolean {

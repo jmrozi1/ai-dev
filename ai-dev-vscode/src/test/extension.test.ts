@@ -54,6 +54,9 @@ import {
 	selectChangedReviewFiles,
 	selectReviewFiles,
 } from '../projectReview';
+import {
+	NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS,
+} from '../pathMatching';
 import type {
 	AssistantChatBackend,
 } from '../assistantChatBackend';
@@ -139,21 +142,26 @@ suite('Extension Test Suite', () => {
 		assert.doesNotMatch(BATCH_UNIT_DOC_FILES_THIS_PASS_HELP_TEXT, /preview only/i);
 	});
 
-	test('Packaged binaries are mandatory source exclusions', async () => {
-		const sourcePath = path.resolve(
-			__dirname,
-			'../../src/extension.ts'
-		);
-		const source = await fs.readFile(sourcePath, 'utf8');
-
-		assert.match(
-			source,
-			/const NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS/
-		);
-		assert.match(source, /'\*\.vsix'/);
-		assert.match(source, /'\*\*\/\*\.vsix'/);
-		assert.match(source, /'\*\*\/\*\.dll'/);
-		assert.match(source, /'\*\*\/\*\.zip'/);
+	test('Packaged binaries are mandatory source exclusions', () => {
+		for (const expectedGlob of [
+			'*.vsix',
+			'**/*.vsix',
+			'*.zip',
+			'**/*.zip',
+			'*.exe',
+			'**/*.exe',
+			'*.dll',
+			'**/*.dll',
+			'*.jar',
+			'**/*.jar',
+		]) {
+			assert.ok(
+				NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS.includes(
+					expectedGlob
+				),
+				`Missing mandatory artifact exclusion: ${expectedGlob}`
+			);
+		}
 	});
 
 	test('Mandatory artifact exclusions are merged with project excludes', async () => {
