@@ -103,6 +103,10 @@ import {
 	writeDependencyMap,
 } from '../dependencyMap';
 import {
+	extractJenkinsPipelineScriptPath,
+	resolveJenkinsPipelineDependency,
+} from '../jenkinsDependencyResolver';
+import {
 	selectQuestionRelevantSummaryExcerpt,
 } from '../summaryAnswerRouting';
 // import * as myExtension from '../../extension';
@@ -785,6 +789,137 @@ suite('Extension Test Suite', () => {
 				(edge) => edge.resolution
 			),
 			['exact', 'inferred']
+		);
+	});
+
+	test('Jenkins SCM Pipeline scriptPath resolves an exact workspace file', () => {
+		const configXml = [
+			'<flow-definition>',
+			'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+			'    <scriptPath>pipelines/billing/Jenkinsfile</scriptPath>',
+			'  </definition>',
+			'</flow-definition>',
+		].join('\n');
+
+		const edge = resolveJenkinsPipelineDependency({
+			configPath:
+				'jenkins/jobs/billing/config.xml',
+			configXml,
+			candidatePaths: [
+				'pipelines/billing/Jenkinsfile',
+				'pipelines/orders/Jenkinsfile',
+			],
+		});
+
+		assert.ok(edge);
+		assert.strictEqual(edge.resolution, 'exact');
+		assert.strictEqual(
+			edge.targetPath,
+			'pipelines/billing/Jenkinsfile'
+		);
+		assert.strictEqual(
+			edge.kind,
+			'jenkins-pipeline-script'
+		);
+	});
+
+	test('Jenkins SCM Pipeline scriptPath resolves a unique suffix as inferred', () => {
+		const configXml = [
+			'<flow-definition>',
+			'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+			'    <scriptPath>ci/Jenkinsfile</scriptPath>',
+			'  </definition>',
+			'</flow-definition>',
+		].join('\n');
+
+		const edge = resolveJenkinsPipelineDependency({
+			configPath: 'jenkins/jobs/app/config.xml',
+			configXml,
+			candidatePaths: [
+				'repositories/app/ci/Jenkinsfile',
+			],
+		});
+
+		assert.ok(edge);
+		assert.strictEqual(edge.resolution, 'inferred');
+		assert.strictEqual(
+			edge.targetPath,
+			'repositories/app/ci/Jenkinsfile'
+		);
+	});
+
+	test('Jenkins SCM Pipeline scriptPath reports ambiguous suffix matches', () => {
+		const configXml = [
+			'<flow-definition>',
+			'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+			'    <scriptPath>ci/Jenkinsfile</scriptPath>',
+			'  </definition>',
+			'</flow-definition>',
+		].join('\n');
+
+		const edge = resolveJenkinsPipelineDependency({
+			configPath: 'jenkins/jobs/app/config.xml',
+			configXml,
+			candidatePaths: [
+				'repositories/app/ci/Jenkinsfile',
+				'repositories/app-copy/ci/Jenkinsfile',
+			],
+		});
+
+		assert.ok(edge);
+		assert.strictEqual(edge.resolution, 'ambiguous');
+		assert.strictEqual(edge.targetPath, undefined);
+		assert.match(
+			edge.evidence[0].detail,
+			/matches multiple workspace files/
+		);
+	});
+
+	test('Jenkins SCM Pipeline scriptPath reports unresolved references', () => {
+		const configXml = [
+			'<flow-definition>',
+			'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+			'    <scriptPath>missing/Jenkinsfile</scriptPath>',
+			'  </definition>',
+			'</flow-definition>',
+		].join('\n');
+
+		const edge = resolveJenkinsPipelineDependency({
+			configPath: 'jenkins/jobs/app/config.xml',
+			configXml,
+			candidatePaths: [
+				'repositories/app/Jenkinsfile',
+			],
+		});
+
+		assert.ok(edge);
+		assert.strictEqual(edge.resolution, 'unresolved');
+		assert.strictEqual(edge.targetPath, undefined);
+	});
+
+	test('Jenkins inline Pipeline definitions do not produce script dependencies', () => {
+		const configXml = [
+			'<flow-definition>',
+			'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition">',
+			'    <script>pipeline { agent any }</script>',
+			'  </definition>',
+			'</flow-definition>',
+		].join('\n');
+
+		assert.strictEqual(
+			extractJenkinsPipelineScriptPath(configXml),
+			undefined
+		);
+		assert.strictEqual(
+			resolveJenkinsPipelineDependency({
+				configPath:
+					'jenkins/jobs/inline/config.xml',
+				configXml,
+				candidatePaths: [
+					'pipelines/Jenkinsfile',
+				],
+			}),
+			undefined
 		);
 	});
 
