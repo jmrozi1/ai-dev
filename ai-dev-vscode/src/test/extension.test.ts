@@ -107,6 +107,9 @@ import {
 	resolveJenkinsPipelineDependency,
 } from '../jenkinsDependencyResolver';
 import {
+	refreshJenkinsDependencyMap,
+} from '../dependencyMapWorkflow';
+import {
 	selectQuestionRelevantSummaryExcerpt,
 } from '../summaryAnswerRouting';
 // import * as myExtension from '../../extension';
@@ -920,6 +923,266 @@ suite('Extension Test Suite', () => {
 				],
 			}),
 			undefined
+		);
+	});
+
+	test('Jenkins dependency refresh persists resolved edges and preserves unrelated edges', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-dependency-refresh-')
+		);
+		const config = await readAiDevConfig(workspaceRoot);
+
+		await fs.mkdir(
+			path.join(
+				workspaceRoot,
+				'jenkins/jobs/billing'
+			),
+			{ recursive: true }
+		);
+		await fs.mkdir(
+			path.join(
+				workspaceRoot,
+				'pipelines/billing'
+			),
+			{ recursive: true }
+		);
+
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'jenkins/jobs/billing/config.xml'
+			),
+			[
+				'<flow-definition>',
+				'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+				'    <scriptPath>pipelines/billing/Jenkinsfile</scriptPath>',
+				'  </definition>',
+				'</flow-definition>',
+			].join('\n'),
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'pipelines/billing/Jenkinsfile'
+			),
+			'pipeline { agent any }',
+			'utf8'
+		);
+
+		await writeDependencyMap(
+			workspaceRoot,
+			config,
+			{
+				version: 1,
+				edges: [
+					{
+						sourcePath: 'addon/MyAddon.toc',
+						targetPath: 'addon/Core.lua',
+						kind: 'wow-toc-load',
+						resolution: 'exact',
+						evidence: [
+							{
+								kind: 'toc-entry',
+								detail:
+									'Core.lua is listed first.',
+							},
+						],
+					},
+				],
+			}
+		);
+
+		const result =
+			await refreshJenkinsDependencyMap(
+				workspaceRoot
+			);
+		const dependencyMap =
+			await readDependencyMap(
+				workspaceRoot,
+				config
+			);
+
+		assert.strictEqual(
+			result.scannedConfigCount,
+			1
+		);
+		assert.strictEqual(result.exactCount, 1);
+		assert.strictEqual(
+			result.dependencyMapPath,
+			'ai-docs/dependency-map.json'
+		);
+		assert.ok(
+			dependencyMap.edges.some(
+				(edge) =>
+					edge.kind
+						=== 'jenkins-pipeline-script'
+					&& edge.targetPath
+						=== 'pipelines/billing/Jenkinsfile'
+			)
+		);
+		assert.ok(
+			dependencyMap.edges.some(
+				(edge) =>
+					edge.kind === 'wow-toc-load'
+			)
+		);
+	});
+
+	test('Jenkins dependency refresh removes stale edges for scanned inline jobs', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-dependency-refresh-')
+		);
+		const config = await readAiDevConfig(workspaceRoot);
+
+		await fs.mkdir(
+			path.join(
+				workspaceRoot,
+				'jenkins/jobs/inline'
+			),
+			{ recursive: true }
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'jenkins/jobs/inline/config.xml'
+			),
+			[
+				'<flow-definition>',
+				'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition">',
+				'    <script>pipeline { agent any }</script>',
+				'  </definition>',
+				'</flow-definition>',
+			].join('\n'),
+			'utf8'
+		);
+
+		await writeDependencyMap(
+			workspaceRoot,
+			config,
+			{
+				version: 1,
+				edges: [
+					{
+						sourcePath:
+							'jenkins/jobs/inline/config.xml',
+						targetPath:
+							'pipelines/old/Jenkinsfile',
+						kind:
+							'jenkins-pipeline-script',
+						resolution: 'exact',
+						evidence: [
+							{
+								kind: 'old-value',
+								detail:
+									'Previously resolved.',
+							},
+						],
+					},
+				],
+			}
+		);
+
+		const result =
+			await refreshJenkinsDependencyMap(
+				workspaceRoot
+			);
+		const dependencyMap =
+			await readDependencyMap(
+				workspaceRoot,
+				config
+			);
+
+		assert.strictEqual(
+			result.skippedCount,
+			1
+		);
+		assert.deepStrictEqual(
+			dependencyMap.edges,
+			[]
+		);
+	});
+
+	test('Jenkins dependency refresh reports ambiguous and unresolved jobs', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-dependency-refresh-')
+		);
+
+		for (const relativePath of [
+			'jenkins/jobs/ambiguous/config.xml',
+			'jenkins/jobs/missing/config.xml',
+			'repositories/a/ci/Jenkinsfile',
+			'repositories/b/ci/Jenkinsfile',
+		]) {
+			await fs.mkdir(
+				path.dirname(
+					path.join(
+						workspaceRoot,
+						relativePath
+					)
+				),
+				{ recursive: true }
+			);
+		}
+
+		const scmConfig = (scriptPath: string) =>
+			[
+				'<flow-definition>',
+				'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+				`    <scriptPath>${scriptPath}</scriptPath>`,
+				'  </definition>',
+				'</flow-definition>',
+			].join('\n');
+
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'jenkins/jobs/ambiguous/config.xml'
+			),
+			scmConfig('ci/Jenkinsfile'),
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'jenkins/jobs/missing/config.xml'
+			),
+			scmConfig('missing/Jenkinsfile'),
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'repositories/a/ci/Jenkinsfile'
+			),
+			'pipeline {}',
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'repositories/b/ci/Jenkinsfile'
+			),
+			'pipeline {}',
+			'utf8'
+		);
+
+		const result =
+			await refreshJenkinsDependencyMap(
+				workspaceRoot
+			);
+
+		assert.strictEqual(
+			result.ambiguousCount,
+			1
+		);
+		assert.strictEqual(
+			result.unresolvedCount,
+			1
+		);
+		assert.strictEqual(
+			result.warnings.length,
+			2
 		);
 	});
 
