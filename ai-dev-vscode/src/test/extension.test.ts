@@ -110,6 +110,9 @@ import {
 	refreshJenkinsDependencyMap,
 } from '../dependencyMapWorkflow';
 import {
+	hydrateSummarizationDependencyContext,
+} from '../summarizationDependencyContext';
+import {
 	selectQuestionRelevantSummaryExcerpt,
 } from '../summaryAnswerRouting';
 // import * as myExtension from '../../extension';
@@ -1363,6 +1366,273 @@ suite('Extension Test Suite', () => {
 		assert.match(
 			prompt,
 			/Use dependency context only when needed/
+		);
+	});
+
+	test('Dependency hydration includes exact files with provenance', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-dependency-context-'
+			)
+		);
+
+		await fs.mkdir(
+			path.join(workspaceRoot, 'pipelines'),
+			{ recursive: true }
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'pipelines/Jenkinsfile'
+			),
+			'pipeline { stage("Build") {} }',
+			'utf8'
+		);
+
+		const result =
+			await hydrateSummarizationDependencyContext({
+				workspaceRoot,
+				dependencyMap: {
+					version: 1,
+					edges: [
+						{
+							sourcePath:
+								'jobs/config.xml',
+							targetPath:
+								'pipelines/Jenkinsfile',
+							kind:
+								'jenkins-pipeline-script',
+							resolution: 'exact',
+							evidence: [
+								{
+									kind:
+										'jenkins-script-path',
+									detail:
+										'Resolved from scriptPath.',
+								},
+							],
+						},
+					],
+				},
+				sourcePaths: ['jobs/config.xml'],
+				resolvedBySource: [
+					{
+						generalInstructions: '',
+						matchingRules: [],
+						combinedInstructions: '',
+						dependencyStrategy: {
+							follow: [
+								'jenkins-pipeline-script',
+							],
+							maxDepth: 1,
+							maxFiles: 4,
+							maxChars: 24000,
+							includeInferred: false,
+						},
+					},
+				],
+			});
+
+		assert.strictEqual(result.files.length, 1);
+		assert.strictEqual(
+			result.files[0].path,
+			'pipelines/Jenkinsfile'
+		);
+		assert.deepStrictEqual(
+			result.files[0].evidence,
+			['Resolved from scriptPath.']
+		);
+		assert.match(
+			result.files[0].contents,
+			/stage\("Build"\)/
+		);
+		assert.deepStrictEqual(result.warnings, []);
+	});
+
+	test('Dependency hydration excludes inferred edges unless enabled', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-dependency-context-'
+			)
+		);
+
+		await fs.writeFile(
+			path.join(workspaceRoot, 'Jenkinsfile'),
+			'pipeline {}',
+			'utf8'
+		);
+
+		const baseResolved = {
+			generalInstructions: '',
+			matchingRules: [],
+			combinedInstructions: '',
+			dependencyStrategy: {
+				follow: [
+					'jenkins-pipeline-script',
+				],
+				maxDepth: 1,
+				maxFiles: 4,
+				maxChars: 24000,
+				includeInferred: false,
+			},
+		};
+
+		const dependencyMap = {
+			version: 1 as const,
+			edges: [
+				{
+					sourcePath: 'jobs/config.xml',
+					targetPath: 'Jenkinsfile',
+					kind:
+						'jenkins-pipeline-script',
+					resolution: 'inferred' as const,
+					evidence: [
+						{
+							kind: 'suffix',
+							detail: 'Unique suffix.',
+						},
+					],
+				},
+			],
+		};
+
+		const excluded =
+			await hydrateSummarizationDependencyContext({
+				workspaceRoot,
+				dependencyMap,
+				sourcePaths: ['jobs/config.xml'],
+				resolvedBySource: [baseResolved],
+			});
+
+		assert.strictEqual(excluded.files.length, 0);
+
+		const included =
+			await hydrateSummarizationDependencyContext({
+				workspaceRoot,
+				dependencyMap,
+				sourcePaths: ['jobs/config.xml'],
+				resolvedBySource: [
+					{
+						...baseResolved,
+						dependencyStrategy: {
+							...baseResolved.dependencyStrategy,
+							includeInferred: true,
+						},
+					},
+				],
+			});
+
+		assert.strictEqual(included.files.length, 1);
+		assert.strictEqual(
+			included.files[0].resolution,
+			'inferred'
+		);
+	});
+
+	test('Dependency hydration reports unresolved and bounded context', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-dependency-context-'
+			)
+		);
+
+		for (const fileName of ['one.txt', 'two.txt']) {
+			await fs.writeFile(
+				path.join(workspaceRoot, fileName),
+				'1234567890',
+				'utf8'
+			);
+		}
+
+		const result =
+			await hydrateSummarizationDependencyContext({
+				workspaceRoot,
+				dependencyMap: {
+					version: 1,
+					edges: [
+						{
+							sourcePath:
+								'jobs/config.xml',
+							kind:
+								'jenkins-pipeline-script',
+							resolution:
+								'unresolved',
+							evidence: [
+								{
+									kind: 'missing',
+									detail:
+										'No Jenkinsfile matched.',
+								},
+							],
+						},
+						...['one.txt', 'two.txt'].map(
+							(targetPath) => ({
+								sourcePath:
+									'jobs/config.xml',
+								targetPath,
+								kind:
+									'jenkins-pipeline-script',
+								resolution:
+									'exact' as const,
+								evidence: [
+									{
+										kind: 'test',
+										detail:
+											`Resolved ${targetPath}.`,
+									},
+								],
+							})
+						),
+					],
+				},
+				sourcePaths: ['jobs/config.xml'],
+				resolvedBySource: [
+					{
+						generalInstructions: '',
+						matchingRules: [],
+						combinedInstructions: '',
+						dependencyStrategy: {
+							follow: [
+								'jenkins-pipeline-script',
+							],
+							maxDepth: 1,
+							maxFiles: 1,
+							maxChars: 5,
+							includeInferred: false,
+						},
+					},
+				],
+			});
+
+		assert.strictEqual(result.files.length, 1);
+		assert.strictEqual(
+			result.files[0].contents.length,
+			5
+		);
+		assert.ok(
+			result.warnings.some(
+				(warning) =>
+					warning.includes(
+						'No Jenkinsfile matched.'
+					)
+			)
+		);
+		assert.ok(
+			result.warnings.some(
+				(warning) =>
+					warning.includes('was clipped')
+			)
+		);
+		assert.ok(
+			result.warnings.some(
+				(warning) =>
+					warning.includes(
+						'limited to 1 file'
+					)
+			)
 		);
 	});
 

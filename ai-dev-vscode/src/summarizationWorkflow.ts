@@ -15,6 +15,12 @@ import {
 	truncateText,
 } from './fileUtilities';
 import {
+	readDependencyMap,
+} from './dependencyMap';
+import {
+	hydrateSummarizationDependencyContext,
+} from './summarizationDependencyContext';
+import {
 	MAX_DIRECT_FILE_CHARS,
 } from './modelContextLimits';
 import {
@@ -874,6 +880,8 @@ export async function executeSummarizationTarget(
 	architectureUpdated: boolean;
 	architectureSkipped?: string;
 	architectureFailed?: string;
+	dependencyFilesIncluded: number;
+	dependencyWarnings: string[];
 	skipped: string[];
 	failed: string[];
 	cancelled: boolean;
@@ -989,6 +997,8 @@ export async function executeSummarizationTarget(
 		architectureFailed: undefined as
 			| string
 			| undefined,
+		dependencyFilesIncluded: 0,
+		dependencyWarnings: [] as string[],
 		skipped: [] as string[],
 		failed: [] as string[],
 		cancelled: false,
@@ -1046,10 +1056,12 @@ export async function executeSummarizationTarget(
 		workflowFileContents,
 		templateFileContents,
 		summarizationConfig,
+		dependencyMap,
 	] = await Promise.all([
 		fs.readFile(workflowAbsolutePath, 'utf8'),
 		fs.readFile(templateAbsolutePath, 'utf8'),
 		readSummarizationConfig(workspaceRoot),
+		readDependencyMap(workspaceRoot, aiDevConfig),
 	]);
 
 	const workflowFilePath = formatRelativePath(
@@ -1158,6 +1170,28 @@ export async function executeSummarizationTarget(
 			const existingSummaryContents =
 				await readOptionalTextFile(outputAbsolutePath);
 
+			const resolvedBySource = sourcePaths.map(
+				(sourcePath) =>
+					resolveSummarizationInstructions(
+						summarizationConfig,
+						sourcePath
+					)
+			);
+
+			const dependencyContext =
+				await hydrateSummarizationDependencyContext({
+					workspaceRoot,
+					dependencyMap,
+					sourcePaths,
+					resolvedBySource,
+				});
+
+			result.dependencyFilesIncluded +=
+				dependencyContext.files.length;
+			result.dependencyWarnings.push(
+				...dependencyContext.warnings
+			);
+
 			const basePrompt =
 				buildGroupedGenerateUnitDocDirectPromptMarkdown({
 					workspaceRoot,
@@ -1174,6 +1208,8 @@ export async function executeSummarizationTarget(
 							)
 							: undefined,
 					selectedSourceFiles,
+					dependencyContextFiles:
+						dependencyContext.files,
 					sourceSetIsAuthoritative: (() => {
 						const allSourcePaths =
 							allConfiguredSourcePathsByDoc.get(
@@ -1187,14 +1223,6 @@ export async function executeSummarizationTarget(
 							);
 					})(),
 				});
-
-			const resolvedBySource = sourcePaths.map(
-				(sourcePath) =>
-					resolveSummarizationInstructions(
-						summarizationConfig,
-						sourcePath
-					)
-			);
 
 			const generalInstructions =
 				resolvedBySource[0]?.generalInstructions ?? '';
