@@ -1186,6 +1186,186 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('Summarization dependency strategies normalize with bounded defaults', () => {
+		const config = normalizeSummarizationConfig({
+			version: 1,
+			generalInstructions: 'General guidance.',
+			rules: [
+				{
+					id: 'jenkins',
+					name: 'Jenkins config',
+					glob: '**/config.xml',
+					priority: 100,
+					enabled: true,
+					instructions:
+						'Explain delegated pipeline behavior.',
+					dependencyStrategy: {
+						follow: [
+							'jenkins-pipeline-script',
+							'jenkins-pipeline-script',
+						],
+					},
+				},
+			],
+		});
+
+		assert.deepStrictEqual(
+			config.rules[0].dependencyStrategy,
+			{
+				follow: [
+					'jenkins-pipeline-script',
+				],
+				maxDepth: 1,
+				maxFiles: 4,
+				maxChars: 24000,
+				includeInferred: false,
+			}
+		);
+	});
+
+	test('Summarization dependency strategy rejects unsupported traversal depth', () => {
+		const config = createDefaultSummarizationConfig();
+
+		config.rules.push({
+			id: 'jenkins',
+			name: 'Jenkins config',
+			glob: '**/config.xml',
+			priority: 100,
+			enabled: true,
+			instructions: 'Explain dependencies.',
+			dependencyStrategy: {
+				follow: [
+					'jenkins-pipeline-script',
+				],
+				maxDepth: 2,
+				maxFiles: 4,
+				maxChars: 24000,
+				includeInferred: false,
+			},
+		});
+
+		const issues =
+			validateSummarizationConfig(config);
+
+		assert.ok(
+			issues.some(
+				(issue) =>
+					issue.field
+					=== 'dependencyStrategy.maxDepth'
+			)
+		);
+	});
+
+	test('Last matching dependency strategy wins', () => {
+		const config = normalizeSummarizationConfig({
+			version: 1,
+			generalInstructions: 'General guidance.',
+			rules: [
+				{
+					id: 'xml',
+					name: 'XML',
+					glob: '**/*.xml',
+					priority: 10,
+					enabled: true,
+					instructions: 'General XML.',
+					dependencyStrategy: {
+						follow: ['xml-reference'],
+						maxDepth: 1,
+						maxFiles: 2,
+						maxChars: 8000,
+						includeInferred: false,
+					},
+				},
+				{
+					id: 'jenkins',
+					name: 'Jenkins',
+					glob: '**/config.xml',
+					priority: 100,
+					enabled: true,
+					instructions: 'Jenkins-specific.',
+					dependencyStrategy: {
+						follow: [
+							'jenkins-pipeline-script',
+						],
+						maxDepth: 1,
+						maxFiles: 4,
+						maxChars: 24000,
+						includeInferred: true,
+					},
+				},
+			],
+		});
+
+		const resolved =
+			resolveSummarizationInstructions(
+				config,
+				'jobs/billing/config.xml'
+			);
+
+		assert.deepStrictEqual(
+			resolved.dependencyStrategy,
+			config.rules[1].dependencyStrategy
+		);
+	});
+
+	test('Grouped summary prompts label resolved dependency context', () => {
+		const prompt =
+			buildGroupedGenerateUnitDocDirectPromptMarkdown({
+				workspaceRoot: '/workspace',
+				workflowFilePath: 'workflow.md',
+				workflowFileContents: 'workflow',
+				templateFilePath: 'template.md',
+				templateFileContents: 'template',
+				targetSummaryPath:
+					'ai-docs/jobs/summary.md',
+				selectedSourceFiles: [
+					{
+						path:
+							'jobs/billing/config.xml',
+						contents:
+							'<scriptPath>ci/Jenkinsfile</scriptPath>',
+					},
+				],
+				dependencyContextFiles: [
+					{
+						primarySourcePath:
+							'jobs/billing/config.xml',
+						path:
+							'repositories/billing/ci/Jenkinsfile',
+						relationshipKind:
+							'jenkins-pipeline-script',
+						resolution: 'exact',
+						evidence: [
+							'Resolved from scriptPath.',
+						],
+						contents:
+							'pipeline { stages { stage("Build") {} } }',
+					},
+				],
+			});
+
+		assert.match(
+			prompt,
+			/Resolved dependency context:/
+		);
+		assert.match(
+			prompt,
+			/Primary source: jobs\/billing\/config\.xml/
+		);
+		assert.match(
+			prompt,
+			/Dependency file: repositories\/billing\/ci\/Jenkinsfile/
+		);
+		assert.match(
+			prompt,
+			/Relationship: jenkins-pipeline-script/
+		);
+		assert.match(
+			prompt,
+			/Use dependency context only when needed/
+		);
+	});
+
 	test('Missing summarization config returns general defaults', async () => {
 		const workspaceRoot = await fs.mkdtemp(
 			path.join(os.tmpdir(), 'ai-dev-summary-config-')

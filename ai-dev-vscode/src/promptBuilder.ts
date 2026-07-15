@@ -65,6 +65,14 @@ export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 		path: string;
 		contents: string;
 	}>;
+	dependencyContextFiles?: Array<{
+		primarySourcePath: string;
+		path: string;
+		relationshipKind: string;
+		resolution: 'exact' | 'inferred';
+		evidence: string[];
+		contents: string;
+	}>;
 	sourceSetIsAuthoritative?: boolean;
 }): string {
 	const {
@@ -76,6 +84,7 @@ export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 		targetSummaryPath,
 		existingSummaryContents,
 		selectedSourceFiles,
+		dependencyContextFiles = [],
 		sourceSetIsAuthoritative = false,
 	} = params;
 
@@ -119,6 +128,35 @@ export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 		lines.push('', 'Source file contents:', sourceFile.path, '', '```text', sourceFile.contents, '```');
 	}
 
+	if (dependencyContextFiles.length > 0) {
+		lines.push(
+			'',
+			'Resolved dependency context:',
+			'Use this context only to explain behavior delegated by the primary source file.'
+		);
+
+		for (
+			const dependencyFile
+			of dependencyContextFiles
+		) {
+			lines.push(
+				'',
+				`Primary source: ${dependencyFile.primarySourcePath}`,
+				`Dependency file: ${dependencyFile.path}`,
+				`Relationship: ${dependencyFile.relationshipKind}`,
+				`Resolution: ${dependencyFile.resolution}`,
+				'Evidence:',
+				...dependencyFile.evidence.map(
+					(evidence) => `- ${evidence}`
+				),
+				'',
+				'```text',
+				dependencyFile.contents,
+				'```'
+			);
+		}
+	}
+
 	lines.push(
 		'',
 		'Instructions:',
@@ -128,7 +166,8 @@ export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 			? 'The selected source files are the complete authoritative current source set for this target summary. Remove entries for source files not in this set.'
 			: 'Preserve useful existing entries for source files not in the selected set unless clearly stale or incorrect.',
 		'Do not generate standalone per-source documentation files.',
-		'Treat provided source file contents as final authority and follow the workflow and template.',
+		'Treat provided primary source file contents as final authority and follow the workflow and template.',
+		'Use dependency context only when needed to explain delegated behavior; do not turn the entry into a dependency-tree summary.',
 		'Return the complete updated contents of the target summary.md file.',
 		'Return raw markdown only.',
 		'Do not wrap the response in ```markdown or any other code fence.',

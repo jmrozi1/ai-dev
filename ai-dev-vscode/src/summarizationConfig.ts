@@ -15,6 +15,14 @@ export const DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS = [
 	'Update the existing scoped summary rather than creating a standalone per-file document.',
 ].join('\n');
 
+export interface SummarizationDependencyStrategy {
+	follow: string[];
+	maxDepth: number;
+	maxFiles: number;
+	maxChars: number;
+	includeInferred: boolean;
+}
+
 export interface SummarizationRule {
 	id: string;
 	name: string;
@@ -22,6 +30,7 @@ export interface SummarizationRule {
 	priority: number;
 	enabled: boolean;
 	instructions: string;
+	dependencyStrategy?: SummarizationDependencyStrategy;
 }
 
 export interface SummarizationConfig {
@@ -40,6 +49,7 @@ export interface ResolvedSummarizationInstructions {
 	generalInstructions: string;
 	matchingRules: SummarizationRule[];
 	combinedInstructions: string;
+	dependencyStrategy?: SummarizationDependencyStrategy;
 }
 
 export function createDefaultSummarizationConfig():
@@ -220,15 +230,125 @@ export function validateSummarizationConfig(
 				message: 'Rule instructions cannot be empty.',
 			});
 		}
+
+		const strategy = rule.dependencyStrategy;
+
+		if (strategy) {
+			if (strategy.follow.length === 0) {
+				issues.push({
+					field: 'dependencyStrategy.follow',
+					ruleId: rule.id,
+					message:
+						'Dependency strategy follow must contain at least one relationship kind.',
+				});
+			}
+
+			if (
+				strategy.follow.some(
+					(kind) => !kind.trim()
+				)
+			) {
+				issues.push({
+					field: 'dependencyStrategy.follow',
+					ruleId: rule.id,
+					message:
+						'Dependency relationship kinds cannot be empty.',
+				});
+			}
+
+			if (strategy.maxDepth !== 1) {
+				issues.push({
+					field: 'dependencyStrategy.maxDepth',
+					ruleId: rule.id,
+					message:
+						'Only direct dependency traversal with maxDepth 1 is currently supported.',
+				});
+			}
+
+			if (
+				!Number.isInteger(strategy.maxFiles)
+				|| strategy.maxFiles < 1
+			) {
+				issues.push({
+					field: 'dependencyStrategy.maxFiles',
+					ruleId: rule.id,
+					message:
+						'Dependency strategy maxFiles must be a positive integer.',
+				});
+			}
+
+			if (
+				!Number.isInteger(strategy.maxChars)
+				|| strategy.maxChars < 1
+			) {
+				issues.push({
+					field: 'dependencyStrategy.maxChars',
+					ruleId: rule.id,
+					message:
+						'Dependency strategy maxChars must be a positive integer.',
+				});
+			}
+		}
 	}
 
 	return issues;
+}
+
+function normalizeDependencyStrategy(
+	value: unknown
+): SummarizationDependencyStrategy | undefined {
+	if (!value || typeof value !== 'object') {
+		return undefined;
+	}
+
+	const raw = value as Partial<
+		SummarizationDependencyStrategy
+	>;
+
+	const follow = Array.isArray(raw.follow)
+		? [
+			...new Set(
+				raw.follow
+					.filter(
+						(kind): kind is string =>
+							typeof kind === 'string'
+							&& kind.trim().length > 0
+					)
+					.map((kind) => kind.trim())
+			),
+		]
+		: [];
+
+	return {
+		follow,
+		maxDepth:
+			typeof raw.maxDepth === 'number'
+				? Math.floor(raw.maxDepth)
+				: 1,
+		maxFiles:
+			typeof raw.maxFiles === 'number'
+				? Math.floor(raw.maxFiles)
+				: 4,
+		maxChars:
+			typeof raw.maxChars === 'number'
+				? Math.floor(raw.maxChars)
+				: 24000,
+		includeInferred:
+			typeof raw.includeInferred === 'boolean'
+				? raw.includeInferred
+				: false,
+	};
 }
 
 function normalizeRule(
 	value: Partial<SummarizationRule>,
 	index: number
 ): SummarizationRule {
+	const dependencyStrategy =
+		normalizeDependencyStrategy(
+			value.dependencyStrategy
+		);
+
 	return {
 		id:
 			typeof value.id === 'string' && value.id.trim()
@@ -254,6 +374,9 @@ function normalizeRule(
 			typeof value.instructions === 'string'
 				? value.instructions.trim()
 				: '',
+		...(dependencyStrategy
+			? { dependencyStrategy }
+			: {}),
 	};
 }
 
@@ -399,9 +522,20 @@ export function resolveSummarizationInstructions(
 		].join('\n')
 	);
 
+	const dependencyStrategy = [
+		...matchingRules,
+	]
+		.reverse()
+		.find(
+			(rule) =>
+				rule.dependencyStrategy !== undefined
+		)
+		?.dependencyStrategy;
+
 	return {
 		generalInstructions: config.generalInstructions,
 		matchingRules,
+		dependencyStrategy,
 		combinedInstructions: [
 			'General summarization instructions:',
 			config.generalInstructions,
