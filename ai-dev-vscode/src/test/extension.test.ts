@@ -53,7 +53,7 @@ import {
 	matchesReviewTarget,
 	selectChangedReviewFiles,
 	selectReviewFiles,
-} from '../extension';
+} from '../projectReview';
 import type {
 	AssistantChatBackend,
 } from '../assistantChatBackend';

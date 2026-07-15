@@ -48,6 +48,9 @@ import {
 } from './architectureSummary';
 import { openSettingsWebview } from './settingsView';
 import {
+	selectReviewFiles,
+} from './projectReview';
+import {
 	AiDevAssistantTerminalManager,
 	type AssistantReviewRequest,
 } from './assistantTerminal';
@@ -3046,119 +3049,6 @@ function isTestFilePath(filePath: string): boolean {
 		|| normalized.includes('.test.')
 		|| normalized.includes('.spec.')
 	);
-}
-
-export function matchesReviewTarget(
-	filePath: string,
-	target?: string
-): boolean {
-	if (!target?.trim()) {
-		return true;
-	}
-
-	const normalizedPath =
-		normalizePathForMarkdown(filePath)
-			.replace(/^\.\//, '');
-
-	const normalizedTarget =
-		normalizePathForMarkdown(target.trim())
-			.replace(/^\.\//, '')
-			.replace(/\/+$/, '');
-
-	if (/[*?\[\]{}]/.test(normalizedTarget)) {
-		return globToRegExp(normalizedTarget).test(
-			normalizedPath
-		);
-	}
-
-	return (
-		normalizedPath === normalizedTarget
-		|| normalizedPath.startsWith(
-			`${normalizedTarget}/`
-		)
-	);
-}
-
-export function selectReviewFiles(params: {
-	candidateFilePaths: string[];
-	mode: 'code' | 'tests';
-	docsDir: string;
-	target?: string;
-	artifactExcludeGlobs?: string[];
-}): {
-	implementationPaths: string[];
-	testPaths: string[];
-	selectedPaths: string[];
-} {
-	const normalizedDocsDir =
-		normalizePathForMarkdown(params.docsDir)
-			.replace(/\/+$/, '');
-
-	const artifactExcludeGlobs =
-		params.artifactExcludeGlobs
-		?? NON_SOURCE_ARTIFACT_EXCLUDE_GLOBS;
-
-	const reviewablePaths = [
-		...new Set(
-			params.candidateFilePaths
-				.map((filePath) =>
-					normalizePathForMarkdown(filePath)
-				)
-				.filter(
-					(filePath) =>
-						filePath !== normalizedDocsDir
-						&& !filePath.startsWith(
-							`${normalizedDocsDir}/`
-						)
-						&& !matchesAnyGlob(
-							filePath,
-							artifactExcludeGlobs
-						)
-						&& matchesReviewTarget(
-							filePath,
-							params.target
-						)
-				)
-		),
-	];
-
-	const implementationPaths =
-		reviewablePaths.filter(
-			(filePath) => !isTestFilePath(filePath)
-		);
-
-	const testPaths =
-		reviewablePaths.filter(isTestFilePath);
-
-	return {
-		implementationPaths,
-		testPaths,
-		selectedPaths:
-			params.mode === 'code'
-				? implementationPaths
-				: reviewablePaths,
-	};
-}
-
-export function selectChangedReviewFiles(params: {
-	changedFilePaths: string[];
-	mode: 'code' | 'tests';
-	docsDir: string;
-	target?: string;
-	artifactExcludeGlobs?: string[];
-}): {
-	implementationPaths: string[];
-	testPaths: string[];
-	selectedPaths: string[];
-} {
-	return selectReviewFiles({
-		candidateFilePaths: params.changedFilePaths,
-		mode: params.mode,
-		docsDir: params.docsDir,
-		target: params.target,
-		artifactExcludeGlobs:
-			params.artifactExcludeGlobs,
-	});
 }
 
 interface ResolvedCodeReviewSelection {
