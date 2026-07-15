@@ -933,6 +933,45 @@ export async function executeSummarizationTarget(
 	const architectureRefreshPlanned =
 		groupedActions.size > 0;
 
+	const allConfiguredSourcePathsByDoc = new Map<
+		string,
+		string[]
+	>();
+
+	const allConfiguredCandidates =
+		await discoverBatchUnitDocCandidates(
+			workspaceRoot,
+			aiDevConfig
+		);
+
+	for (const sourceAbsolutePath of allConfiguredCandidates) {
+		const sourcePath = normalizePathForMarkdown(
+			path.relative(workspaceRoot, sourceAbsolutePath)
+		);
+		const docPath = getExpectedDirectorySummaryPath({
+			workspaceRoot,
+			sourceFilePath: sourceAbsolutePath,
+			docsDir: getConfiguredDocsDir(aiDevConfig),
+		});
+		const existing =
+			allConfiguredSourcePathsByDoc.get(docPath);
+
+		if (existing) {
+			existing.push(sourcePath);
+		} else {
+			allConfiguredSourcePathsByDoc.set(
+				docPath,
+				[sourcePath]
+			);
+		}
+	}
+
+	for (const sourcePaths of allConfiguredSourcePathsByDoc.values()) {
+		sourcePaths.sort((left, right) =>
+			left.localeCompare(right)
+		);
+	}
+
 	const result = {
 		matchedSourceCount: selection.counts.afterGlobFilter,
 		plannedModelCalls:
@@ -1135,6 +1174,18 @@ export async function executeSummarizationTarget(
 							)
 							: undefined,
 					selectedSourceFiles,
+					sourceSetIsAuthoritative: (() => {
+						const allSourcePaths =
+							allConfiguredSourcePathsByDoc.get(
+								docPath
+							) ?? [];
+
+						return allSourcePaths.length === sourcePaths.length
+							&& allSourcePaths.every(
+								(sourcePath, index) =>
+									sourcePath === sourcePaths[index]
+							);
+					})(),
 				});
 
 			const resolvedBySource = sourcePaths.map(

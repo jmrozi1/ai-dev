@@ -89,6 +89,9 @@ import {
 import {
 	buildSummarizationConfigHtml,
 } from '../summarizationConfigPanel';
+import {
+	buildGroupedGenerateUnitDocDirectPromptMarkdown,
+} from '../promptBuilder';
 // import * as myExtension from '../../extension';
 
 async function waitForCondition(
@@ -616,6 +619,68 @@ suite('Extension Test Suite', () => {
 				'**/jobs/**/config.xml'
 			),
 			false
+		);
+	});
+
+	test('Authoritative grouped summary prompts remove stale source entries', () => {
+		const prompt =
+			buildGroupedGenerateUnitDocDirectPromptMarkdown({
+				workspaceRoot: '/workspace',
+				workflowFilePath: 'workflow.md',
+				workflowFileContents: 'workflow',
+				templateFilePath: 'template.md',
+				templateFileContents: 'template',
+				targetSummaryPath: 'ai-docs/src/summary.md',
+				existingSummaryContents: '- stale entry',
+				selectedSourceFiles: [
+					{
+						path: 'src/current.ts',
+						contents:
+							'export const current = true;',
+					},
+				],
+				sourceSetIsAuthoritative: true,
+			});
+
+		assert.match(
+			prompt,
+			/complete authoritative current source set/
+		);
+		assert.match(
+			prompt,
+			/Remove entries for source files not in this set/
+		);
+		assert.doesNotMatch(
+			prompt,
+			/Preserve useful existing entries/
+		);
+	});
+
+	test('Partial grouped summary prompts preserve unselected entries', () => {
+		const prompt =
+			buildGroupedGenerateUnitDocDirectPromptMarkdown({
+				workspaceRoot: '/workspace',
+				workflowFilePath: 'workflow.md',
+				workflowFileContents: 'workflow',
+				templateFilePath: 'template.md',
+				templateFileContents: 'template',
+				targetSummaryPath: 'ai-docs/src/summary.md',
+				selectedSourceFiles: [
+					{
+						path: 'src/current.ts',
+						contents:
+							'export const current = true;',
+					},
+				],
+			});
+
+		assert.match(
+			prompt,
+			/Preserve useful existing entries/
+		);
+		assert.doesNotMatch(
+			prompt,
+			/complete authoritative current source set/
 		);
 	});
 

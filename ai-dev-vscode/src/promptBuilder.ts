@@ -65,6 +65,7 @@ export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 		path: string;
 		contents: string;
 	}>;
+	sourceSetIsAuthoritative?: boolean;
 }): string {
 	const {
 		workspaceRoot,
@@ -75,6 +76,7 @@ export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 		targetSummaryPath,
 		existingSummaryContents,
 		selectedSourceFiles,
+		sourceSetIsAuthoritative = false,
 	} = params;
 
 	const lines = [
@@ -122,7 +124,9 @@ export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 		'Instructions:',
 		'Generate the complete updated markdown for the target summary file.',
 		'Update or add entries for all selected source files in that summary file.',
-		'Preserve useful existing entries for source files not in the selected set unless clearly stale or incorrect.',
+		sourceSetIsAuthoritative
+			? 'The selected source files are the complete authoritative current source set for this target summary. Remove entries for source files not in this set.'
+			: 'Preserve useful existing entries for source files not in the selected set unless clearly stale or incorrect.',
 		'Do not generate standalone per-source documentation files.',
 		'Treat provided source file contents as final authority and follow the workflow and template.',
 		'Return the complete updated contents of the target summary.md file.',
