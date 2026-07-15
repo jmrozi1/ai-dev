@@ -13,7 +13,7 @@ import {
 	getLargeBatchUnitDocRunWarningMessage,
 	normalizeBatchUnitDocFilesThisPass,
 	shouldShowLargeBatchUnitDocRunWarning,
-} from '../batchUnitDocsView';
+} from '../batchUnitDocs';
 import { readAiDevConfig, resolveAiDevCorePath, setAiDevExtensionRootPath } from '../config';
 import {
 	applyTextInput,

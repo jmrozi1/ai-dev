@@ -40,12 +40,12 @@ import {
 	type BatchUnitDocPreviewResult,
 	type BatchUnitDocStatus,
 	type BatchUnitDocsFormState,
-} from './batchUnitDocsView';
+} from './batchUnitDocs';
 import {
 	type ArchitectureSummaryPreviewItem,
 	type ArchitectureSummaryPreviewResult,
 	type ArchitectureSummaryStatus,
-} from './architectureSummaryView';
+} from './architectureSummary';
 import { openSettingsWebview } from './settingsView';
 import {
 	AiDevAssistantTerminalManager,
