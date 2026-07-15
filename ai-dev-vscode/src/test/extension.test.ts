@@ -1997,6 +1997,262 @@ suite('Extension Test Suite', () => {
 	});
 
 
+	test('Automatic project routing surfaces summary evidence warnings', async () => {
+		const outputChunks: string[] = [];
+		const reports: Array<ReturnType<typeof createAssistantReport>> = [];
+		const summaryQuestions: string[] = [];
+		const isolatedPrompts: string[] = [];
+		let chatMessageCount = 0;
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'Routing Warning Model',
+			}),
+			sendMessage: async () => {
+				chatMessageCount += 1;
+				return 'Unexpected chat response';
+			},
+			sendIsolatedMessage: async (prompt) => {
+				isolatedPrompts.push(prompt);
+				return 'The deployment job is deploy-service-x.';
+			},
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend,
+			async (question) => {
+				summaryQuestions.push(question);
+
+				return {
+					prompt: 'summary evidence prompt',
+					warnings: [
+						'Unable to verify the referenced Jenkinsfile.',
+					],
+				};
+			},
+			undefined,
+			undefined,
+			(report) => {
+				reports.push(report);
+			}
+		);
+
+		const writeSubscription =
+			pty.onDidWrite((chunk) => {
+				outputChunks.push(chunk);
+			});
+
+		try {
+			pty.open({ columns: 120, rows: 30 });
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes(
+					'Launched Routing Warning Model'
+				)
+			);
+
+			pty.handleInput(
+				'Where do we deploy the billing service?'
+			);
+			pty.handleInput('\r');
+
+			await waitForCondition(() =>
+				reports.length === 1
+			);
+
+			const output = outputChunks.join('');
+
+			assert.deepStrictEqual(
+				summaryQuestions,
+				['Where do we deploy the billing service?']
+			);
+			assert.deepStrictEqual(
+				isolatedPrompts,
+				['summary evidence prompt']
+			);
+			assert.strictEqual(chatMessageCount, 0);
+			assert.match(
+				output,
+				/WARNING Unable to verify the referenced Jenkinsfile\./
+			);
+			assert.deepStrictEqual(
+				reports[0].warnings,
+				[
+					'Unable to verify the referenced Jenkinsfile.',
+				]
+			);
+		} finally {
+			writeSubscription.dispose();
+			pty.close();
+		}
+	});
+
+	test('Automatic general chat avoids project routing warnings', async () => {
+		const outputChunks: string[] = [];
+		const chatPrompts: string[] = [];
+		let summaryRouteCalled = false;
+		let isolatedMessageCalled = false;
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'General Chat Model',
+			}),
+			sendMessage: async (prompt) => {
+				chatPrompts.push(prompt);
+				return 'Eventual consistency allows temporary divergence.';
+			},
+			sendIsolatedMessage: async () => {
+				isolatedMessageCalled = true;
+				return '';
+			},
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend,
+			async () => {
+				summaryRouteCalled = true;
+
+				return {
+					prompt: 'unexpected summary prompt',
+					warnings: [
+						'Unexpected routing warning.',
+					],
+				};
+			}
+		);
+
+		const writeSubscription =
+			pty.onDidWrite((chunk) => {
+				outputChunks.push(chunk);
+			});
+
+		try {
+			pty.open({ columns: 120, rows: 30 });
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes(
+					'Launched General Chat Model'
+				)
+			);
+
+			pty.handleInput(
+				'What is eventual consistency?'
+			);
+			pty.handleInput('\r');
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes(
+					'Eventual consistency allows temporary divergence.'
+				)
+			);
+
+			const output = outputChunks.join('');
+
+			assert.deepStrictEqual(
+				chatPrompts,
+				['What is eventual consistency?']
+			);
+			assert.strictEqual(summaryRouteCalled, false);
+			assert.strictEqual(
+				isolatedMessageCalled,
+				false
+			);
+			assert.doesNotMatch(
+				output,
+				/Unexpected routing warning/
+			);
+		} finally {
+			writeSubscription.dispose();
+			pty.close();
+		}
+	});
+
+	test('Explicit chat bypasses project routing and warnings', async () => {
+		const outputChunks: string[] = [];
+		const chatPrompts: string[] = [];
+		let summaryRouteCalled = false;
+		let isolatedMessageCalled = false;
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'Explicit Chat Model',
+			}),
+			sendMessage: async (prompt) => {
+				chatPrompts.push(prompt);
+				return 'General Jenkins explanation.';
+			},
+			sendIsolatedMessage: async () => {
+				isolatedMessageCalled = true;
+				return '';
+			},
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend,
+			async () => {
+				summaryRouteCalled = true;
+
+				return {
+					prompt: 'unexpected summary prompt',
+					warnings: [
+						'Unexpected project evidence warning.',
+					],
+				};
+			}
+		);
+
+		const writeSubscription =
+			pty.onDidWrite((chunk) => {
+				outputChunks.push(chunk);
+			});
+
+		try {
+			pty.open({ columns: 120, rows: 30 });
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes(
+					'Launched Explicit Chat Model'
+				)
+			);
+
+			pty.handleInput(
+				'/ask --chat How does our Jenkins pipeline work?'
+			);
+			pty.handleInput('\r');
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes(
+					'General Jenkins explanation.'
+				)
+			);
+
+			const output = outputChunks.join('');
+
+			assert.deepStrictEqual(
+				chatPrompts,
+				['How does our Jenkins pipeline work?']
+			);
+			assert.strictEqual(summaryRouteCalled, false);
+			assert.strictEqual(
+				isolatedMessageCalled,
+				false
+			);
+			assert.doesNotMatch(
+				output,
+				/Unexpected project evidence warning/
+			);
+		} finally {
+			writeSubscription.dispose();
+			pty.close();
+		}
+	});
+
 	test('Settings help is deterministic and does not open settings', async () => {
 		const outputChunks: string[] = [];
 
