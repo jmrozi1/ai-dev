@@ -303,6 +303,33 @@ export function buildSummarizationConfigHtml(
 			gap: 8px;
 		}
 
+		.dependency-section {
+			display: grid;
+			gap: 14px;
+			padding: 14px;
+			border: 1px solid var(--vscode-panel-border);
+			background: var(--vscode-sideBar-background);
+		}
+
+		.dependency-fields {
+			display: grid;
+			grid-template-columns:
+				minmax(0, 1fr)
+				minmax(120px, 0.35fr)
+				minmax(140px, 0.45fr);
+			gap: 12px;
+		}
+
+		.dependency-fields[hidden] {
+			display: none;
+		}
+
+		@media (max-width: 720px) {
+			.dependency-fields {
+				grid-template-columns: 1fr;
+			}
+		}
+
 		.modal-actions {
 			display: flex;
 			gap: 10px;
@@ -481,6 +508,74 @@ export function buildSummarizationConfigHtml(
 				<span>Enabled</span>
 			</label>
 
+			<section
+				id="dependencySection"
+				class="dependency-section"
+			>
+				<label class="checkbox-row">
+					<input
+						id="dependencyEnabled"
+						type="checkbox"
+					>
+					<span>Enable dependency context</span>
+				</label>
+
+				<div
+					id="dependencyFields"
+					class="dependency-fields"
+					hidden
+				>
+					<div class="field">
+						<label for="dependencyKinds">
+							Relationship kinds
+						</label>
+						<input
+							id="dependencyKinds"
+							type="text"
+							placeholder="jenkins-pipeline-script"
+						>
+						<div class="field-note">
+							Comma-separated dependency edge kinds.
+						</div>
+					</div>
+
+					<div class="field">
+						<label for="dependencyMaxFiles">
+							Maximum files
+						</label>
+						<input
+							id="dependencyMaxFiles"
+							type="number"
+							min="1"
+						>
+					</div>
+
+					<div class="field">
+						<label for="dependencyMaxChars">
+							Maximum characters
+						</label>
+						<input
+							id="dependencyMaxChars"
+							type="number"
+							min="1"
+						>
+					</div>
+
+					<label class="checkbox-row">
+						<input
+							id="dependencyIncludeInferred"
+							type="checkbox"
+						>
+						<span>Include inferred matches</span>
+					</label>
+
+					<div class="field-note">
+						Traversal is currently limited to direct
+						dependencies only.
+					</div>
+				</div>
+			</section>
+
 			<div class="field">
 				<label for="ruleInstructions">Instructions</label>
 				<textarea id="ruleInstructions"></textarea>
@@ -537,6 +632,22 @@ export function buildSummarizationConfigHtml(
 			document.getElementById('ruleEnabled');
 		const instructionsInput =
 			document.getElementById('ruleInstructions');
+		const dependencySection =
+			document.getElementById('dependencySection');
+		const dependencyEnabled =
+			document.getElementById('dependencyEnabled');
+		const dependencyFields =
+			document.getElementById('dependencyFields');
+		const dependencyKinds =
+			document.getElementById('dependencyKinds');
+		const dependencyMaxFiles =
+			document.getElementById('dependencyMaxFiles');
+		const dependencyMaxChars =
+			document.getElementById('dependencyMaxChars');
+		const dependencyIncludeInferred =
+			document.getElementById(
+				'dependencyIncludeInferred'
+			);
 		const deleteButton =
 			document.getElementById('deleteRuleButton');
 		const cancelButton =
@@ -668,6 +779,11 @@ export function buildSummarizationConfigHtml(
 			return config.rules.find((rule) => rule.id === key);
 		}
 
+		function updateDependencyFieldsVisibility() {
+			dependencyFields.hidden =
+				!dependencyEnabled.checked;
+		}
+
 		function openEditor(key) {
 			editingKey = key;
 
@@ -694,6 +810,7 @@ export function buildSummarizationConfigHtml(
 			globField.hidden = isGeneral;
 			priorityField.hidden = isGeneral;
 			enabledField.hidden = isGeneral;
+			dependencySection.hidden = isGeneral;
 			deleteButton.hidden = isGeneral;
 			testPatternEnabled.parentElement.hidden = isGeneral;
 			testPatternEnabled.checked = false;
@@ -705,6 +822,27 @@ export function buildSummarizationConfigHtml(
 			priorityInput.value = String(rule.priority);
 			enabledInput.checked = !!rule.enabled;
 			instructionsInput.value = rule.instructions;
+
+			const dependencyStrategy =
+				rule.dependencyStrategy;
+
+			dependencyEnabled.checked =
+				!!dependencyStrategy;
+			dependencyKinds.value =
+				dependencyStrategy
+					? dependencyStrategy.follow.join(', ')
+					: 'jenkins-pipeline-script';
+			dependencyMaxFiles.value = String(
+				dependencyStrategy?.maxFiles ?? 4
+			);
+			dependencyMaxChars.value = String(
+				dependencyStrategy?.maxChars ?? 24000
+			);
+			dependencyIncludeInferred.checked =
+				dependencyStrategy
+					?.includeInferred ?? false;
+
+			updateDependencyFieldsVisibility();
 
 			dialog.showModal();
 			instructionsInput.focus();
@@ -766,6 +904,48 @@ export function buildSummarizationConfigHtml(
 				rule.priority = priority;
 				rule.enabled = enabledInput.checked;
 				rule.instructions = instructions;
+
+				if (dependencyEnabled.checked) {
+					const follow = [
+						...new Set(
+							dependencyKinds.value
+								.split(',')
+								.map((kind) => kind.trim())
+								.filter((kind) => kind.length > 0)
+						),
+					];
+					const maxFiles = Number(
+						dependencyMaxFiles.value
+					);
+					const maxChars = Number(
+						dependencyMaxChars.value
+					);
+
+					if (
+						follow.length === 0
+						|| !Number.isInteger(maxFiles)
+						|| maxFiles < 1
+						|| !Number.isInteger(maxChars)
+						|| maxChars < 1
+					) {
+						setStatus(
+							'Dependency kinds, maximum files, and maximum characters must be valid.',
+							'error'
+						);
+						return;
+					}
+
+					rule.dependencyStrategy = {
+						follow,
+						maxDepth: 1,
+						maxFiles,
+						maxChars,
+						includeInferred:
+							dependencyIncludeInferred.checked,
+					};
+				} else {
+					delete rule.dependencyStrategy;
+				}
 			}
 
 			saveConfig();
@@ -814,6 +994,10 @@ export function buildSummarizationConfigHtml(
 		});
 
 		saveButton.addEventListener('click', saveEditor);
+		dependencyEnabled.addEventListener(
+			'change',
+			updateDependencyFieldsVisibility
+		);
 		deleteButton.addEventListener(
 			'click',
 			deleteEditorRule

@@ -555,6 +555,94 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('Summarization config HTML includes dependency strategy controls', () => {
+		const config = createDefaultSummarizationConfig();
+
+		config.rules.push({
+			id: 'jenkins',
+			name: 'Jenkins',
+			glob: '**/config.xml',
+			priority: 100,
+			enabled: true,
+			instructions: 'Explain the pipeline.',
+			dependencyStrategy: {
+				follow: [
+					'jenkins-pipeline-script',
+				],
+				maxDepth: 1,
+				maxFiles: 4,
+				maxChars: 24000,
+				includeInferred: true,
+			},
+		});
+
+		const html =
+			buildSummarizationConfigHtml(config);
+
+		assert.match(
+			html,
+			/id="dependencyEnabled"/
+		);
+		assert.match(
+			html,
+			/id="dependencyKinds"/
+		);
+		assert.match(
+			html,
+			/id="dependencyMaxFiles"/
+		);
+		assert.match(
+			html,
+			/id="dependencyMaxChars"/
+		);
+		assert.match(
+			html,
+			/id="dependencyIncludeInferred"/
+		);
+		assert.match(
+			html,
+			/jenkins-pipeline-script/
+		);
+	});
+
+	test('Summarization config HTML fixes dependency traversal at depth one', () => {
+		const html = buildSummarizationConfigHtml(
+			createDefaultSummarizationConfig()
+		);
+
+		assert.match(
+			html,
+			/Traversal is currently limited to direct/
+		);
+		assert.match(
+			html,
+			/maxDepth: 1/
+		);
+		assert.doesNotMatch(
+			html,
+			/id="dependencyMaxDepth"/
+		);
+	});
+
+	test('Summarization config HTML removes disabled dependency strategies', () => {
+		const html = buildSummarizationConfigHtml(
+			createDefaultSummarizationConfig()
+		);
+
+		assert.match(
+			html,
+			/delete rule\.dependencyStrategy/
+		);
+		assert.match(
+			html,
+			/updateDependencyFieldsVisibility/
+		);
+		assert.match(
+			html,
+			/dependencySection\.hidden = isGeneral/
+		);
+	});
+
 	test('Summarization config HTML includes live inline pattern testing', () => {
 		const html = buildSummarizationConfigHtml(
 			createDefaultSummarizationConfig()
