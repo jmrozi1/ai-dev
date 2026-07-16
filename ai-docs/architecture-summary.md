@@ -4,7 +4,7 @@
 
 | Path | Read | Contains |
 |---|---|---|
-| `ai-dev-vscode/src/` | `ai-docs/ai-dev-vscode/src/summary.md` | VS Code extension TypeScript source: activation and command wiring, assistant terminal and chat backends, slash-command input handling, prompt construction, settings and report webviews, configuration and summarization rules, source discovery, review/summarization workflows, answer routing, and git/workspace utilities. Route questions about extension behavior, assistant flows, prompt contracts, review or summarization workflows, routing, or configuration handling here. |
+| `ai-dev-vscode/src/` | `ai-docs/ai-dev-vscode/src/summary.md` | VS Code extension TypeScript source: activation and command wiring, assistant terminal and chat backends, slash-command input handling, prompt construction, settings and report webviews, configuration and summarization rules, source discovery, dependency-map workflows, review/summarization workflows, answer routing, and git/workspace utilities. Route questions about extension behavior, assistant flows, prompt contracts, review or summarization workflows, routing, dependency context, or configuration handling here. |
 | `ai-dev-vscode/src/test/` | `ai-docs/ai-dev-vscode/src/test/summary.md` | Extension unit/integration test suite covering config resolution, batch doc limits, assistant input/command parsing, routing, and summarization config workflows. Route questions about expected behavior contracts, regression coverage, or edge cases here. |
 
 ## Unsummarized
