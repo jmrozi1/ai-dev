@@ -6,28 +6,32 @@ Generate or update a compact routing summary for one source unit.
 
 A source unit may be a file, script, module, class, configuration file, addon component, Jenkins job, workflow file, or similar project artifact.
 
-The summary exists to help AI route from a user question to the right source file.
+The summary exists to help AI route from a user question to the right source file while preserving enough stable behavioral context to answer high-level questions efficiently.
 
-The summary does not replace the source file. Source files remain the authority for exact behavior, values, table contents, function bodies, control flow, load order effects, and implementation details.
+The summary does not replace the source file. Source files remain the authority for exact values, table contents, function bodies, detailed control flow, load-order effects, and implementation details.
+
+When supplied dependency context establishes behavior delegated by the primary source, summarize that observable behavior as part of the primary source entry. Do not replace known behavior with instructions to read the dependency file.
 
 ## Routing Model
 
-Generated summaries answer one question:
+Generated summaries answer two closely related questions:
 
 ```text
+What stable responsibility or observable outcome does this source own?
 Should AI read this source file for the current task?
 ```
 
-A good summary should help AI quickly decide:
+A good summary should help AI quickly determine:
 
-* what the source unit owns or defines
+* the source unit's purpose or observable outcome
 * what kinds of questions should route to it
-* whether the source unit is configuration, runtime logic, debug/test code, wiring, framework code, or support code
-* which exact source file to open next
+* whether it is configuration, runtime logic, orchestration, debug/test code, wiring, framework code, or support code
+* meaningful delegated behavior established by supplied dependency context
+* which exact source file or implementation path to inspect for deeper verification
 
-Do not use summaries as human manual pages.
+Do not turn summaries into exhaustive human manual pages.
 
-Do not duplicate source details that will become stale.
+Do not duplicate volatile details that will become stale.
 
 ## Inputs
 
@@ -47,25 +51,37 @@ Create or update the summary entry for the source unit.
 
 The summary entry is intended to be stored in the nearest appropriate `summary.md`, not in a separate per-file documentation file.
 
-The output should be a single compact entry suitable for insertion into a `summary.md` file.
+The output should be one compact entry suitable for insertion into a `summary.md` file.
+
+Ordinary files should normally remain single-line entries. Complex orchestration or behavioral roots may use a short indented block when one sentence would discard important stable purpose, lifecycle, outputs, or side effects.
 
 ## Summary Entry Format
 
-Use this format:
+For ordinary source units, use this format:
 
 ```markdown
-- `<relative/source/path>` — <summary paragraph>
+- `<relative/source/path>` — <purpose or stable responsibility>; read this file for <routing reasons>.
 ```
 
-The summary paragraph should usually be one sentence.
+For a complex source unit whose observable behavior is delegated across supplied dependencies, use a compact behavioral block:
 
-Use semicolons if needed to keep related routing ideas together.
-
-Preferred shape:
-
-```text
-Defines/owns <thing>; read this file for <routing reason>, <routing reason>, and <routing reason>.
+```markdown
+- `<relative/source/path>`
+  - **Purpose:** <stable responsibility or observable outcome>
+  - **Behavior:** <important lifecycle, gates, or delegated work>
+  - **Outputs/side effects:** <meaningful products or state changes>
+  - **Boundaries:** <important stopping points, excluded outcomes, or responsibilities intentionally not performed>
+  - **Configuration:** <important invocation or operating constraints>
+  - **Implementation:** <primary routing paths or symbols>
 ```
+
+Include only the labels that add meaningful information.
+
+Preserve important boundaries when they distinguish the source unit's responsibility, such as building without deploying, promoting without rebuilding, validating without mutating state, or preparing data without publishing it.
+
+Put purpose, observable outcome, and meaningful boundaries first. Put implementation paths last.
+
+Do not substitute “read another file” for behavior already established by supplied dependency context.
 
 Examples:
 
@@ -85,12 +101,13 @@ Use these rough limits:
 
 * tiny/simple/debug file: one short sentence
 * normal file: one sentence with 2–4 routing reasons
-* complex file: one short paragraph, still suitable as a single summary entry
-* unusually large or dense file: one compact paragraph that identifies major ownership areas without paraphrasing implementation
+* complex file: one short paragraph or compact behavioral block
+* orchestration or delegated behavioral root: enough structure to preserve stable purpose, lifecycle, outputs, and side effects
+* unusually large or dense file: a compact entry identifying major ownership areas without paraphrasing implementation line by line
 
-Do not exceed what is needed for routing.
+Do not exceed what is needed for routing and high-level behavioral understanding.
 
-If the source is so complex that a single summary cannot route well, still keep the summary compact and let future specialized artifacts handle deeper analysis.
+If detailed implementation remains necessary, route to the authoritative source after preserving the stable observable behavior already established.
 
 ## Core Rules
 
@@ -99,11 +116,13 @@ If the source is so complex that a single summary cannot route well, still keep 
 * Do not add metadata unless the active workflow consumes it.
 * Do not emit YAML frontmatter.
 * Do not create a standalone per-file doc.
-* Do not duplicate exact source values unless they are essential routing anchors.
+* Do not duplicate volatile exact source values unless they are essential routing or behavioral anchors.
 * Do not list every config entry, spell, coordinate, duration, branch, table row, or helper function.
-* Prefer stable ownership, role, symbols, and routing reasons over volatile values.
+* Prefer stable purpose, observable outcome, ownership, role, symbols, and routing reasons over volatile values.
 * If the source unit configures or populates a shared project symbol, name that symbol.
-* If exact values or exact behavior matter, the answer workflow should read the source file.
+* If exact values or detailed mechanics matter, the answer workflow should verify them against source.
+* Preserve stable high-level behavior established by supplied source and dependency context.
+* Put implementation paths after purpose, behavior, outputs, and side effects.
 * If behavior is inferred, keep the inference modest and label it when needed.
 * If a relationship cannot be confirmed from provided context, do not state it as fact.
 * Keep the entry concise.
@@ -127,8 +146,8 @@ Do not include:
 * generated timestamps
 * source hashes
 * reviewed flags
-* full inputs/outputs
-* full main flow
+* exhaustive inputs/outputs
+* exhaustive control flow
 * exhaustive function/API tables
 * exhaustive edge-case tables
 * operational risks
@@ -178,13 +197,16 @@ Good:
 
 ## Complex Logic File Rules
 
-For complex logic files:
+For complex logic or orchestration files:
 
-* identify the main responsibility of the file
+* identify the main responsibility and observable outcome
 * identify major stable entry points or exported surfaces only when they help routing
-* avoid full control-flow summaries
+* preserve important lifecycle stages, gates, outputs, side effects, and stopping boundaries without paraphrasing every branch
+* state important excluded outcomes when they distinguish the artifact's responsibility
+* synthesize behavior delegated through supplied dependency context
 * avoid listing every helper
-* prefer “read this file for X” over “this file does step 1, step 2, step 3…”
+* do not replace established behavior with “read this file for X”
+* place detailed implementation routing after the behavioral summary
 
 ## Relationship Rules
 
@@ -214,13 +236,15 @@ When a source file changes, update only the affected summary entry unless the fi
 
 ## Quality Bar
 
-A good summary entry helps AI route to the right source file faster than reading the whole tree.
+A good summary entry helps AI route to the right source file faster than reading the whole tree and preserves the stable behavioral reason that the file matters.
 
 The summary is successful if AI can:
 
-* decide whether this source file is relevant
+* identify the source unit's purpose or observable outcome
+* decide whether the source file is relevant
 * understand why it may be relevant
-* know to read the source for exact details
+* answer high-level behavioral questions when supplied context established the answer
+* know when to inspect source for exact values or deeper mechanics
 
 The summary is not successful if it becomes a mini manual, duplicates source, or requires frequent updates for ordinary source value changes.
 
@@ -236,7 +260,9 @@ Do not create metadata the toolchain does not use.
 
 Do not hide uncertainty by inventing relationships.
 
-Do not generate a summary that is longer than necessary for routing.
+Do not generate a summary that is longer than necessary for routing and stable high-level behavioral understanding.
+
+Do not produce an entry that names every implementation file but omits the outcome those files collectively implement.
 
 ## Final Response
 

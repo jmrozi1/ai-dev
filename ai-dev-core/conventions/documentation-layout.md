@@ -76,7 +76,7 @@ Do not include excluded directories, generated docs, editor folders, dependency 
 
 A `summary.md` file describes source files in a directory.
 
-Each entry should help AI route from a user question to likely source files.
+Each entry should help AI route from a user question to likely source files while preserving the source unit's stable purpose or observable outcome.
 
 Example:
 
@@ -121,11 +121,15 @@ Do not put large reverse-dependency lists into ordinary summary entries.
 
 Summary entries should be compact and proportional to source complexity.
 
-Prefer this shape:
+Ordinary files should normally use:
 
 ```text
-<source path> — Defines/owns <stable thing>; read this file for <routing reasons>.
+<source path> — <stable purpose or responsibility>; read this file for <routing reasons>.
 ```
+
+Complex orchestration or behavioral roots may use a short indented block covering purpose, behavior, outputs or side effects, important responsibility boundaries, configuration, and implementation routing.
+
+When dependency context establishes delegated behavior, preserve that behavior in the primary source entry. Also preserve stable stopping boundaries or excluded outcomes when they distinguish the source unit's purpose. Do not merely list the files involved or direct the reader elsewhere.
 
 Do not duplicate volatile source values such as current thresholds, row coordinates, durations, table entries, spell lists, or branch details unless they are essential routing anchors.
 

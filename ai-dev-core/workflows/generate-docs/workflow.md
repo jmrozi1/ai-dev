@@ -8,7 +8,7 @@ The primary generated artifacts are `architecture-summary.md` and directory-leve
 
 `architecture-summary.md` maps source directories to directory summaries so AI can decide which `summary.md` files to read first.
 
-A `summary.md` file maps source files in a directory to short routing summaries so AI can decide which source files to read for a user question.
+A `summary.md` file maps source files in a directory to compact purpose-and-routing summaries so AI can identify relevant files and retain stable high-level behavior.
 
 This workflow does not generate per-file documentation pages by default.
 
@@ -43,13 +43,16 @@ A directory summary should contain entries like:
 - `configs/retributionConfig.lua` — Defines `SR.specConfigs["Retribution"]`; read this file for Ret spell layout, row/group placement, display conditions, and defensive buff-gating rules.
 Core Rules
 Treat source files as final authority.
-Use summaries for routing only.
+Use summaries for routing and stable high-level behavioral context.
 Do not duplicate volatile source values.
 Do not create standalone per-file docs by default.
 Do not emit metadata unless a workflow consumes it.
 Do not use hashes, timestamps, or reviewed flags unless tooling consumes them.
 Keep summaries compact and proportional to file complexity.
-Exact source values should be read from source, not copied into summaries.
+Preserve stable purpose, observable outcomes, meaningful lifecycle stages, outputs, side effects, and responsibility boundaries when established by supplied source or dependency context.
+State important excluded outcomes when they distinguish what an orchestration artifact does from what it deliberately does not do.
+Put implementation paths after behavioral meaning.
+Exact volatile source values should be read from source, not copied into summaries.
 Preserve useful existing summary entries unless clearly stale.
 Remove or update stale summary entries when files move, are deleted, or change role.
 Generate or Update Summary Entries
@@ -100,9 +103,10 @@ Quality Bar
 Generated summaries are successful when AI can:
 
 identify likely source files from a user question
-understand why a file may be relevant
+understand the stable purpose or observable outcome of a relevant source unit
+retain high-level behavior delegated through supplied dependencies
 avoid reading the whole repository by default
-know when to inspect source for exact details
+know when to inspect source for exact values or deeper mechanics
 
 Generated summaries are not successful when they:
 

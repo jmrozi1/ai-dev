@@ -72,13 +72,15 @@ Do not create a finding when:
 
 ### 2. Summary quality
 
-A useful summary entry should be compact and routing-focused.
+A useful summary entry should be compact, purpose-first, and routing-focused.
 
-It should usually answer:
+An ordinary entry should usually answer:
 
 ```text
-<source path> — Defines/owns <stable thing>; read this file for <routing reasons>.
+<source path> — <stable purpose or responsibility>; read this file for <routing reasons>.
 ```
+
+A complex orchestration or behavioral root may use a short structured block when a one-line entry would discard stable lifecycle, outputs, side effects, responsibility boundaries, or behavior established through supplied dependencies.
 
 Flag summary entries that:
 
@@ -86,7 +88,10 @@ Flag summary entries that:
 * are misleading
 * are bloated with source paraphrase
 * duplicate volatile values
-* fail to identify the file’s stable role
+* fail to identify the file’s stable purpose, role, or observable outcome
+* list implementation files while omitting the behavior they collectively implement
+* omit an important stopping boundary or excluded outcome that materially distinguishes the artifact's responsibility
+* replace behavior already established by dependency context with “read another file”
 * fail to include important stable project symbols when those symbols are needed for routing
 
 Do not require polished prose.
