@@ -109,6 +109,9 @@ import {
 	resolveJenkinsPipelineDependency,
 } from '../jenkinsDependencyResolver';
 import {
+	resolveDelegatedFileDependencies,
+} from '../delegatedFileDependencyResolver';
+import {
 	getJenkinsDependencyResolverScope,
 	isJenkinsConfigInResolverScope,
 	refreshJenkinsDependencyMap,
@@ -1025,6 +1028,180 @@ suite('Extension Test Suite', () => {
 				],
 			}),
 			undefined
+		);
+	});
+
+	test('Delegated resolver discovers Jenkins shell script commands', () => {
+		const edges =
+			resolveDelegatedFileDependencies({
+				sourcePath:
+					'demo/pipelines/build.jenkins',
+				sourceContents: [
+					"sh 'chmod +x scripts/build.sh'",
+					"sh './scripts/build.sh'",
+				].join('\n'),
+				candidatePaths: [
+					'demo/scripts/build.sh',
+				],
+			});
+
+		assert.strictEqual(edges.length, 1);
+		assert.strictEqual(
+			edges[0].kind,
+			'shell-command-script'
+		);
+		assert.strictEqual(
+			edges[0].resolution,
+			'inferred'
+		);
+		assert.strictEqual(
+			edges[0].targetPath,
+			'demo/scripts/build.sh'
+		);
+	});
+
+	test('Delegated resolver discovers literal shell source dependencies', () => {
+		const edges =
+			resolveDelegatedFileDependencies({
+				sourcePath:
+					'demo/scripts/ci/build-release.sh',
+				sourceContents: [
+					'source config/build.env',
+					'source scripts/lib/quality-gates.sh',
+					'source scripts/lib/package-release.sh',
+				].join('\n'),
+				candidatePaths: [
+					'demo/config/build.env',
+					'demo/scripts/lib/quality-gates.sh',
+					'demo/scripts/lib/package-release.sh',
+				],
+			});
+
+		assert.deepStrictEqual(
+			edges.map((edge) => [
+				edge.kind,
+				edge.targetPath,
+				edge.resolution,
+			]),
+			[
+				[
+					'shell-source',
+					'demo/config/build.env',
+					'inferred',
+				],
+				[
+					'shell-source',
+					'demo/scripts/lib/quality-gates.sh',
+					'inferred',
+				],
+				[
+					'shell-source',
+					'demo/scripts/lib/package-release.sh',
+					'inferred',
+				],
+			]
+		);
+	});
+
+	test('Jenkins dependency refresh recursively resolves delegated files', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-recursive-dependencies-'
+			)
+		);
+
+		await fs.writeFile(
+			path.join(workspaceRoot, '.ai-dev.yaml'),
+			[
+				'dependencyResolvers:',
+				'  jenkinsConfigInclude:',
+				'    - "jobs/**/config.xml"',
+			].join('\n'),
+			'utf8'
+		);
+
+		const files: Record<string, string> = {
+			'jobs/build/config.xml': [
+				'<flow-definition>',
+				'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+				'    <scriptPath>pipelines/build.jenkins</scriptPath>',
+				'  </definition>',
+				'</flow-definition>',
+			].join('\n'),
+			'repository/pipelines/build.jenkins':
+				"sh './scripts/ci/build-release.sh'",
+			'repository/scripts/ci/build-release.sh': [
+				'source config/build.env',
+				'source scripts/lib/quality-gates.sh',
+			].join('\n'),
+			'repository/config/build.env':
+				'APP_NAME=demo',
+			'repository/scripts/lib/quality-gates.sh':
+				'run_quality_gates() { true; }',
+		};
+
+		for (
+			const [relativePath, contents]
+			of Object.entries(files)
+		) {
+			const absolutePath =
+				path.join(
+					workspaceRoot,
+					relativePath
+				);
+
+			await fs.mkdir(
+				path.dirname(absolutePath),
+				{ recursive: true }
+			);
+			await fs.writeFile(
+				absolutePath,
+				contents,
+				'utf8'
+			);
+		}
+
+		await refreshJenkinsDependencyMap(
+			workspaceRoot
+		);
+
+		const config =
+			await readAiDevConfig(workspaceRoot);
+		const dependencyMap =
+			await readDependencyMap(
+				workspaceRoot,
+				config
+			);
+
+		assert.deepStrictEqual(
+			dependencyMap.edges.map((edge) => [
+				edge.kind,
+				edge.sourcePath,
+				edge.targetPath,
+			]),
+			[
+				[
+					'jenkins-pipeline-script',
+					'jobs/build/config.xml',
+					'repository/pipelines/build.jenkins',
+				],
+				[
+					'shell-command-script',
+					'repository/pipelines/build.jenkins',
+					'repository/scripts/ci/build-release.sh',
+				],
+				[
+					'shell-source',
+					'repository/scripts/ci/build-release.sh',
+					'repository/config/build.env',
+				],
+				[
+					'shell-source',
+					'repository/scripts/ci/build-release.sh',
+					'repository/scripts/lib/quality-gates.sh',
+				],
+			]
 		);
 	});
 

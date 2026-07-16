@@ -12,6 +12,11 @@ import {
 	resolveJenkinsPipelineDependency,
 } from './jenkinsDependencyResolver';
 import {
+	SHELL_COMMAND_SCRIPT_EDGE_KIND,
+	SHELL_SOURCE_EDGE_KIND,
+	resolveDelegatedFileDependencies,
+} from './delegatedFileDependencyResolver';
+import {
 	discoverBatchUnitDocCandidates,
 	parseYamlList,
 } from './sourceDiscovery';
@@ -200,13 +205,136 @@ export async function refreshJenkinsDependencyMap(
 		}
 	}
 
+	const delegatedEdgeKinds = new Set([
+		SHELL_COMMAND_SCRIPT_EDGE_KIND,
+		SHELL_SOURCE_EDGE_KIND,
+	]);
+	const candidateByPath = new Map(
+		candidatePaths.map((relativePath, index) => [
+			relativePath,
+			candidateAbsolutePaths[index],
+		])
+	);
+	const pendingDelegatedFiles: Array<{
+		relativePath: string;
+		depth: number;
+	}> = generatedEdges
+		.filter(
+			(edge) =>
+				(edge.resolution === 'exact'
+					|| edge.resolution === 'inferred')
+				&& edge.targetPath
+		)
+		.map((edge) => ({
+			relativePath:
+				normalizePathForMarkdown(
+					edge.targetPath as string
+				),
+			depth: 1,
+		}));
+	const visitedDelegatedPaths =
+		new Set<string>();
+	const maxDelegatedDepth = 5;
+	const maxDelegatedFiles = 100;
+	let delegatedFileCount = 0;
+
+	while (
+		pendingDelegatedFiles.length > 0
+		&& delegatedFileCount < maxDelegatedFiles
+	) {
+		const current =
+			pendingDelegatedFiles.shift();
+
+		if (
+			!current
+			|| current.depth > maxDelegatedDepth
+			|| visitedDelegatedPaths.has(
+				current.relativePath
+			)
+		) {
+			continue;
+		}
+
+		visitedDelegatedPaths.add(
+			current.relativePath
+		);
+
+		const absolutePath =
+			candidateByPath.get(
+				current.relativePath
+			);
+
+		if (!absolutePath) {
+			continue;
+		}
+
+		let sourceContents: string;
+
+		try {
+			sourceContents = await fs.readFile(
+				absolutePath,
+				'utf8'
+			);
+		} catch (error) {
+			const message =
+				error instanceof Error
+					? error.message
+					: String(error);
+
+			warnings.push(
+				`${current.relativePath}: failed to read delegated dependency source: ${message}`
+			);
+			continue;
+		}
+
+		delegatedFileCount += 1;
+
+		const delegatedEdges =
+			resolveDelegatedFileDependencies({
+				sourcePath:
+					current.relativePath,
+				sourceContents,
+				candidatePaths,
+			});
+
+		generatedEdges.push(
+			...delegatedEdges
+		);
+
+		for (const edge of delegatedEdges) {
+			if (
+				(edge.resolution !== 'exact'
+					&& edge.resolution
+						!== 'inferred')
+				|| !edge.targetPath
+			) {
+				continue;
+			}
+
+			pendingDelegatedFiles.push({
+				relativePath:
+					normalizePathForMarkdown(
+						edge.targetPath
+					),
+				depth: current.depth + 1,
+			});
+		}
+	}
+
 	const preservedEdges = existingMap.edges.filter(
 		(edge) => {
 			if (
 				edge.kind
 					!== JENKINS_PIPELINE_SCRIPT_EDGE_KIND
+				&& !delegatedEdgeKinds.has(
+					edge.kind
+				)
 			) {
 				return true;
+			}
+
+			if (delegatedEdgeKinds.has(edge.kind)) {
+				return false;
 			}
 
 			return failedConfigPaths.has(
