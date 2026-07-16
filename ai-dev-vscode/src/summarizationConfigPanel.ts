@@ -540,6 +540,21 @@ export function buildSummarizationConfigHtml(
 					</div>
 
 					<div class="field">
+						<label for="dependencyMaxDepth">
+							Maximum depth
+						</label>
+						<input
+							id="dependencyMaxDepth"
+							type="number"
+							min="1"
+							max="10"
+						>
+						<div class="field-note">
+							Depth 1 includes direct dependencies.
+						</div>
+					</div>
+
+					<div class="field">
 						<label for="dependencyMaxFiles">
 							Maximum files
 						</label>
@@ -570,8 +585,9 @@ export function buildSummarizationConfigHtml(
 					</label>
 
 					<div class="field-note">
-						Traversal is currently limited to direct
-						dependencies only.
+						Relationship kinds select the first hop.
+						Downstream resolved dependencies are followed
+						until the configured depth or budget is reached.
 					</div>
 				</div>
 			</section>
@@ -640,6 +656,8 @@ export function buildSummarizationConfigHtml(
 			document.getElementById('dependencyFields');
 		const dependencyKinds =
 			document.getElementById('dependencyKinds');
+		const dependencyMaxDepth =
+			document.getElementById('dependencyMaxDepth');
 		const dependencyMaxFiles =
 			document.getElementById('dependencyMaxFiles');
 		const dependencyMaxChars =
@@ -832,6 +850,9 @@ export function buildSummarizationConfigHtml(
 				dependencyStrategy
 					? dependencyStrategy.follow.join(', ')
 					: 'jenkins-pipeline-script';
+			dependencyMaxDepth.value = String(
+				dependencyStrategy?.maxDepth ?? 1
+			);
 			dependencyMaxFiles.value = String(
 				dependencyStrategy?.maxFiles ?? 4
 			);
@@ -914,6 +935,9 @@ export function buildSummarizationConfigHtml(
 								.filter((kind) => kind.length > 0)
 						),
 					];
+					const maxDepth = Number(
+						dependencyMaxDepth.value
+					);
 					const maxFiles = Number(
 						dependencyMaxFiles.value
 					);
@@ -923,13 +947,16 @@ export function buildSummarizationConfigHtml(
 
 					if (
 						follow.length === 0
+						|| !Number.isInteger(maxDepth)
+						|| maxDepth < 1
+						|| maxDepth > 10
 						|| !Number.isInteger(maxFiles)
 						|| maxFiles < 1
 						|| !Number.isInteger(maxChars)
 						|| maxChars < 1
 					) {
 						setStatus(
-							'Dependency kinds, maximum files, and maximum characters must be valid.',
+							'Dependency kinds, maximum depth, maximum files, and maximum characters must be valid.',
 							'error'
 						);
 						return;
@@ -937,7 +964,7 @@ export function buildSummarizationConfigHtml(
 
 					rule.dependencyStrategy = {
 						follow,
-						maxDepth: 1,
+						maxDepth,
 						maxFiles,
 						maxChars,
 						includeInferred:

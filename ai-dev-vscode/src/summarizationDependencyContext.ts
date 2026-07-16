@@ -39,7 +39,6 @@ export async function hydrateSummarizationDependencyContext(
 ): Promise<SummarizationDependencyContextResult> {
 	const files: SummarizationDependencyContextFile[] = [];
 	const warnings: string[] = [];
-	const includedEdgeKeys = new Set<string>();
 
 	for (
 		let sourceIndex = 0;
@@ -58,147 +57,216 @@ export async function hydrateSummarizationDependencyContext(
 			continue;
 		}
 
-		const edges = findOutgoingDependencyEdges(
-			params.dependencyMap,
-			primarySourcePath,
+		const pending: Array<{
+			sourcePath: string;
+			depth: number;
+			firstHop: boolean;
+		}> = [
 			{
-				kinds: strategy.follow,
-				includeInferred:
-					strategy.includeInferred,
-				includeUnresolved: true,
-			}
-		);
-
-		for (const edge of edges) {
-			if (
-				edge.resolution === 'ambiguous'
-				|| edge.resolution === 'unresolved'
-			) {
-				warnings.push(
-					`${primarySourcePath}: ${edge.evidence
-						.map((evidence) =>
-							evidence.detail
-						)
-						.join(' ')}`
-				);
-			}
-		}
+				sourcePath: primarySourcePath,
+				depth: 0,
+				firstHop: true,
+			},
+		];
+		const visitedTraversalPaths =
+			new Set<string>();
+		const includedDependencyPaths =
+			new Set<string>();
 
 		let includedFileCount = 0;
 		let includedChars = 0;
+		let fileLimitWarningAdded = false;
+		let charLimitWarningAdded = false;
 
-		for (const edge of edges) {
-			if (
-				edge.resolution === 'ambiguous'
-				|| edge.resolution === 'unresolved'
-			) {
-				continue;
-			}
+		while (pending.length > 0) {
+			const current = pending.shift();
 
-			if (!edge.targetPath) {
-				warnings.push(
-					`${primarySourcePath}: ${edge.kind} edge has no target path.`
-				);
-				continue;
-			}
-
-			const dependencyPath =
-				normalizePathForMarkdown(
-					edge.targetPath
-				);
-			const edgeKey = [
-				primarySourcePath,
-				dependencyPath,
-				edge.kind,
-			].join('\0');
-
-			if (includedEdgeKeys.has(edgeKey)) {
-				continue;
-			}
-
-			if (
-				includedFileCount
-				>= strategy.maxFiles
-			) {
-				warnings.push(
-					`${primarySourcePath}: dependency context was limited to ${strategy.maxFiles} file(s).`
-				);
+			if (!current) {
 				break;
 			}
 
-			const remainingChars =
-				strategy.maxChars - includedChars;
-
-			if (remainingChars <= 0) {
-				warnings.push(
-					`${primarySourcePath}: dependency context reached the ${strategy.maxChars}-character limit.`
-				);
-				break;
-			}
-
-			const dependencyAbsolutePath =
-				path.resolve(
-					params.workspaceRoot,
-					dependencyPath
-				);
-
 			if (
-				!isPathInsideDirectory(
-					dependencyAbsolutePath,
-					params.workspaceRoot
+				current.depth >= strategy.maxDepth
+				|| visitedTraversalPaths.has(
+					current.sourcePath
 				)
 			) {
-				warnings.push(
-					`${primarySourcePath}: dependency target is outside the workspace: ${dependencyPath}`
-				);
 				continue;
 			}
 
-			let contents: string;
+			visitedTraversalPaths.add(
+				current.sourcePath
+			);
 
-			try {
-				contents = await fs.readFile(
-					dependencyAbsolutePath,
-					'utf8'
-				);
-			} catch (error) {
-				const message =
-					error instanceof Error
-						? error.message
-						: String(error);
+			const edges = findOutgoingDependencyEdges(
+				params.dependencyMap,
+				current.sourcePath,
+				{
+					...(current.firstHop
+						? { kinds: strategy.follow }
+						: {}),
+					includeInferred:
+						strategy.includeInferred,
+					includeUnresolved: true,
+				}
+			);
 
-				warnings.push(
-					`${primarySourcePath}: unable to read dependency ${dependencyPath}: ${message}`
-				);
-				continue;
+			for (const edge of edges) {
+				if (
+					edge.resolution === 'ambiguous'
+					|| edge.resolution === 'unresolved'
+				) {
+					warnings.push(
+						`${current.sourcePath}: ${edge.evidence
+							.map((evidence) =>
+								evidence.detail
+							)
+							.join(' ')}`
+					);
+				}
 			}
 
-			const clippedContents =
-				contents.slice(0, remainingChars);
+			for (const edge of edges) {
+				if (
+					edge.resolution === 'ambiguous'
+					|| edge.resolution === 'unresolved'
+				) {
+					continue;
+				}
 
-			if (
-				clippedContents.length
-				< contents.length
-			) {
-				warnings.push(
-					`${primarySourcePath}: dependency ${dependencyPath} was clipped to the remaining ${remainingChars} characters.`
+				if (!edge.targetPath) {
+					warnings.push(
+						`${current.sourcePath}: ${edge.kind} edge has no target path.`
+					);
+					continue;
+				}
+
+				const dependencyPath =
+					normalizePathForMarkdown(
+						edge.targetPath
+					);
+				const dependencyDepth =
+					current.depth + 1;
+
+				if (
+					includedDependencyPaths.has(
+						dependencyPath
+					)
+				) {
+					continue;
+				}
+
+				if (
+					includedFileCount
+						>= strategy.maxFiles
+				) {
+					if (!fileLimitWarningAdded) {
+						warnings.push(
+							`${primarySourcePath}: dependency context was limited to ${strategy.maxFiles} file(s).`
+						);
+						fileLimitWarningAdded = true;
+					}
+					break;
+				}
+
+				const remainingChars =
+					strategy.maxChars
+					- includedChars;
+
+				if (remainingChars <= 0) {
+					if (!charLimitWarningAdded) {
+						warnings.push(
+							`${primarySourcePath}: dependency context reached the ${strategy.maxChars}-character limit.`
+						);
+						charLimitWarningAdded = true;
+					}
+					break;
+				}
+
+				const dependencyAbsolutePath =
+					path.resolve(
+						params.workspaceRoot,
+						dependencyPath
+					);
+
+				if (
+					!isPathInsideDirectory(
+						dependencyAbsolutePath,
+						params.workspaceRoot
+					)
+				) {
+					warnings.push(
+						`${current.sourcePath}: dependency target is outside the workspace: ${dependencyPath}`
+					);
+					continue;
+				}
+
+				let contents: string;
+
+				try {
+					contents = await fs.readFile(
+						dependencyAbsolutePath,
+						'utf8'
+					);
+				} catch (error) {
+					const message =
+						error instanceof Error
+							? error.message
+							: String(error);
+
+					warnings.push(
+						`${current.sourcePath}: unable to read dependency ${dependencyPath}: ${message}`
+					);
+					continue;
+				}
+
+				const clippedContents =
+					contents.slice(
+						0,
+						remainingChars
+					);
+
+				if (
+					clippedContents.length
+						< contents.length
+				) {
+					warnings.push(
+						`${primarySourcePath}: dependency ${dependencyPath} was clipped to the remaining ${remainingChars} characters.`
+					);
+				}
+
+				files.push({
+					primarySourcePath,
+					path: dependencyPath,
+					relationshipKind: edge.kind,
+					resolution: edge.resolution,
+					evidence: edge.evidence.map(
+						(evidence) =>
+							evidence.detail
+					),
+					contents: clippedContents,
+				});
+
+				includedDependencyPaths.add(
+					dependencyPath
 				);
+				includedFileCount += 1;
+				includedChars +=
+					clippedContents.length;
+
+				if (
+					dependencyDepth
+						< strategy.maxDepth
+				) {
+					pending.push({
+						sourcePath:
+							dependencyPath,
+						depth:
+							dependencyDepth,
+						firstHop: false,
+					});
+				}
 			}
-
-			files.push({
-				primarySourcePath,
-				path: dependencyPath,
-				relationshipKind: edge.kind,
-				resolution: edge.resolution,
-				evidence: edge.evidence.map(
-					(evidence) => evidence.detail
-				),
-				contents: clippedContents,
-			});
-
-			includedEdgeKeys.add(edgeKey);
-			includedFileCount += 1;
-			includedChars += clippedContents.length;
 		}
 	}
 

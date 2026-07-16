@@ -256,12 +256,16 @@ export function validateSummarizationConfig(
 				});
 			}
 
-			if (strategy.maxDepth !== 1) {
+			if (
+				!Number.isInteger(strategy.maxDepth)
+				|| strategy.maxDepth < 1
+				|| strategy.maxDepth > 10
+			) {
 				issues.push({
 					field: 'dependencyStrategy.maxDepth',
 					ruleId: rule.id,
 					message:
-						'Only direct dependency traversal with maxDepth 1 is currently supported.',
+						'Dependency strategy maxDepth must be an integer from 1 through 10.',
 				});
 			}
 

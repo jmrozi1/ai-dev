@@ -617,22 +617,26 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
-	test('Summarization config HTML fixes dependency traversal at depth one', () => {
+	test('Summarization config HTML exposes bounded dependency depth', () => {
 		const html = buildSummarizationConfigHtml(
 			createDefaultSummarizationConfig()
 		);
 
 		assert.match(
 			html,
-			/Traversal is currently limited to direct/
+			/id="dependencyMaxDepth"/
 		);
 		assert.match(
 			html,
-			/maxDepth: 1/
+			/Depth 1 includes direct dependencies/
+		);
+		assert.match(
+			html,
+			/maxDepth/
 		);
 		assert.doesNotMatch(
 			html,
-			/id="dependencyMaxDepth"/
+			/limited to direct/
 		);
 	});
 
@@ -1863,7 +1867,7 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
-	test('Summarization dependency strategy rejects unsupported traversal depth', () => {
+	test('Summarization dependency strategy accepts bounded recursive depth', () => {
 		const config = createDefaultSummarizationConfig();
 
 		config.rules.push({
@@ -1877,18 +1881,22 @@ suite('Extension Test Suite', () => {
 				follow: [
 					'jenkins-pipeline-script',
 				],
-				maxDepth: 2,
-				maxFiles: 4,
+				maxDepth: 3,
+				maxFiles: 8,
 				maxChars: 24000,
 				includeInferred: false,
 			},
 		});
 
-		const issues =
-			validateSummarizationConfig(config);
+		assert.deepStrictEqual(
+			validateSummarizationConfig(config),
+			[]
+		);
+
+		config.rules[0].dependencyStrategy!.maxDepth = 11;
 
 		assert.ok(
-			issues.some(
+			validateSummarizationConfig(config).some(
 				(issue) =>
 					issue.field
 					=== 'dependencyStrategy.maxDepth'
@@ -2196,6 +2204,232 @@ suite('Extension Test Suite', () => {
 			/stage\("Build"\)/
 		);
 		assert.deepStrictEqual(result.warnings, []);
+	});
+
+	test('Dependency hydration follows downstream relationship kinds to configured depth', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-recursive-context-'
+			)
+		);
+
+		const files: Record<string, string> = {
+			'pipelines/build.jenkins':
+				"sh './scripts/build.sh'",
+			'scripts/build.sh':
+				'source scripts/lib/package.sh',
+			'scripts/lib/package.sh':
+				'package_release() { true; }',
+		};
+
+		for (
+			const [relativePath, contents]
+			of Object.entries(files)
+		) {
+			const absolutePath =
+				path.join(
+					workspaceRoot,
+					relativePath
+				);
+
+			await fs.mkdir(
+				path.dirname(absolutePath),
+				{ recursive: true }
+			);
+			await fs.writeFile(
+				absolutePath,
+				contents,
+				'utf8'
+			);
+		}
+
+		const dependencyMap = {
+			version: 1 as const,
+			edges: [
+				{
+					sourcePath:
+						'jobs/config.xml',
+					targetPath:
+						'pipelines/build.jenkins',
+					kind:
+						'jenkins-pipeline-script',
+					resolution:
+						'exact' as const,
+					evidence: [
+						{
+							kind: 'jenkins',
+							detail:
+								'Resolved Jenkins pipeline.',
+						},
+					],
+				},
+				{
+					sourcePath:
+						'pipelines/build.jenkins',
+					targetPath:
+						'scripts/build.sh',
+					kind:
+						'shell-command-script',
+					resolution:
+						'exact' as const,
+					evidence: [
+						{
+							kind: 'shell',
+							detail:
+								'Invokes build script.',
+						},
+					],
+				},
+				{
+					sourcePath:
+						'scripts/build.sh',
+					targetPath:
+						'scripts/lib/package.sh',
+					kind: 'shell-source',
+					resolution:
+						'exact' as const,
+					evidence: [
+						{
+							kind: 'source',
+							detail:
+								'Sources package library.',
+						},
+					],
+				},
+			],
+		};
+
+		const result =
+			await hydrateSummarizationDependencyContext({
+				workspaceRoot,
+				dependencyMap,
+				sourcePaths: ['jobs/config.xml'],
+				resolvedBySource: [
+					{
+						generalInstructions: '',
+						matchingRules: [],
+						combinedInstructions: '',
+						dependencyStrategy: {
+							follow: [
+								'jenkins-pipeline-script',
+							],
+							maxDepth: 3,
+							maxFiles: 8,
+							maxChars: 24000,
+							includeInferred: false,
+						},
+					},
+				],
+			});
+
+		assert.deepStrictEqual(
+			result.files.map((file) => [
+				file.path,
+				file.relationshipKind,
+			]),
+			[
+				[
+					'pipelines/build.jenkins',
+					'jenkins-pipeline-script',
+				],
+				[
+					'scripts/build.sh',
+					'shell-command-script',
+				],
+				[
+					'scripts/lib/package.sh',
+					'shell-source',
+				],
+			]
+		);
+		assert.ok(
+			result.files.every(
+				(file) =>
+					file.primarySourcePath
+					=== 'jobs/config.xml'
+			)
+		);
+		assert.deepStrictEqual(result.warnings, []);
+	});
+
+	test('Dependency hydration stops at configured depth', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-recursive-context-'
+			)
+		);
+
+		for (const relativePath of [
+			'one.txt',
+			'two.txt',
+		]) {
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					relativePath
+				),
+				relativePath,
+				'utf8'
+			);
+		}
+
+		const result =
+			await hydrateSummarizationDependencyContext({
+				workspaceRoot,
+				dependencyMap: {
+					version: 1,
+					edges: [
+						{
+							sourcePath: 'root.txt',
+							targetPath: 'one.txt',
+							kind: 'root-edge',
+							resolution: 'exact',
+							evidence: [
+								{
+									kind: 'test',
+									detail: 'First hop.',
+								},
+							],
+						},
+						{
+							sourcePath: 'one.txt',
+							targetPath: 'two.txt',
+							kind: 'nested-edge',
+							resolution: 'exact',
+							evidence: [
+								{
+									kind: 'test',
+									detail: 'Second hop.',
+								},
+							],
+						},
+					],
+				},
+				sourcePaths: ['root.txt'],
+				resolvedBySource: [
+					{
+						generalInstructions: '',
+						matchingRules: [],
+						combinedInstructions: '',
+						dependencyStrategy: {
+							follow: ['root-edge'],
+							maxDepth: 1,
+							maxFiles: 8,
+							maxChars: 24000,
+							includeInferred: false,
+						},
+					},
+				],
+			});
+
+		assert.deepStrictEqual(
+			result.files.map(
+				(file) => file.path
+			),
+			['one.txt']
+		);
 	});
 
 	test('Dependency hydration excludes inferred edges unless enabled', async () => {
