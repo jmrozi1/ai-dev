@@ -119,6 +119,8 @@ import {
 	hydrateSummarizationDependencyContext,
 } from '../summarizationDependencyContext';
 import {
+	parseRoutedDocumentationReferences,
+	resolveRoutedDocumentationPath,
 	selectQuestionRelevantSummaryExcerpt,
 } from '../summaryAnswerRouting';
 import {
@@ -2472,6 +2474,108 @@ suite('Extension Test Suite', () => {
 		assert.match(
 			prompt,
 			/When summaries and verified source disagree/
+		);
+	});
+
+	test('Summary routing parses architecture table references', () => {
+		const markdown = [
+			'# Architecture Summary',
+			'',
+			'## Summaries',
+			'',
+			'| Path | Read | Contains |',
+			'|---|---|---|',
+			'| `jobs/demo-build-app/` | `ai-docs/jobs/demo-build-app/summary.md` | Build job behavior. |',
+		].join('\n');
+
+		assert.deepStrictEqual(
+			parseRoutedDocumentationReferences(
+				markdown
+			),
+			[
+				{
+					label:
+						'| `jobs/demo-build-app/` | `ai-docs/jobs/demo-build-app/summary.md` | Build job behavior. |',
+					target:
+						'ai-docs/jobs/demo-build-app/summary.md',
+				},
+			]
+		);
+	});
+
+	test('Summary routing ignores expected summaries in the unsummarized section', () => {
+		const markdown = [
+			'# Architecture Summary',
+			'',
+			'## Summaries',
+			'',
+			'| Path | Read | Contains |',
+			'|---|---|---|',
+			'| `jobs/` | `ai-docs/jobs/summary.md` | Jenkins jobs. |',
+			'',
+			'## Unsummarized',
+			'',
+			'| Path | Expected Summary | Status |',
+			'|---|---|---|',
+			'| `demo-cicd/` | `ai-docs/demo-cicd/summary.md` | Missing summary. |',
+		].join('\n');
+
+		assert.deepStrictEqual(
+			parseRoutedDocumentationReferences(
+				markdown
+			),
+			[
+				{
+					label:
+						'| `jobs/` | `ai-docs/jobs/summary.md` | Jenkins jobs. |',
+					target:
+						'ai-docs/jobs/summary.md',
+				},
+			]
+		);
+	});
+
+	test('Summary routing preserves ordinary Markdown links', () => {
+		assert.deepStrictEqual(
+			parseRoutedDocumentationReferences(
+				'[Jobs](jobs/summary.md)'
+			),
+			[
+				{
+					label: 'Jobs',
+					target: 'jobs/summary.md',
+				},
+			]
+		);
+	});
+
+	test('Summary routing resolves workspace-relative ai-docs paths', () => {
+		assert.strictEqual(
+			resolveRoutedDocumentationPath({
+				workspaceRoot: '/workspace',
+				docsDirAbsolutePath:
+					'/workspace/ai-docs',
+				baseFilePath:
+					'/workspace/ai-docs/architecture-summary.md',
+				rawTarget:
+					'ai-docs/jobs/demo-build-app/summary.md',
+			}),
+			'/workspace/ai-docs/jobs/demo-build-app/summary.md'
+		);
+	});
+
+	test('Summary routing resolves child-relative Markdown paths', () => {
+		assert.strictEqual(
+			resolveRoutedDocumentationPath({
+				workspaceRoot: '/workspace',
+				docsDirAbsolutePath:
+					'/workspace/ai-docs',
+				baseFilePath:
+					'/workspace/ai-docs/jobs/summary.md',
+				rawTarget:
+					'build/summary.md',
+			}),
+			'/workspace/ai-docs/jobs/build/summary.md'
 		);
 	});
 

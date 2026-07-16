@@ -56,29 +56,86 @@ interface DiscoveredSummaryFile {
 	score: number;
 }
 
-interface ParsedMarkdownLink {
+interface ParsedDocumentationReference {
 	label: string;
 	target: string;
 }
 
-function parseMarkdownLinks(markdown: string): ParsedMarkdownLink[] {
-	const links: ParsedMarkdownLink[] = [];
-	const regex = /\[([^\]]*)\]\(([^)]+)\)/g;
-	let match: RegExpExecArray | null;
-	while ((match = regex.exec(markdown)) !== null) {
-		const label = match[1]?.trim();
-		const target = match[2]?.trim();
-		if (!target) {
+export function parseRoutedDocumentationReferences(
+	markdown: string
+): ParsedDocumentationReference[] {
+	const references: ParsedDocumentationReference[] = [];
+	const seenTargets = new Set<string>();
+
+	const pushReference = (
+		label: string,
+		target: string
+	): void => {
+		const trimmedTarget = target.trim();
+
+		if (
+			!trimmedTarget
+			|| seenTargets.has(trimmedTarget)
+		) {
+			return;
+		}
+
+		seenTargets.add(trimmedTarget);
+		references.push({
+			label: label.trim(),
+			target: trimmedTarget,
+		});
+	};
+
+	const markdownLinkRegex =
+		/\[([^\]]*)\]\(([^)]+)\)/g;
+	let markdownLinkMatch: RegExpExecArray | null;
+
+	while (
+		(markdownLinkMatch =
+			markdownLinkRegex.exec(markdown)) !== null
+	) {
+		pushReference(
+			markdownLinkMatch[1] ?? '',
+			markdownLinkMatch[2] ?? ''
+		);
+	}
+
+	let currentLevelTwoHeading = '';
+
+	for (const line of markdown.split(/\r?\n/)) {
+		const levelTwoHeadingMatch =
+			/^##\s+(.+?)\s*$/.exec(line);
+
+		if (levelTwoHeadingMatch) {
+			currentLevelTwoHeading =
+				levelTwoHeadingMatch[1]
+					?.trim()
+					.toLowerCase()
+					?? '';
 			continue;
 		}
 
-		links.push({
-			label: label ?? '',
-			target,
-		});
+		if (currentLevelTwoHeading !== 'summaries') {
+			continue;
+		}
+
+		const backtickedPathRegex =
+			/`([^`\r\n]+\.md(?:[?#][^`\r\n]*)?)`/g;
+		let pathMatch: RegExpExecArray | null;
+
+		while (
+			(pathMatch =
+				backtickedPathRegex.exec(line)) !== null
+		) {
+			pushReference(
+				line,
+				pathMatch[1] ?? ''
+			);
+		}
 	}
 
-	return links;
+	return references;
 }
 
 function tokenizeQuestionForRouting(question: string): string[] {
@@ -291,14 +348,20 @@ async function selectFallbackDiscoveredSummaries(params: {
 	return candidates.slice(0, Math.min(2, params.maxSummaries));
 }
 
-function resolveLinkedMarkdownPath(params: {
+export function resolveRoutedDocumentationPath(params: {
 	workspaceRoot: string;
 	docsDirAbsolutePath: string;
 	baseFilePath: string;
 	rawTarget: string;
 }): string | undefined {
-	const { workspaceRoot, docsDirAbsolutePath, baseFilePath, rawTarget } = params;
+	const {
+		workspaceRoot,
+		docsDirAbsolutePath,
+		baseFilePath,
+		rawTarget,
+	} = params;
 	const trimmed = rawTarget.trim();
+
 	if (trimmed.length === 0) {
 		return undefined;
 	}
@@ -311,18 +374,62 @@ function resolveLinkedMarkdownPath(params: {
 		return undefined;
 	}
 
-	const targetWithoutFragment = trimmed.split('#', 1)[0] ?? '';
-	const targetWithoutQuery = targetWithoutFragment.split('?', 1)[0] ?? '';
-	if (!targetWithoutQuery.toLowerCase().endsWith('.md')) {
+	const targetWithoutFragment =
+		trimmed.split('#', 1)[0] ?? '';
+	const targetWithoutQuery =
+		targetWithoutFragment.split('?', 1)[0] ?? '';
+
+	if (
+		!targetWithoutQuery
+			.toLowerCase()
+			.endsWith('.md')
+	) {
 		return undefined;
 	}
 
-	const absolutePath = path.resolve(path.dirname(baseFilePath), targetWithoutQuery);
-	if (!isPathInsideDirectory(absolutePath, workspaceRoot)) {
+	const normalizedTarget =
+		normalizePathForMarkdown(
+			targetWithoutQuery
+		).replace(/^\.\/+/, '');
+	const docsDirRelativePath =
+		normalizePathForMarkdown(
+			path.relative(
+				workspaceRoot,
+				docsDirAbsolutePath
+			)
+		);
+
+	const targetIsWorkspaceRelative =
+		normalizedTarget === docsDirRelativePath
+		|| normalizedTarget.startsWith(
+			`${docsDirRelativePath}/`
+		);
+
+	const absolutePath = targetIsWorkspaceRelative
+		? path.resolve(
+			workspaceRoot,
+			normalizedTarget
+		)
+		: path.resolve(
+			path.dirname(baseFilePath),
+			normalizedTarget
+		);
+
+	if (
+		!isPathInsideDirectory(
+			absolutePath,
+			workspaceRoot
+		)
+	) {
 		return undefined;
 	}
 
-	if (!isPathInsideDirectory(absolutePath, docsDirAbsolutePath)) {
+	if (
+		!isPathInsideDirectory(
+			absolutePath,
+			docsDirAbsolutePath
+		)
+	) {
 		return undefined;
 	}
 
@@ -387,10 +494,10 @@ async function collectRoutedDocumentationContextForAnswer(params: {
 			break;
 		}
 
-		const parsedLinks = parseMarkdownLinks(currentSummary.contents)
+		const parsedLinks = parseRoutedDocumentationReferences(currentSummary.contents)
 			.map((link) => ({
 				...link,
-				resolvedPath: resolveLinkedMarkdownPath({
+				resolvedPath: resolveRoutedDocumentationPath({
 					workspaceRoot: params.workspaceRoot,
 					docsDirAbsolutePath: params.docsDirAbsolutePath,
 					baseFilePath: currentSummary.absolutePath,
