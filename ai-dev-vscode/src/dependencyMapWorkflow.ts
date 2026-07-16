@@ -13,10 +13,14 @@ import {
 } from './jenkinsDependencyResolver';
 import {
 	discoverBatchUnitDocCandidates,
+	parseYamlList,
 } from './sourceDiscovery';
 import {
 	readAiDevConfig,
 } from './config';
+import {
+	matchesAnyGlob,
+} from './pathMatching';
 import {
 	normalizePathForMarkdown,
 } from './workspace';
@@ -39,6 +43,62 @@ export interface DependencyMapPreflightResult {
 	warnings: string[];
 }
 
+export interface JenkinsDependencyResolverScope {
+	includeGlobs: string[];
+	excludeGlobs: string[];
+}
+
+export function getJenkinsDependencyResolverScope(
+	config: { raw: string }
+): JenkinsDependencyResolverScope {
+	return {
+		includeGlobs: parseYamlList(
+			config.raw,
+			'dependencyResolvers',
+			'jenkinsConfigInclude'
+		),
+		excludeGlobs: parseYamlList(
+			config.raw,
+			'dependencyResolvers',
+			'jenkinsConfigExclude'
+		),
+	};
+}
+
+export function isJenkinsConfigInResolverScope(
+	relativePath: string,
+	scope: JenkinsDependencyResolverScope
+): boolean {
+	const normalizedPath =
+		normalizePathForMarkdown(relativePath);
+
+	if (!isJenkinsConfigPath(normalizedPath)) {
+		return false;
+	}
+
+	if (
+		scope.includeGlobs.length > 0
+		&& !matchesAnyGlob(
+			normalizedPath,
+			scope.includeGlobs
+		)
+	) {
+		return false;
+	}
+
+	if (
+		scope.excludeGlobs.length > 0
+		&& matchesAnyGlob(
+			normalizedPath,
+			scope.excludeGlobs
+		)
+	) {
+		return false;
+	}
+
+	return true;
+}
+
 export function isJenkinsConfigPath(
 	relativePath: string
 ): boolean {
@@ -59,6 +119,8 @@ export async function refreshJenkinsDependencyMap(
 	workspaceRoot: string
 ): Promise<DependencyMapRefreshResult> {
 	const config = await readAiDevConfig(workspaceRoot);
+	const resolverScope =
+		getJenkinsDependencyResolverScope(config);
 	const candidateAbsolutePaths =
 		await discoverBatchUnitDocCandidates(
 			workspaceRoot,
@@ -78,7 +140,10 @@ export async function refreshJenkinsDependencyMap(
 			relativePath: candidatePaths[index],
 		}))
 		.filter((candidate) =>
-			isJenkinsConfigPath(candidate.relativePath)
+			isJenkinsConfigInResolverScope(
+				candidate.relativePath,
+				resolverScope
+			)
 		)
 		.sort((left, right) =>
 			left.relativePath.localeCompare(

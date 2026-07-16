@@ -108,6 +108,8 @@ import {
 	resolveJenkinsPipelineDependency,
 } from '../jenkinsDependencyResolver';
 import {
+	getJenkinsDependencyResolverScope,
+	isJenkinsConfigInResolverScope,
 	refreshJenkinsDependencyMap,
 	refreshJenkinsDependencyMapForSummarization,
 	shouldRefreshJenkinsDependencyMap,
@@ -1017,6 +1019,159 @@ suite('Extension Test Suite', () => {
 				],
 			}),
 			undefined
+		);
+	});
+
+	test('Jenkins resolver scope parses include and exclude globs', () => {
+		const scope =
+			getJenkinsDependencyResolverScope({
+				raw: [
+					'dependencyResolvers:',
+					'  jenkinsConfigInclude:',
+					'    - "jobs/**/config.xml"',
+					'    - "tools/jenkins/jobs/**/config.xml"',
+					'  jenkinsConfigExclude:',
+					'    - "**/external-context/**"',
+					'    - "**/fixtures/**"',
+				].join('\n'),
+			});
+
+		assert.deepStrictEqual(scope, {
+			includeGlobs: [
+				'jobs/**/config.xml',
+				'tools/jenkins/jobs/**/config.xml',
+			],
+			excludeGlobs: [
+				'**/external-context/**',
+				'**/fixtures/**',
+			],
+		});
+	});
+
+	test('Jenkins resolver scope applies includes before excludes', () => {
+		const scope = {
+			includeGlobs: [
+				'jobs/**/config.xml',
+				'demo-cicd/**/jobs/**/config.xml',
+			],
+			excludeGlobs: [
+				'**/external-context/**',
+			],
+		};
+
+		assert.strictEqual(
+			isJenkinsConfigInResolverScope(
+				'jobs/demo-build-app/config.xml',
+				scope
+			),
+			true
+		);
+		assert.strictEqual(
+			isJenkinsConfigInResolverScope(
+				'demo-cicd/external-context/jenkins/jobs/demo-build-app/config.xml',
+				scope
+			),
+			false
+		);
+		assert.strictEqual(
+			isJenkinsConfigInResolverScope(
+				'demo-cicd/pipelines/build-app.jenkins',
+				scope
+			),
+			false
+		);
+	});
+
+	test('Jenkins dependency refresh honors resolver-specific config scope', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-dependency-scope-'
+			)
+		);
+
+		await fs.writeFile(
+			path.join(workspaceRoot, '.ai-dev.yaml'),
+			[
+				'dependencyResolvers:',
+				'  jenkinsConfigInclude:',
+				'    - "jobs/**/config.xml"',
+				'  jenkinsConfigExclude:',
+				'    - "**/fixtures/**"',
+			].join('\n'),
+			'utf8'
+		);
+
+		for (const relativePath of [
+			'jobs/real/config.xml',
+			'jobs/fixtures/copy/config.xml',
+			'demo-cicd/tools/jenkins/jobs/copy/config.xml',
+			'demo-cicd/pipelines/build-app.jenkins',
+		]) {
+			await fs.mkdir(
+				path.dirname(
+					path.join(
+						workspaceRoot,
+						relativePath
+					)
+				),
+				{ recursive: true }
+			);
+		}
+
+		const configXml = [
+			'<flow-definition>',
+			'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+			'    <scriptPath>pipelines/build-app.jenkins</scriptPath>',
+			'  </definition>',
+			'</flow-definition>',
+		].join('\n');
+
+		for (const relativePath of [
+			'jobs/real/config.xml',
+			'jobs/fixtures/copy/config.xml',
+			'demo-cicd/tools/jenkins/jobs/copy/config.xml',
+		]) {
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					relativePath
+				),
+				configXml,
+				'utf8'
+			);
+		}
+
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'demo-cicd/pipelines/build-app.jenkins'
+			),
+			'pipeline {}',
+			'utf8'
+		);
+
+		const result =
+			await refreshJenkinsDependencyMap(
+				workspaceRoot
+			);
+		const config =
+			await readAiDevConfig(workspaceRoot);
+		const dependencyMap =
+			await readDependencyMap(
+				workspaceRoot,
+				config
+			);
+
+		assert.strictEqual(
+			result.scannedConfigCount,
+			1
+		);
+		assert.deepStrictEqual(
+			dependencyMap.edges.map(
+				(edge) => edge.sourcePath
+			),
+			['jobs/real/config.xml']
 		);
 	});
 
