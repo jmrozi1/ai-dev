@@ -1082,6 +1082,133 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('Jenkins dependency refresh removes stale edges outside resolver scope', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-dependency-scope-'
+			)
+		);
+
+		await fs.writeFile(
+			path.join(workspaceRoot, '.ai-dev.yaml'),
+			[
+				'dependencyResolvers:',
+				'  jenkinsConfigInclude:',
+				'    - "jobs/**/config.xml"',
+			].join('\n'),
+			'utf8'
+		);
+
+		await fs.mkdir(
+			path.join(workspaceRoot, 'jobs/real'),
+			{ recursive: true }
+		);
+		await fs.mkdir(
+			path.join(
+				workspaceRoot,
+				'demo-cicd/pipelines'
+			),
+			{ recursive: true }
+		);
+
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'jobs/real/config.xml'
+			),
+			[
+				'<flow-definition>',
+				'  <definition class="org.jenkinsci.plugins.workflow.cps.CpsScmFlowDefinition">',
+				'    <scriptPath>pipelines/build-app.jenkins</scriptPath>',
+				'  </definition>',
+				'</flow-definition>',
+			].join('\n'),
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'demo-cicd/pipelines/build-app.jenkins'
+			),
+			'pipeline {}',
+			'utf8'
+		);
+
+		const config =
+			await readAiDevConfig(workspaceRoot);
+
+		await writeDependencyMap(
+			workspaceRoot,
+			config,
+			{
+				version: 1,
+				edges: [
+					{
+						sourcePath:
+							'demo-cicd/external-context/jobs/copy/config.xml',
+						targetPath:
+							'demo-cicd/pipelines/build-app.jenkins',
+						kind:
+							'jenkins-pipeline-script',
+						resolution: 'inferred',
+						evidence: [
+							{
+								kind: 'old',
+								detail:
+									'Previously in scope.',
+							},
+						],
+					},
+					{
+						sourcePath:
+							'addon/MyAddon.toc',
+						targetPath:
+							'addon/Core.lua',
+						kind: 'wow-toc-load',
+						resolution: 'exact',
+						evidence: [
+							{
+								kind: 'toc-entry',
+								detail:
+									'Unrelated resolver edge.',
+							},
+						],
+					},
+				],
+			}
+		);
+
+		await refreshJenkinsDependencyMap(
+			workspaceRoot
+		);
+
+		const dependencyMap =
+			await readDependencyMap(
+				workspaceRoot,
+				config
+			);
+
+		assert.deepStrictEqual(
+			dependencyMap.edges.map(
+				(edge) => [
+					edge.kind,
+					edge.sourcePath,
+				]
+			),
+			[
+				[
+					'wow-toc-load',
+					'addon/MyAddon.toc',
+				],
+				[
+					'jenkins-pipeline-script',
+					'jobs/real/config.xml',
+				],
+			]
+		);
+	});
+
 	test('Jenkins dependency refresh honors resolver-specific config scope', async () => {
 		const workspaceRoot = await fs.mkdtemp(
 			path.join(

@@ -154,6 +154,7 @@ export async function refreshJenkinsDependencyMap(
 	const existingMap =
 		await readDependencyMap(workspaceRoot, config);
 	const scannedConfigPaths = new Set<string>();
+	const failedConfigPaths = new Set<string>();
 	const generatedEdges: DependencyEdge[] = [];
 	const warnings: string[] = [];
 
@@ -170,6 +171,9 @@ export async function refreshJenkinsDependencyMap(
 			);
 		} catch (error) {
 			failedCount += 1;
+			failedConfigPaths.add(
+				candidate.relativePath
+			);
 			const message =
 				error instanceof Error
 					? error.message
@@ -197,16 +201,20 @@ export async function refreshJenkinsDependencyMap(
 	}
 
 	const preservedEdges = existingMap.edges.filter(
-		(edge) =>
-			!(
+		(edge) => {
+			if (
 				edge.kind
-					=== JENKINS_PIPELINE_SCRIPT_EDGE_KIND
-				&& scannedConfigPaths.has(
-					normalizePathForMarkdown(
-						edge.sourcePath
-					)
+					!== JENKINS_PIPELINE_SCRIPT_EDGE_KIND
+			) {
+				return true;
+			}
+
+			return failedConfigPaths.has(
+				normalizePathForMarkdown(
+					edge.sourcePath
 				)
-			)
+			);
+		}
 	);
 
 	const mergedEdges = sortDependencyEdges([
