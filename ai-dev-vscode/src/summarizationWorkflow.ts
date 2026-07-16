@@ -30,6 +30,7 @@ import {
 	matchesAnyGlob,
 } from './pathMatching';
 import {
+	appendDependencyContextToDirectPromptMarkdown,
 	buildGenerateArchitectureSummaryDirectPromptMarkdown,
 	buildGroupedGenerateUnitDocDirectPromptMarkdown,
 } from './promptBuilder';
@@ -1488,14 +1489,42 @@ export async function prepareSingleFileSummary(
 			bundle.selectedSourcePath
 		);
 
+	const dependencyMapPreflight =
+		await refreshJenkinsDependencyMapForSummarization(
+			workspaceRoot,
+			[bundle.selectedSourcePath]
+		);
+
+	const dependencyMap = await readDependencyMap(
+		workspaceRoot,
+		aiDevConfig
+	);
+
+	const dependencyContext =
+		await hydrateSummarizationDependencyContext({
+			workspaceRoot,
+			dependencyMap,
+			sourcePaths: [bundle.selectedSourcePath],
+			resolvedBySource: [resolvedInstructions],
+		});
+
+	const enrichedPrompt =
+		appendDependencyContextToDirectPromptMarkdown(
+			bundle.directPromptMarkdown,
+			dependencyContext.files
+		);
+
 	return {
 		prompt: injectSummarizationInstructions(
-			bundle.directPromptMarkdown,
+			enrichedPrompt,
 			resolvedInstructions
 		),
 		sourcePath: bundle.selectedSourcePath,
 		outputPath: bundle.expectedSummaryPath,
-		warnings: [],
+		warnings: [
+			...dependencyMapPreflight.warnings,
+			...dependencyContext.warnings,
+		],
 	};
 }
 

@@ -53,6 +53,65 @@ export function buildUnitDocPromptMarkdown(params: {
 	].join('\n');
 }
 
+export interface DirectPromptDependencyContextFile {
+	primarySourcePath: string;
+	path: string;
+	relationshipKind: string;
+	resolution: 'exact' | 'inferred';
+	evidence: string[];
+	contents: string;
+}
+
+export function appendDependencyContextToDirectPromptMarkdown(
+	prompt: string,
+	dependencyContextFiles: DirectPromptDependencyContextFile[]
+): string {
+	if (dependencyContextFiles.length === 0) {
+		return prompt;
+	}
+
+	const marker = '\nInstructions:\n';
+	const markerIndex = prompt.lastIndexOf(marker);
+
+	if (markerIndex < 0) {
+		throw new Error(
+			'Direct summarization prompt is missing its Instructions section.'
+		);
+	}
+
+	const dependencyLines = [
+		'',
+		'Resolved dependency context:',
+		'Use this context only to explain behavior delegated by the primary source file.',
+	];
+
+	for (const dependencyFile of dependencyContextFiles) {
+		dependencyLines.push(
+			'',
+			`Primary source: ${dependencyFile.primarySourcePath}`,
+			`Dependency file: ${dependencyFile.path}`,
+			`Relationship: ${dependencyFile.relationshipKind}`,
+			`Resolution: ${dependencyFile.resolution}`,
+			'Evidence:',
+			...dependencyFile.evidence.map(
+				(evidence) => `- ${evidence}`
+			),
+			'',
+			'```text',
+			dependencyFile.contents,
+			'```'
+		);
+	}
+
+	dependencyLines.push('');
+
+	return [
+		prompt.slice(0, markerIndex),
+		dependencyLines.join('\n'),
+		prompt.slice(markerIndex),
+	].join('');
+}
+
 export function buildGroupedGenerateUnitDocDirectPromptMarkdown(params: {
 	workspaceRoot: string;
 	workflowFilePath: string;

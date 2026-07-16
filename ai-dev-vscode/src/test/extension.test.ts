@@ -90,6 +90,7 @@ import {
 	buildSummarizationConfigHtml,
 } from '../summarizationConfigPanel';
 import {
+	appendDependencyContextToDirectPromptMarkdown,
 	buildGroupedGenerateUnitDocDirectPromptMarkdown,
 } from '../promptBuilder';
 import {
@@ -1479,6 +1480,117 @@ suite('Extension Test Suite', () => {
 		assert.deepStrictEqual(
 			resolved.dependencyStrategy,
 			config.rules[1].dependencyStrategy
+		);
+	});
+
+	test('Direct summary prompts include resolved dependency context before instructions', () => {
+		const prompt =
+			appendDependencyContextToDirectPromptMarkdown(
+				[
+					'AI Dev direct task: generate-unit-doc',
+					'',
+					'Source file contents:',
+					'jobs/demo-build-app/config.xml',
+					'',
+					'```text',
+					'<scriptPath>pipelines/build-app.jenkins</scriptPath>',
+					'```',
+					'',
+					'Instructions:',
+					'Generate the complete updated markdown.',
+				].join('\n'),
+				[
+					{
+						primarySourcePath:
+							'jobs/demo-build-app/config.xml',
+						path:
+							'demo-cicd/pipelines/build-app.jenkins',
+						relationshipKind:
+							'jenkins-pipeline-script',
+						resolution: 'inferred',
+						evidence: [
+							'Resolved by unique workspace suffix.',
+						],
+						contents:
+							'pipeline { stage("Build and Test") {} }',
+					},
+				]
+			);
+
+		assert.match(
+			prompt,
+			/Resolved dependency context:/
+		);
+		assert.match(
+			prompt,
+			/Dependency file: demo-cicd\/pipelines\/build-app\.jenkins/
+		);
+		assert.match(
+			prompt,
+			/stage\("Build and Test"\)/
+		);
+		assert.ok(
+			prompt.indexOf(
+				'Resolved dependency context:'
+			) < prompt.indexOf('Instructions:')
+		);
+	});
+
+	test('Direct summary prompts remain unchanged without dependency context', () => {
+		const prompt = [
+			'AI Dev direct task: generate-unit-doc',
+			'',
+			'Instructions:',
+			'Generate markdown.',
+		].join('\n');
+
+		assert.strictEqual(
+			appendDependencyContextToDirectPromptMarkdown(
+				prompt,
+				[]
+			),
+			prompt
+		);
+	});
+
+	test('Single-file preparation uses dependency preflight and hydration', async () => {
+		const sourcePath = path.resolve(
+			__dirname,
+			'../../src/summarizationWorkflow.ts'
+		);
+		const source = await fs.readFile(
+			sourcePath,
+			'utf8'
+		);
+
+		const singleFileSection = source.slice(
+			source.indexOf(
+				'export async function prepareSingleFileSummary'
+			),
+			source.indexOf(
+				'export async function completeSingleFileSummary'
+			)
+		);
+
+		assert.match(
+			singleFileSection,
+			/refreshJenkinsDependencyMapForSummarization/
+		);
+		assert.match(
+			singleFileSection,
+			/hydrateSummarizationDependencyContext/
+		);
+		assert.match(
+			singleFileSection,
+			/appendDependencyContextToDirectPromptMarkdown/
+		);
+		assert.match(
+			singleFileSection,
+			/dependencyMapPreflight\.warnings/
+		);
+		assert.match(
+			singleFileSection,
+			/dependencyContext\.warnings/
 		);
 	});
 
