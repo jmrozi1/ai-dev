@@ -2,7 +2,7 @@
   "name": "ai-dev-vscode",
   "displayName": "ai-dev-vscode",
   "description": "Thin VS Code wrapper for AI Dev workflows",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "engines": {
     "vscode": "^1.123.0"
   },

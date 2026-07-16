@@ -266,9 +266,8 @@ Do not produce an entry that names every implementation file but omits the outco
 
 ## Final Response
 
-When completing this workflow, summarize:
+Return only the complete updated raw Markdown contents of the target `summary.md` file.
 
-* source unit summarized
-* summary entry created or updated
-* routing role identified
-* whether parent `summary.md` files may need regeneration
+Do not append an execution report, source-count recap, routing-role recap, parent-regeneration note, separator, or explanatory text.
+
+Do not wrap the result in a Markdown code fence.
