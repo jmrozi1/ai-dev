@@ -91,6 +91,7 @@ import {
 } from '../summarizationConfigPanel';
 import {
 	appendDependencyContextToDirectPromptMarkdown,
+	buildAnswerFromAiDocsDirectPromptMarkdown,
 	buildGroupedGenerateUnitDocDirectPromptMarkdown,
 } from '../promptBuilder';
 import {
@@ -120,6 +121,9 @@ import {
 import {
 	selectQuestionRelevantSummaryExcerpt,
 } from '../summaryAnswerRouting';
+import {
+	collectVerifiedAnswerSourceContext,
+} from '../answerSourceVerification';
 // import * as myExtension from '../../extension';
 
 async function waitForCondition(
@@ -2259,6 +2263,215 @@ suite('Extension Test Suite', () => {
 				'**/jobs/**/config.xml'
 			),
 			false
+		);
+	});
+
+	test('Answer verification reads source paths named by routed summaries', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		await fs.mkdir(
+			path.join(workspaceRoot, 'src'),
+			{ recursive: true }
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'src/example.ts'
+			),
+			'export const answer = 42;',
+			'utf8'
+		);
+
+		const result =
+			await collectVerifiedAnswerSourceContext({
+				workspaceRoot,
+				docsDir: 'ai-docs',
+				summaryEvidence: [
+					{
+						path:
+							'ai-docs/src/summary.md',
+						contents:
+							'- `src/example.ts` — Defines the answer.',
+					},
+				],
+				dependencyMap: {
+					version: 1,
+					edges: [],
+				},
+			});
+
+		assert.deepStrictEqual(
+			result.files.map((file) => [
+				file.role,
+				file.path,
+			]),
+			[
+				[
+					'primary-source',
+					'src/example.ts',
+				],
+			]
+		);
+		assert.match(
+			result.files[0].contents,
+			/answer = 42/
+		);
+		assert.deepStrictEqual(result.warnings, []);
+	});
+
+	test('Answer verification follows direct dependency edges', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		for (const relativePath of [
+			'jobs/config.xml',
+			'pipelines/Jenkinsfile',
+		]) {
+			await fs.mkdir(
+				path.dirname(
+					path.join(
+						workspaceRoot,
+						relativePath
+					)
+				),
+				{ recursive: true }
+			);
+		}
+
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'jobs/config.xml'
+			),
+			'<scriptPath>pipelines/Jenkinsfile</scriptPath>',
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(
+				workspaceRoot,
+				'pipelines/Jenkinsfile'
+			),
+			'pipeline { stage("Deploy") {} }',
+			'utf8'
+		);
+
+		const result =
+			await collectVerifiedAnswerSourceContext({
+				workspaceRoot,
+				docsDir: 'ai-docs',
+				summaryEvidence: [
+					{
+						path:
+							'ai-docs/jobs/summary.md',
+						contents:
+							'- `jobs/config.xml` — Deploy job.',
+					},
+				],
+				dependencyMap: {
+					version: 1,
+					edges: [
+						{
+							sourcePath:
+								'jobs/config.xml',
+							targetPath:
+								'pipelines/Jenkinsfile',
+							kind:
+								'jenkins-pipeline-script',
+							resolution: 'inferred',
+							evidence: [
+								{
+									kind: 'suffix',
+									detail:
+										'Unique suffix match.',
+								},
+							],
+						},
+					],
+				},
+			});
+
+		assert.deepStrictEqual(
+			result.files.map((file) => [
+				file.role,
+				file.path,
+			]),
+			[
+				[
+					'primary-source',
+					'jobs/config.xml',
+				],
+				[
+					'dependency',
+					'pipelines/Jenkinsfile',
+				],
+			]
+		);
+		assert.match(
+			result.files[1].contents,
+			/stage\("Deploy"\)/
+		);
+		assert.strictEqual(
+			result.files[1].resolution,
+			'inferred'
+		);
+	});
+
+	test('Answer prompts distinguish summaries from verified source', () => {
+		const prompt =
+			buildAnswerFromAiDocsDirectPromptMarkdown({
+				workspaceRoot: '/workspace',
+				workflowFilePath: 'workflow.md',
+				workflowFileContents: 'workflow',
+				aiDevYamlLabel: '.ai-dev.yaml',
+				aiDevYamlContents: 'documentation:',
+				rootSummaryPath:
+					'ai-docs/architecture-summary.md',
+				rootSummaryExists: true,
+				rootSummaryEmpty: false,
+				rootSummaryContents:
+					'Architecture routing.',
+				docsDir: 'ai-docs',
+				discoveredSummaryCount: 1,
+				routedDocumentationFiles: [
+					{
+						path:
+							'ai-docs/jobs/summary.md',
+						kind: 'summary',
+						contents:
+							'- `jobs/config.xml` — Deploy job.',
+					},
+				],
+				verifiedSourceFiles: [
+					{
+						path: 'jobs/config.xml',
+						role: 'primary-source',
+						contents: '<flow-definition />',
+					},
+				],
+				userQuestion:
+					'How does deployment work?',
+			});
+
+		assert.match(
+			prompt,
+			/Verified authoritative source context:/
+		);
+		assert.match(
+			prompt,
+			/Verified source: jobs\/config\.xml/
+		);
+		assert.match(
+			prompt,
+			/When summaries and verified source disagree/
 		);
 	});
 

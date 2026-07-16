@@ -12,6 +12,12 @@ import {
 	readOptionalTextFile,
 } from './fileUtilities';
 import {
+	readDependencyMap,
+} from './dependencyMap';
+import {
+	collectVerifiedAnswerSourceContext,
+} from './answerSourceVerification';
+import {
 	buildAnswerFromAiDocsDirectPromptMarkdown,
 } from './promptBuilder';
 import {
@@ -594,6 +600,39 @@ export async function buildSummaryAnswerRoute(
 		})
 		: [];
 
+	const summaryEvidence = [
+		...routedDocumentationContext.routedFiles
+			.filter((file) => file.kind === 'summary')
+			.map((file) => ({
+				path: file.path,
+				contents: file.contents,
+			})),
+		...fallbackDiscoveredSummaries.map(
+			(summary) => ({
+				path: summary.relativePath,
+				contents:
+					selectQuestionRelevantSummaryExcerpt(
+						summary.contents,
+						trimmedUserQuestion,
+						MAX_ROUTED_DOC_FILE_CHARS
+					),
+			})
+		),
+	];
+
+	const dependencyMap = await readDependencyMap(
+		workspaceRoot,
+		aiDevConfig
+	);
+
+	const verifiedSourceContext =
+		await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir,
+			summaryEvidence,
+			dependencyMap,
+		});
+
 	const prompt = buildAnswerFromAiDocsDirectPromptMarkdown({
 		workspaceRoot,
 		workflowFilePath,
@@ -622,10 +661,14 @@ export async function buildSummaryAnswerRoute(
 			})),
 		missingDocumentationPaths:
 			routedDocumentationContext.missingPaths,
+		verifiedSourceFiles:
+			verifiedSourceContext.files,
 		userQuestion: trimmedUserQuestion,
 	});
 
-	const warnings: string[] = [];
+	const warnings: string[] = [
+		...verifiedSourceContext.warnings,
+	];
 
 	if (!rootSummaryExists) {
 		warnings.push(

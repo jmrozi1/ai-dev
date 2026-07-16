@@ -423,6 +423,15 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		score: number;
 	}>;
 	missingDocumentationPaths?: string[];
+	verifiedSourceFiles?: Array<{
+		path: string;
+		role: 'primary-source' | 'dependency';
+		primarySourcePath?: string;
+		relationshipKind?: string;
+		resolution?: 'exact' | 'inferred';
+		evidence?: string[];
+		contents: string;
+	}>;
 	userQuestion: string;
 }): string {
 	const {
@@ -441,6 +450,7 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		routedDocumentationFiles,
 		fallbackDiscoveredSummaries,
 		missingDocumentationPaths,
+		verifiedSourceFiles,
 		userQuestion,
 	} = params;
 
@@ -520,6 +530,55 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		);
 	}
 
+	if (verifiedSourceFiles && verifiedSourceFiles.length > 0) {
+		lines.push(
+			'',
+			'Verified authoritative source context:'
+		);
+
+		for (const file of verifiedSourceFiles) {
+			lines.push(
+				'',
+				`Verified source: ${file.path}`,
+				`Role: ${file.role}`,
+			);
+
+			if (file.primarySourcePath) {
+				lines.push(
+					`Primary source: ${file.primarySourcePath}`
+				);
+			}
+
+			if (file.relationshipKind) {
+				lines.push(
+					`Relationship: ${file.relationshipKind}`
+				);
+			}
+
+			if (file.resolution) {
+				lines.push(
+					`Resolution: ${file.resolution}`
+				);
+			}
+
+			if (file.evidence?.length) {
+				lines.push(
+					'Evidence:',
+					...file.evidence.map(
+						(item) => `- ${item}`
+					)
+				);
+			}
+
+			lines.push(
+				'',
+				'```text',
+				file.contents,
+				'```'
+			);
+		}
+	}
+
 	lines.push(
 		'',
 		'Instructions:',
@@ -529,7 +588,9 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		'If a root architecture/routing context was provided, do not warn that ai-docs/summary.md is missing.',
 		'If your answer relies only on fallback discovered summaries, state that the root architecture/routing context was missing or incomplete for this question.',
 		'Cite the summary file(s) you used.',
-		'Verify exact behavior against source files before asserting specific runtime values or mechanics.',
+		'Use verified authoritative source context to confirm exact behavior, values, mechanics, and delegated implementation.',
+		'When summaries and verified source disagree, treat verified source as authoritative and mention the discrepancy.',
+		'Do not claim source verification for facts supported only by summaries.',
 		'If provided routing context is still insufficient, clearly list the additional files you need.'
 	);
 
