@@ -281,11 +281,21 @@ export type AssistantSummaryRoute = (
 	question: string
 ) => Promise<AssistantSummaryRouteResult>;
 
+export interface AssistantSummarizeDependencyContextFile {
+	primarySourcePath: string;
+	path: string;
+	relationshipKind: string;
+	resolution: 'exact' | 'inferred';
+	evidence: string[];
+}
+
 export interface AssistantSummarizePreparation {
 	prompt: string;
 	sourcePath: string;
 	outputPath: string;
 	warnings: string[];
+	dependencyMapRefreshed: boolean;
+	dependencyFiles: AssistantSummarizeDependencyContextFile[];
 }
 
 export interface AssistantSummarizeCompletion {
@@ -321,6 +331,7 @@ export interface AssistantSummarizeExecutionResult {
 	dependencyMapRefreshed: boolean;
 	dependencyMapRefreshWarnings: string[];
 	dependencyFilesIncluded: number;
+	dependencyFiles: AssistantSummarizeDependencyContextFile[];
 	dependencyWarnings: string[];
 	skipped: string[];
 	failed: string[];
@@ -558,6 +569,60 @@ export function buildUnstructuredReviewFallback(
 	].join('\n');
 }
 
+
+export function buildSummarizationReportMarkdown(
+	params: {
+		target: string;
+		matchedSourceCount: number;
+		updatedSummaryPaths: string[];
+		dependencyMapRefreshed: boolean;
+		dependencyFiles: AssistantSummarizeDependencyContextFile[];
+		completedModelCalls: number;
+		plannedModelCalls: number;
+		cancelled: boolean;
+	}
+): string {
+	const dependencyLines =
+		params.dependencyFiles.length > 0
+			? params.dependencyFiles.map((file) => {
+				const evidence = file.evidence.length > 0
+					? file.evidence.join(' ')
+					: 'No additional evidence recorded.';
+
+				return [
+					`- Dependency: \`${file.path}\``,
+					`  Primary source: \`${file.primarySourcePath}\``,
+					`  Relationship: \`${file.relationshipKind}\``,
+					`  Resolution: \`${file.resolution}\``,
+					`  Evidence: ${evidence}`,
+				].join('\n');
+			})
+			: ['- none'];
+
+	return [
+		'## Summary',
+		'',
+		`- Target: \`${params.target}\``,
+		`- Source files matched: ${params.matchedSourceCount}`,
+		`- Summary files updated: ${params.updatedSummaryPaths.length}`,
+		`- Dependency map refreshed: ${params.dependencyMapRefreshed ? 'yes' : 'no'}`,
+		`- Dependency files included: ${params.dependencyFiles.length}`,
+		`- Model calls completed: ${params.completedModelCalls}/${params.plannedModelCalls}`,
+		`- Cancelled: ${params.cancelled ? 'yes' : 'no'}`,
+		'',
+		'## Updated summaries',
+		'',
+		...(params.updatedSummaryPaths.length > 0
+			? params.updatedSummaryPaths.map(
+				(filePath) => `- \`${filePath}\``
+			)
+			: ['- none']),
+		'',
+		'## Included dependency context',
+		'',
+		...dependencyLines,
+	].join('\n');
+}
 
 export type AssistantReportSink = (
 	report: AssistantReport
@@ -1051,6 +1116,47 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				ANSI_LIGHT_GRAY
 			);
 
+			const reportWarnings = [
+				...result.dependencyMapRefreshWarnings,
+				...result.dependencyWarnings,
+				...result.skipped.map(
+					(item) => `Skipped ${item}`
+				),
+				...result.failed,
+			];
+
+			const report = createAssistantReport({
+				route: 'summarize',
+				title: 'AI Dev Summarization Report',
+				question: target,
+				modelName: this.modelName,
+				warnings: reportWarnings,
+				rawResponse:
+					buildSummarizationReportMarkdown({
+						target,
+						matchedSourceCount:
+							result.matchedSourceCount,
+						updatedSummaryPaths:
+							result.updatedSummaryPaths,
+						dependencyMapRefreshed:
+							result.dependencyMapRefreshed,
+						dependencyFiles:
+							result.dependencyFiles,
+						completedModelCalls:
+							result.completedModelCalls,
+						plannedModelCalls:
+							result.plannedModelCalls,
+						cancelled:
+							result.cancelled,
+					}),
+			});
+
+			this.reportSink?.(report);
+			this.writePermanentLine(
+				'  /showreport for details',
+				ANSI_LIGHT_GRAY
+			);
+
 			if (result.cancelled) {
 				this.writePermanentLine(
 					`${BULLET_CHAR} Cancelled`,
@@ -1155,6 +1261,36 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					ANSI_LIGHT_GRAY
 				);
 			}
+
+			const report = createAssistantReport({
+				route: 'summarize',
+				title: 'AI Dev Summarization Report',
+				question: target,
+				modelName: this.modelName,
+				warnings,
+				rawResponse:
+					buildSummarizationReportMarkdown({
+						target,
+						matchedSourceCount: 1,
+						updatedSummaryPaths:
+							completion.written
+								? [completion.outputPath]
+								: [],
+						dependencyMapRefreshed:
+							preparation.dependencyMapRefreshed,
+						dependencyFiles:
+							preparation.dependencyFiles,
+						completedModelCalls: 1,
+						plannedModelCalls: 1,
+						cancelled: false,
+					}),
+			});
+
+			this.reportSink?.(report);
+			this.writePermanentLine(
+				'  /showreport for details',
+				ANSI_LIGHT_GRAY
+			);
 		} catch (error) {
 			this.prepareForPermanentOutput();
 

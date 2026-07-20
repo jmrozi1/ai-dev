@@ -30,6 +30,7 @@ import {
 import {
 	AiDevAssistantPseudoterminal,
 	AiDevAssistantTerminalManager,
+	buildSummarizationReportMarkdown,
 	buildUnstructuredReviewFallback,
 	getCommonPrefix,
 	getMatchingAssistantCommands,
@@ -2353,6 +2354,95 @@ suite('Extension Test Suite', () => {
 		assert.deepStrictEqual(result.warnings, []);
 	});
 
+	test('Dependency hydration terminates cyclic dependency graphs', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-cycle-context-'
+			)
+		);
+
+		await fs.writeFile(
+			path.join(workspaceRoot, 'one.txt'),
+			'one',
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(workspaceRoot, 'two.txt'),
+			'two',
+			'utf8'
+		);
+
+		const result =
+			await hydrateSummarizationDependencyContext({
+				workspaceRoot,
+				dependencyMap: {
+					version: 1,
+					edges: [
+						{
+							sourcePath: 'root.txt',
+							targetPath: 'one.txt',
+							kind: 'root-edge',
+							resolution: 'exact',
+							evidence: [
+								{
+									kind: 'test',
+									detail: 'Root to one.',
+								},
+							],
+						},
+						{
+							sourcePath: 'one.txt',
+							targetPath: 'two.txt',
+							kind: 'nested-edge',
+							resolution: 'exact',
+							evidence: [
+								{
+									kind: 'test',
+									detail: 'One to two.',
+								},
+							],
+						},
+						{
+							sourcePath: 'two.txt',
+							targetPath: 'one.txt',
+							kind: 'nested-edge',
+							resolution: 'exact',
+							evidence: [
+								{
+									kind: 'test',
+									detail: 'Two back to one.',
+								},
+							],
+						},
+					],
+				},
+				sourcePaths: ['root.txt'],
+				resolvedBySource: [
+					{
+						generalInstructions: '',
+						matchingRules: [],
+						combinedInstructions: '',
+						dependencyStrategy: {
+							follow: ['root-edge'],
+							maxDepth: 10,
+							maxFiles: 10,
+							maxChars: 24000,
+							includeInferred: false,
+						},
+					},
+				],
+			});
+
+		assert.deepStrictEqual(
+			result.files.map(
+				(file) => file.path
+			),
+			['one.txt', 'two.txt']
+		);
+		assert.deepStrictEqual(result.warnings, []);
+	});
+
 	test('Dependency hydration stops at configured depth', async () => {
 		const workspaceRoot = await fs.mkdtemp(
 			path.join(
@@ -4217,6 +4307,57 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(state.input, '');
 		assert.strictEqual(state.mode, 'chat');
 		assert.strictEqual(state.tabPressCount, 0);
+	});
+
+	test('Summarization report records included dependency evidence', () => {
+		const markdown =
+			buildSummarizationReportMarkdown({
+				target:
+					'jobs/demo-build-app/config.xml',
+				matchedSourceCount: 1,
+				updatedSummaryPaths: [
+					'ai-docs/jobs/demo-build-app/summary.md',
+				],
+				dependencyMapRefreshed: true,
+				dependencyFiles: [
+					{
+						primarySourcePath:
+							'jobs/demo-build-app/config.xml',
+						path:
+							'demo-cicd/pipelines/build-app.jenkins',
+						relationshipKind:
+							'jenkins-pipeline-script',
+						resolution: 'inferred',
+						evidence: [
+							'Unique scriptPath suffix match.',
+						],
+					},
+				],
+				completedModelCalls: 2,
+				plannedModelCalls: 2,
+				cancelled: false,
+			});
+
+		assert.match(
+			markdown,
+			/## Included dependency context/
+		);
+		assert.match(
+			markdown,
+			/demo-cicd\/pipelines\/build-app\.jenkins/
+		);
+		assert.match(
+			markdown,
+			/jenkins-pipeline-script/
+		);
+		assert.match(
+			markdown,
+			/Unique scriptPath suffix match/
+		);
+		assert.doesNotMatch(
+			markdown,
+			/pipeline \{/
+		);
 	});
 
 	test('Glob summarize targets use grouped execution', async () => {

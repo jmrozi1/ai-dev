@@ -887,6 +887,13 @@ export async function executeSummarizationTarget(
 	dependencyMapRefreshed: boolean;
 	dependencyMapRefreshWarnings: string[];
 	dependencyFilesIncluded: number;
+	dependencyFiles: Array<{
+		primarySourcePath: string;
+		path: string;
+		relationshipKind: string;
+		resolution: 'exact' | 'inferred';
+		evidence: string[];
+	}>;
 	dependencyWarnings: string[];
 	skipped: string[];
 	failed: string[];
@@ -1023,6 +1030,13 @@ export async function executeSummarizationTarget(
 		dependencyMapRefreshed: false,
 		dependencyMapRefreshWarnings: [] as string[],
 		dependencyFilesIncluded: 0,
+		dependencyFiles: [] as Array<{
+			primarySourcePath: string;
+			path: string;
+			relationshipKind: string;
+			resolution: 'exact' | 'inferred';
+			evidence: string[];
+		}>,
 		dependencyWarnings: [] as string[],
 		skipped: [] as string[],
 		failed: [] as string[],
@@ -1228,6 +1242,19 @@ export async function executeSummarizationTarget(
 
 			result.dependencyFilesIncluded +=
 				dependencyContext.files.length;
+			result.dependencyFiles.push(
+				...dependencyContext.files.map(
+					(file) => ({
+						primarySourcePath:
+							file.primarySourcePath,
+						path: file.path,
+						relationshipKind:
+							file.relationshipKind,
+						resolution: file.resolution,
+						evidence: [...file.evidence],
+					})
+				)
+			);
 			result.dependencyWarnings.push(
 				...dependencyContext.warnings
 			);
@@ -1428,6 +1455,14 @@ export async function prepareSingleFileSummary(
 	sourcePath: string;
 	outputPath: string;
 	warnings: string[];
+	dependencyMapRefreshed: boolean;
+	dependencyFiles: Array<{
+		primarySourcePath: string;
+		path: string;
+		relationshipKind: string;
+		resolution: 'exact' | 'inferred';
+		evidence: string[];
+	}>;
 }> {
 	const workspaceRoot = getOpenWorkspaceRoot();
 	if (!workspaceRoot) {
@@ -1525,6 +1560,20 @@ export async function prepareSingleFileSummary(
 			...dependencyMapPreflight.warnings,
 			...dependencyContext.warnings,
 		],
+		dependencyMapRefreshed:
+			dependencyMapPreflight.refreshed,
+		dependencyFiles:
+			dependencyContext.files.map(
+				(file) => ({
+					primarySourcePath:
+						file.primarySourcePath,
+					path: file.path,
+					relationshipKind:
+						file.relationshipKind,
+					resolution: file.resolution,
+					evidence: [...file.evidence],
+				})
+			),
 	};
 }
 
@@ -1534,6 +1583,14 @@ export async function completeSingleFileSummary(
 		sourcePath: string;
 		outputPath: string;
 		warnings: string[];
+		dependencyMapRefreshed: boolean;
+		dependencyFiles: Array<{
+			primarySourcePath: string;
+			path: string;
+			relationshipKind: string;
+			resolution: 'exact' | 'inferred';
+			evidence: string[];
+		}>;
 	},
 	rawResponseText: string
 ): Promise<{
