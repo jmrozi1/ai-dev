@@ -309,6 +309,42 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
+	test('Extension README documents dependency configuration layers', async () => {
+		const readmePath = path.resolve(
+			__dirname,
+			'../../README.md'
+		);
+		const readme = await fs.readFile(
+			readmePath,
+			'utf8'
+		);
+
+		assert.match(readme, /Resolver configuration/);
+		assert.match(readme, /Dependency strategy/);
+		assert.match(readme, /Summarization instructions/);
+		assert.match(readme, /jenkinsConfigInclude/);
+		assert.match(readme, /jenkinsConfigExclude/);
+
+		for (const relationshipKind of [
+			'jenkins-pipeline-script',
+			'shell-command-script',
+			'shell-source',
+		]) {
+			assert.match(readme, new RegExp(relationshipKind));
+		}
+
+		assert.match(readme, /maxDepth/);
+		assert.match(readme, /maxFiles/);
+		assert.match(readme, /maxChars/);
+		assert.match(readme, /includeInferred/);
+		assert.match(readme, /ai-dev-vscode-0\.1\.0\.vsix/);
+		assert.doesNotMatch(readme, /ai-dev-vscode-0\.0\.1\.vsix/);
+		assert.doesNotMatch(
+			readme,
+			/A workspace should include a `\.ai-dev\.yaml` file/
+		);
+	});
+
 	test('Mandatory .ai-dev.yaml terminology is removed from extension and workflow details', async () => {
 		const extensionSourcePath = path.resolve(__dirname, '../../src/extension.ts');
 		const extensionSource = await fs.readFile(
