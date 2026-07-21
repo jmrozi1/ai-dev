@@ -1,0 +1,649 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_name="$(basename "${BASH_SOURCE[0]}")"
+
+error() {
+	printf '%s: %s\n' "$script_name" "$1" >&2
+	exit 1
+}
+
+resolve_repo_root() {
+	local repo_root
+	if ! repo_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"; then
+		error 'Not inside a Git repository. Run this command from within a repository.'
+	fi
+
+	printf '%s' "$repo_root"
+}
+
+config_file_for_repo_root() {
+	printf '%s/.ai-dev/config.json' "$1"
+}
+
+workflow_state_file_for_repo_root() {
+	printf '%s/.ai-dev/workflow.json' "$1"
+}
+
+resolve_repo_root_if_available() {
+	local repo_root
+	if repo_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"; then
+		printf '%s' "$repo_root"
+		return 0
+	fi
+
+	return 1
+}
+
+expand_home_prefix() {
+	local path_value="$1"
+
+	if [[ "$path_value" == '~' ]]; then
+		printf '%s' "$HOME"
+		return 0
+	fi
+
+	if [[ "${path_value:0:2}" == '~/' ]]; then
+		printf '%s/%s' "$HOME" "${path_value:2}"
+		return 0
+	fi
+
+	printf '%s' "$path_value"
+}
+
+resolve_output_destination() {
+	local repo_root="$1"
+	local configured_path="$2"
+	local expanded_path
+	expanded_path="$(expand_home_prefix "$configured_path")"
+
+	if [[ "$expanded_path" == /* ]]; then
+		printf '%s' "$expanded_path"
+		return 0
+	fi
+
+	printf '%s/%s' "$repo_root" "$expanded_path"
+}
+
+write_routed_output() {
+	local temporary_output="$1"
+	local destination="$2"
+	local parent_directory
+	parent_directory="$(dirname "$destination")"
+
+	if [[ ! -d "$parent_directory" ]]; then
+		printf '%s: Cannot write output to %s: parent directory does not exist: %s\n' "$script_name" "$destination" "$parent_directory" >&2
+		printf '%s: Generated output preserved at %s\n' "$script_name" "$temporary_output" >&2
+		return 1
+	fi
+
+	if cat "$temporary_output" >"$destination"; then
+		rm -f "$temporary_output"
+		printf 'Output written to %s\n' "$destination"
+		return 0
+	fi
+
+	printf '%s: Cannot write output to %s\n' "$script_name" "$destination" >&2
+	printf '%s: Generated output preserved at %s\n' "$script_name" "$temporary_output" >&2
+	return 1
+}
+
+run_operational_command() {
+	local config_error_policy="${1:-}"
+	local command_function="${2:-}"
+
+	if [[ "$config_error_policy" != 'strict' && "$config_error_policy" != 'ignore' ]]; then
+		error "Unknown operational config policy: ${config_error_policy}. Supported policies: strict, ignore."
+	fi
+
+	if [[ -z "$command_function" ]]; then
+		error 'Operational command function is required.'
+	fi
+
+	shift 2
+
+	local repo_root
+	if repo_root="$(resolve_repo_root_if_available)"; then
+		local config_file
+		config_file="$(config_file_for_repo_root "$repo_root")"
+
+		local out_value
+		local helper_status=0
+		set +e
+		if [[ "$config_error_policy" == 'ignore' ]]; then
+			out_value="$(config_json_helper 'get' "$config_file" 'out' 2>/dev/null)"
+		else
+			out_value="$(config_json_helper 'get' "$config_file" 'out')"
+		fi
+		helper_status=$?
+		set -e
+		if [[ "$helper_status" -ne 0 ]]; then
+			if [[ "$config_error_policy" == 'ignore' ]]; then
+				"$command_function" "$@"
+				return $?
+			fi
+			return "$helper_status"
+		fi
+
+		if [[ -n "$out_value" ]]; then
+			local temporary_output
+			temporary_output="$(mktemp "${TMPDIR:-/tmp}/${script_name}.output.XXXXXX")"
+
+			local command_status=0
+			set +e
+			"$command_function" "$@" >"$temporary_output"
+			command_status=$?
+			set -e
+			if [[ "$command_status" -ne 0 ]]; then
+				cat "$temporary_output"
+				rm -f "$temporary_output"
+				return "$command_status"
+			fi
+
+			local destination
+			destination="$(resolve_output_destination "$repo_root" "$out_value")"
+			write_routed_output "$temporary_output" "$destination"
+			return $?
+		fi
+	fi
+
+	"$command_function" "$@"
+}
+
+print_test_arguments() {
+	local first="${1:-}"
+	local second="${2:-}"
+	printf 'arg1=%s\n' "$first"
+	printf 'arg2=%s\n' "$second"
+}
+
+validate_config_key() {
+	local command="$1"
+	local key="$2"
+
+	if [[ "$key" != 'out' ]]; then
+		error "Unknown configuration key for ${command}: ${key}. Supported key: out."
+	fi
+}
+
+validate_out_value() {
+	local value="$1"
+
+	if [[ -z "${value//[[:space:]]/}" ]]; then
+		error 'out value cannot be empty.'
+	fi
+}
+
+config_json_helper() {
+	local operation="$1"
+	local config_file="$2"
+	local key="$3"
+	local value="${4-}"
+
+	python3 - "$script_name" "$operation" "$config_file" "$key" "$value" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+
+def fail(message):
+	print(f"{script_name}: {message}", file=sys.stderr)
+	sys.exit(1)
+
+
+script_name = sys.argv[1]
+operation = sys.argv[2]
+config_path = Path(sys.argv[3])
+key = sys.argv[4]
+value = sys.argv[5]
+
+if key != 'out':
+	fail(f"Unknown configuration key for {operation}: {key}. Supported key: out.")
+
+
+def load_config():
+	if not config_path.exists():
+		return {}
+
+	try:
+		data = json.loads(config_path.read_text(encoding='utf-8'))
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON in {config_path}: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+	if not isinstance(data, dict):
+		fail(f"Invalid configuration in {config_path}: expected a JSON object.")
+
+	unknown_keys = sorted(name for name in data if name != 'out')
+	if unknown_keys:
+		fail(f"Unknown configuration key(s) in {config_path}: {', '.join(unknown_keys)}")
+
+	if 'out' in data:
+		out_value = data['out']
+		if not isinstance(out_value, str):
+			fail(f"Invalid configuration in {config_path}: out must be a string.")
+		if not out_value.strip():
+			fail(f"Invalid configuration in {config_path}: out cannot be empty.")
+
+	return data
+
+
+def write_config(data):
+	config_path.parent.mkdir(parents=True, exist_ok=True)
+	with tempfile.NamedTemporaryFile(
+		mode='w',
+		encoding='utf-8',
+		dir=config_path.parent,
+		prefix=f'{config_path.name}.tmp-',
+		delete=False,
+	) as handle:
+		json.dump(data, handle, indent=2)
+		handle.write('\n')
+		temporary_path = Path(handle.name)
+	try:
+		os.replace(temporary_path, config_path)
+	except Exception:
+		try:
+			temporary_path.unlink()
+		except FileNotFoundError:
+			pass
+		raise
+
+
+if operation == 'get':
+	config = load_config()
+	if 'out' not in config:
+		sys.exit(0)
+	print(config['out'])
+elif operation == 'set':
+	if not value.strip():
+		fail('out value cannot be empty.')
+	config = load_config()
+	config['out'] = value
+	write_config(config)
+	print(f'out: {value}')
+elif operation == 'unset':
+	config = load_config()
+	if 'out' not in config:
+		print('out: not configured')
+		sys.exit(0)
+	del config['out']
+	if config:
+		write_config(config)
+	elif config_path.exists():
+		config_path.unlink()
+	print('out: not configured')
+else:
+	fail(f'Unknown configuration operation: {operation}')
+PY
+}
+
+workflow_state_json_helper() {
+	local operation="$1"
+	local workflow_state_file="$2"
+	local payload="${3-}"
+
+	python3 - "$script_name" "$operation" "$workflow_state_file" "$payload" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+
+def fail(message):
+	print(f"{script_name}: {message}", file=sys.stderr)
+	sys.exit(1)
+
+
+script_name = sys.argv[1]
+operation = sys.argv[2]
+state_path = Path(sys.argv[3])
+payload = sys.argv[4]
+
+DEFAULTS = {
+	'mainBranch': 'main',
+	'scratchBranch': 'scratch',
+	'checkpoint': 0,
+}
+
+ALLOWED_KEYS = {
+	'activeIssueNumber',
+	'activeIssueTitle',
+	'mainBranch',
+	'scratchBranch',
+	'checkpoint',
+}
+
+
+def is_int(value):
+	return isinstance(value, int) and not isinstance(value, bool)
+
+
+def normalize_and_validate(state_data, context):
+	if not isinstance(state_data, dict):
+		fail(f"Invalid workflow state in {context}: expected a JSON object.")
+
+	unknown_keys = sorted(name for name in state_data if name not in ALLOWED_KEYS)
+	if unknown_keys:
+		fail(f"Unknown workflow state key(s) in {context}: {', '.join(unknown_keys)}")
+
+	normalized = {
+		'mainBranch': DEFAULTS['mainBranch'],
+		'scratchBranch': DEFAULTS['scratchBranch'],
+		'checkpoint': DEFAULTS['checkpoint'],
+	}
+
+	if 'mainBranch' in state_data:
+		main_branch = state_data['mainBranch']
+		if not isinstance(main_branch, str):
+			fail(f"Invalid workflow state in {context}: mainBranch must be a string.")
+		main_branch = main_branch.strip()
+		if not main_branch:
+			fail(f"Invalid workflow state in {context}: mainBranch cannot be empty.")
+		normalized['mainBranch'] = main_branch
+
+	if 'scratchBranch' in state_data:
+		scratch_branch = state_data['scratchBranch']
+		if not isinstance(scratch_branch, str):
+			fail(f"Invalid workflow state in {context}: scratchBranch must be a string.")
+		scratch_branch = scratch_branch.strip()
+		if not scratch_branch:
+			fail(f"Invalid workflow state in {context}: scratchBranch cannot be empty.")
+		normalized['scratchBranch'] = scratch_branch
+
+	if 'checkpoint' in state_data:
+		checkpoint = state_data['checkpoint']
+		if not is_int(checkpoint) or checkpoint < 0:
+			fail(f"Invalid workflow state in {context}: checkpoint must be a non-negative integer.")
+		normalized['checkpoint'] = checkpoint
+
+	has_issue_number = 'activeIssueNumber' in state_data
+	has_issue_title = 'activeIssueTitle' in state_data
+
+	if has_issue_number:
+		issue_number = state_data['activeIssueNumber']
+		if not is_int(issue_number) or issue_number <= 0:
+			fail(f"Invalid workflow state in {context}: activeIssueNumber must be a positive integer.")
+		normalized['activeIssueNumber'] = issue_number
+
+	if has_issue_title:
+		issue_title = state_data['activeIssueTitle']
+		if not isinstance(issue_title, str):
+			fail(f"Invalid workflow state in {context}: activeIssueTitle must be a string.")
+		issue_title = issue_title.strip()
+		if not issue_title:
+			fail(f"Invalid workflow state in {context}: activeIssueTitle cannot be empty.")
+		normalized['activeIssueTitle'] = issue_title
+
+	if has_issue_title and not has_issue_number:
+		fail(f"Invalid workflow state in {context}: activeIssueTitle requires activeIssueNumber.")
+
+	return normalized
+
+
+def load_state():
+	if not state_path.exists():
+		return dict(DEFAULTS)
+
+	try:
+		raw_state = json.loads(state_path.read_text(encoding='utf-8'))
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON in {state_path}: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+
+	return normalize_and_validate(raw_state, str(state_path))
+
+
+def write_state(state_data):
+	state_path.parent.mkdir(parents=True, exist_ok=True)
+	with tempfile.NamedTemporaryFile(
+		mode='w',
+		encoding='utf-8',
+		dir=state_path.parent,
+		prefix=f'{state_path.name}.tmp-',
+		delete=False,
+	) as handle:
+		json.dump(state_data, handle, indent=2)
+		handle.write('\n')
+		temporary_path = Path(handle.name)
+	try:
+		os.replace(temporary_path, state_path)
+	except Exception:
+		try:
+			temporary_path.unlink()
+		except FileNotFoundError:
+			pass
+		raise
+
+
+if operation == 'get':
+	state = load_state()
+	print(json.dumps(state, indent=2))
+elif operation == 'set':
+	try:
+		payload_data = json.loads(payload)
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON payload for workflow state: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+	state = normalize_and_validate(payload_data, 'state payload')
+	write_state(state)
+	print(json.dumps(state, indent=2))
+elif operation == 'clear':
+	if state_path.exists():
+		state_path.unlink()
+	print(json.dumps(dict(DEFAULTS), indent=2))
+else:
+	fail(f"Unknown workflow state operation: {operation}")
+PY
+}
+
+print_config_not_configured() {
+	printf 'out: not configured\n'
+}
+
+print_config_value() {
+	local value="$1"
+	printf '%s\n' "$value"
+}
+
+handle_config_get() {
+	local key="${1:-}"
+	local extra="${2:-}"
+
+	if [[ -z "$key" || -n "$extra" ]]; then
+		error "Usage: ${script_name} get out"
+	fi
+
+	validate_config_key 'get' "$key"
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+	local config_file
+	config_file="$(config_file_for_repo_root "$repo_root")"
+
+	local value
+	local helper_status=0
+	set +e
+	value="$(config_json_helper 'get' "$config_file" "$key")"
+	helper_status=$?
+	set -e
+	if [[ "$helper_status" -eq 0 ]]; then
+		if [[ -n "$value" ]]; then
+			print_config_value "$value"
+		else
+			print_config_not_configured
+		fi
+	else
+		return "$helper_status"
+	fi
+}
+
+handle_config_set() {
+	local assignment="${1:-}"
+	local extra="${2:-}"
+
+	if [[ -z "$assignment" || -n "$extra" ]]; then
+		error "Usage: ${script_name} set out=<path>"
+	fi
+
+	local key="${assignment%%=*}"
+	local value="${assignment#*=}"
+	if [[ "$key" != "$assignment" ]]; then
+		validate_config_key 'set' "$key"
+		validate_out_value "$value"
+	else
+		error "Usage: ${script_name} set out=<path>"
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+	local config_file
+	config_file="$(config_file_for_repo_root "$repo_root")"
+
+	config_json_helper 'set' "$config_file" 'out' "$value"
+}
+
+handle_config_unset() {
+	local key="${1:-}"
+	local extra="${2:-}"
+
+	if [[ -z "$key" || -n "$extra" ]]; then
+		error "Usage: ${script_name} unset out"
+	fi
+
+	validate_config_key 'unset' "$key"
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+	local config_file
+	config_file="$(config_file_for_repo_root "$repo_root")"
+
+	config_json_helper 'unset' "$config_file" "$key"
+}
+
+print_help() {
+	cat <<EOF
+${script_name} help
+${script_name} start <issue-number>
+${script_name} status
+${script_name} review
+${script_name} commit
+${script_name} reset
+${script_name} promote "<commit-message>"
+${script_name} complete
+${script_name} get out
+${script_name} set out=/path/to/file
+${script_name} unset out
+
+Read-only
+  ${script_name} help
+  ${script_name} status
+  ${script_name} review
+  ${script_name} get out
+
+Configuration
+  ${script_name} set out=/path/to/file
+  ${script_name} unset out
+
+Workflow mutations
+  ${script_name} start <issue-number>
+  ${script_name} commit
+  ${script_name} reset
+  ${script_name} promote "<commit-message>"
+  ${script_name} complete
+EOF
+}
+
+print_unknown_command() {
+	local command="$1"
+	printf '%s: unknown command: %s\n' "$script_name" "$command" >&2
+	printf 'Run %s help for usage.\n' "$script_name" >&2
+}
+
+main() {
+	local command="${1:-}"
+	local first_argument="${2:-}"
+	local second_argument="${3:-}"
+
+	case "$command" in
+		''|'help')
+			run_operational_command ignore print_help
+			return 0
+			;;
+		__test-route-args)
+			if [[ "${FLOW_TEST_MODE:-0}" != '1' ]]; then
+				print_unknown_command "$command"
+				return 1
+			fi
+			run_operational_command strict print_test_arguments "$first_argument" "$second_argument"
+			return 0
+			;;
+		__test-invalid-policy)
+			if [[ "${FLOW_TEST_MODE:-0}" != '1' ]]; then
+				print_unknown_command "$command"
+				return 1
+			fi
+			run_operational_command bogus print_help
+			return 0
+			;;
+		__test-state-get)
+			if [[ "${FLOW_TEST_MODE:-0}" != '1' ]]; then
+				print_unknown_command "$command"
+				return 1
+			fi
+			local repo_root
+			repo_root="$(resolve_repo_root)"
+			local workflow_state_file
+			workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+			workflow_state_json_helper 'get' "$workflow_state_file"
+			return 0
+			;;
+		__test-state-set)
+			if [[ "${FLOW_TEST_MODE:-0}" != '1' ]]; then
+				print_unknown_command "$command"
+				return 1
+			fi
+			if [[ -z "$first_argument" || -n "$second_argument" ]]; then
+				error "Usage: ${script_name} __test-state-set <json>"
+			fi
+			local repo_root
+			repo_root="$(resolve_repo_root)"
+			local workflow_state_file
+			workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+			workflow_state_json_helper 'set' "$workflow_state_file" "$first_argument"
+			return 0
+			;;
+		__test-state-clear)
+			if [[ "${FLOW_TEST_MODE:-0}" != '1' ]]; then
+				print_unknown_command "$command"
+				return 1
+			fi
+			if [[ -n "$first_argument" || -n "$second_argument" ]]; then
+				error "Usage: ${script_name} __test-state-clear"
+			fi
+			local repo_root
+			repo_root="$(resolve_repo_root)"
+			local workflow_state_file
+			workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+			workflow_state_json_helper 'clear' "$workflow_state_file"
+			return 0
+			;;
+		get)
+			handle_config_get "$first_argument" "$second_argument"
+			return 0
+			;;
+		set)
+			handle_config_set "$first_argument" "$second_argument"
+			return 0
+			;;
+		unset)
+			handle_config_unset "$first_argument" "$second_argument"
+			return 0
+			;;
+		*)
+			print_unknown_command "$command"
+			return 1
+			;;
+	esac
+}
+
+main "$@"

@@ -10,6 +10,7 @@ ai-dev-vscode/vendor/
 out.txt
 *.log
 .DS_Store
+.ai-dev/
 
 # generated command output
 **/out.txt
