@@ -660,9 +660,9 @@ handle_status() {
 
 	if [[ "$workflow_status" == 'active' ]]; then
 		if [[ -n "$active_issue_title" ]]; then
-			printf 'Issue %s — %s\n' "$active_issue_number" "$active_issue_title"
+			printf 'Issue: %s — %s\n' "$active_issue_number" "$active_issue_title"
 		else
-			printf 'Issue %s\n' "$active_issue_number"
+			printf 'Issue: %s\n' "$active_issue_number"
 		fi
 	else
 		printf 'No active workflow.\n'
