@@ -197,6 +197,166 @@ print(json.dumps(payload))
 PY
 }
 
+git_status_value() {
+	local value="$1"
+	if [[ "$value" == 'yes' ]]; then
+		printf 'yes'
+		return 0
+	fi
+	printf 'no'
+}
+
+classify_porcelain_entry() {
+	local entry="$1"
+	local x_status="${entry:0:1}"
+	local y_status="${entry:1:1}"
+
+	local staged='no'
+	local unstaged='no'
+	local untracked='no'
+
+	if [[ "$x_status$y_status" == '??' ]]; then
+		untracked='yes'
+	else
+		if [[ "$x_status" != ' ' ]]; then
+			staged='yes'
+		fi
+
+		if [[ "$y_status" != ' ' ]]; then
+			unstaged='yes'
+		fi
+	fi
+
+	printf '%s %s %s\n' "$staged" "$unstaged" "$untracked"
+}
+
+branch_state_for_repo() {
+	local repo_root="$1"
+	local main_branch="$2"
+	local scratch_branch="$3"
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		printf 'main branch missing'
+		return 0
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		printf 'scratch branch missing'
+		return 0
+	fi
+
+	local counts
+	counts="$(git -C "$repo_root" rev-list --left-right --count "${main_branch}...${scratch_branch}")"
+
+	local main_only_count scratch_only_count
+	IFS=$' \t' read -r main_only_count scratch_only_count <<< "$counts"
+
+	if [[ "$main_only_count" -eq 0 && "$scratch_only_count" -eq 0 ]]; then
+		printf 'scratch equal to main'
+		return 0
+	fi
+
+	if [[ "$main_only_count" -eq 0 ]]; then
+		printf 'scratch ahead of main by %s commit(s)' "$scratch_only_count"
+		return 0
+	fi
+
+	if [[ "$scratch_only_count" -eq 0 ]]; then
+		printf 'scratch behind main by %s commit(s)' "$main_only_count"
+		return 0
+	fi
+
+	printf 'scratch and main have diverged: scratch ahead by %s commit(s), behind by %s commit(s)' "$scratch_only_count" "$main_only_count"
+}
+
+handle_status() {
+	local argument_count="$1"
+	shift
+
+	if [[ "$argument_count" -ne 0 ]]; then
+		error "Usage: ${script_name} status"
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	local active_issue_title
+	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+	local checkpoint
+	checkpoint="$(workflow_state_get_field 'checkpoint' "$state_json")"
+
+	local workflow_status='inactive'
+	if [[ -n "$active_issue_number" ]]; then
+		workflow_status='active'
+	fi
+
+	local porcelain_status
+	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+
+	local staged='no'
+	local unstaged='no'
+	local untracked='no'
+	local line
+	while IFS= read -r line; do
+		if [[ -z "$line" ]]; then
+			continue
+		fi
+
+		local entry_staged entry_unstaged entry_untracked
+		read -r entry_staged entry_unstaged entry_untracked <<< "$(classify_porcelain_entry "$line")"
+
+		if [[ "$entry_staged" == 'yes' ]]; then
+			staged='yes'
+		fi
+
+		if [[ "$entry_unstaged" == 'yes' ]]; then
+			unstaged='yes'
+		fi
+
+		if [[ "$entry_untracked" == 'yes' ]]; then
+			untracked='yes'
+		fi
+		done <<< "$porcelain_status"
+
+	local working_tree='clean'
+	if [[ "$staged" == 'yes' || "$unstaged" == 'yes' || "$untracked" == 'yes' ]]; then
+		working_tree='dirty'
+	fi
+
+	local current_branch
+	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+	local branch_state
+	branch_state="$(branch_state_for_repo "$repo_root" "$main_branch" "$scratch_branch")"
+
+	printf 'Workflow: %s\n' "$workflow_status"
+	if [[ "$workflow_status" == 'active' ]]; then
+		printf 'activeIssueNumber: %s\n' "$active_issue_number"
+		if [[ -n "$active_issue_title" ]]; then
+			printf 'activeIssueTitle: %s\n' "$active_issue_title"
+		fi
+	fi
+	printf 'mainBranch: %s\n' "$main_branch"
+	printf 'scratchBranch: %s\n' "$scratch_branch"
+	printf 'checkpoint: %s\n' "$checkpoint"
+	printf 'currentBranch: %s\n' "$current_branch"
+	printf 'workingTree: %s\n' "$working_tree"
+	printf 'staged: %s\n' "$(git_status_value "$staged")"
+	printf 'unstaged: %s\n' "$(git_status_value "$unstaged")"
+	printf 'untracked: %s\n' "$(git_status_value "$untracked")"
+	printf 'branchState: %s\n' "$branch_state"
+}
+
 handle_start() {
 	local argument_count="$1"
 	shift
@@ -675,6 +835,10 @@ main() {
 	case "$command" in
 		''|'help')
 			run_operational_command ignore print_help
+			return 0
+			;;
+		status)
+			run_operational_command strict handle_status "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		__test-route-args)
