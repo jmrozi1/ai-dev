@@ -107,6 +107,7 @@ assert_contains "$help_output" 'flow help'
 assert_contains "$help_output" 'flow start <issue-number>'
 assert_contains "$help_output" 'flow status'
 assert_contains "$help_output" 'flow review'
+assert_contains "$help_output" 'flow commit'
 assert_contains "$help_output" 'flow promote "<commit-message>"'
 assert_contains "$help_output" 'Read-only'
 assert_contains "$help_output" 'Configuration'
@@ -137,6 +138,7 @@ malformed_help_output="$(cat "$malformed_help_output_file")"
 assert_equals "$malformed_help_status" "0"
 assert_contains "$malformed_help_output" 'flow help'
 assert_contains "$malformed_help_output" 'flow review'
+assert_contains "$malformed_help_output" 'flow commit'
 assert_not_contains "$malformed_help_output" 'Output written to'
 assert_not_contains "$malformed_help_output" 'Invalid JSON in'
 
@@ -151,6 +153,7 @@ malformed_no_args_output="$(cat "$malformed_no_args_output_file")"
 assert_equals "$malformed_no_args_status" "0"
 assert_contains "$malformed_no_args_output" 'flow help'
 assert_contains "$malformed_no_args_output" 'flow review'
+assert_contains "$malformed_no_args_output" 'flow commit'
 assert_not_contains "$malformed_no_args_output" 'Output written to'
 assert_not_contains "$malformed_no_args_output" 'Invalid JSON in'
 
@@ -380,5 +383,6 @@ assert_equals "$symlink_status" "0"
 assert_equals "$symlink_terminal_output" "Output written to $symlink_help_file"
 assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow help'
 assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow review'
+assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow commit'
 
 printf 'flow CLI tests passed\n'

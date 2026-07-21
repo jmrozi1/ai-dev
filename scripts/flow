@@ -197,6 +197,37 @@ print(json.dumps(payload))
 PY
 }
 
+build_checkpoint_state_payload() {
+	local issue_number="$1"
+	local issue_title="$2"
+	local main_branch="$3"
+	local scratch_branch="$4"
+	local checkpoint="$5"
+
+	python3 - "$issue_number" "$issue_title" "$main_branch" "$scratch_branch" "$checkpoint" <<'PY'
+import json
+import sys
+
+issue_number = int(sys.argv[1])
+issue_title = sys.argv[2]
+main_branch = sys.argv[3]
+scratch_branch = sys.argv[4]
+checkpoint = int(sys.argv[5])
+
+payload = {
+	'activeIssueNumber': issue_number,
+	'mainBranch': main_branch,
+	'scratchBranch': scratch_branch,
+	'checkpoint': checkpoint,
+}
+
+if issue_title:
+	payload['activeIssueTitle'] = issue_title
+
+print(json.dumps(payload))
+PY
+}
+
 git_status_value() {
 	local value="$1"
 	if [[ "$value" == 'yes' ]]; then
@@ -430,6 +461,84 @@ handle_review() {
 	fi
 
 	git -C "$repo_root" diff --cached --binary --no-ext-diff
+}
+
+handle_commit() {
+	local argument_count="$1"
+	shift
+
+	if [[ "$argument_count" -ne 0 ]]; then
+		error "Usage: ${script_name} commit"
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	if [[ -z "$active_issue_number" ]]; then
+		error 'Cannot commit workflow: no active issue is set.'
+	fi
+
+	local active_issue_title
+	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+	local checkpoint
+	checkpoint="$(workflow_state_get_field 'checkpoint' "$state_json")"
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		error "Scratch branch does not exist locally: ${scratch_branch}"
+	fi
+
+	local current_branch
+	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+	if [[ "$current_branch" != "$scratch_branch" ]]; then
+		error "Cannot commit workflow: current branch ${current_branch} does not match scratchBranch ${scratch_branch}."
+	fi
+
+	local porcelain_status
+	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	local staged unstaged untracked working_tree
+	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
+
+	if [[ "$unstaged" == 'yes' ]]; then
+		error 'Cannot commit workflow: unstaged tracked changes are present.'
+	fi
+
+	if [[ "$untracked" == 'yes' ]]; then
+		error 'Cannot commit workflow: untracked files are present.'
+	fi
+
+	if [[ "$staged" != 'yes' ]]; then
+		error 'Cannot commit workflow: no staged changes are available.'
+	fi
+
+	local new_checkpoint=$(( checkpoint + 1 ))
+	if ! git -C "$repo_root" commit -q --message "$new_checkpoint"; then
+		error 'Git commit failed.'
+	fi
+
+	local state_payload
+	state_payload="$(build_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" "$new_checkpoint")"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
+
+	local commit_hash
+	commit_hash="$(git -C "$repo_root" rev-parse HEAD)"
+	printf 'Created checkpoint %s\n' "$new_checkpoint"
+	printf 'commit: %s\n' "$commit_hash"
+	printf 'activeIssueNumber: %s\n' "$active_issue_number"
 }
 
 handle_start() {
@@ -738,25 +847,27 @@ def load_state():
 
 
 def write_state(state_data):
-	state_path.parent.mkdir(parents=True, exist_ok=True)
-	with tempfile.NamedTemporaryFile(
-		mode='w',
-		encoding='utf-8',
-		dir=state_path.parent,
-		prefix=f'{state_path.name}.tmp-',
-		delete=False,
-	) as handle:
-		json.dump(state_data, handle, indent=2)
-		handle.write('\n')
-		temporary_path = Path(handle.name)
+	temporary_path = None
 	try:
+		state_path.parent.mkdir(parents=True, exist_ok=True)
+		with tempfile.NamedTemporaryFile(
+			mode='w',
+			encoding='utf-8',
+			dir=state_path.parent,
+			prefix=f'{state_path.name}.tmp-',
+			delete=False,
+		) as handle:
+			json.dump(state_data, handle, indent=2)
+			handle.write('\n')
+			temporary_path = Path(handle.name)
 		os.replace(temporary_path, state_path)
-	except Exception:
-		try:
-			temporary_path.unlink()
-		except FileNotFoundError:
-			pass
-		raise
+	except Exception as exc:
+		if temporary_path is not None:
+			try:
+				temporary_path.unlink()
+			except FileNotFoundError:
+				pass
+		fail(f"Cannot write workflow state to {state_path}: {exc}")
 
 
 if operation == 'get':
@@ -918,6 +1029,10 @@ main() {
 			;;
 		review)
 			run_operational_command strict handle_review "$(( $# - 1 ))" "${@:2}"
+			return 0
+			;;
+		commit)
+			run_operational_command strict handle_commit "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		__test-route-args)
