@@ -228,6 +228,27 @@ print(json.dumps(payload))
 PY
 }
 
+build_inactive_state_payload() {
+	local main_branch="$1"
+	local scratch_branch="$2"
+
+	python3 - "$main_branch" "$scratch_branch" <<'PY'
+import json
+import sys
+
+main_branch = sys.argv[1]
+scratch_branch = sys.argv[2]
+
+payload = {
+	'mainBranch': main_branch,
+	'scratchBranch': scratch_branch,
+	'checkpoint': 0,
+}
+
+print(json.dumps(payload))
+PY
+}
+
 git_status_value() {
 	local value="$1"
 	if [[ "$value" == 'yes' ]]; then
@@ -715,6 +736,91 @@ handle_promote() {
 	printf 'commit: %s\n' "$promoted_commit"
 	printf 'checkpoint: 0\n'
 	printf 'activeIssueNumber: %s\n' "$active_issue_number"
+}
+
+handle_complete() {
+	local argument_count="$1"
+	shift
+
+	if [[ "$argument_count" -ne 0 ]]; then
+		error "Usage: ${script_name} complete"
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	if [[ -z "$active_issue_number" ]]; then
+		error 'Cannot complete workflow: no active issue is set.'
+	fi
+
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+	local checkpoint
+	checkpoint="$(workflow_state_get_field 'checkpoint' "$state_json")"
+
+	if [[ "$main_branch" == "$scratch_branch" ]]; then
+		error 'Invalid workflow state: mainBranch and scratchBranch must be different.'
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		error "Scratch branch does not exist locally: ${scratch_branch}"
+	fi
+
+	local current_branch
+	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+	if [[ "$current_branch" != "$scratch_branch" ]]; then
+		error "Cannot complete workflow: current branch ${current_branch} does not match scratchBranch ${scratch_branch}."
+	fi
+
+	local porcelain_status
+	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	local staged unstaged untracked working_tree
+	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
+	if [[ "$staged" == 'yes' || "$unstaged" == 'yes' || "$untracked" == 'yes' ]]; then
+		error 'Cannot complete workflow: repository must be clean.'
+	fi
+
+	local counts
+	counts="$(git -C "$repo_root" rev-list --left-right --count "${main_branch}...${scratch_branch}")"
+	local main_only_count scratch_only_count
+	IFS=$' \t' read -r main_only_count scratch_only_count <<< "$counts"
+
+	if [[ "$main_only_count" -eq 0 && "$scratch_only_count" -eq 0 ]]; then
+		:
+	elif [[ "$main_only_count" -eq 0 ]]; then
+		error "Cannot complete workflow: ${scratch_branch} is ahead of ${main_branch}."
+	elif [[ "$scratch_only_count" -eq 0 ]]; then
+		error "Cannot complete workflow: ${scratch_branch} is behind ${main_branch}."
+	else
+		error "Cannot complete workflow: ${scratch_branch} and ${main_branch} have diverged."
+	fi
+
+	if [[ "$checkpoint" != '0' ]]; then
+		error "Cannot complete workflow: checkpoint must be 0 (current: ${checkpoint})."
+	fi
+
+	local state_payload
+	state_payload="$(build_inactive_state_payload "$main_branch" "$scratch_branch")"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
+
+	printf 'Completed issue %s\n' "$active_issue_number"
+	printf 'Workflow: inactive\n'
+	printf 'mainBranch: %s\n' "$main_branch"
+	printf 'scratchBranch: %s\n' "$scratch_branch"
+	printf 'checkpoint: 0\n'
 }
 
 handle_start() {
@@ -1217,6 +1323,10 @@ main() {
 			;;
 		promote)
 			run_operational_command strict handle_promote "$(( $# - 1 ))" "${@:2}"
+			return 0
+			;;
+		complete)
+			run_operational_command strict handle_complete "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		__test-route-args)
