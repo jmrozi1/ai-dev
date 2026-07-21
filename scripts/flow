@@ -357,12 +357,240 @@ branch_state_for_repo() {
 	printf 'scratch and main have diverged: scratch ahead by %s commit(s), behind by %s commit(s)' "$scratch_only_count" "$main_only_count"
 }
 
+branch_relation_info_for_repo() {
+	local repo_root="$1"
+	local main_branch="$2"
+	local scratch_branch="$3"
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		printf 'missing-main 0 0\n'
+		return 0
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		printf 'missing-scratch 0 0\n'
+		return 0
+	fi
+
+	local counts
+	counts="$(git -C "$repo_root" rev-list --left-right --count "${main_branch}...${scratch_branch}")"
+
+	local main_only_count scratch_only_count
+	IFS=$' \t' read -r main_only_count scratch_only_count <<< "$counts"
+
+	if [[ "$main_only_count" -eq 0 && "$scratch_only_count" -eq 0 ]]; then
+		printf 'equal 0 0\n'
+		return 0
+	fi
+
+	if [[ "$main_only_count" -eq 0 ]]; then
+		printf 'ahead %s %s\n' "$main_only_count" "$scratch_only_count"
+		return 0
+	fi
+
+	if [[ "$scratch_only_count" -eq 0 ]]; then
+		printf 'behind %s %s\n' "$main_only_count" "$scratch_only_count"
+		return 0
+	fi
+
+	printf 'diverged %s %s\n' "$main_only_count" "$scratch_only_count"
+}
+
+relationship_line_for_default_status() {
+	local relation_state="$1"
+	local main_branch="$2"
+	local scratch_branch="$3"
+	local main_only_count="$4"
+	local scratch_only_count="$5"
+
+	case "$relation_state" in
+		ahead)
+			if [[ "$scratch_only_count" -eq 1 ]]; then
+				printf '1 commit ahead of %s' "$main_branch"
+			else
+				printf '%s commits ahead of %s' "$scratch_only_count" "$main_branch"
+			fi
+			return 0
+			;;
+		behind)
+			if [[ "$main_only_count" -eq 1 ]]; then
+				printf '1 commit behind %s' "$main_branch"
+			else
+				printf '%s commits behind %s' "$main_only_count" "$main_branch"
+			fi
+			return 0
+			;;
+		diverged)
+			printf 'Branches have diverged: %s on %s, %s on %s' "$main_only_count" "$main_branch" "$scratch_only_count" "$scratch_branch"
+			return 0
+			;;
+		*)
+			return 0
+			;;
+	esac
+}
+
+relationship_line_for_verbose_status() {
+	local relation_state="$1"
+	local main_only_count="$2"
+	local scratch_only_count="$3"
+	local main_branch="$4"
+	local scratch_branch="$5"
+
+	case "$relation_state" in
+		equal)
+			printf '%s equals %s' "$scratch_branch" "$main_branch"
+			;;
+		ahead)
+			if [[ "$scratch_only_count" -eq 1 ]]; then
+				printf '%s is 1 commit ahead of %s' "$scratch_branch" "$main_branch"
+			else
+				printf '%s is %s commits ahead of %s' "$scratch_branch" "$scratch_only_count" "$main_branch"
+			fi
+			;;
+		behind)
+			if [[ "$main_only_count" -eq 1 ]]; then
+				printf '%s is 1 commit behind %s' "$scratch_branch" "$main_branch"
+			else
+				printf '%s is %s commits behind %s' "$scratch_branch" "$main_only_count" "$main_branch"
+			fi
+			;;
+		diverged)
+			printf '%s and %s have diverged: %s on %s, %s on %s' "$scratch_branch" "$main_branch" "$main_only_count" "$main_branch" "$scratch_only_count" "$scratch_branch"
+			;;
+		missing-main)
+			printf '%s branch missing' "$main_branch"
+			;;
+		missing-scratch)
+			printf '%s branch missing' "$scratch_branch"
+			;;
+		*)
+			printf 'relationship unavailable'
+			;;
+	esac
+}
+
+normalize_status_path_list() {
+	local paths="$1"
+
+	if [[ -z "$paths" ]]; then
+		return 0
+	fi
+
+	printf '%s\n' "$paths" | awk 'length($0) > 0' | LC_ALL=C sort -u
+}
+
+count_status_paths() {
+	local paths="$1"
+
+	if [[ -z "$paths" ]]; then
+		printf '0'
+		return 0
+	fi
+
+	awk 'length($0) > 0 { count += 1 } END { print count + 0 }' <<< "$paths"
+}
+
+collect_status_details() {
+	local porcelain_status="$1"
+
+	local staged_paths=''
+	local modified_paths=''
+	local untracked_paths=''
+	local line
+	while IFS= read -r line; do
+		if [[ -z "$line" ]]; then
+			continue
+		fi
+
+		local x_status="${line:0:1}"
+		local y_status="${line:1:1}"
+		local path_text="${line:3}"
+
+		if [[ "$x_status$y_status" == '??' ]]; then
+			untracked_paths+="${path_text}"$'\n'
+			continue
+		fi
+
+		if [[ "$x_status" != ' ' ]]; then
+			staged_paths+="${path_text}"$'\n'
+		fi
+
+		if [[ "$y_status" != ' ' ]]; then
+			modified_paths+="${path_text}"$'\n'
+		fi
+	done <<< "$porcelain_status"
+
+	STATUS_STAGED_PATHS="$(normalize_status_path_list "$staged_paths")"
+	STATUS_MODIFIED_PATHS="$(normalize_status_path_list "$modified_paths")"
+	STATUS_UNTRACKED_PATHS="$(normalize_status_path_list "$untracked_paths")"
+
+	STATUS_STAGED_COUNT="$(count_status_paths "$STATUS_STAGED_PATHS")"
+	STATUS_MODIFIED_COUNT="$(count_status_paths "$STATUS_MODIFIED_PATHS")"
+	STATUS_UNTRACKED_COUNT="$(count_status_paths "$STATUS_UNTRACKED_PATHS")"
+
+	STATUS_WORKING_TREE='clean'
+	if [[ "$STATUS_STAGED_COUNT" -gt 0 || "$STATUS_MODIFIED_COUNT" -gt 0 || "$STATUS_UNTRACKED_COUNT" -gt 0 ]]; then
+		STATUS_WORKING_TREE='dirty'
+	fi
+}
+
+print_status_path_category() {
+	local category_name="$1"
+	local paths="$2"
+
+	if [[ -z "$paths" ]]; then
+		return 0
+	fi
+
+	printf '  %s:\n' "$category_name"
+	while IFS= read -r line; do
+		if [[ -z "$line" ]]; then
+			continue
+		fi
+		printf '    %s\n' "$line"
+	done <<< "$paths"
+}
+
+print_status_count_line() {
+	local count="$1"
+	local label="$2"
+
+	if [[ "$count" -eq 1 ]]; then
+		printf '  1 %s\n' "$label"
+		return 0
+	fi
+
+	printf '  %s %s\n' "$count" "$label"
+}
+
+normalize_branch_name_for_status() {
+	local raw_branch="$1"
+
+	if [[ "$raw_branch" == 'HEAD' ]]; then
+		printf 'detached HEAD'
+		return 0
+	fi
+
+	printf '%s' "$raw_branch"
+}
+
 handle_status() {
 	local argument_count="$1"
 	shift
 
-	if [[ "$argument_count" -ne 0 ]]; then
-		error "Usage: ${script_name} status"
+	local verbose='no'
+	if [[ "$argument_count" -eq 0 ]]; then
+		:
+	elif [[ "$argument_count" -eq 1 ]]; then
+		local first_argument="${1:-}"
+		if [[ "$first_argument" == '-v' || "$first_argument" == '--verbose' ]]; then
+			verbose='yes'
+		else
+			error "Usage: ${script_name} status [-v|--verbose]"
+		fi
+	else
+		error "Usage: ${script_name} status [-v|--verbose]"
 	fi
 
 	local repo_root
@@ -391,31 +619,108 @@ handle_status() {
 
 	local porcelain_status
 	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
-
-	local staged unstaged untracked working_tree
-	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
+	collect_status_details "$porcelain_status"
 
 	local current_branch
-	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
-	local branch_state
-	branch_state="$(branch_state_for_repo "$repo_root" "$main_branch" "$scratch_branch")"
+	current_branch="$(normalize_branch_name_for_status "$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)")"
 
-	printf 'Workflow: %s\n' "$workflow_status"
-	if [[ "$workflow_status" == 'active' ]]; then
-		printf 'activeIssueNumber: %s\n' "$active_issue_number"
-		if [[ -n "$active_issue_title" ]]; then
-			printf 'activeIssueTitle: %s\n' "$active_issue_title"
+	local relation_state main_only_count scratch_only_count
+	read -r relation_state main_only_count scratch_only_count <<< "$(branch_relation_info_for_repo "$repo_root" "$main_branch" "$scratch_branch")"
+
+	if [[ "$verbose" == 'yes' ]]; then
+		printf 'Workflow:\n'
+		if [[ "$workflow_status" == 'active' ]]; then
+			printf '  state: active\n'
+			printf '  issue number: %s\n' "$active_issue_number"
+			if [[ -n "$active_issue_title" ]]; then
+				printf '  issue title: %s\n' "$active_issue_title"
+			fi
+			printf '  checkpoint: %s\n' "$checkpoint"
+		else
+			printf '  state: inactive\n'
+			printf '  checkpoint: %s\n' "$checkpoint"
 		fi
+
+		printf 'Repository:\n'
+		printf '  current branch: %s\n' "$current_branch"
+		printf '  main branch: %s\n' "$main_branch"
+		printf '  scratch branch: %s\n' "$scratch_branch"
+		printf '  relation: %s\n' "$(relationship_line_for_verbose_status "$relation_state" "$main_only_count" "$scratch_only_count" "$main_branch" "$scratch_branch")"
+
+		printf 'Working tree:\n'
+		if [[ "$STATUS_WORKING_TREE" == 'clean' ]]; then
+			printf '  clean\n'
+		else
+			print_status_path_category 'staged' "$STATUS_STAGED_PATHS"
+			print_status_path_category 'modified' "$STATUS_MODIFIED_PATHS"
+			print_status_path_category 'untracked' "$STATUS_UNTRACKED_PATHS"
+		fi
+		return 0
 	fi
-	printf 'mainBranch: %s\n' "$main_branch"
-	printf 'scratchBranch: %s\n' "$scratch_branch"
-	printf 'checkpoint: %s\n' "$checkpoint"
-	printf 'currentBranch: %s\n' "$current_branch"
-	printf 'workingTree: %s\n' "$working_tree"
-	printf 'staged: %s\n' "$(git_status_value "$staged")"
-	printf 'unstaged: %s\n' "$(git_status_value "$unstaged")"
-	printf 'untracked: %s\n' "$(git_status_value "$untracked")"
-	printf 'branchState: %s\n' "$branch_state"
+
+	if [[ "$workflow_status" == 'active' ]]; then
+		if [[ -n "$active_issue_title" ]]; then
+			printf 'Issue %s — %s\n' "$active_issue_number" "$active_issue_title"
+		else
+			printf 'Issue %s\n' "$active_issue_number"
+		fi
+	else
+		printf 'No active workflow.\n'
+	fi
+	printf 'Branch: %s\n' "$current_branch"
+
+	local relationship_line=''
+	relationship_line="$(relationship_line_for_default_status "$relation_state" "$main_branch" "$scratch_branch" "$main_only_count" "$scratch_only_count")"
+
+	local has_deviation='no'
+	if [[ "$workflow_status" == 'active' && "$current_branch" != "$scratch_branch" ]]; then
+		has_deviation='yes'
+	fi
+	if [[ -n "$relationship_line" ]]; then
+		has_deviation='yes'
+	fi
+	if [[ "$STATUS_STAGED_COUNT" -gt 0 || "$STATUS_MODIFIED_COUNT" -gt 0 || "$STATUS_UNTRACKED_COUNT" -gt 0 ]]; then
+		has_deviation='yes'
+	fi
+
+	local checkpoint_conveyed='no'
+	if [[ "$relation_state" == 'ahead' && "$scratch_only_count" -eq "$checkpoint" ]]; then
+		checkpoint_conveyed='yes'
+	fi
+
+	if [[ "$checkpoint" != '0' && "$checkpoint_conveyed" != 'yes' ]]; then
+		has_deviation='yes'
+	fi
+
+	if [[ "$has_deviation" != 'yes' ]]; then
+		return 0
+	fi
+
+	printf '\nWorking tree:\n'
+
+	if [[ "$workflow_status" == 'active' && "$current_branch" != "$scratch_branch" ]]; then
+		printf '  Expected branch: %s\n' "$scratch_branch"
+	fi
+
+	if [[ -n "$relationship_line" ]]; then
+		printf '  %s\n' "$relationship_line"
+	fi
+
+	if [[ "$STATUS_STAGED_COUNT" -gt 0 ]]; then
+		print_status_count_line "$STATUS_STAGED_COUNT" 'staged'
+	fi
+
+	if [[ "$STATUS_MODIFIED_COUNT" -gt 0 ]]; then
+		print_status_count_line "$STATUS_MODIFIED_COUNT" 'modified'
+	fi
+
+	if [[ "$STATUS_UNTRACKED_COUNT" -gt 0 ]]; then
+		print_status_count_line "$STATUS_UNTRACKED_COUNT" 'untracked'
+	fi
+
+	if [[ "$checkpoint" != '0' && "$checkpoint_conveyed" != 'yes' ]]; then
+		printf '  Checkpoint: %s\n' "$checkpoint"
+	fi
 }
 
 handle_review() {
@@ -1260,7 +1565,7 @@ print_help() {
 	cat <<EOF
 ${script_name} help
 ${script_name} start <issue-number>
-${script_name} status
+${script_name} status [-v|--verbose]
 ${script_name} review
 ${script_name} commit
 ${script_name} reset
@@ -1272,7 +1577,7 @@ ${script_name} unset out
 
 Read-only
   ${script_name} help
-  ${script_name} status
+  ${script_name} status [-v|--verbose]
   ${script_name} review
   ${script_name} get out
 

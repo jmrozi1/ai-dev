@@ -105,7 +105,7 @@ help_output="$(cat "$help_output_file")"
 assert_equals "$help_status" "0"
 assert_contains "$help_output" 'flow help'
 assert_contains "$help_output" 'flow start <issue-number>'
-assert_contains "$help_output" 'flow status'
+assert_contains "$help_output" 'flow status [-v|--verbose]'
 assert_contains "$help_output" 'flow review'
 assert_contains "$help_output" 'flow commit'
 assert_contains "$help_output" 'flow reset'
