@@ -11,6 +11,7 @@ out.txt
 *.log
 .DS_Store
 .ai-dev/workflow.json
+.ai-dev/config.json
 
 # generated command output
 **/out.txt
