@@ -229,7 +229,7 @@ assert_equals "$empty_arg_status" '1'
 assert_contains "$(cat "$empty_arg_output")" 'Usage: flow status [-v|--verbose]'
 
 help_output="$(run_flow "$repo_args/subdir" help)"
-assert_contains "$help_output" 'flow status [-v|--verbose]'
+assert_contains "$help_output" 'status     Show the active issue and current repository state.'
 
 # outside repository
 outside_repo="$TMP_DIR/outside-repo"

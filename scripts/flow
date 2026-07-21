@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-script_name="$(basename "${BASH_SOURCE[0]}")"
+script_name="$(basename "${0:-${BASH_SOURCE[0]}}")"
 
 error() {
 	printf '%s: %s\n' "$script_name" "$1" >&2
@@ -1563,35 +1563,162 @@ handle_config_unset() {
 
 print_help() {
 	cat <<EOF
-${script_name} help
-${script_name} start <issue-number>
-${script_name} status [-v|--verbose]
-${script_name} review
-${script_name} commit
-${script_name} reset
-${script_name} promote "<commit-message>"
-${script_name} complete
-${script_name} get out
-${script_name} set out=/path/to/file
-${script_name} unset out
+Usage: ${script_name} <command> [options]
 
-Read-only
-  ${script_name} help
-  ${script_name} status [-v|--verbose]
-  ${script_name} review
-  ${script_name} get out
+Manage an issue-focused development workflow using permanent main history
+and disposable scratch checkpoints.
 
-Configuration
-  ${script_name} set out=/path/to/file
-  ${script_name} unset out
+Commands:
+  start      Begin work on an issue and reset scratch from main.
+  status     Show the active issue and current repository state.
+  review     Generate the cumulative change package for review.
+  commit     Create the next numbered checkpoint on scratch.
+  reset      Discard scratch work and restore it from main.
+  promote    Squash scratch into one permanent commit on main.
+  complete   Clear the completed local workflow.
+  get        Read a repository setting.
+  set        Change a repository setting.
+  unset      Remove a repository setting.
+  help       Show this help.
 
-Workflow mutations
-  ${script_name} start <issue-number>
-  ${script_name} commit
-  ${script_name} reset
-  ${script_name} promote "<commit-message>"
-  ${script_name} complete
+Run \`${script_name} <command> --help\` for command-specific help.
 EOF
+}
+
+is_help_flag() {
+	case "$1" in
+		-h|--help)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+print_command_help() {
+	local command="$1"
+
+	case "$command" in
+		start)
+			cat <<EOF
+Usage: ${script_name} start <issue-number>
+
+Begin work on an issue by resetting scratch to main, checking out scratch,
+and recording the active issue.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		status)
+			cat <<EOF
+Usage: ${script_name} status [-v|--verbose]
+
+Show the active issue, current branch, and repository deviations.
+
+Options:
+  -v, --verbose  Show complete workflow and Git details.
+  -h, --help     Show this help.
+EOF
+			;;
+		review)
+			cat <<EOF
+Usage: ${script_name} review
+
+Generate a cumulative review package for all scratch and working-tree
+changes relative to main.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		commit)
+			cat <<EOF
+Usage: ${script_name} commit
+
+Create the next numbered checkpoint commit on scratch.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		reset)
+			cat <<EOF
+Usage: ${script_name} reset
+
+Discard scratch commits and working-tree changes by resetting scratch to
+main while preserving the active issue.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		promote)
+			cat <<EOF
+Usage: ${script_name} promote "<commit-message>"
+
+Squash the complete scratch change into one permanent commit on main, then
+reset scratch to the promoted main commit.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		complete)
+			cat <<EOF
+Usage: ${script_name} complete
+
+Clear the active local workflow after scratch and main are synchronized.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		get)
+			cat <<EOF
+Usage: ${script_name} get out
+
+Show the configured operational output destination.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		set)
+			cat <<EOF
+Usage: ${script_name} set out=<path>
+
+Configure operational command output to replace the specified file.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		unset)
+			cat <<EOF
+Usage: ${script_name} unset out
+
+Remove the configured operational output destination.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		help)
+			cat <<EOF
+Usage: ${script_name} help
+
+Show top-level command help.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		*)
+			error "Unknown command help target: ${command}"
+			;;
+	esac
 }
 
 print_unknown_command() {
@@ -1604,34 +1731,89 @@ main() {
 	local command="${1:-}"
 	local first_argument="${2:-}"
 	local second_argument="${3:-}"
+	local argument_count=0
+	if [[ $# -gt 0 ]]; then
+		argument_count=$(( $# - 1 ))
+	fi
+
+	if [[ $# -eq 0 ]]; then
+		print_help
+		return 0
+	fi
 
 	case "$command" in
-		''|'help')
-			run_operational_command ignore print_help
+		-h|--help)
+			if [[ "$argument_count" -ne 0 ]]; then
+				error "Usage: ${script_name} <command> [options]"
+			fi
+			print_help
 			return 0
 			;;
-		status)
-			run_operational_command strict handle_status "$(( $# - 1 ))" "${@:2}"
-			return 0
+		help)
+			if [[ "$argument_count" -eq 0 ]]; then
+				print_help
+				return 0
+			fi
+
+			if [[ "$argument_count" -eq 1 ]] && is_help_flag "$first_argument"; then
+				print_command_help help
+				return 0
+			fi
+
+			error "Usage: ${script_name} help"
 			;;
-		review)
-			run_operational_command strict handle_review "$(( $# - 1 ))" "${@:2}"
-			return 0
-			;;
-		commit)
-			run_operational_command strict handle_commit "$(( $# - 1 ))" "${@:2}"
-			return 0
-			;;
-		reset)
-			run_operational_command strict handle_reset "$(( $# - 1 ))" "${@:2}"
-			return 0
-			;;
-		promote)
-			run_operational_command strict handle_promote "$(( $# - 1 ))" "${@:2}"
-			return 0
-			;;
-		complete)
-			run_operational_command strict handle_complete "$(( $# - 1 ))" "${@:2}"
+		start|status|review|commit|reset|promote|complete|get|set|unset)
+			if [[ "$argument_count" -eq 1 ]] && is_help_flag "$first_argument"; then
+				print_command_help "$command"
+				return 0
+			fi
+
+			case "$command" in
+				status)
+					run_operational_command strict handle_status "$argument_count" "${@:2}"
+					return 0
+					;;
+				review)
+					run_operational_command strict handle_review "$argument_count" "${@:2}"
+					return 0
+					;;
+				commit)
+					run_operational_command strict handle_commit "$argument_count" "${@:2}"
+					return 0
+					;;
+				reset)
+					run_operational_command strict handle_reset "$argument_count" "${@:2}"
+					return 0
+					;;
+				promote)
+					run_operational_command strict handle_promote "$argument_count" "${@:2}"
+					return 0
+					;;
+				complete)
+					run_operational_command strict handle_complete "$argument_count" "${@:2}"
+					return 0
+					;;
+				start)
+					run_operational_command strict handle_start "$argument_count" "${@:2}"
+					return 0
+					;;
+				get)
+					handle_config_get "$first_argument" "$second_argument"
+					return 0
+					;;
+				set)
+					handle_config_set "$first_argument" "$second_argument"
+					return 0
+					;;
+				unset)
+					handle_config_unset "$first_argument" "$second_argument"
+					return 0
+					;;
+				*)
+					print_unknown_command "$command"
+					return 1
+					;;
+			esac
 			return 0
 			;;
 		__test-route-args)
@@ -1690,22 +1872,6 @@ main() {
 			local workflow_state_file
 			workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
 			workflow_state_json_helper 'clear' "$workflow_state_file"
-			return 0
-			;;
-		get)
-			handle_config_get "$first_argument" "$second_argument"
-			return 0
-			;;
-		set)
-			handle_config_set "$first_argument" "$second_argument"
-			return 0
-			;;
-		unset)
-			handle_config_unset "$first_argument" "$second_argument"
-			return 0
-			;;
-		start)
-			run_operational_command strict handle_start "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		*)

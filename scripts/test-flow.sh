@@ -87,6 +87,31 @@ run_flow_capture() {
 	fi
 }
 
+expected_top_help() {
+	local command_name="$1"
+	cat <<EOF
+Usage: ${command_name} <command> [options]
+
+Manage an issue-focused development workflow using permanent main history
+and disposable scratch checkpoints.
+
+Commands:
+  start      Begin work on an issue and reset scratch from main.
+  status     Show the active issue and current repository state.
+  review     Generate the cumulative change package for review.
+  commit     Create the next numbered checkpoint on scratch.
+  reset      Discard scratch work and restore it from main.
+  promote    Squash scratch into one permanent commit on main.
+  complete   Clear the completed local workflow.
+  get        Read a repository setting.
+  set        Change a repository setting.
+  unset      Remove a repository setting.
+  help       Show this help.
+
+Run \`${command_name} <command> --help\` for command-specific help.
+EOF
+}
+
 repo_unset="$TMP_DIR/repo-unset"
 repo_routing="$TMP_DIR/repo-routing"
 repo_malformed="$TMP_DIR/repo-malformed"
@@ -94,7 +119,7 @@ init_repo "$repo_unset"
 init_repo "$repo_routing"
 init_repo "$repo_malformed"
 
-# help with out unset
+# top-level help bypasses routing and works without repo/config context
 help_output_file="$TMP_DIR/help-output"
 if run_flow_capture "$repo_unset/subdir" "$help_output_file" help; then
 	help_status=0
@@ -103,20 +128,12 @@ else
 fi
 help_output="$(cat "$help_output_file")"
 assert_equals "$help_status" "0"
-assert_contains "$help_output" 'flow help'
-assert_contains "$help_output" 'flow start <issue-number>'
-assert_contains "$help_output" 'flow status [-v|--verbose]'
-assert_contains "$help_output" 'flow review'
-assert_contains "$help_output" 'flow commit'
-assert_contains "$help_output" 'flow reset'
-assert_contains "$help_output" 'flow promote "<commit-message>"'
-assert_contains "$help_output" 'flow complete'
-assert_contains "$help_output" 'Read-only'
-assert_contains "$help_output" 'Configuration'
-assert_contains "$help_output" 'Workflow mutations'
+assert_contains "$help_output" 'Usage: flow <command> [options]'
+assert_contains "$help_output" 'Commands:'
+assert_contains "$help_output" '  help       Show this help.'
 assert_not_exists "$repo_unset/.ai-dev"
 
-# no-argument help with out unset matches flow help
+# no-argument invocation matches help and top-level flags
 no_args_output_file="$TMP_DIR/no-args-output"
 if run_flow_capture "$repo_unset/subdir" "$no_args_output_file"; then
 	no_args_status=0
@@ -126,6 +143,26 @@ fi
 no_args_output="$(cat "$no_args_output_file")"
 assert_equals "$no_args_status" "0"
 assert_equals "$no_args_output" "$help_output"
+
+minus_h_output_file="$TMP_DIR/minus-h-output"
+if run_flow_capture "$repo_unset/subdir" "$minus_h_output_file" -h; then
+	minus_h_status=0
+else
+	minus_h_status=$?
+fi
+minus_h_output="$(cat "$minus_h_output_file")"
+assert_equals "$minus_h_status" "0"
+assert_equals "$minus_h_output" "$help_output"
+
+long_help_output_file="$TMP_DIR/long-help-output"
+if run_flow_capture "$repo_unset/subdir" "$long_help_output_file" --help; then
+	long_help_status=0
+else
+	long_help_status=$?
+fi
+long_help_output="$(cat "$long_help_output_file")"
+assert_equals "$long_help_status" "0"
+assert_equals "$long_help_output" "$help_output"
 
 # malformed config + help succeeds and prints to stdout
 mkdir -p "$repo_malformed/.ai-dev"
@@ -138,11 +175,7 @@ else
 fi
 malformed_help_output="$(cat "$malformed_help_output_file")"
 assert_equals "$malformed_help_status" "0"
-assert_contains "$malformed_help_output" 'flow help'
-assert_contains "$malformed_help_output" 'flow review'
-assert_contains "$malformed_help_output" 'flow commit'
-assert_contains "$malformed_help_output" 'flow reset'
-assert_contains "$malformed_help_output" 'flow complete'
+assert_equals "$malformed_help_output" "$help_output"
 assert_not_contains "$malformed_help_output" 'Output written to'
 assert_not_contains "$malformed_help_output" 'Invalid JSON in'
 
@@ -155,11 +188,7 @@ else
 fi
 malformed_no_args_output="$(cat "$malformed_no_args_output_file")"
 assert_equals "$malformed_no_args_status" "0"
-assert_contains "$malformed_no_args_output" 'flow help'
-assert_contains "$malformed_no_args_output" 'flow review'
-assert_contains "$malformed_no_args_output" 'flow commit'
-assert_contains "$malformed_no_args_output" 'flow reset'
-assert_contains "$malformed_no_args_output" 'flow complete'
+assert_equals "$malformed_no_args_output" "$help_output"
 assert_not_contains "$malformed_no_args_output" 'Output written to'
 assert_not_contains "$malformed_no_args_output" 'Invalid JSON in'
 
@@ -203,76 +232,44 @@ assert_equals "$passthrough_status" "0"
 assert_contains "$passthrough_output" 'arg1=123'
 assert_contains "$passthrough_output" 'arg2=value with spaces'
 
-# help with relative out
+# help never routes output even when configured
 mkdir -p "$repo_routing/reports"
 set_repo_out "$repo_routing" 'reports/help.txt'
-relative_terminal_output_file="$TMP_DIR/relative-terminal-output"
-if run_flow_capture "$repo_routing/subdir" "$relative_terminal_output_file" help; then
-	relative_status=0
+help_routed_output_file="$TMP_DIR/help-routed-output"
+if run_flow_capture "$repo_routing/subdir" "$help_routed_output_file" help; then
+	help_routed_status=0
 else
-	relative_status=$?
+	help_routed_status=$?
 fi
-relative_terminal_output="$(cat "$relative_terminal_output_file")"
-relative_output_path="$repo_routing/reports/help.txt"
-assert_equals "$relative_status" "0"
-assert_equals "$relative_terminal_output" "Output written to $relative_output_path"
-assert_contains "$(cat "$relative_output_path")" 'flow help'
+help_routed_output="$(cat "$help_routed_output_file")"
+assert_equals "$help_routed_status" "0"
+assert_equals "$help_routed_output" "$help_output"
+assert_not_exists "$repo_routing/reports/help.txt"
 
-# no-argument help routing with relative out
-relative_no_args_terminal_output_file="$TMP_DIR/relative-no-args-terminal-output"
-if run_flow_capture "$repo_routing/subdir" "$relative_no_args_terminal_output_file"; then
-	relative_no_args_status=0
+help_routed_no_args_file="$TMP_DIR/help-routed-no-args-output"
+if run_flow_capture "$repo_routing/subdir" "$help_routed_no_args_file"; then
+	help_routed_no_args_status=0
 else
-	relative_no_args_status=$?
+	help_routed_no_args_status=$?
 fi
-relative_no_args_terminal_output="$(cat "$relative_no_args_terminal_output_file")"
-assert_equals "$relative_no_args_status" "0"
-assert_equals "$relative_no_args_terminal_output" "Output written to $relative_output_path"
-assert_contains "$(cat "$relative_output_path")" 'flow help'
+help_routed_no_args_output="$(cat "$help_routed_no_args_file")"
+assert_equals "$help_routed_no_args_status" "0"
+assert_equals "$help_routed_no_args_output" "$help_output"
+assert_not_exists "$repo_routing/reports/help.txt"
 
-# help with absolute out
-absolute_output_path="$TMP_DIR/absolute-help.txt"
-set_repo_out "$repo_routing" "$absolute_output_path"
-absolute_terminal_output_file="$TMP_DIR/absolute-terminal-output"
-if run_flow_capture "$repo_routing/subdir" "$absolute_terminal_output_file" help; then
-	absolute_status=0
+help_routed_status_flag_file="$TMP_DIR/help-routed-status-help-output"
+if run_flow_capture "$repo_routing/subdir" "$help_routed_status_flag_file" status --help; then
+	help_routed_status_flag_status=0
 else
-	absolute_status=$?
+	help_routed_status_flag_status=$?
 fi
-absolute_terminal_output="$(cat "$absolute_terminal_output_file")"
-assert_equals "$absolute_status" "0"
-assert_equals "$absolute_terminal_output" "Output written to $absolute_output_path"
-assert_contains "$(cat "$absolute_output_path")" 'flow help'
+help_routed_status_flag_output="$(cat "$help_routed_status_flag_file")"
+assert_equals "$help_routed_status_flag_status" "0"
+assert_contains "$help_routed_status_flag_output" 'Usage: flow status [-v|--verbose]'
+assert_not_exists "$repo_routing/reports/help.txt"
 
-# help with tilde-expansion out
-home_root="$TMP_DIR/home"
-mkdir -p "$home_root/ai-dev-home"
-tilde_output_path="$home_root/ai-dev-home/help.txt"
+# restore configured out for subsequent routing checks
 set_repo_out "$repo_routing" '~/ai-dev-home/help.txt'
-tilde_terminal_output_file="$TMP_DIR/tilde-terminal-output"
-if HOME="$home_root" run_flow_capture "$repo_routing/subdir" "$tilde_terminal_output_file" help; then
-	tilde_status=0
-else
-	tilde_status=$?
-fi
-tilde_terminal_output="$(cat "$tilde_terminal_output_file")"
-assert_equals "$tilde_status" "0"
-assert_equals "$tilde_terminal_output" "Output written to $tilde_output_path"
-assert_contains "$(cat "$tilde_output_path")" 'flow help'
-
-# configured output replaces existing content
-printf 'old content\n' > "$tilde_output_path"
-if HOME="$home_root" run_flow_capture "$repo_routing/subdir" "$TMP_DIR/replace-terminal-output" help; then
-	replace_status=0
-else
-	replace_status=$?
-fi
-replace_terminal_output="$(cat "$TMP_DIR/replace-terminal-output")"
-replace_file_text="$(cat "$tilde_output_path")"
-assert_equals "$replace_status" "0"
-assert_equals "$replace_terminal_output" "Output written to $tilde_output_path"
-assert_not_contains "$replace_file_text" 'old content'
-assert_contains "$replace_file_text" 'flow help'
 
 # configuration commands remain in the terminal
 if run_flow_capture "$repo_routing/subdir" "$TMP_DIR/get-out-output" get out; then
@@ -305,9 +302,6 @@ assert_equals "$unset_out_status" "0"
 assert_equals "$unset_out_text" 'out: not configured'
 assert_not_contains "$unset_out_text" 'Output written to'
 
-# restore configured out for subsequent routing checks
-set_repo_out "$repo_routing" '~/ai-dev-home/help.txt'
-
 # unknown-command errors remain in the terminal
 unknown_output_file="$TMP_DIR/unknown-output"
 if run_flow_capture "$repo_routing/subdir" "$unknown_output_file" gibberish; then
@@ -321,7 +315,7 @@ assert_contains "$unknown_output" 'flow: unknown command: gibberish'
 assert_contains "$unknown_output" 'Run flow help for usage.'
 assert_not_contains "$unknown_output" 'Output written to'
 
-# missing parent directory fails clearly
+# help ignores routing destination problems
 set_repo_out "$repo_routing" 'missing-parent/help.txt'
 missing_parent_output_file="$TMP_DIR/missing-parent-output"
 if run_flow_capture "$repo_routing/subdir" "$missing_parent_output_file" help; then
@@ -330,13 +324,10 @@ else
 	missing_parent_status=$?
 fi
 missing_parent_output="$(cat "$missing_parent_output_file")"
-assert_equals "$missing_parent_status" "1"
-assert_contains "$missing_parent_output" 'Cannot write output to'
-assert_contains "$missing_parent_output" 'parent directory does not exist'
-assert_contains "$missing_parent_output" 'Generated output preserved at'
+assert_equals "$missing_parent_status" "0"
+assert_equals "$missing_parent_output" "$help_output"
 assert_not_exists "$repo_routing/missing-parent/help.txt"
 
-# unwritable destination fails clearly (portable where non-root)
 if [[ "$(id -u)" != '0' ]]; then
 	mkdir -p "$repo_routing/no-write"
 	chmod 500 "$repo_routing/no-write"
@@ -348,9 +339,8 @@ if [[ "$(id -u)" != '0' ]]; then
 		unwritable_status=$?
 	fi
 	unwritable_output="$(cat "$unwritable_output_file")"
-	assert_equals "$unwritable_status" "1"
-	assert_contains "$unwritable_output" 'Cannot write output to'
-	assert_contains "$unwritable_output" 'Generated output preserved at'
+	assert_equals "$unwritable_status" "0"
+	assert_equals "$unwritable_output" "$help_output"
 	assert_not_exists "$repo_routing/no-write/help.txt"
 	chmod 700 "$repo_routing/no-write"
 fi
@@ -366,10 +356,9 @@ else
 fi
 outside_output="$(cat "$outside_output_file")"
 assert_equals "$outside_status" "0"
-assert_contains "$outside_output" 'flow help'
-assert_not_contains "$outside_output" 'Output written to'
+assert_equals "$outside_output" "$help_output"
 
-# alternate invoked command name appears inside redirected help
+# alternate invoked command name appears inside top-level help
 mkdir -p "$repo_routing/reports"
 set_repo_out "$repo_routing" 'reports/alt-help.txt'
 symlink_path="$TMP_DIR/ai-dev-flow"
@@ -384,13 +373,8 @@ else
 	symlink_status=$?
 fi
 symlink_terminal_output="$(cat "$symlink_terminal_output_file")"
-symlink_help_file="$repo_routing/reports/alt-help.txt"
 assert_equals "$symlink_status" "0"
-assert_equals "$symlink_terminal_output" "Output written to $symlink_help_file"
-assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow help'
-assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow review'
-assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow commit'
-assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow reset'
-assert_contains "$(cat "$symlink_help_file")" 'ai-dev-flow complete'
+assert_equals "$symlink_terminal_output" "$(expected_top_help ai-dev-flow)"
+assert_not_exists "$repo_routing/reports/alt-help.txt"
 
 printf 'flow CLI tests passed\n'
