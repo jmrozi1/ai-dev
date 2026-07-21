@@ -541,6 +541,76 @@ handle_commit() {
 	printf 'activeIssueNumber: %s\n' "$active_issue_number"
 }
 
+handle_reset() {
+	local argument_count="$1"
+	shift
+
+	if [[ "$argument_count" -ne 0 ]]; then
+		error "Usage: ${script_name} reset"
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	if [[ -z "$active_issue_number" ]]; then
+		error 'Cannot reset workflow: no active issue is set.'
+	fi
+
+	local active_issue_title
+	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+
+	if [[ "$main_branch" == "$scratch_branch" ]]; then
+		error 'Invalid workflow state: mainBranch and scratchBranch must be different.'
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		error "Scratch branch does not exist locally: ${scratch_branch}"
+	fi
+
+	local current_branch
+	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+	if [[ "$current_branch" != "$scratch_branch" ]]; then
+		error "Cannot reset workflow: current branch ${current_branch} does not match scratchBranch ${scratch_branch}."
+	fi
+
+	local main_commit
+	main_commit="$(git -C "$repo_root" rev-parse "$main_branch")"
+
+	if ! git -C "$repo_root" reset --hard -q "$main_commit"; then
+		error 'Git reset failed.'
+	fi
+
+	if ! (
+		cd "$repo_root"
+		git clean -f -d -q
+	); then
+		error 'Git clean failed.'
+	fi
+
+	local state_payload
+	state_payload="$(build_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
+
+	printf 'Reset %s to %s\n' "$scratch_branch" "$main_branch"
+	printf 'checkpoint: 0\n'
+	printf 'activeIssueNumber: %s\n' "$active_issue_number"
+}
+
 handle_start() {
 	local argument_count="$1"
 	shift
@@ -1033,6 +1103,10 @@ main() {
 			;;
 		commit)
 			run_operational_command strict handle_commit "$(( $# - 1 ))" "${@:2}"
+			return 0
+			;;
+		reset)
+			run_operational_command strict handle_reset "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		__test-route-args)
