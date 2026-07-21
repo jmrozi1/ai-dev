@@ -104,6 +104,7 @@ fi
 help_output="$(cat "$help_output_file")"
 assert_equals "$help_status" "0"
 assert_contains "$help_output" 'flow help'
+assert_contains "$help_output" 'flow start <issue-number>'
 assert_contains "$help_output" 'flow promote "<commit-message>"'
 assert_contains "$help_output" 'Read-only'
 assert_contains "$help_output" 'Configuration'

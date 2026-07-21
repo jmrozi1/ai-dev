@@ -10,7 +10,7 @@ ai-dev-vscode/vendor/
 out.txt
 *.log
 .DS_Store
-.ai-dev/
+.ai-dev/workflow.json
 
 # generated command output
 **/out.txt

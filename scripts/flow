@@ -157,6 +157,114 @@ print_test_arguments() {
 	printf 'arg2=%s\n' "$second"
 }
 
+workflow_state_get_field() {
+	local key="$1"
+	local state_json="$2"
+
+	python3 - "$key" "$state_json" <<'PY'
+import json
+import sys
+
+key = sys.argv[1]
+data = json.loads(sys.argv[2])
+value = data.get(key)
+if value is None:
+	sys.exit(0)
+print(value)
+PY
+}
+
+build_start_state_payload() {
+	local issue_number="$1"
+	local main_branch="$2"
+	local scratch_branch="$3"
+
+	python3 - "$issue_number" "$main_branch" "$scratch_branch" <<'PY'
+import json
+import sys
+
+issue_number = int(sys.argv[1])
+main_branch = sys.argv[2]
+scratch_branch = sys.argv[3]
+
+payload = {
+	'activeIssueNumber': issue_number,
+	'mainBranch': main_branch,
+	'scratchBranch': scratch_branch,
+	'checkpoint': 0,
+}
+print(json.dumps(payload))
+PY
+}
+
+handle_start() {
+	local argument_count="$1"
+	shift
+
+	local issue_number="${1:-}"
+
+	if [[ "$argument_count" -ne 1 ]]; then
+		error "Usage: ${script_name} start <issue-number>"
+	fi
+
+	if [[ ! "$issue_number" =~ ^[1-9][0-9]*$ ]]; then
+		error 'issue-number must be a positive integer.'
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	if [[ -n "$active_issue_number" ]]; then
+		error "Cannot start workflow: active issue ${active_issue_number} is already set."
+	fi
+
+	local working_tree_status
+	working_tree_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	if [[ -n "$working_tree_status" ]]; then
+		error 'Working tree is not clean. Commit, stash, or remove changes before starting.'
+	fi
+
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+
+	if [[ "$main_branch" == "$scratch_branch" ]]; then
+		error 'Invalid workflow state: mainBranch and scratchBranch must be different.'
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	git -C "$repo_root" checkout -q "$main_branch"
+	local main_commit
+	main_commit="$(git -C "$repo_root" rev-parse HEAD)"
+
+	if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		git -C "$repo_root" checkout -q "$scratch_branch"
+		git -C "$repo_root" reset --hard -q "$main_commit"
+	else
+		git -C "$repo_root" checkout -q -b "$scratch_branch" "$main_commit"
+	fi
+
+	local state_payload
+	state_payload="$(build_start_state_payload "$issue_number" "$main_branch" "$scratch_branch")"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
+
+	printf 'Started issue %s\n' "$issue_number"
+	printf 'mainBranch: %s\n' "$main_branch"
+	printf 'scratchBranch: %s\n' "$scratch_branch"
+	printf 'checkpoint: 0\n'
+}
+
 validate_config_key() {
 	local command="$1"
 	local key="$2"
@@ -637,6 +745,10 @@ main() {
 			;;
 		unset)
 			handle_config_unset "$first_argument" "$second_argument"
+			return 0
+			;;
+		start)
+			run_operational_command strict handle_start "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		*)
