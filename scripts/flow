@@ -611,6 +611,112 @@ handle_reset() {
 	printf 'activeIssueNumber: %s\n' "$active_issue_number"
 }
 
+handle_promote() {
+	local argument_count="$1"
+	shift
+
+	local commit_message="${1-}"
+	if [[ "$argument_count" -ne 1 || -z "${commit_message//[[:space:]]/}" ]]; then
+		error "Usage: ${script_name} promote \"<commit-message>\""
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	if [[ -z "$active_issue_number" ]]; then
+		error 'Cannot promote workflow: no active issue is set.'
+	fi
+
+	local active_issue_title
+	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+
+	if [[ "$main_branch" == "$scratch_branch" ]]; then
+		error 'Invalid workflow state: mainBranch and scratchBranch must be different.'
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		error "Scratch branch does not exist locally: ${scratch_branch}"
+	fi
+
+	local current_branch
+	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+	if [[ "$current_branch" != "$scratch_branch" ]]; then
+		error "Cannot promote workflow: current branch ${current_branch} does not match scratchBranch ${scratch_branch}."
+	fi
+
+	local porcelain_status
+	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	local staged unstaged untracked working_tree
+	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
+	if [[ "$staged" == 'yes' || "$unstaged" == 'yes' || "$untracked" == 'yes' ]]; then
+		error 'Cannot promote workflow: repository must be clean.'
+	fi
+
+	local counts
+	counts="$(git -C "$repo_root" rev-list --left-right --count "${main_branch}...${scratch_branch}")"
+	local main_only_count scratch_only_count
+	IFS=$' \t' read -r main_only_count scratch_only_count <<< "$counts"
+
+	if [[ "$main_only_count" -eq 0 && "$scratch_only_count" -eq 0 ]]; then
+		error "Cannot promote workflow: ${scratch_branch} is equal to ${main_branch}."
+	fi
+
+	if [[ "$scratch_only_count" -eq 0 ]]; then
+		error "Cannot promote workflow: ${scratch_branch} is behind ${main_branch}."
+	fi
+
+	if [[ "$main_only_count" -ne 0 ]]; then
+		error "Cannot promote workflow: ${scratch_branch} and ${main_branch} have diverged."
+	fi
+
+	if ! git -C "$repo_root" checkout -q "$main_branch"; then
+		error "Cannot promote workflow: failed to switch to ${main_branch}."
+	fi
+
+	if ! git -C "$repo_root" merge --squash "$scratch_branch"; then
+		error 'Cannot promote workflow: squash merge failed.'
+	fi
+
+	if ! git -C "$repo_root" commit -q --message "$commit_message"; then
+		error 'Cannot promote workflow: Git commit failed.'
+	fi
+
+	local promoted_commit
+	promoted_commit="$(git -C "$repo_root" rev-parse HEAD)"
+
+	if ! git -C "$repo_root" checkout -q "$scratch_branch"; then
+		error "Cannot promote workflow: failed to switch back to ${scratch_branch}."
+	fi
+
+	if ! git -C "$repo_root" reset --hard -q "$promoted_commit"; then
+		error "Cannot promote workflow: failed to reset ${scratch_branch} to promoted commit."
+	fi
+
+	local state_payload
+	state_payload="$(build_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
+
+	printf 'Promoted %s to %s\n' "$scratch_branch" "$main_branch"
+	printf 'commit: %s\n' "$promoted_commit"
+	printf 'checkpoint: 0\n'
+	printf 'activeIssueNumber: %s\n' "$active_issue_number"
+}
+
 handle_start() {
 	local argument_count="$1"
 	shift
@@ -1107,6 +1213,10 @@ main() {
 			;;
 		reset)
 			run_operational_command strict handle_reset "$(( $# - 1 ))" "${@:2}"
+			return 0
+			;;
+		promote)
+			run_operational_command strict handle_promote "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		__test-route-args)
