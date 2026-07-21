@@ -79,7 +79,6 @@ write_routed_output() {
 
 	if cat "$temporary_output" >"$destination"; then
 		rm -f "$temporary_output"
-		printf 'Output written to %s\n' "$destination"
 		return 0
 	fi
 
@@ -140,10 +139,16 @@ run_operational_command() {
 				return "$command_status"
 			fi
 
+			cat "$temporary_output"
+
 			local destination
 			destination="$(resolve_output_destination "$repo_root" "$out_value")"
-			write_routed_output "$temporary_output" "$destination"
-			return $?
+			if write_routed_output "$temporary_output" "$destination"; then
+				printf 'Output written to %s\n' "$destination"
+				return 0
+			fi
+
+			return 1
 		fi
 	fi
 

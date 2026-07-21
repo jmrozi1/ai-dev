@@ -118,6 +118,17 @@ repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_unset"
 init_repo "$repo_routing"
 init_repo "$repo_malformed"
+(
+	cd "$repo_routing"
+	git config user.name 'Flow Routing Tests'
+	git config user.email 'flow-routing-tests@example.com'
+	printf '.ai-dev/workflow.json\n' > .gitignore
+	printf 'base\n' > tracked.txt
+	git add .gitignore tracked.txt
+	git commit -q -m 'initial commit'
+	git branch -M main
+)
+repo_routing_branch="$(git -C "$repo_routing" symbolic-ref --quiet --short HEAD)"
 
 # top-level help bypasses routing and works without repo/config context
 help_output_file="$TMP_DIR/help-output"
@@ -232,8 +243,41 @@ assert_equals "$passthrough_status" "0"
 assert_contains "$passthrough_output" 'arg1=123'
 assert_contains "$passthrough_output" 'arg2=value with spaces'
 
-# help never routes output even when configured
+# tee-style routing prints command output to stdout and writes the same output to the file
 mkdir -p "$repo_routing/reports"
+status_routed_path="$TMP_DIR/status-routed.txt"
+set_repo_out "$repo_routing" "$status_routed_path"
+status_routed_output_file="$TMP_DIR/status-routed-output"
+if run_flow_capture "$repo_routing/subdir" "$status_routed_output_file" status; then
+	status_routed_status=0
+else
+	status_routed_status=$?
+fi
+status_routed_output="$(cat "$status_routed_output_file")"
+status_routed_file_output="$(cat "$status_routed_path")"
+status_routed_output_without_confirmation="$(printf '%s\n' "$status_routed_output" | sed '$d')"
+status_routed_output_confirmation="$(printf '%s\n' "$status_routed_output" | tail -n 1)"
+assert_equals "$status_routed_status" "0"
+assert_contains "$status_routed_output" 'No active workflow.'
+assert_contains "$status_routed_output" "Branch: ${repo_routing_branch}"
+assert_contains "$status_routed_output" 'Output written to '
+assert_equals "$status_routed_output_without_confirmation" "$status_routed_file_output"
+assert_equals "$status_routed_output_confirmation" "Output written to $status_routed_path"
+assert_not_contains "$status_routed_file_output" 'Output written to'
+
+if run_flow_capture "$repo_routing/subdir" "$TMP_DIR/status-routed-output-2" status; then
+	status_routed_status_2=0
+else
+	status_routed_status_2=$?
+fi
+status_routed_output_2="$(cat "$TMP_DIR/status-routed-output-2")"
+status_routed_file_output_2="$(cat "$status_routed_path")"
+status_routed_output_2_without_confirmation="$(printf '%s\n' "$status_routed_output_2" | sed '$d')"
+assert_equals "$status_routed_status_2" "0"
+assert_equals "$status_routed_output_2_without_confirmation" "$status_routed_file_output_2"
+assert_equals "$status_routed_file_output_2" "$status_routed_file_output"
+
+# help never routes output even when configured
 set_repo_out "$repo_routing" 'reports/help.txt'
 help_routed_output_file="$TMP_DIR/help-routed-output"
 if run_flow_capture "$repo_routing/subdir" "$help_routed_output_file" help; then
@@ -315,17 +359,20 @@ assert_contains "$unknown_output" 'flow: unknown command: gibberish'
 assert_contains "$unknown_output" 'Run flow help for usage.'
 assert_not_contains "$unknown_output" 'Output written to'
 
-# help ignores routing destination problems
+# routed commands preserve invalid-path behavior and generated-output recovery
 set_repo_out "$repo_routing" 'missing-parent/help.txt'
 missing_parent_output_file="$TMP_DIR/missing-parent-output"
-if run_flow_capture "$repo_routing/subdir" "$missing_parent_output_file" help; then
+if run_flow_capture "$repo_routing/subdir" "$missing_parent_output_file" status; then
 	missing_parent_status=0
 else
 	missing_parent_status=$?
 fi
 missing_parent_output="$(cat "$missing_parent_output_file")"
-assert_equals "$missing_parent_status" "0"
-assert_equals "$missing_parent_output" "$help_output"
+assert_equals "$missing_parent_status" "1"
+assert_contains "$missing_parent_output" 'No active workflow.'
+assert_contains "$missing_parent_output" "Branch: ${repo_routing_branch}"
+assert_contains "$missing_parent_output" 'Cannot write output to'
+assert_contains "$missing_parent_output" 'Generated output preserved at'
 assert_not_exists "$repo_routing/missing-parent/help.txt"
 
 if [[ "$(id -u)" != '0' ]]; then
@@ -333,14 +380,17 @@ if [[ "$(id -u)" != '0' ]]; then
 	chmod 500 "$repo_routing/no-write"
 	set_repo_out "$repo_routing" 'no-write/help.txt'
 	unwritable_output_file="$TMP_DIR/unwritable-output"
-	if run_flow_capture "$repo_routing/subdir" "$unwritable_output_file" help; then
+	if run_flow_capture "$repo_routing/subdir" "$unwritable_output_file" status; then
 		unwritable_status=0
 	else
 		unwritable_status=$?
 	fi
 	unwritable_output="$(cat "$unwritable_output_file")"
-	assert_equals "$unwritable_status" "0"
-	assert_equals "$unwritable_output" "$help_output"
+	assert_equals "$unwritable_status" "1"
+	assert_contains "$unwritable_output" 'No active workflow.'
+	assert_contains "$unwritable_output" "Branch: ${repo_routing_branch}"
+	assert_contains "$unwritable_output" 'Cannot write output to'
+	assert_contains "$unwritable_output" 'Generated output preserved at'
 	assert_not_exists "$repo_routing/no-write/help.txt"
 	chmod 700 "$repo_routing/no-write"
 fi
