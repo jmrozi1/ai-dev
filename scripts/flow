@@ -230,6 +230,42 @@ classify_porcelain_entry() {
 	printf '%s %s %s\n' "$staged" "$unstaged" "$untracked"
 }
 
+summarize_porcelain_status() {
+	local porcelain_status="$1"
+
+	local staged='no'
+	local unstaged='no'
+	local untracked='no'
+	local line
+	while IFS= read -r line; do
+		if [[ -z "$line" ]]; then
+			continue
+		fi
+
+		local entry_staged entry_unstaged entry_untracked
+		read -r entry_staged entry_unstaged entry_untracked <<< "$(classify_porcelain_entry "$line")"
+
+		if [[ "$entry_staged" == 'yes' ]]; then
+			staged='yes'
+		fi
+
+		if [[ "$entry_unstaged" == 'yes' ]]; then
+			unstaged='yes'
+		fi
+
+		if [[ "$entry_untracked" == 'yes' ]]; then
+			untracked='yes'
+		fi
+	done <<< "$porcelain_status"
+
+	local working_tree='clean'
+	if [[ "$staged" == 'yes' || "$unstaged" == 'yes' || "$untracked" == 'yes' ]]; then
+		working_tree='dirty'
+	fi
+
+	printf '%s %s %s %s\n' "$staged" "$unstaged" "$untracked" "$working_tree"
+}
+
 branch_state_for_repo() {
 	local repo_root="$1"
 	local main_branch="$2"
@@ -304,35 +340,8 @@ handle_status() {
 	local porcelain_status
 	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
 
-	local staged='no'
-	local unstaged='no'
-	local untracked='no'
-	local line
-	while IFS= read -r line; do
-		if [[ -z "$line" ]]; then
-			continue
-		fi
-
-		local entry_staged entry_unstaged entry_untracked
-		read -r entry_staged entry_unstaged entry_untracked <<< "$(classify_porcelain_entry "$line")"
-
-		if [[ "$entry_staged" == 'yes' ]]; then
-			staged='yes'
-		fi
-
-		if [[ "$entry_unstaged" == 'yes' ]]; then
-			unstaged='yes'
-		fi
-
-		if [[ "$entry_untracked" == 'yes' ]]; then
-			untracked='yes'
-		fi
-		done <<< "$porcelain_status"
-
-	local working_tree='clean'
-	if [[ "$staged" == 'yes' || "$unstaged" == 'yes' || "$untracked" == 'yes' ]]; then
-		working_tree='dirty'
-	fi
+	local staged unstaged untracked working_tree
+	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
 
 	local current_branch
 	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
@@ -355,6 +364,72 @@ handle_status() {
 	printf 'unstaged: %s\n' "$(git_status_value "$unstaged")"
 	printf 'untracked: %s\n' "$(git_status_value "$untracked")"
 	printf 'branchState: %s\n' "$branch_state"
+}
+
+handle_review() {
+	local argument_count="$1"
+	shift
+
+	if [[ "$argument_count" -ne 0 ]]; then
+		error "Usage: ${script_name} review"
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	if [[ -z "$active_issue_number" ]]; then
+		error 'Cannot review workflow: no active issue is set.'
+	fi
+
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		error "Scratch branch does not exist locally: ${scratch_branch}"
+	fi
+
+	local current_branch
+	current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+	if [[ "$current_branch" != "$scratch_branch" ]]; then
+		error "Cannot review workflow: current branch ${current_branch} does not match scratchBranch ${scratch_branch}."
+	fi
+
+	local porcelain_status
+	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	local staged unstaged untracked working_tree
+	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
+	if [[ "$working_tree" == 'clean' ]]; then
+		error 'No proposed changes to review.'
+	fi
+
+	git -C "$repo_root" add --all
+
+	local diff_status=0
+	set +e
+	git -C "$repo_root" diff --cached --binary --no-ext-diff --quiet
+	diff_status=$?
+	set -e
+	if [[ "$diff_status" -eq 0 ]]; then
+		error 'No staged changes available for review.'
+	fi
+	if [[ "$diff_status" -ne 1 ]]; then
+		return "$diff_status"
+	fi
+
+	git -C "$repo_root" diff --cached --binary --no-ext-diff
 }
 
 handle_start() {
@@ -839,6 +914,10 @@ main() {
 			;;
 		status)
 			run_operational_command strict handle_status "$(( $# - 1 ))" "${@:2}"
+			return 0
+			;;
+		review)
+			run_operational_command strict handle_review "$(( $# - 1 ))" "${@:2}"
 			return 0
 			;;
 		__test-route-args)

@@ -106,6 +106,7 @@ assert_equals "$help_status" "0"
 assert_contains "$help_output" 'flow help'
 assert_contains "$help_output" 'flow start <issue-number>'
 assert_contains "$help_output" 'flow status'
+assert_contains "$help_output" 'flow review'
 assert_contains "$help_output" 'flow promote "<commit-message>"'
 assert_contains "$help_output" 'Read-only'
 assert_contains "$help_output" 'Configuration'
