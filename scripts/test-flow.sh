@@ -97,6 +97,7 @@ and disposable scratch checkpoints.
 
 Commands:
   start      Begin work on an issue and reset scratch from main.
+	patch      Begin or adopt a local patch workflow on scratch.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
   commit     Create the next numbered checkpoint on scratch.

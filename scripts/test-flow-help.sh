@@ -142,6 +142,7 @@ and disposable scratch checkpoints.
 
 Commands:
   start      Begin work on an issue and reset scratch from main.
+	patch      Begin or adopt a local patch workflow on scratch.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
   commit     Create the next numbered checkpoint on scratch.
@@ -171,6 +172,19 @@ and recording the active issue.
 
 Options:
   -h, --help  Show this help.
+EOF
+			;;
+		patch)
+			cat <<EOF
+Usage: ${command_name} patch "<description>"
+       ${command_name} patch --adopt "<description>"
+
+Start a local patch workflow for small, self-contained changes, or adopt
+existing scratch work without changing commits, index, or working tree.
+
+Options:
+  --adopt      Adopt existing work on scratch and preserve repository state.
+  -h, --help   Show this help.
 EOF
 			;;
 		status)
@@ -307,7 +321,7 @@ help_command_verbose="$(cd "$help_repo/subdir" && "$symlink_path" help --help)"
 assert_equals "$help_command_output" "$help_command_verbose"
 
 # command-specific help for every public command
-for command in start status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete get set unset help; do
 	command_help_short="$TMP_DIR/${command}-short.txt"
 	command_help_long="$TMP_DIR/${command}-long.txt"
 	if run_flow_capture "$help_repo/subdir" "$command_help_short" "$command" -h; then
@@ -329,7 +343,7 @@ for command in start status review commit reset promote complete get set unset h
 # help works outside Git repositories and with malformed config
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
-for command in start status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete get set unset help; do
 	for help_flag in -h --help; do
 		outside_output="$TMP_DIR/outside-${command}-${help_flag//-/}.txt"
 		if run_flow_capture "$outside_repo" "$outside_output" "$command" "$help_flag"; then
@@ -346,7 +360,7 @@ repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"
 mkdir -p "$repo_malformed/.ai-dev"
 printf '{ invalid json\n' > "$repo_malformed/.ai-dev/config.json"
-for command in start status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete get set unset help; do
 	malformed_output="$TMP_DIR/malformed-${command}.txt"
 	if run_flow_capture "$repo_malformed/subdir" "$malformed_output" "$command" --help; then
 		malformed_status=0
@@ -365,7 +379,7 @@ git -C "$repo_bypass" checkout -q -b scratch
 state_set "$repo_bypass/subdir" '{"activeIssueNumber":99,"mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 git -C "$repo_bypass" checkout -q main
 printf '{ invalid workflow json\n' > "$repo_bypass/.ai-dev/workflow.json"
-for command in start status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete get set unset help; do
 	bypass_output="$TMP_DIR/bypass-${command}.txt"
 	if run_flow_capture "$repo_bypass/subdir" "$bypass_output" "$command" -h; then
 		bypass_status=0
@@ -405,7 +419,7 @@ assert_contains "$(cat "$command_help_routed_output")" 'Usage: flow status [-v|-
 assert_not_exists "$set_repo_out"
 
 # extra arguments combined with help are rejected
-for command in status review commit reset complete get set unset help; do
+for command in patch status review commit reset complete get set unset help; do
 	extra_output="$TMP_DIR/${command}-extra.txt"
 	if run_flow_capture "$help_repo/subdir" "$extra_output" "$command" -h extra; then
 		extra_status=0

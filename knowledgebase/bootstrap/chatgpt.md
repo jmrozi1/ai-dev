@@ -127,6 +127,24 @@ flow commit
 flow promote "<meaningful commit message>"
 ```
 
+For small, self-contained local changes that do not warrant a GitHub issue, use:
+
+```text
+flow patch "<description>"
+```
+
+Use this form when disposable scratch work should be reset from `main` before starting.
+
+When suitable work already exists on `scratch`, use:
+
+```text
+flow patch --adopt "<description>"
+```
+
+Patch workflows still follow the same operational lifecycle: review, checkpointing, promotion, and completion.
+
+Use patch workflows instead of the previous temporary ordinary-Git workaround for one-off local changes.
+
 `flow commit` creates a disposable checkpoint on `scratch`.
 
 `flow promote` places the approved cumulative change on `main` as one meaningful commit and synchronizes `scratch` with it.

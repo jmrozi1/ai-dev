@@ -492,9 +492,15 @@ else
 	routing_status=$?
 fi
 assert_equals "$routing_status" '0'
-assert_equals "$(cat "$routing_terminal_output")" "Output written to $routed_output_path"
-assert_contains "$(cat "$routed_output_path")" 'No active workflow.'
-assert_contains "$(cat "$routed_output_path")" 'Branch: main'
+routing_terminal_text="$(cat "$routing_terminal_output")"
+routing_file_text="$(cat "$routed_output_path")"
+routing_terminal_without_confirmation="$(printf '%s\n' "$routing_terminal_text" | sed '$d')"
+routing_terminal_confirmation="$(printf '%s\n' "$routing_terminal_text" | tail -n 1)"
+assert_contains "$routing_terminal_text" 'No active workflow.'
+assert_contains "$routing_terminal_text" 'Branch: main'
+assert_equals "$routing_terminal_without_confirmation" "$routing_file_text"
+assert_equals "$routing_terminal_confirmation" "Output written to $routed_output_path"
+assert_not_contains "$routing_file_text" 'Output written to'
 
 repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"

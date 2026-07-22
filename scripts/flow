@@ -202,7 +202,7 @@ print(json.dumps(payload))
 PY
 }
 
-build_checkpoint_state_payload() {
+build_issue_checkpoint_state_payload() {
 	local issue_number="$1"
 	local issue_title="$2"
 	local main_branch="$3"
@@ -231,6 +231,67 @@ if issue_title:
 
 print(json.dumps(payload))
 PY
+}
+
+build_patch_state_payload() {
+	local description="$1"
+	local main_branch="$2"
+	local scratch_branch="$3"
+	local checkpoint="$4"
+
+	python3 - "$description" "$main_branch" "$scratch_branch" "$checkpoint" <<'PY'
+import json
+import sys
+
+description = sys.argv[1]
+main_branch = sys.argv[2]
+scratch_branch = sys.argv[3]
+checkpoint = int(sys.argv[4])
+
+payload = {
+	'patchDescription': description,
+	'mainBranch': main_branch,
+	'scratchBranch': scratch_branch,
+	'checkpoint': checkpoint,
+}
+
+print(json.dumps(payload))
+PY
+}
+
+workflow_kind_from_state() {
+	local active_issue_number="$1"
+	local patch_description="$2"
+
+	if [[ -n "$active_issue_number" ]]; then
+		printf 'issue'
+		return 0
+	fi
+
+	if [[ -n "$patch_description" ]]; then
+		printf 'patch'
+		return 0
+	fi
+
+	printf 'inactive'
+}
+
+count_numbered_scratch_checkpoints() {
+	local repo_root="$1"
+	local main_branch="$2"
+	local scratch_branch="$3"
+
+	local max_checkpoint=0
+	local subject
+	while IFS= read -r subject; do
+		if [[ "$subject" =~ ^[1-9][0-9]*$ ]]; then
+			if (( subject > max_checkpoint )); then
+				max_checkpoint=$subject
+			fi
+		fi
+	done < <(git -C "$repo_root" log --format=%s "${main_branch}..${scratch_branch}")
+
+	printf '%s' "$max_checkpoint"
 }
 
 build_inactive_state_payload() {
@@ -610,6 +671,8 @@ handle_status() {
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
 	local active_issue_title
 	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
 	local main_branch
 	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
 	local scratch_branch
@@ -617,8 +680,10 @@ handle_status() {
 	local checkpoint
 	checkpoint="$(workflow_state_get_field 'checkpoint' "$state_json")"
 
+	local workflow_kind
+	workflow_kind="$(workflow_kind_from_state "$active_issue_number" "$patch_description")"
 	local workflow_status='inactive'
-	if [[ -n "$active_issue_number" ]]; then
+	if [[ "$workflow_kind" != 'inactive' ]]; then
 		workflow_status='active'
 	fi
 
@@ -636,9 +701,14 @@ handle_status() {
 		printf 'Workflow:\n'
 		if [[ "$workflow_status" == 'active' ]]; then
 			printf '  state: active\n'
-			printf '  issue number: %s\n' "$active_issue_number"
-			if [[ -n "$active_issue_title" ]]; then
-				printf '  issue title: %s\n' "$active_issue_title"
+			printf '  type: %s\n' "$workflow_kind"
+			if [[ "$workflow_kind" == 'issue' ]]; then
+				printf '  issue number: %s\n' "$active_issue_number"
+				if [[ -n "$active_issue_title" ]]; then
+					printf '  issue title: %s\n' "$active_issue_title"
+				fi
+			elif [[ "$workflow_kind" == 'patch' ]]; then
+				printf '  patch: %s\n' "$patch_description"
 			fi
 			printf '  checkpoint: %s\n' "$checkpoint"
 		else
@@ -664,10 +734,14 @@ handle_status() {
 	fi
 
 	if [[ "$workflow_status" == 'active' ]]; then
-		if [[ -n "$active_issue_title" ]]; then
-			printf 'Issue: %s — %s\n' "$active_issue_number" "$active_issue_title"
-		else
-			printf 'Issue: %s\n' "$active_issue_number"
+		if [[ "$workflow_kind" == 'issue' ]]; then
+			if [[ -n "$active_issue_title" ]]; then
+				printf 'Issue %s — %s\n' "$active_issue_number" "$active_issue_title"
+			else
+				printf 'Issue %s\n' "$active_issue_number"
+			fi
+		elif [[ "$workflow_kind" == 'patch' ]]; then
+			printf 'Patch: %s\n' "$patch_description"
 		fi
 	else
 		printf 'No active workflow.\n'
@@ -746,7 +820,11 @@ handle_review() {
 
 	local active_issue_number
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
-	if [[ -z "$active_issue_number" ]]; then
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	local workflow_kind
+	workflow_kind="$(workflow_kind_from_state "$active_issue_number" "$patch_description")"
+	if [[ "$workflow_kind" == 'inactive' ]]; then
 		error 'Cannot review workflow: no active issue is set.'
 	fi
 
@@ -791,6 +869,10 @@ handle_review() {
 		return "$diff_status"
 	fi
 
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		printf 'Patch: %s\n\n' "$patch_description"
+	fi
+
 	git -C "$repo_root" diff --cached --binary --no-ext-diff
 }
 
@@ -812,7 +894,11 @@ handle_commit() {
 
 	local active_issue_number
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
-	if [[ -z "$active_issue_number" ]]; then
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	local workflow_kind
+	workflow_kind="$(workflow_kind_from_state "$active_issue_number" "$patch_description")"
+	if [[ "$workflow_kind" == 'inactive' ]]; then
 		error 'Cannot commit workflow: no active issue is set.'
 	fi
 
@@ -862,14 +948,22 @@ handle_commit() {
 	fi
 
 	local state_payload
-	state_payload="$(build_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" "$new_checkpoint")"
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		state_payload="$(build_patch_state_payload "$patch_description" "$main_branch" "$scratch_branch" "$new_checkpoint")"
+	else
+		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" "$new_checkpoint")"
+	fi
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
 	local commit_hash
 	commit_hash="$(git -C "$repo_root" rev-parse HEAD)"
 	printf 'Created checkpoint %s\n' "$new_checkpoint"
 	printf 'commit: %s\n' "$commit_hash"
-	printf 'activeIssueNumber: %s\n' "$active_issue_number"
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		printf 'patch: %s\n' "$patch_description"
+	else
+		printf 'activeIssueNumber: %s\n' "$active_issue_number"
+	fi
 }
 
 handle_reset() {
@@ -890,7 +984,11 @@ handle_reset() {
 
 	local active_issue_number
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
-	if [[ -z "$active_issue_number" ]]; then
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	local workflow_kind
+	workflow_kind="$(workflow_kind_from_state "$active_issue_number" "$patch_description")"
+	if [[ "$workflow_kind" == 'inactive' ]]; then
 		error 'Cannot reset workflow: no active issue is set.'
 	fi
 
@@ -934,12 +1032,20 @@ handle_reset() {
 	fi
 
 	local state_payload
-	state_payload="$(build_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		state_payload="$(build_patch_state_payload "$patch_description" "$main_branch" "$scratch_branch" '0')"
+	else
+		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+	fi
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
 	printf 'Reset %s to %s\n' "$scratch_branch" "$main_branch"
 	printf 'checkpoint: 0\n'
-	printf 'activeIssueNumber: %s\n' "$active_issue_number"
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		printf 'patch: %s\n' "$patch_description"
+	else
+		printf 'activeIssueNumber: %s\n' "$active_issue_number"
+	fi
 }
 
 handle_promote() {
@@ -961,7 +1067,11 @@ handle_promote() {
 
 	local active_issue_number
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
-	if [[ -z "$active_issue_number" ]]; then
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	local workflow_kind
+	workflow_kind="$(workflow_kind_from_state "$active_issue_number" "$patch_description")"
+	if [[ "$workflow_kind" == 'inactive' ]]; then
 		error 'Cannot promote workflow: no active issue is set.'
 	fi
 
@@ -1039,13 +1149,21 @@ handle_promote() {
 	fi
 
 	local state_payload
-	state_payload="$(build_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		state_payload="$(build_patch_state_payload "$patch_description" "$main_branch" "$scratch_branch" '0')"
+	else
+		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+	fi
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
 	printf 'Promoted %s to %s\n' "$scratch_branch" "$main_branch"
 	printf 'commit: %s\n' "$promoted_commit"
 	printf 'checkpoint: 0\n'
-	printf 'activeIssueNumber: %s\n' "$active_issue_number"
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		printf 'patch: %s\n' "$patch_description"
+	else
+		printf 'activeIssueNumber: %s\n' "$active_issue_number"
+	fi
 }
 
 handle_complete() {
@@ -1066,7 +1184,11 @@ handle_complete() {
 
 	local active_issue_number
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
-	if [[ -z "$active_issue_number" ]]; then
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	local workflow_kind
+	workflow_kind="$(workflow_kind_from_state "$active_issue_number" "$patch_description")"
+	if [[ "$workflow_kind" == 'inactive' ]]; then
 		error 'Cannot complete workflow: no active issue is set.'
 	fi
 
@@ -1126,7 +1248,11 @@ handle_complete() {
 	state_payload="$(build_inactive_state_payload "$main_branch" "$scratch_branch")"
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
-	printf 'Completed issue %s\n' "$active_issue_number"
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		printf 'Completed patch: %s\n' "$patch_description"
+	else
+		printf 'Completed issue %s\n' "$active_issue_number"
+	fi
 	printf 'Workflow: inactive\n'
 	printf 'mainBranch: %s\n' "$main_branch"
 	printf 'scratchBranch: %s\n' "$scratch_branch"
@@ -1157,8 +1283,14 @@ handle_start() {
 
 	local active_issue_number
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
-	if [[ -n "$active_issue_number" ]]; then
-		error "Cannot start workflow: active issue ${active_issue_number} is already set."
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	if [[ -n "$active_issue_number" || -n "$patch_description" ]]; then
+		if [[ -n "$active_issue_number" ]]; then
+			error "Cannot start workflow: active issue ${active_issue_number} is already set."
+		fi
+
+		error "Cannot start workflow: active patch ${patch_description} is already set."
 	fi
 
 	local working_tree_status
@@ -1196,6 +1328,115 @@ handle_start() {
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
 	printf 'Started issue %s\n' "$issue_number"
+	printf 'mainBranch: %s\n' "$main_branch"
+	printf 'scratchBranch: %s\n' "$scratch_branch"
+	printf 'checkpoint: 0\n'
+}
+
+handle_patch() {
+	local argument_count="$1"
+	shift
+
+	local adopt_mode='no'
+	local description=''
+
+	if [[ "$argument_count" -eq 1 ]]; then
+		if [[ "${1:-}" == '--adopt' ]]; then
+			error "Usage: ${script_name} patch [--adopt] \"<description>\""
+		fi
+
+		description="${1:-}"
+	elif [[ "$argument_count" -eq 2 && "${1:-}" == '--adopt' ]]; then
+		adopt_mode='yes'
+		description="${2:-}"
+	else
+		error "Usage: ${script_name} patch [--adopt] \"<description>\""
+	fi
+
+	if [[ -z "${description//[[:space:]]/}" ]]; then
+		error 'patch description cannot be empty.'
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	if [[ -n "$active_issue_number" || -n "$patch_description" ]]; then
+		if [[ -n "$active_issue_number" ]]; then
+			error "Cannot patch workflow: active issue ${active_issue_number} is already set."
+		fi
+
+		error "Cannot patch workflow: active patch ${patch_description} is already set."
+	fi
+
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+
+	if [[ "$main_branch" == "$scratch_branch" ]]; then
+		error 'Invalid workflow state: mainBranch and scratchBranch must be different.'
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if [[ "$adopt_mode" == 'yes' ]]; then
+		local current_branch
+		current_branch="$(git -C "$repo_root" rev-parse --abbrev-ref HEAD)"
+		if [[ "$current_branch" != "$scratch_branch" ]]; then
+			error "Cannot patch workflow: current branch ${current_branch} does not match scratchBranch ${scratch_branch}."
+		fi
+
+		if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+			error "Scratch branch does not exist locally: ${scratch_branch}"
+		fi
+
+		local checkpoint
+		checkpoint="$(count_numbered_scratch_checkpoints "$repo_root" "$main_branch" "$scratch_branch")"
+
+		local state_payload
+		state_payload="$(build_patch_state_payload "$description" "$main_branch" "$scratch_branch" "$checkpoint")"
+		workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
+
+		printf 'Adopted patch: %s\n' "$description"
+		printf 'mainBranch: %s\n' "$main_branch"
+		printf 'scratchBranch: %s\n' "$scratch_branch"
+		printf 'checkpoint: %s\n' "$checkpoint"
+		return 0
+	fi
+
+	local working_tree_status
+	working_tree_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	if [[ -n "$working_tree_status" ]]; then
+		error 'Working tree is not clean. Commit, stash, or remove changes before starting.'
+	fi
+
+	git -C "$repo_root" checkout -q "$main_branch"
+	local main_commit
+	main_commit="$(git -C "$repo_root" rev-parse HEAD)"
+
+	if git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		git -C "$repo_root" checkout -q "$scratch_branch"
+		git -C "$repo_root" reset --hard -q "$main_commit"
+	else
+		git -C "$repo_root" checkout -q -b "$scratch_branch" "$main_commit"
+	fi
+
+	local state_payload
+	state_payload="$(build_patch_state_payload "$description" "$main_branch" "$scratch_branch" '0')"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
+
+	printf 'Started patch: %s\n' "$description"
 	printf 'mainBranch: %s\n' "$main_branch"
 	printf 'scratchBranch: %s\n' "$scratch_branch"
 	printf 'checkpoint: 0\n'
@@ -1354,6 +1595,7 @@ DEFAULTS = {
 ALLOWED_KEYS = {
 	'activeIssueNumber',
 	'activeIssueTitle',
+	'patchDescription',
 	'mainBranch',
 	'scratchBranch',
 	'checkpoint',
@@ -1404,6 +1646,10 @@ def normalize_and_validate(state_data, context):
 
 	has_issue_number = 'activeIssueNumber' in state_data
 	has_issue_title = 'activeIssueTitle' in state_data
+	has_patch_description = 'patchDescription' in state_data
+
+	if has_issue_number and has_patch_description:
+		fail(f"Invalid workflow state in {context}: activeIssueNumber and patchDescription cannot both be set.")
 
 	if has_issue_number:
 		issue_number = state_data['activeIssueNumber']
@@ -1422,6 +1668,15 @@ def normalize_and_validate(state_data, context):
 
 	if has_issue_title and not has_issue_number:
 		fail(f"Invalid workflow state in {context}: activeIssueTitle requires activeIssueNumber.")
+
+	if has_patch_description:
+		patch_description = state_data['patchDescription']
+		if not isinstance(patch_description, str):
+			fail(f"Invalid workflow state in {context}: patchDescription must be a string.")
+		patch_description = patch_description.strip()
+		if not patch_description:
+			fail(f"Invalid workflow state in {context}: patchDescription cannot be empty.")
+		normalized['patchDescription'] = patch_description
 
 	return normalized
 
@@ -1575,6 +1830,7 @@ and disposable scratch checkpoints.
 
 Commands:
   start      Begin work on an issue and reset scratch from main.
+	patch      Begin or adopt a local patch workflow on scratch.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
   commit     Create the next numbered checkpoint on scratch.
@@ -1625,6 +1881,19 @@ Show the active issue, current branch, and repository deviations.
 Options:
   -v, --verbose  Show complete workflow and Git details.
   -h, --help     Show this help.
+EOF
+			;;
+		patch)
+			cat <<EOF
+Usage: ${script_name} patch "<description>"
+       ${script_name} patch --adopt "<description>"
+
+Start a local patch workflow for small, self-contained changes, or adopt
+existing scratch work without changing commits, index, or working tree.
+
+Options:
+  --adopt      Adopt existing work on scratch and preserve repository state.
+  -h, --help   Show this help.
 EOF
 			;;
 		review)
@@ -1767,7 +2036,7 @@ main() {
 
 			error "Usage: ${script_name} help"
 			;;
-		start|status|review|commit|reset|promote|complete|get|set|unset)
+		start|patch|status|review|commit|reset|promote|complete|get|set|unset)
 			if [[ "$argument_count" -eq 1 ]] && is_help_flag "$first_argument"; then
 				print_command_help "$command"
 				return 0
@@ -1800,6 +2069,10 @@ main() {
 					;;
 				start)
 					run_operational_command strict handle_start "$argument_count" "${@:2}"
+					return 0
+					;;
+				patch)
+					run_operational_command strict handle_patch "$argument_count" "${@:2}"
 					return 0
 					;;
 				get)
