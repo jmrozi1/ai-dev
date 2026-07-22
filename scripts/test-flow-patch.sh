@@ -334,6 +334,8 @@ status_verbose="$(run_flow "$repo_status/subdir" status --verbose)"
 assert_equals "$status_default" $'Patch: Patch status\nBranch: scratch'
 assert_contains "$status_verbose" '  type: patch'
 assert_contains "$status_verbose" '  patch: Patch status'
+assert_not_contains "$status_verbose" 'issue URL'
+assert_not_contains "$status_verbose" 'github.com'
 
 # review identifies patch
 repo_review="$TMP_DIR/repo-review"

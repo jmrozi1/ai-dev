@@ -102,7 +102,7 @@ assert_not_exists "$repo_a/.ai-dev"
 
 # save and load with trimming normalization
 set_full_output="$TMP_DIR/set-full-output"
-set_full_payload='{"activeIssueNumber":2,"activeIssueTitle":"  Issue title  ","mainBranch":"  main-dev  ","scratchBranch":"  scratch-dev  ","checkpoint":3}'
+set_full_payload='{"activeIssueNumber":2,"activeIssueTitle":"  Issue title  ","activeIssueUrl":"  https://github.com/jmrozi1/ai-dev/issues/2  ","mainBranch":"  main-dev  ","scratchBranch":"  scratch-dev  ","checkpoint":3}'
 if run_flow_capture "$repo_a/subdir" "$set_full_output" __test-state-set "$set_full_payload"; then
 	set_full_status=0
 else
@@ -115,7 +115,8 @@ assert_equals "$set_full_text" $'{
   "scratchBranch": "scratch-dev",
   "checkpoint": 3,
   "activeIssueNumber": 2,
-  "activeIssueTitle": "Issue title"
+  "activeIssueTitle": "Issue title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/2"
 }'
 
 workflow_file_a="$repo_a/.ai-dev/workflow.json"
@@ -124,7 +125,8 @@ assert_equals "$(cat "$workflow_file_a")" $'{
   "scratchBranch": "scratch-dev",
   "checkpoint": 3,
   "activeIssueNumber": 2,
-  "activeIssueTitle": "Issue title"
+  "activeIssueTitle": "Issue title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/2"
 }'
 assert_file_ends_with_newline "$workflow_file_a"
 
@@ -273,6 +275,42 @@ fi
 orphan_title_text="$(cat "$orphan_title_output")"
 assert_equals "$orphan_title_status" "1"
 assert_contains "$orphan_title_text" 'activeIssueTitle requires activeIssueNumber'
+
+# issue URL without issue number
+orphan_url_output="$TMP_DIR/orphan-url-output"
+orphan_url_payload='{"activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/2","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}'
+if run_flow_capture "$repo_a/subdir" "$orphan_url_output" __test-state-set "$orphan_url_payload"; then
+	orphan_url_status=0
+else
+	orphan_url_status=$?
+fi
+orphan_url_text="$(cat "$orphan_url_output")"
+assert_equals "$orphan_url_status" "1"
+assert_contains "$orphan_url_text" 'activeIssueUrl requires activeIssueNumber'
+
+# malformed issue URL
+invalid_url_output="$TMP_DIR/invalid-url-output"
+invalid_url_payload='{"activeIssueNumber":2,"activeIssueUrl":"not-a-url","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}'
+if run_flow_capture "$repo_a/subdir" "$invalid_url_output" __test-state-set "$invalid_url_payload"; then
+	invalid_url_status=0
+else
+	invalid_url_status=$?
+fi
+invalid_url_text="$(cat "$invalid_url_output")"
+assert_equals "$invalid_url_status" "1"
+assert_contains "$invalid_url_text" 'activeIssueUrl must be a valid HTTP(S) URL'
+
+# patch metadata cannot carry issue URL
+patch_url_output="$TMP_DIR/patch-url-output"
+patch_url_payload='{"patchDescription":"Patch only","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/2","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}'
+if run_flow_capture "$repo_a/subdir" "$patch_url_output" __test-state-set "$patch_url_payload"; then
+	patch_url_status=0
+else
+	patch_url_status=$?
+fi
+patch_url_text="$(cat "$patch_url_output")"
+assert_equals "$patch_url_status" "1"
+assert_contains "$patch_url_text" 'activeIssueUrl requires activeIssueNumber'
 
 # empty branch names
 empty_main_branch_output="$TMP_DIR/empty-main-branch-output"

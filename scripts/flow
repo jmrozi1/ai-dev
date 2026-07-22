@@ -181,16 +181,20 @@ PY
 
 build_start_state_payload() {
 	local issue_number="$1"
-	local main_branch="$2"
-	local scratch_branch="$3"
+	local issue_title="$2"
+	local issue_url="$3"
+	local main_branch="$4"
+	local scratch_branch="$5"
 
-	python3 - "$issue_number" "$main_branch" "$scratch_branch" <<'PY'
+	python3 - "$issue_number" "$issue_title" "$issue_url" "$main_branch" "$scratch_branch" <<'PY'
 import json
 import sys
 
 issue_number = int(sys.argv[1])
-main_branch = sys.argv[2]
-scratch_branch = sys.argv[3]
+issue_title = sys.argv[2]
+issue_url = sys.argv[3]
+main_branch = sys.argv[4]
+scratch_branch = sys.argv[5]
 
 payload = {
 	'activeIssueNumber': issue_number,
@@ -198,6 +202,13 @@ payload = {
 	'scratchBranch': scratch_branch,
 	'checkpoint': 0,
 }
+
+if issue_title:
+	payload['activeIssueTitle'] = issue_title
+
+if issue_url:
+	payload['activeIssueUrl'] = issue_url
+
 print(json.dumps(payload))
 PY
 }
@@ -205,19 +216,21 @@ PY
 build_issue_checkpoint_state_payload() {
 	local issue_number="$1"
 	local issue_title="$2"
-	local main_branch="$3"
-	local scratch_branch="$4"
-	local checkpoint="$5"
+	local issue_url="$3"
+	local main_branch="$4"
+	local scratch_branch="$5"
+	local checkpoint="$6"
 
-	python3 - "$issue_number" "$issue_title" "$main_branch" "$scratch_branch" "$checkpoint" <<'PY'
+	python3 - "$issue_number" "$issue_title" "$issue_url" "$main_branch" "$scratch_branch" "$checkpoint" <<'PY'
 import json
 import sys
 
 issue_number = int(sys.argv[1])
 issue_title = sys.argv[2]
-main_branch = sys.argv[3]
-scratch_branch = sys.argv[4]
-checkpoint = int(sys.argv[5])
+issue_url = sys.argv[3]
+main_branch = sys.argv[4]
+scratch_branch = sys.argv[5]
+checkpoint = int(sys.argv[6])
 
 payload = {
 	'activeIssueNumber': issue_number,
@@ -229,8 +242,66 @@ payload = {
 if issue_title:
 	payload['activeIssueTitle'] = issue_title
 
+if issue_url:
+	payload['activeIssueUrl'] = issue_url
+
 print(json.dumps(payload))
 PY
+}
+
+resolve_issue_metadata() {
+	local issue_number="$1"
+
+	if ! command -v gh >/dev/null 2>&1; then
+		return 0
+	fi
+
+	local metadata_json
+	local metadata_status=0
+	set +e
+	metadata_json="$(gh issue view "$issue_number" --json title,url 2>/dev/null)"
+	metadata_status=$?
+	set -e
+
+	if [[ "$metadata_status" -ne 0 || -z "$metadata_json" ]]; then
+		return 0
+	fi
+
+	local parsed_metadata
+	local parse_status=0
+	set +e
+	parsed_metadata="$(python3 - "$metadata_json" <<'PY'
+import json
+import sys
+
+try:
+	data = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+	print('')
+	print('')
+	sys.exit(0)
+
+title = data.get('title')
+url = data.get('url')
+
+if not isinstance(title, str):
+	title = ''
+
+if not isinstance(url, str):
+	url = ''
+
+print(title.strip())
+print(url.strip())
+PY
+)"
+	parse_status=$?
+	set -e
+
+	if [[ "$parse_status" -ne 0 ]]; then
+		return 0
+	fi
+
+	printf '%s\n' "$parsed_metadata"
 }
 
 build_patch_state_payload() {
@@ -671,6 +742,8 @@ handle_status() {
 	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
 	local active_issue_title
 	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local active_issue_url
+	active_issue_url="$(workflow_state_get_field 'activeIssueUrl' "$state_json")"
 	local patch_description
 	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
 	local main_branch
@@ -706,6 +779,9 @@ handle_status() {
 				printf '  issue number: %s\n' "$active_issue_number"
 				if [[ -n "$active_issue_title" ]]; then
 					printf '  issue title: %s\n' "$active_issue_title"
+				fi
+				if [[ -n "$active_issue_url" ]]; then
+					printf '  issue URL: %s\n' "$active_issue_url"
 				fi
 			elif [[ "$workflow_kind" == 'patch' ]]; then
 				printf '  patch: %s\n' "$patch_description"
@@ -904,6 +980,8 @@ handle_commit() {
 
 	local active_issue_title
 	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local active_issue_url
+	active_issue_url="$(workflow_state_get_field 'activeIssueUrl' "$state_json")"
 	local main_branch
 	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
 	local scratch_branch
@@ -951,7 +1029,7 @@ handle_commit() {
 	if [[ "$workflow_kind" == 'patch' ]]; then
 		state_payload="$(build_patch_state_payload "$patch_description" "$main_branch" "$scratch_branch" "$new_checkpoint")"
 	else
-		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" "$new_checkpoint")"
+		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$active_issue_url" "$main_branch" "$scratch_branch" "$new_checkpoint")"
 	fi
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
@@ -994,6 +1072,8 @@ handle_reset() {
 
 	local active_issue_title
 	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local active_issue_url
+	active_issue_url="$(workflow_state_get_field 'activeIssueUrl' "$state_json")"
 	local main_branch
 	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
 	local scratch_branch
@@ -1035,7 +1115,7 @@ handle_reset() {
 	if [[ "$workflow_kind" == 'patch' ]]; then
 		state_payload="$(build_patch_state_payload "$patch_description" "$main_branch" "$scratch_branch" '0')"
 	else
-		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$active_issue_url" "$main_branch" "$scratch_branch" '0')"
 	fi
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
@@ -1077,6 +1157,8 @@ handle_promote() {
 
 	local active_issue_title
 	active_issue_title="$(workflow_state_get_field 'activeIssueTitle' "$state_json")"
+	local active_issue_url
+	active_issue_url="$(workflow_state_get_field 'activeIssueUrl' "$state_json")"
 	local main_branch
 	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
 	local scratch_branch
@@ -1152,7 +1234,7 @@ handle_promote() {
 	if [[ "$workflow_kind" == 'patch' ]]; then
 		state_payload="$(build_patch_state_payload "$patch_description" "$main_branch" "$scratch_branch" '0')"
 	else
-		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$main_branch" "$scratch_branch" '0')"
+		state_payload="$(build_issue_checkpoint_state_payload "$active_issue_number" "$active_issue_title" "$active_issue_url" "$main_branch" "$scratch_branch" '0')"
 	fi
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
@@ -1312,6 +1394,21 @@ handle_start() {
 		error "Main branch does not exist locally: ${main_branch}"
 	fi
 
+	local issue_title=''
+	local issue_url=''
+	local issue_metadata
+	issue_metadata="$(resolve_issue_metadata "$issue_number")"
+	if [[ -n "$issue_metadata" ]]; then
+		local issue_metadata_lines=()
+		mapfile -t issue_metadata_lines <<< "$issue_metadata"
+		issue_title="${issue_metadata_lines[0]:-}"
+		issue_url="${issue_metadata_lines[1]:-}"
+	fi
+
+	local state_payload
+	state_payload="$(build_start_state_payload "$issue_number" "$issue_title" "$issue_url" "$main_branch" "$scratch_branch")"
+	workflow_state_json_helper 'validate' "$workflow_state_file" "$state_payload" >/dev/null
+
 	git -C "$repo_root" checkout -q "$main_branch"
 	local main_commit
 	main_commit="$(git -C "$repo_root" rev-parse HEAD)"
@@ -1322,9 +1419,6 @@ handle_start() {
 	else
 		git -C "$repo_root" checkout -q -b "$scratch_branch" "$main_commit"
 	fi
-
-	local state_payload
-	state_payload="$(build_start_state_payload "$issue_number" "$main_branch" "$scratch_branch")"
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
 
 	printf 'Started issue %s\n' "$issue_number"
@@ -1595,6 +1689,7 @@ DEFAULTS = {
 ALLOWED_KEYS = {
 	'activeIssueNumber',
 	'activeIssueTitle',
+	'activeIssueUrl',
 	'patchDescription',
 	'mainBranch',
 	'scratchBranch',
@@ -1646,6 +1741,7 @@ def normalize_and_validate(state_data, context):
 
 	has_issue_number = 'activeIssueNumber' in state_data
 	has_issue_title = 'activeIssueTitle' in state_data
+	has_issue_url = 'activeIssueUrl' in state_data
 	has_patch_description = 'patchDescription' in state_data
 
 	if has_issue_number and has_patch_description:
@@ -1668,6 +1764,22 @@ def normalize_and_validate(state_data, context):
 
 	if has_issue_title and not has_issue_number:
 		fail(f"Invalid workflow state in {context}: activeIssueTitle requires activeIssueNumber.")
+
+	if has_issue_url:
+		issue_url = state_data['activeIssueUrl']
+		if not isinstance(issue_url, str):
+			fail(f"Invalid workflow state in {context}: activeIssueUrl must be a string.")
+		issue_url = issue_url.strip()
+		if not issue_url:
+			fail(f"Invalid workflow state in {context}: activeIssueUrl cannot be empty.")
+		from urllib.parse import urlparse
+		parsed_url = urlparse(issue_url)
+		if parsed_url.scheme not in ('http', 'https') or not parsed_url.netloc:
+			fail(f"Invalid workflow state in {context}: activeIssueUrl must be a valid HTTP(S) URL.")
+		normalized['activeIssueUrl'] = issue_url
+
+	if has_issue_url and not has_issue_number:
+		fail(f"Invalid workflow state in {context}: activeIssueUrl requires activeIssueNumber.")
 
 	if has_patch_description:
 		patch_description = state_data['patchDescription']
@@ -1727,6 +1839,13 @@ elif operation == 'set':
 		fail(f"Invalid JSON payload for workflow state: {exc.msg} (line {exc.lineno}, column {exc.colno})")
 	state = normalize_and_validate(payload_data, 'state payload')
 	write_state(state)
+	print(json.dumps(state, indent=2))
+elif operation == 'validate':
+	try:
+		payload_data = json.loads(payload)
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON payload for workflow state: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+	state = normalize_and_validate(payload_data, 'state payload')
 	print(json.dumps(state, indent=2))
 elif operation == 'clear':
 	if state_path.exists():

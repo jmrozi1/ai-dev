@@ -119,6 +119,12 @@ current_head() {
 	git -C "$repo_root" rev-parse HEAD
 }
 
+branch_head() {
+	local repo_root="$1"
+	local branch_name="$2"
+	git -C "$repo_root" rev-parse "$branch_name"
+}
+
 repo_status_porcelain() {
 	local repo_root="$1"
 	git -C "$repo_root" status --porcelain --untracked-files=all
@@ -389,6 +395,262 @@ assert_contains "$custom_state" '"mainBranch": "trunk"'
 assert_contains "$custom_state" '"scratchBranch": "work"'
 assert_contains "$custom_state" '"checkpoint": 0'
 assert_not_contains "$custom_state" 'activeIssueTitle'
+
+# issue metadata from gh is recorded when available
+repo_issue_metadata="$TMP_DIR/repo-issue-metadata"
+init_repo "$repo_issue_metadata"
+mock_bin_dir="$TMP_DIR/mock-bin"
+mkdir -p "$mock_bin_dir"
+cat >"$mock_bin_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == 'issue' && "${2:-}" == 'view' && "${3:-}" == '25' && "${4:-}" == '--json' && "${5:-}" == 'title,url' ]]; then
+	printf '{"title":"Issue from gh","url":"https://github.com/jmrozi1/ai-dev/issues/25"}\n'
+	exit 0
+fi
+
+exit 1
+EOF
+chmod +x "$mock_bin_dir/gh"
+
+issue_metadata_output="$TMP_DIR/issue-metadata-output"
+if (
+	cd "$repo_issue_metadata/subdir"
+	PATH="$mock_bin_dir:$PATH" "$FLOW" start 25
+) >"$issue_metadata_output" 2>&1; then
+	issue_metadata_status=0
+else
+	issue_metadata_status=$?
+fi
+issue_metadata_text="$(cat "$issue_metadata_output")"
+assert_equals "$issue_metadata_status" "0"
+assert_contains "$issue_metadata_text" 'Started issue 25'
+issue_metadata_state="$(state_get "$repo_issue_metadata/subdir")"
+assert_equals "$issue_metadata_state" $'{
+  "mainBranch": "main",
+  "scratchBranch": "scratch",
+  "checkpoint": 0,
+  "activeIssueNumber": 25,
+  "activeIssueTitle": "Issue from gh",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/25"
+}'
+
+# missing gh is treated as unavailable metadata
+repo_issue_no_gh="$TMP_DIR/repo-issue-no-gh"
+init_repo "$repo_issue_no_gh"
+no_gh_bin_dir="$TMP_DIR/no-gh-bin"
+mkdir -p "$no_gh_bin_dir"
+ln -sf "$(command -v basename)" "$no_gh_bin_dir/basename"
+ln -sf "$(command -v bash)" "$no_gh_bin_dir/bash"
+ln -sf "$(command -v git)" "$no_gh_bin_dir/git"
+ln -sf "$(command -v python3)" "$no_gh_bin_dir/python3"
+issue_no_gh_output="$TMP_DIR/issue-no-gh-output"
+if (
+	cd "$repo_issue_no_gh/subdir"
+	PATH="$no_gh_bin_dir" "$FLOW" start 26
+) >"$issue_no_gh_output" 2>&1; then
+	issue_no_gh_status=0
+else
+	issue_no_gh_status=$?
+fi
+issue_no_gh_text="$(cat "$issue_no_gh_output")"
+assert_equals "$issue_no_gh_status" "0"
+assert_contains "$issue_no_gh_text" 'Started issue 26'
+assert_equals "$(state_get "$repo_issue_no_gh/subdir")" $'{
+  "mainBranch": "main",
+  "scratchBranch": "scratch",
+  "checkpoint": 0,
+  "activeIssueNumber": 26
+}'
+
+# gh nonzero is treated as unavailable metadata
+repo_issue_gh_nonzero="$TMP_DIR/repo-issue-gh-nonzero"
+init_repo "$repo_issue_gh_nonzero"
+gh_nonzero_bin_dir="$TMP_DIR/gh-nonzero-bin"
+mkdir -p "$gh_nonzero_bin_dir"
+cat >"$gh_nonzero_bin_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+exit 1
+EOF
+chmod +x "$gh_nonzero_bin_dir/gh"
+issue_gh_nonzero_output="$TMP_DIR/issue-gh-nonzero-output"
+if (
+	cd "$repo_issue_gh_nonzero/subdir"
+	PATH="$gh_nonzero_bin_dir:$PATH" "$FLOW" start 27
+) >"$issue_gh_nonzero_output" 2>&1; then
+	issue_gh_nonzero_status=0
+else
+	issue_gh_nonzero_status=$?
+fi
+issue_gh_nonzero_text="$(cat "$issue_gh_nonzero_output")"
+assert_equals "$issue_gh_nonzero_status" "0"
+assert_contains "$issue_gh_nonzero_text" 'Started issue 27'
+assert_equals "$(state_get "$repo_issue_gh_nonzero/subdir")" $'{
+  "mainBranch": "main",
+  "scratchBranch": "scratch",
+  "checkpoint": 0,
+  "activeIssueNumber": 27
+}'
+
+# malformed gh JSON is treated as unavailable metadata with no traceback
+repo_issue_gh_malformed="$TMP_DIR/repo-issue-gh-malformed"
+init_repo "$repo_issue_gh_malformed"
+gh_malformed_bin_dir="$TMP_DIR/gh-malformed-bin"
+mkdir -p "$gh_malformed_bin_dir"
+cat >"$gh_malformed_bin_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '{ malformed json\n'
+EOF
+chmod +x "$gh_malformed_bin_dir/gh"
+issue_gh_malformed_output="$TMP_DIR/issue-gh-malformed-output"
+if (
+	cd "$repo_issue_gh_malformed/subdir"
+	PATH="$gh_malformed_bin_dir:$PATH" "$FLOW" start 28
+) >"$issue_gh_malformed_output" 2>&1; then
+	issue_gh_malformed_status=0
+else
+	issue_gh_malformed_status=$?
+fi
+issue_gh_malformed_text="$(cat "$issue_gh_malformed_output")"
+assert_equals "$issue_gh_malformed_status" "0"
+assert_contains "$issue_gh_malformed_text" 'Started issue 28'
+assert_not_contains "$issue_gh_malformed_text" 'Traceback'
+assert_equals "$(state_get "$repo_issue_gh_malformed/subdir")" $'{
+  "mainBranch": "main",
+  "scratchBranch": "scratch",
+  "checkpoint": 0,
+  "activeIssueNumber": 28
+}'
+
+# invalid gh URL fails validation before git mutations when scratch does not exist
+repo_issue_gh_invalid_url_missing_scratch="$TMP_DIR/repo-issue-gh-invalid-url-missing-scratch"
+init_repo "$repo_issue_gh_invalid_url_missing_scratch"
+gh_invalid_url_bin_dir="$TMP_DIR/gh-invalid-url-bin"
+mkdir -p "$gh_invalid_url_bin_dir"
+cat >"$gh_invalid_url_bin_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+printf '{"title":"Bad URL","url":"not-a-url"}\n'
+EOF
+chmod +x "$gh_invalid_url_bin_dir/gh"
+
+missing_branch_before="$(current_branch "$repo_issue_gh_invalid_url_missing_scratch")"
+missing_head_before="$(current_head "$repo_issue_gh_invalid_url_missing_scratch")"
+missing_main_ref_before="$(branch_head "$repo_issue_gh_invalid_url_missing_scratch" main)"
+missing_status_before="$(repo_status_porcelain "$repo_issue_gh_invalid_url_missing_scratch")"
+missing_scratch_exists_before='no'
+if git -C "$repo_issue_gh_invalid_url_missing_scratch" show-ref --verify --quiet refs/heads/scratch; then
+	missing_scratch_exists_before='yes'
+fi
+missing_workflow_file="$repo_issue_gh_invalid_url_missing_scratch/.ai-dev/workflow.json"
+missing_workflow_exists_before='no'
+missing_workflow_content_before=''
+if [[ -f "$missing_workflow_file" ]]; then
+	missing_workflow_exists_before='yes'
+	missing_workflow_content_before="$(cat "$missing_workflow_file")"
+fi
+
+issue_gh_invalid_url_missing_output="$TMP_DIR/issue-gh-invalid-url-missing-output"
+if (
+	cd "$repo_issue_gh_invalid_url_missing_scratch/subdir"
+	PATH="$gh_invalid_url_bin_dir:$PATH" "$FLOW" start 29
+) >"$issue_gh_invalid_url_missing_output" 2>&1; then
+	issue_gh_invalid_url_missing_status=0
+else
+	issue_gh_invalid_url_missing_status=$?
+fi
+issue_gh_invalid_url_missing_text="$(cat "$issue_gh_invalid_url_missing_output")"
+assert_equals "$issue_gh_invalid_url_missing_status" "1"
+assert_contains "$issue_gh_invalid_url_missing_text" 'activeIssueUrl must be a valid HTTP(S) URL'
+assert_not_contains "$issue_gh_invalid_url_missing_text" 'Traceback'
+
+assert_equals "$(current_branch "$repo_issue_gh_invalid_url_missing_scratch")" "$missing_branch_before"
+assert_equals "$(current_head "$repo_issue_gh_invalid_url_missing_scratch")" "$missing_head_before"
+assert_equals "$(branch_head "$repo_issue_gh_invalid_url_missing_scratch" main)" "$missing_main_ref_before"
+assert_equals "$(repo_status_porcelain "$repo_issue_gh_invalid_url_missing_scratch")" "$missing_status_before"
+if git -C "$repo_issue_gh_invalid_url_missing_scratch" show-ref --verify --quiet refs/heads/scratch; then
+	missing_scratch_exists_after='yes'
+else
+	missing_scratch_exists_after='no'
+fi
+assert_equals "$missing_scratch_exists_after" "$missing_scratch_exists_before"
+if [[ "$missing_workflow_exists_before" == 'yes' ]]; then
+	assert_file_exists "$missing_workflow_file"
+	assert_equals "$(cat "$missing_workflow_file")" "$missing_workflow_content_before"
+else
+	assert_not_exists "$missing_workflow_file"
+fi
+assert_equals "$(state_get "$repo_issue_gh_invalid_url_missing_scratch/subdir")" $'{
+  "mainBranch": "main",
+  "scratchBranch": "scratch",
+  "checkpoint": 0
+}'
+
+# invalid gh URL fails validation before git mutations when scratch already exists
+repo_issue_gh_invalid_url_existing_scratch="$TMP_DIR/repo-issue-gh-invalid-url-existing-scratch"
+init_repo "$repo_issue_gh_invalid_url_existing_scratch"
+git -C "$repo_issue_gh_invalid_url_existing_scratch" checkout -q -b scratch
+printf 'disposable\n' > "$repo_issue_gh_invalid_url_existing_scratch/disposable.txt"
+git -C "$repo_issue_gh_invalid_url_existing_scratch" add disposable.txt
+git -C "$repo_issue_gh_invalid_url_existing_scratch" commit -q -m 'disposable scratch commit'
+git -C "$repo_issue_gh_invalid_url_existing_scratch" checkout -q main
+
+existing_branch_before="$(current_branch "$repo_issue_gh_invalid_url_existing_scratch")"
+existing_head_before="$(current_head "$repo_issue_gh_invalid_url_existing_scratch")"
+existing_main_ref_before="$(branch_head "$repo_issue_gh_invalid_url_existing_scratch" main)"
+existing_status_before="$(repo_status_porcelain "$repo_issue_gh_invalid_url_existing_scratch")"
+existing_scratch_exists_before='no'
+existing_scratch_ref_before=''
+if git -C "$repo_issue_gh_invalid_url_existing_scratch" show-ref --verify --quiet refs/heads/scratch; then
+	existing_scratch_exists_before='yes'
+	existing_scratch_ref_before="$(branch_head "$repo_issue_gh_invalid_url_existing_scratch" scratch)"
+fi
+existing_workflow_file="$repo_issue_gh_invalid_url_existing_scratch/.ai-dev/workflow.json"
+existing_workflow_exists_before='no'
+existing_workflow_content_before=''
+if [[ -f "$existing_workflow_file" ]]; then
+	existing_workflow_exists_before='yes'
+	existing_workflow_content_before="$(cat "$existing_workflow_file")"
+fi
+
+issue_gh_invalid_url_existing_output="$TMP_DIR/issue-gh-invalid-url-existing-output"
+if (
+	cd "$repo_issue_gh_invalid_url_existing_scratch/subdir"
+	PATH="$gh_invalid_url_bin_dir:$PATH" "$FLOW" start 30
+) >"$issue_gh_invalid_url_existing_output" 2>&1; then
+	issue_gh_invalid_url_existing_status=0
+else
+	issue_gh_invalid_url_existing_status=$?
+fi
+issue_gh_invalid_url_existing_text="$(cat "$issue_gh_invalid_url_existing_output")"
+assert_equals "$issue_gh_invalid_url_existing_status" "1"
+assert_contains "$issue_gh_invalid_url_existing_text" 'activeIssueUrl must be a valid HTTP(S) URL'
+assert_not_contains "$issue_gh_invalid_url_existing_text" 'Traceback'
+
+assert_equals "$(current_branch "$repo_issue_gh_invalid_url_existing_scratch")" "$existing_branch_before"
+assert_equals "$(current_head "$repo_issue_gh_invalid_url_existing_scratch")" "$existing_head_before"
+assert_equals "$(branch_head "$repo_issue_gh_invalid_url_existing_scratch" main)" "$existing_main_ref_before"
+assert_equals "$(repo_status_porcelain "$repo_issue_gh_invalid_url_existing_scratch")" "$existing_status_before"
+if git -C "$repo_issue_gh_invalid_url_existing_scratch" show-ref --verify --quiet refs/heads/scratch; then
+	existing_scratch_exists_after='yes'
+	existing_scratch_ref_after="$(branch_head "$repo_issue_gh_invalid_url_existing_scratch" scratch)"
+else
+	existing_scratch_exists_after='no'
+	existing_scratch_ref_after=''
+fi
+assert_equals "$existing_scratch_exists_after" "$existing_scratch_exists_before"
+assert_equals "$existing_scratch_ref_after" "$existing_scratch_ref_before"
+if [[ "$existing_workflow_exists_before" == 'yes' ]]; then
+	assert_file_exists "$existing_workflow_file"
+	assert_equals "$(cat "$existing_workflow_file")" "$existing_workflow_content_before"
+else
+	assert_not_exists "$existing_workflow_file"
+fi
+assert_equals "$(state_get "$repo_issue_gh_invalid_url_existing_scratch/subdir")" $'{
+  "mainBranch": "main",
+  "scratchBranch": "scratch",
+  "checkpoint": 0
+}'
 
 # config file remains visible to Git while workflow file is ignored
 repo_config_visibility="$TMP_DIR/repo-config-visibility"

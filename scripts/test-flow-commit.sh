@@ -402,7 +402,7 @@ git -C "$repo_success_zero" check-ignore -q .ai-dev/workflow.json
 repo_success_nonzero="$TMP_DIR/repo-success-nonzero"
 init_repo "$repo_success_nonzero"
 git -C "$repo_success_nonzero" checkout -q -b scratch
-state_set "$repo_success_nonzero/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Checkpoint title","mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
+state_set "$repo_success_nonzero/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Checkpoint title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/22","mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 printf 'next checkpoint\n' >> "$repo_success_nonzero/tracked.txt"
 git -C "$repo_success_nonzero" add tracked.txt
 success_nonzero_output="$TMP_DIR/success-nonzero-output"
@@ -423,7 +423,8 @@ assert_equals "$(state_get "$repo_success_nonzero/subdir")" $'{
   "scratchBranch": "scratch",
   "checkpoint": 5,
   "activeIssueNumber": 22,
-  "activeIssueTitle": "Checkpoint title"
+  "activeIssueTitle": "Checkpoint title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/22"
 }'
 assert_repo_clean "$repo_success_nonzero"
 
@@ -501,7 +502,7 @@ if [[ "$(id -u)" != '0' ]]; then
 	repo_state_fail="$TMP_DIR/repo-state-fail"
 	init_repo "$repo_state_fail"
 	git -C "$repo_state_fail" checkout -q -b scratch
-	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":26,"activeIssueTitle":"Persist title","mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
+	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":26,"activeIssueTitle":"Persist title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/26","mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
 	printf 'persist failure\n' >> "$repo_state_fail/tracked.txt"
 	git -C "$repo_state_fail" add tracked.txt
 	state_fail_head_before="$(current_head "$repo_state_fail")"
@@ -526,7 +527,8 @@ if [[ "$(id -u)" != '0' ]]; then
   "scratchBranch": "scratch",
   "checkpoint": 2,
   "activeIssueNumber": 26,
-  "activeIssueTitle": "Persist title"
+  "activeIssueTitle": "Persist title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/26"
 }'
 	assert_equals "$(cached_diff "$repo_state_fail")" ''
 	assert_equals "$(head_diff "$repo_state_fail")" ''

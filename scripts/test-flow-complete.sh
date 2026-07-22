@@ -407,7 +407,7 @@ init_repo "$repo_success"
 success_routed_output_path="$TMP_DIR/success-out.txt"
 track_config_file "$repo_success" "$success_routed_output_path"
 git -C "$repo_success" checkout -q -b scratch
-state_set "$repo_success/subdir" '{"activeIssueNumber":21,"activeIssueTitle":"Done title","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+state_set "$repo_success/subdir" '{"activeIssueNumber":21,"activeIssueTitle":"Done title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/21","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
 success_branch_before="$(current_branch "$repo_success")"
 success_head_before="$(current_head "$repo_success")"
 success_main_before="$(branch_head "$repo_success" main)"
@@ -443,7 +443,7 @@ repo_custom="$TMP_DIR/repo-custom"
 init_repo "$repo_custom"
 git -C "$repo_custom" branch -m main trunk
 git -C "$repo_custom" checkout -q -b sandbox
-state_set "$repo_custom/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Custom","mainBranch":"trunk","scratchBranch":"sandbox","checkpoint":0}' >/dev/null
+state_set "$repo_custom/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Custom","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/22","mainBranch":"trunk","scratchBranch":"sandbox","checkpoint":0}' >/dev/null
 custom_output="$TMP_DIR/custom-output"
 if run_flow_capture "$repo_custom/subdir" "$custom_output" complete; then
 	custom_status=0
@@ -496,7 +496,7 @@ if [[ "$(id -u)" != '0' ]]; then
 	repo_state_fail="$TMP_DIR/repo-state-fail"
 	init_repo "$repo_state_fail"
 	git -C "$repo_state_fail" checkout -q -b scratch
-	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":25,"activeIssueTitle":"Persist title","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":25,"activeIssueTitle":"Persist title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/25","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
 	state_before="$(cat "$repo_state_fail/.ai-dev/workflow.json")"
 	head_before="$(current_head "$repo_state_fail")"
 	main_before="$(branch_head "$repo_state_fail" main)"
@@ -528,7 +528,8 @@ if [[ "$(id -u)" != '0' ]]; then
   "scratchBranch": "scratch",
   "checkpoint": 0,
   "activeIssueNumber": 25,
-  "activeIssueTitle": "Persist title"
+  "activeIssueTitle": "Persist title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/25"
 }'
 fi
 

@@ -446,7 +446,7 @@ assert_contains "$single_text" 'activeIssueNumber: 21'
 repo_multi="$TMP_DIR/repo-multi"
 init_repo "$repo_multi"
 git -C "$repo_multi" checkout -q -b scratch
-state_set "$repo_multi/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Promotion title","mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
+state_set "$repo_multi/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Promotion title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/22","mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 create_commit_on_current_branch "$repo_multi" a.txt 'a' '1'
 create_commit_on_current_branch "$repo_multi" b.txt 'b' '2'
 create_commit_on_current_branch "$repo_multi" c.txt 'c' '3'
@@ -470,7 +470,8 @@ assert_equals "$(state_get "$repo_multi")" $'{
   "scratchBranch": "scratch",
   "checkpoint": 0,
   "activeIssueNumber": 22,
-  "activeIssueTitle": "Promotion title"
+  "activeIssueTitle": "Promotion title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/22"
 }'
 assert_repo_clean "$repo_multi"
 assert_contains "$multi_text" 'Promoted scratch to main'
@@ -479,7 +480,7 @@ repo_custom="$TMP_DIR/repo-custom"
 init_repo "$repo_custom"
 git -C "$repo_custom" branch -m main trunk
 git -C "$repo_custom" checkout -q -b sandbox
-state_set "$repo_custom/subdir" '{"activeIssueNumber":23,"activeIssueTitle":"Custom","mainBranch":"trunk","scratchBranch":"sandbox","checkpoint":2}' >/dev/null
+state_set "$repo_custom/subdir" '{"activeIssueNumber":23,"activeIssueTitle":"Custom","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/23","mainBranch":"trunk","scratchBranch":"sandbox","checkpoint":2}' >/dev/null
 create_commit_on_current_branch "$repo_custom" custom.txt 'custom' '1'
 custom_output="$TMP_DIR/custom-output"
 if run_flow_capture "$repo_custom/subdir" "$custom_output" promote 'Custom ship'; then
@@ -498,7 +499,8 @@ assert_equals "$(state_get "$repo_custom")" $'{
   "scratchBranch": "sandbox",
   "checkpoint": 0,
   "activeIssueNumber": 23,
-  "activeIssueTitle": "Custom"
+  "activeIssueTitle": "Custom",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/23"
 }'
 
 repo_subdir="$TMP_DIR/repo-subdir"
@@ -691,7 +693,7 @@ if [[ "$(id -u)" != '0' ]]; then
 	repo_state_fail="$TMP_DIR/repo-state-fail"
 	init_repo "$repo_state_fail"
 	git -C "$repo_state_fail" checkout -q -b scratch
-	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":31,"activeIssueTitle":"Persist title","mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
+	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":31,"activeIssueTitle":"Persist title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/31","mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
 	create_commit_on_current_branch "$repo_state_fail" state.txt 'state' '1'
 	state_fail_before="$(cat "$repo_state_fail/.ai-dev/workflow.json")"
 	chmod 500 "$repo_state_fail/.ai-dev"
@@ -715,7 +717,8 @@ if [[ "$(id -u)" != '0' ]]; then
   "scratchBranch": "scratch",
   "checkpoint": 2,
   "activeIssueNumber": 31,
-  "activeIssueTitle": "Persist title"
+  "activeIssueTitle": "Persist title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/31"
 }'
 fi
 

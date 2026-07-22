@@ -265,13 +265,15 @@ assert_contains "$inactive_verbose" '  clean'
 repo_active_title="$TMP_DIR/repo-active-title"
 init_repo "$repo_active_title"
 git -C "$repo_active_title" checkout -q -b scratch
-state_set "$repo_active_title/subdir" '{"activeIssueNumber":42,"activeIssueTitle":"Improve flow status","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+state_set "$repo_active_title/subdir" '{"activeIssueNumber":42,"activeIssueTitle":"Improve flow status","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/42","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
 active_title_default="$(run_flow "$repo_active_title/subdir" status)"
 assert_equals "$active_title_default" $'Issue 42 — Improve flow status\nBranch: scratch'
 assert_not_contains "$active_title_default" 'Checkpoint: 0'
 assert_not_contains "$active_title_default" 'staged'
 assert_not_contains "$active_title_default" 'modified'
 assert_not_contains "$active_title_default" 'untracked'
+assert_not_contains "$active_title_default" 'issue URL'
+assert_not_contains "$active_title_default" 'github.com'
 
 repo_active_no_title="$TMP_DIR/repo-active-no-title"
 init_repo "$repo_active_no_title"
@@ -408,6 +410,7 @@ assert_contains "$verbose_active_output" 'Workflow:'
 assert_contains "$verbose_active_output" '  state: active'
 assert_contains "$verbose_active_output" '  issue number: 42'
 assert_contains "$verbose_active_output" '  issue title: Improve flow status'
+assert_contains "$verbose_active_output" '  issue URL: https://github.com/jmrozi1/ai-dev/issues/42'
 assert_contains "$verbose_active_output" '  checkpoint: 0'
 assert_contains "$verbose_active_output" 'Repository:'
 assert_contains "$verbose_active_output" '  current branch: scratch'
@@ -519,7 +522,7 @@ assert_contains "$(cat "$malformed_output")" 'Invalid JSON in'
 repo_read_only="$TMP_DIR/repo-read-only"
 init_repo "$repo_read_only"
 git -C "$repo_read_only" checkout -q -b scratch
-state_set "$repo_read_only/subdir" '{"activeIssueNumber":90,"activeIssueTitle":"Read only","mainBranch":"main","scratchBranch":"scratch","checkpoint":3}' >/dev/null
+state_set "$repo_read_only/subdir" '{"activeIssueNumber":90,"activeIssueTitle":"Read only","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/90","mainBranch":"main","scratchBranch":"scratch","checkpoint":3}' >/dev/null
 printf 'staged\n' >> "$repo_read_only/tracked.txt"
 git -C "$repo_read_only" add tracked.txt
 printf 'modified\n' >> "$repo_read_only/tracked.txt"
@@ -540,6 +543,7 @@ read_only_default_output="$(run_flow "$repo_read_only/subdir" status)"
 read_only_verbose_output="$(run_flow "$repo_read_only/subdir" status -v)"
 assert_contains "$read_only_default_output" 'Issue 90 — Read only'
 assert_contains "$read_only_verbose_output" '  issue number: 90'
+assert_contains "$read_only_verbose_output" '  issue URL: https://github.com/jmrozi1/ai-dev/issues/90'
 assert_contains "$read_only_verbose_output" '  state: active'
 
 assert_equals "$(cat "$repo_read_only/.ai-dev/workflow.json")" "$state_before"
@@ -557,7 +561,8 @@ assert_equals "$(state_get "$repo_read_only/subdir")" $'{
   "scratchBranch": "scratch",
   "checkpoint": 3,
   "activeIssueNumber": 90,
-  "activeIssueTitle": "Read only"
+  "activeIssueTitle": "Read only",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/90"
 }'
 
 printf 'flow status tests passed\n'

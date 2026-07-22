@@ -330,7 +330,7 @@ assert_repo_clean "$repo_diverged"
 repo_cleanup="$TMP_DIR/repo-cleanup"
 init_repo "$repo_cleanup"
 git -C "$repo_cleanup" checkout -q -b scratch
-state_set "$repo_cleanup/subdir" '{"activeIssueNumber":21,"activeIssueTitle":"Reset title","mainBranch":"main","scratchBranch":"scratch","checkpoint":5}' >/dev/null
+state_set "$repo_cleanup/subdir" '{"activeIssueNumber":21,"activeIssueTitle":"Reset title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/21","mainBranch":"main","scratchBranch":"scratch","checkpoint":5}' >/dev/null
 printf 'staged\n' >> "$repo_cleanup/tracked.txt"
 git -C "$repo_cleanup" add tracked.txt
 printf 'unstaged\n' >> "$repo_cleanup/tracked.txt"
@@ -365,14 +365,15 @@ assert_equals "$(state_get "$repo_cleanup")" $'{
   "scratchBranch": "scratch",
   "checkpoint": 0,
   "activeIssueNumber": 21,
-  "activeIssueTitle": "Reset title"
+  "activeIssueTitle": "Reset title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/21"
 }'
 
 repo_custom="$TMP_DIR/repo-custom"
 init_repo "$repo_custom"
 git -C "$repo_custom" branch -m main trunk
 git -C "$repo_custom" checkout -q -b sandbox
-state_set "$repo_custom/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Custom branches","mainBranch":"trunk","scratchBranch":"sandbox","checkpoint":7}' >/dev/null
+state_set "$repo_custom/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Custom branches","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/22","mainBranch":"trunk","scratchBranch":"sandbox","checkpoint":7}' >/dev/null
 printf 'custom\n' >> "$repo_custom/tracked.txt"
 git -C "$repo_custom" add tracked.txt
 custom_output="$TMP_DIR/custom-output"
@@ -389,7 +390,8 @@ assert_equals "$(state_get "$repo_custom")" $'{
   "scratchBranch": "sandbox",
   "checkpoint": 0,
   "activeIssueNumber": 22,
-  "activeIssueTitle": "Custom branches"
+  "activeIssueTitle": "Custom branches",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/22"
 }'
 assert_repo_clean "$repo_custom"
 
@@ -457,7 +459,7 @@ if [[ "$(id -u)" != '0' ]]; then
 	repo_state_fail="$TMP_DIR/repo-state-fail"
 	init_repo "$repo_state_fail"
 	git -C "$repo_state_fail" checkout -q -b scratch
-	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":26,"activeIssueTitle":"Persist title","mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
+	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":26,"activeIssueTitle":"Persist title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/26","mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
 	printf 'staged\n' >> "$repo_state_fail/tracked.txt"
 	git -C "$repo_state_fail" add tracked.txt
 	printf 'untracked\n' > "$repo_state_fail/remove.txt"
@@ -484,7 +486,8 @@ if [[ "$(id -u)" != '0' ]]; then
   "scratchBranch": "scratch",
   "checkpoint": 2,
   "activeIssueNumber": 26,
-  "activeIssueTitle": "Persist title"
+  "activeIssueTitle": "Persist title",
+  "activeIssueUrl": "https://github.com/jmrozi1/ai-dev/issues/26"
 }'
 	assert_repo_clean "$repo_state_fail"
 fi
