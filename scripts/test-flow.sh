@@ -104,6 +104,8 @@ Commands:
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.
   complete   Clear the completed local workflow.
+	block      Block the active issue workflow and release the active slot.
+	resume     Resume a previously blocked issue workflow.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.

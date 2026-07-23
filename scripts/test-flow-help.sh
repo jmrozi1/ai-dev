@@ -149,6 +149,8 @@ Commands:
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.
   complete   Clear the completed local workflow.
+	block      Block the active issue workflow and release the active slot.
+	resume     Resume a previously blocked issue workflow.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
@@ -251,6 +253,27 @@ Options:
   -h, --help  Show this help.
 EOF
 			;;
+		block)
+			cat <<EOF
+Usage: ${command_name} block "<reason>"
+
+Block an active issue workflow, keep the issue open, and release the
+local active workflow slot.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		resume)
+			cat <<EOF
+Usage: ${command_name} resume <ticket-number>
+
+Resume a blocked issue workflow and restore it as the local active issue.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
 		get)
 			cat <<EOF
 Usage: ${command_name} get out
@@ -321,7 +344,7 @@ help_command_verbose="$(cd "$help_repo/subdir" && "$symlink_path" help --help)"
 assert_equals "$help_command_output" "$help_command_verbose"
 
 # command-specific help for every public command
-for command in start patch status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete block resume get set unset help; do
 	command_help_short="$TMP_DIR/${command}-short.txt"
 	command_help_long="$TMP_DIR/${command}-long.txt"
 	if run_flow_capture "$help_repo/subdir" "$command_help_short" "$command" -h; then
@@ -343,7 +366,7 @@ for command in start patch status review commit reset promote complete get set u
 # help works outside Git repositories and with malformed config
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
-for command in start patch status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete block resume get set unset help; do
 	for help_flag in -h --help; do
 		outside_output="$TMP_DIR/outside-${command}-${help_flag//-/}.txt"
 		if run_flow_capture "$outside_repo" "$outside_output" "$command" "$help_flag"; then
@@ -360,7 +383,7 @@ repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"
 mkdir -p "$repo_malformed/.ai-dev"
 printf '{ invalid json\n' > "$repo_malformed/.ai-dev/config.json"
-for command in start patch status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete block resume get set unset help; do
 	malformed_output="$TMP_DIR/malformed-${command}.txt"
 	if run_flow_capture "$repo_malformed/subdir" "$malformed_output" "$command" --help; then
 		malformed_status=0
@@ -379,7 +402,7 @@ git -C "$repo_bypass" checkout -q -b scratch
 state_set "$repo_bypass/subdir" '{"activeIssueNumber":99,"mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 git -C "$repo_bypass" checkout -q main
 printf '{ invalid workflow json\n' > "$repo_bypass/.ai-dev/workflow.json"
-for command in start patch status review commit reset promote complete get set unset help; do
+for command in start patch status review commit reset promote complete block resume get set unset help; do
 	bypass_output="$TMP_DIR/bypass-${command}.txt"
 	if run_flow_capture "$repo_bypass/subdir" "$bypass_output" "$command" -h; then
 		bypass_status=0
@@ -419,7 +442,7 @@ assert_contains "$(cat "$command_help_routed_output")" 'Usage: flow status [-v|-
 assert_not_exists "$set_repo_out"
 
 # extra arguments combined with help are rejected
-for command in patch status review commit reset complete get set unset help; do
+for command in patch status review commit reset complete block resume get set unset help; do
 	extra_output="$TMP_DIR/${command}-extra.txt"
 	if run_flow_capture "$help_repo/subdir" "$extra_output" "$command" -h extra; then
 		extra_status=0

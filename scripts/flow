@@ -25,6 +25,10 @@ workflow_state_file_for_repo_root() {
 	printf '%s/.ai-dev/workflow.json' "$1"
 }
 
+blocked_workflows_file_for_repo_root() {
+	printf '%s/.ai-dev/blocked-workflows.json' "$1"
+}
+
 resolve_repo_root_if_available() {
 	local repo_root
 	if repo_root="$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null)"; then
@@ -304,6 +308,151 @@ PY
 	printf '%s\n' "$parsed_metadata"
 }
 
+resolve_issue_details_with_labels() {
+	local issue_number="$1"
+
+	if ! command -v gh >/dev/null 2>&1; then
+		error 'GitHub CLI (gh) is required for this command.'
+	fi
+
+	local issue_json
+	local issue_status=0
+	set +e
+	issue_json="$(gh issue view "$issue_number" --json title,url,labels 2>&1)"
+	issue_status=$?
+	set -e
+
+	if [[ "$issue_status" -ne 0 ]]; then
+		error "GitHub issue lookup failed for #${issue_number}: ${issue_json}"
+	fi
+
+	local parsed_issue
+	local parse_status=0
+	set +e
+	parsed_issue="$(python3 - "$issue_json" <<'PY'
+import json
+import sys
+
+try:
+	data = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+	print('', file=sys.stderr)
+	sys.exit(1)
+
+title = data.get('title')
+url = data.get('url')
+labels = data.get('labels')
+
+if not isinstance(title, str):
+	title = ''
+
+if not isinstance(url, str):
+	url = ''
+
+if not isinstance(labels, list):
+	labels = []
+
+label_names = []
+for item in labels:
+	if isinstance(item, dict):
+		name = item.get('name')
+		if isinstance(name, str):
+			name = name.strip()
+			if name:
+				label_names.append(name)
+
+print(title.strip())
+print(url.strip())
+print(','.join(label_names))
+PY
+)"
+	parse_status=$?
+	set -e
+
+	if [[ "$parse_status" -ne 0 ]]; then
+		error "GitHub issue lookup failed for #${issue_number}: invalid JSON response."
+	fi
+
+	printf '%s\n' "$parsed_issue"
+}
+
+reconcile_github_workflow_label() {
+	local issue_number="$1"
+	local target_label="$2"
+	local labels_csv="$3"
+	local errexit_was_enabled='no'
+	if [[ "$-" == *e* ]]; then
+		errexit_was_enabled='yes'
+	fi
+
+	local reconcile_result
+	local reconcile_status=0
+	set +e
+	reconcile_result="$(python3 - "$target_label" "$labels_csv" <<'PY'
+import sys
+
+target = sys.argv[1]
+raw_labels = sys.argv[2]
+workflow_labels = ['active', 'blocked', 'backlog']
+
+labels = []
+for entry in raw_labels.split(','):
+	entry = entry.strip()
+	if entry:
+		labels.append(entry)
+
+remove = []
+for label in workflow_labels:
+	if label != target and label in labels:
+		remove.append(label)
+
+add_needed = 'yes' if target not in labels else 'no'
+print(','.join(remove))
+print(add_needed)
+PY
+)"
+	reconcile_status=$?
+	if [[ "$errexit_was_enabled" == 'yes' ]]; then
+		set -e
+	fi
+
+	if [[ "$reconcile_status" -ne 0 ]]; then
+		printf '%s: GitHub label reconciliation failed for #%s.\n' "$script_name" "$issue_number" >&2
+		return 1
+	fi
+
+	local reconcile_lines=()
+	mapfile -t reconcile_lines <<< "$reconcile_result"
+	local labels_to_remove="${reconcile_lines[0]:-}"
+	local add_needed="${reconcile_lines[1]:-no}"
+
+	local edit_args=(issue edit "$issue_number")
+	if [[ "$add_needed" == 'yes' ]]; then
+		edit_args+=(--add-label "$target_label")
+	fi
+	if [[ -n "$labels_to_remove" ]]; then
+		edit_args+=(--remove-label "$labels_to_remove")
+	fi
+
+	if [[ "$add_needed" != 'yes' && -z "$labels_to_remove" ]]; then
+		return 0
+	fi
+
+	local edit_output
+	local edit_status=0
+	set +e
+	edit_output="$(gh "${edit_args[@]}" 2>&1)"
+	edit_status=$?
+	if [[ "$errexit_was_enabled" == 'yes' ]]; then
+		set -e
+	fi
+
+	if [[ "$edit_status" -ne 0 ]]; then
+		printf '%s: GitHub label reconciliation failed for #%s: %s\n' "$script_name" "$issue_number" "$edit_output" >&2
+		return 1
+	fi
+}
+
 build_patch_state_payload() {
 	local description="$1"
 	local main_branch="$2"
@@ -383,6 +532,83 @@ payload = {
 }
 
 print(json.dumps(payload))
+PY
+}
+
+build_blocked_workflow_record_payload() {
+	local issue_number="$1"
+	local issue_title="$2"
+	local issue_url="$3"
+	local reason="$4"
+	local blocked_at="$5"
+
+	python3 - "$issue_number" "$issue_title" "$issue_url" "$reason" "$blocked_at" <<'PY'
+import json
+import sys
+
+payload = {
+	'issueNumber': int(sys.argv[1]),
+	'issueTitle': sys.argv[2],
+	'issueUrl': sys.argv[3],
+	'reason': sys.argv[4],
+	'blockedAt': sys.argv[5],
+}
+
+print(json.dumps(payload))
+PY
+}
+
+now_utc_iso_timestamp() {
+	python3 - <<'PY'
+from datetime import datetime, timezone
+
+print(datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace('+00:00', 'Z'))
+PY
+}
+
+format_blocked_workflow_summary_lines() {
+	local blocked_json="$1"
+
+	python3 - "$blocked_json" <<'PY'
+import json
+import sys
+
+try:
+	data = json.loads(sys.argv[1])
+except json.JSONDecodeError:
+	print('')
+	sys.exit(0)
+
+items = data.get('blockedWorkflows', [])
+if not isinstance(items, list) or not items:
+	print('  none')
+	sys.exit(0)
+
+normalized = []
+for item in items:
+	if not isinstance(item, dict):
+		continue
+	issue_number = item.get('issueNumber')
+	issue_title = item.get('issueTitle')
+	reason = item.get('reason')
+	if not isinstance(issue_number, int):
+		continue
+	if not isinstance(issue_title, str):
+		issue_title = ''
+	if not isinstance(reason, str):
+		reason = ''
+	normalized.append((issue_number, issue_title.strip(), reason.strip()))
+
+if not normalized:
+	print('  none')
+	sys.exit(0)
+
+for issue_number, issue_title, reason in sorted(normalized, key=lambda x: x[0]):
+	if issue_title:
+		print(f'  issue {issue_number} - {issue_title}')
+	else:
+		print(f'  issue {issue_number}')
+	print(f'    reason: {reason}')
 PY
 }
 
@@ -770,6 +996,11 @@ handle_status() {
 	local relation_state main_only_count scratch_only_count
 	read -r relation_state main_only_count scratch_only_count <<< "$(branch_relation_info_for_repo "$repo_root" "$main_branch" "$scratch_branch")"
 
+	local blocked_workflows_file
+	blocked_workflows_file="$(blocked_workflows_file_for_repo_root "$repo_root")"
+	local blocked_workflows_json
+	blocked_workflows_json="$(blocked_workflows_json_helper 'get' "$blocked_workflows_file")"
+
 	if [[ "$verbose" == 'yes' ]]; then
 		printf 'Workflow:\n'
 		if [[ "$workflow_status" == 'active' ]]; then
@@ -806,6 +1037,9 @@ handle_status() {
 			print_status_path_category 'modified' "$STATUS_MODIFIED_PATHS"
 			print_status_path_category 'untracked' "$STATUS_UNTRACKED_PATHS"
 		fi
+
+		printf 'Blocked workflows:\n'
+		format_blocked_workflow_summary_lines "$blocked_workflows_json"
 		return 0
 	fi
 
@@ -1536,6 +1770,234 @@ handle_patch() {
 	printf 'checkpoint: 0\n'
 }
 
+handle_block() {
+	local argument_count="$1"
+	shift
+
+	local reason="${1:-}"
+	if [[ "$argument_count" -ne 1 || -z "${reason//[[:space:]]/}" ]]; then
+		error "Usage: ${script_name} block \"<reason>\""
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	local workflow_kind
+	workflow_kind="$(workflow_kind_from_state "$active_issue_number" "$patch_description")"
+	if [[ "$workflow_kind" == 'inactive' ]]; then
+		error 'Cannot block workflow: no active issue is set.'
+	fi
+	if [[ "$workflow_kind" == 'patch' ]]; then
+		error 'Cannot block workflow: patch workflows are not supported.'
+	fi
+
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+	local checkpoint
+	checkpoint="$(workflow_state_get_field 'checkpoint' "$state_json")"
+
+	if [[ "$main_branch" == "$scratch_branch" ]]; then
+		error 'Invalid workflow state: mainBranch and scratchBranch must be different.'
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		error "Scratch branch does not exist locally: ${scratch_branch}"
+	fi
+
+	local porcelain_status
+	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	local staged unstaged untracked working_tree
+	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
+	if [[ "$staged" == 'yes' || "$unstaged" == 'yes' || "$untracked" == 'yes' ]]; then
+		error 'Cannot block workflow: repository must be clean.'
+	fi
+
+	local counts
+	counts="$(git -C "$repo_root" rev-list --left-right --count "${main_branch}...${scratch_branch}")"
+	local main_only_count scratch_only_count
+	IFS=$' \t' read -r main_only_count scratch_only_count <<< "$counts"
+	if [[ "$main_only_count" -ne 0 || "$scratch_only_count" -ne 0 ]]; then
+		error "Cannot block workflow: ${scratch_branch} must equal ${main_branch}."
+	fi
+
+	if [[ "$checkpoint" != '0' ]]; then
+		error "Cannot block workflow: checkpoint must be 0 (current: ${checkpoint})."
+	fi
+
+	local issue_details
+	issue_details="$(resolve_issue_details_with_labels "$active_issue_number")"
+	local issue_lines=()
+	mapfile -t issue_lines <<< "$issue_details"
+	local issue_title="${issue_lines[0]:-}"
+	local issue_url="${issue_lines[1]:-}"
+	local issue_labels_csv="${issue_lines[2]:-}"
+
+	local blocked_workflows_file
+	blocked_workflows_file="$(blocked_workflows_file_for_repo_root "$repo_root")"
+	local blocked_before_json
+	blocked_before_json="$(blocked_workflows_json_helper 'get' "$blocked_workflows_file")"
+
+	local blocked_at
+	blocked_at="$(now_utc_iso_timestamp)"
+	local blocked_record_payload
+	blocked_record_payload="$(build_blocked_workflow_record_payload "$active_issue_number" "$issue_title" "$issue_url" "$reason" "$blocked_at")"
+	blocked_workflows_json_helper 'upsert' "$blocked_workflows_file" "$blocked_record_payload" >/dev/null
+
+	local github_failed='no'
+	set +e
+	reconcile_github_workflow_label "$active_issue_number" 'blocked' "$issue_labels_csv"
+	local reconcile_status=$?
+	set -e
+	if [[ "$reconcile_status" -ne 0 ]]; then
+		github_failed='yes'
+	fi
+
+	if [[ "$github_failed" == 'yes' ]]; then
+		set +e
+		blocked_workflows_json_helper 'set' "$blocked_workflows_file" "$blocked_before_json" >/dev/null
+		local restore_status=$?
+		set -e
+		if [[ "$restore_status" -ne 0 ]]; then
+			printf '%s: Warning: failed to remove provisional blocked record for issue %s.\n' "$script_name" "$active_issue_number" >&2
+		fi
+		error "Cannot block workflow: failed to synchronize GitHub labels for issue ${active_issue_number}."
+	fi
+
+	local inactive_payload
+	inactive_payload="$(build_inactive_state_payload "$main_branch" "$scratch_branch")"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$inactive_payload" >/dev/null
+
+	printf 'Blocked issue %s\n' "$active_issue_number"
+	printf 'reason: %s\n' "$reason"
+	printf 'Workflow: inactive\n'
+	printf 'mainBranch: %s\n' "$main_branch"
+	printf 'scratchBranch: %s\n' "$scratch_branch"
+	printf 'checkpoint: 0\n'
+}
+
+handle_resume() {
+	local argument_count="$1"
+	shift
+
+	local issue_number="${1:-}"
+	if [[ "$argument_count" -ne 1 ]]; then
+		error "Usage: ${script_name} resume <ticket-number>"
+	fi
+
+	if [[ ! "$issue_number" =~ ^[1-9][0-9]*$ ]]; then
+		error 'ticket-number must be a positive integer.'
+	fi
+
+	local repo_root
+	repo_root="$(resolve_repo_root)"
+
+	local workflow_state_file
+	workflow_state_file="$(workflow_state_file_for_repo_root "$repo_root")"
+	local state_json
+	state_json="$(workflow_state_json_helper 'get' "$workflow_state_file")"
+
+	local active_issue_number
+	active_issue_number="$(workflow_state_get_field 'activeIssueNumber' "$state_json")"
+	local patch_description
+	patch_description="$(workflow_state_get_field 'patchDescription' "$state_json")"
+	if [[ -n "$active_issue_number" || -n "$patch_description" ]]; then
+		if [[ -n "$active_issue_number" ]]; then
+			error "Cannot resume workflow: active issue ${active_issue_number} is already set."
+		fi
+		error "Cannot resume workflow: active patch ${patch_description} is already set."
+	fi
+
+	local main_branch
+	main_branch="$(workflow_state_get_field 'mainBranch' "$state_json")"
+	local scratch_branch
+	scratch_branch="$(workflow_state_get_field 'scratchBranch' "$state_json")"
+
+	if [[ "$main_branch" == "$scratch_branch" ]]; then
+		error 'Invalid workflow state: mainBranch and scratchBranch must be different.'
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$main_branch"; then
+		error "Main branch does not exist locally: ${main_branch}"
+	fi
+
+	if ! git -C "$repo_root" show-ref --verify --quiet "refs/heads/$scratch_branch"; then
+		error "Scratch branch does not exist locally: ${scratch_branch}"
+	fi
+
+	local porcelain_status
+	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
+	local staged unstaged untracked working_tree
+	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
+	if [[ "$staged" == 'yes' || "$unstaged" == 'yes' || "$untracked" == 'yes' ]]; then
+		error 'Cannot resume workflow: repository must be clean.'
+	fi
+
+	local counts
+	counts="$(git -C "$repo_root" rev-list --left-right --count "${main_branch}...${scratch_branch}")"
+	local main_only_count scratch_only_count
+	IFS=$' \t' read -r main_only_count scratch_only_count <<< "$counts"
+	if [[ "$main_only_count" -ne 0 || "$scratch_only_count" -ne 0 ]]; then
+		error "Cannot resume workflow: ${scratch_branch} must equal ${main_branch}."
+	fi
+
+	local blocked_workflows_file
+	blocked_workflows_file="$(blocked_workflows_file_for_repo_root "$repo_root")"
+	local blocked_record_json
+	blocked_record_json="$(blocked_workflows_json_helper 'get-record' "$blocked_workflows_file" "$issue_number")"
+	if [[ -z "$blocked_record_json" ]]; then
+		error "Cannot resume workflow: no blocked record exists for issue ${issue_number}."
+	fi
+
+	local blocked_record_fields
+	blocked_record_fields="$(python3 - "$blocked_record_json" <<'PY'
+import json
+import sys
+
+data = json.loads(sys.argv[1])
+print(data.get('issueTitle', ''))
+print(data.get('issueUrl', ''))
+PY
+)"
+	local blocked_record_lines=()
+	mapfile -t blocked_record_lines <<< "$blocked_record_fields"
+	local blocked_issue_title="${blocked_record_lines[0]:-}"
+	local blocked_issue_url="${blocked_record_lines[1]:-}"
+
+	local issue_details
+	issue_details="$(resolve_issue_details_with_labels "$issue_number")"
+	local issue_lines=()
+	mapfile -t issue_lines <<< "$issue_details"
+	local issue_labels_csv="${issue_lines[2]:-}"
+
+	reconcile_github_workflow_label "$issue_number" 'active' "$issue_labels_csv"
+
+	local resumed_state_payload
+	resumed_state_payload="$(build_start_state_payload "$issue_number" "$blocked_issue_title" "$blocked_issue_url" "$main_branch" "$scratch_branch")"
+	workflow_state_json_helper 'set' "$workflow_state_file" "$resumed_state_payload" >/dev/null
+
+	blocked_workflows_json_helper 'remove' "$blocked_workflows_file" "$issue_number" >/dev/null
+
+	printf 'Resumed issue %s\n' "$issue_number"
+	printf 'mainBranch: %s\n' "$main_branch"
+	printf 'scratchBranch: %s\n' "$scratch_branch"
+	printf 'checkpoint: 0\n'
+}
+
 validate_config_key() {
 	local command="$1"
 	local key="$2"
@@ -1856,6 +2318,244 @@ else:
 PY
 }
 
+blocked_workflows_json_helper() {
+	local operation="$1"
+	local blocked_workflows_file="$2"
+	local payload="${3-}"
+
+	python3 - "$script_name" "$operation" "$blocked_workflows_file" "$payload" <<'PY'
+import json
+import os
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+def fail(message):
+	print(f"{script_name}: {message}", file=sys.stderr)
+	sys.exit(1)
+
+
+script_name = sys.argv[1]
+operation = sys.argv[2]
+blocked_path = Path(sys.argv[3])
+payload = sys.argv[4]
+
+DEFAULTS = {
+	'blockedWorkflows': [],
+}
+
+ALLOWED_TOP_LEVEL_KEYS = {
+	'blockedWorkflows',
+}
+
+ALLOWED_RECORD_KEYS = {
+	'issueNumber',
+	'issueTitle',
+	'issueUrl',
+	'reason',
+	'blockedAt',
+}
+
+
+def is_int(value):
+	return isinstance(value, int) and not isinstance(value, bool)
+
+
+def normalize_record(record_data, context):
+	if not isinstance(record_data, dict):
+		fail(f"Invalid blocked workflow record in {context}: expected a JSON object.")
+
+	unknown_keys = sorted(name for name in record_data if name not in ALLOWED_RECORD_KEYS)
+	if unknown_keys:
+		fail(f"Unknown blocked workflow record key(s) in {context}: {', '.join(unknown_keys)}")
+
+	missing = [name for name in ('issueNumber', 'issueTitle', 'issueUrl', 'reason', 'blockedAt') if name not in record_data]
+	if missing:
+		fail(f"Invalid blocked workflow record in {context}: missing required key(s): {', '.join(missing)}")
+
+	issue_number = record_data['issueNumber']
+	if not is_int(issue_number) or issue_number <= 0:
+		fail(f"Invalid blocked workflow record in {context}: issueNumber must be a positive integer.")
+
+	issue_title = record_data['issueTitle']
+	if not isinstance(issue_title, str):
+		fail(f"Invalid blocked workflow record in {context}: issueTitle must be a string.")
+	issue_title = issue_title.strip()
+	if not issue_title:
+		fail(f"Invalid blocked workflow record in {context}: issueTitle cannot be empty.")
+
+	issue_url = record_data['issueUrl']
+	if not isinstance(issue_url, str):
+		fail(f"Invalid blocked workflow record in {context}: issueUrl must be a string.")
+	issue_url = issue_url.strip()
+	if not issue_url:
+		fail(f"Invalid blocked workflow record in {context}: issueUrl cannot be empty.")
+	parsed_url = urlparse(issue_url)
+	if parsed_url.scheme not in ('http', 'https') or not parsed_url.netloc:
+		fail(f"Invalid blocked workflow record in {context}: issueUrl must be a valid HTTP(S) URL.")
+
+	reason = record_data['reason']
+	if not isinstance(reason, str):
+		fail(f"Invalid blocked workflow record in {context}: reason must be a string.")
+	reason = reason.strip()
+	if not reason:
+		fail(f"Invalid blocked workflow record in {context}: reason cannot be empty.")
+
+	blocked_at = record_data['blockedAt']
+	if not isinstance(blocked_at, str):
+		fail(f"Invalid blocked workflow record in {context}: blockedAt must be a string.")
+	blocked_at = blocked_at.strip()
+	if not blocked_at:
+		fail(f"Invalid blocked workflow record in {context}: blockedAt cannot be empty.")
+	iso_value = blocked_at.replace('Z', '+00:00')
+	try:
+		datetime.fromisoformat(iso_value)
+	except ValueError:
+		fail(f"Invalid blocked workflow record in {context}: blockedAt must be an ISO-8601 timestamp.")
+
+	return {
+		'issueNumber': issue_number,
+		'issueTitle': issue_title,
+		'issueUrl': issue_url,
+		'reason': reason,
+		'blockedAt': blocked_at,
+	}
+
+
+def normalize_document(document_data, context):
+	if not isinstance(document_data, dict):
+		fail(f"Invalid blocked workflows in {context}: expected a JSON object.")
+
+	unknown_keys = sorted(name for name in document_data if name not in ALLOWED_TOP_LEVEL_KEYS)
+	if unknown_keys:
+		fail(f"Unknown blocked workflow key(s) in {context}: {', '.join(unknown_keys)}")
+
+	records = document_data.get('blockedWorkflows', [])
+	if not isinstance(records, list):
+		fail(f"Invalid blocked workflows in {context}: blockedWorkflows must be an array.")
+
+	normalized_records = []
+	seen_issue_numbers = set()
+	for index, record in enumerate(records):
+		normalized_record = normalize_record(record, f"{context} record #{index + 1}")
+		issue_number = normalized_record['issueNumber']
+		if issue_number in seen_issue_numbers:
+			fail(f"Invalid blocked workflows in {context}: duplicate issueNumber {issue_number}.")
+		seen_issue_numbers.add(issue_number)
+		normalized_records.append(normalized_record)
+
+	return {
+		'blockedWorkflows': normalized_records,
+	}
+
+
+def load_document():
+	if not blocked_path.exists():
+		return dict(DEFAULTS)
+
+	try:
+		raw_document = json.loads(blocked_path.read_text(encoding='utf-8'))
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON in {blocked_path}: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+
+	return normalize_document(raw_document, str(blocked_path))
+
+
+def write_document(document_data):
+	temporary_path = None
+	try:
+		blocked_path.parent.mkdir(parents=True, exist_ok=True)
+		with tempfile.NamedTemporaryFile(
+			mode='w',
+			encoding='utf-8',
+			dir=blocked_path.parent,
+			prefix=f'{blocked_path.name}.tmp-',
+			delete=False,
+		) as handle:
+			json.dump(document_data, handle, indent=2)
+			handle.write('\n')
+			temporary_path = Path(handle.name)
+		os.replace(temporary_path, blocked_path)
+	except Exception as exc:
+		if temporary_path is not None:
+			try:
+				temporary_path.unlink()
+			except FileNotFoundError:
+				pass
+		fail(f"Cannot write blocked workflows to {blocked_path}: {exc}")
+
+
+if operation == 'get':
+	document = load_document()
+	print(json.dumps(document, indent=2))
+elif operation == 'set':
+	try:
+		payload_data = json.loads(payload)
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON payload for blocked workflows: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+	document = normalize_document(payload_data, 'blocked workflows payload')
+	write_document(document)
+	print(json.dumps(document, indent=2))
+elif operation == 'validate':
+	try:
+		payload_data = json.loads(payload)
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON payload for blocked workflows: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+	document = normalize_document(payload_data, 'blocked workflows payload')
+	print(json.dumps(document, indent=2))
+elif operation == 'upsert':
+	try:
+		record_payload = json.loads(payload)
+	except json.JSONDecodeError as exc:
+		fail(f"Invalid JSON payload for blocked workflow record: {exc.msg} (line {exc.lineno}, column {exc.colno})")
+	normalized_record = normalize_record(record_payload, 'blocked workflow payload')
+	document = load_document()
+	updated_records = []
+	replaced = False
+	for record in document['blockedWorkflows']:
+		if record['issueNumber'] == normalized_record['issueNumber']:
+			updated_records.append(normalized_record)
+			replaced = True
+		else:
+			updated_records.append(record)
+	if not replaced:
+		updated_records.append(normalized_record)
+	document = normalize_document({'blockedWorkflows': updated_records}, 'blocked workflows upsert result')
+	write_document(document)
+	print(json.dumps(document, indent=2))
+elif operation == 'remove':
+	try:
+		issue_number = int(payload)
+	except ValueError:
+		fail('Invalid blocked workflow issue number payload: expected a positive integer.')
+	if issue_number <= 0:
+		fail('Invalid blocked workflow issue number payload: expected a positive integer.')
+	document = load_document()
+	updated_records = [record for record in document['blockedWorkflows'] if record['issueNumber'] != issue_number]
+	document = normalize_document({'blockedWorkflows': updated_records}, 'blocked workflows remove result')
+	write_document(document)
+	print(json.dumps(document, indent=2))
+elif operation == 'get-record':
+	try:
+		issue_number = int(payload)
+	except ValueError:
+		fail('Invalid blocked workflow issue number payload: expected a positive integer.')
+	if issue_number <= 0:
+		fail('Invalid blocked workflow issue number payload: expected a positive integer.')
+	document = load_document()
+	for record in document['blockedWorkflows']:
+		if record['issueNumber'] == issue_number:
+			print(json.dumps(record, indent=2))
+			sys.exit(0)
+	print('')
+else:
+	fail(f"Unknown blocked workflows operation: {operation}")
+PY
+}
+
 print_config_not_configured() {
 	printf 'out: not configured\n'
 }
@@ -1956,6 +2656,8 @@ Commands:
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.
   complete   Clear the completed local workflow.
+	block      Block the active issue workflow and release the active slot.
+	resume     Resume a previously blocked issue workflow.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
@@ -2068,6 +2770,27 @@ Options:
   -h, --help  Show this help.
 EOF
 			;;
+		block)
+			cat <<EOF
+Usage: ${script_name} block "<reason>"
+
+Block an active issue workflow, keep the issue open, and release the
+local active workflow slot.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		resume)
+			cat <<EOF
+Usage: ${script_name} resume <ticket-number>
+
+Resume a blocked issue workflow and restore it as the local active issue.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
 		get)
 			cat <<EOF
 Usage: ${script_name} get out
@@ -2155,7 +2878,7 @@ main() {
 
 			error "Usage: ${script_name} help"
 			;;
-		start|patch|status|review|commit|reset|promote|complete|get|set|unset)
+		start|patch|status|review|commit|reset|promote|complete|block|resume|get|set|unset)
 			if [[ "$argument_count" -eq 1 ]] && is_help_flag "$first_argument"; then
 				print_command_help "$command"
 				return 0
@@ -2184,6 +2907,14 @@ main() {
 					;;
 				complete)
 					run_operational_command strict handle_complete "$argument_count" "${@:2}"
+					return 0
+					;;
+				block)
+					run_operational_command strict handle_block "$argument_count" "${@:2}"
+					return 0
+					;;
+				resume)
+					run_operational_command strict handle_resume "$argument_count" "${@:2}"
 					return 0
 					;;
 				start)

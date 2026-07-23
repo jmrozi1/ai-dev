@@ -12,6 +12,7 @@ out.txt
 .DS_Store
 .ai-dev/workflow.json
 .ai-dev/config.json
+.ai-dev/blocked-workflows.json
 
 # generated command output
 **/out.txt
