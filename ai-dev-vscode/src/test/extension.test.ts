@@ -73,9 +73,6 @@ import {
 	getAssistantLookupItems,
 } from '../assistantCommands';
 import {
-	chooseAutomaticAssistantRoute,
-} from '../assistantRouting';
-import {
 	DEFAULT_GENERAL_SUMMARY_INSTRUCTIONS,
 	createDefaultSummarizationConfig,
 	injectSummarizationInstructions,
@@ -123,12 +120,17 @@ import {
 	hydrateSummarizationDependencyContext,
 } from '../summarizationDependencyContext';
 import {
+	buildSummaryAnswerRoute,
+	buildProjectRouteDiagnostics,
 	parseRoutedDocumentationReferences,
 	resolveRoutedDocumentationPath,
+	selectRelevantKnowledgebaseCandidates,
 	selectQuestionRelevantSummaryExcerpt,
 } from '../summaryAnswerRouting';
 import {
+	collectVerifiedAnswerSourceFailures,
 	collectVerifiedAnswerSourceContext,
+	isFileVerificationCandidate,
 } from '../answerSourceVerification';
 // import * as myExtension from '../../extension';
 
@@ -148,6 +150,100 @@ async function waitForCondition(
 		await new Promise<void>((resolve) =>
 			setTimeout(resolve, 10)
 		);
+	}
+}
+
+async function withTemporaryWorkspace<T>(
+	run: (context: {
+		workspaceRoot: string;
+		docsDir: string;
+		sourceDir: string;
+	}) => Promise<T>
+): Promise<T> {
+	const workspaceRoot =
+		vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+
+	if (!workspaceRoot) {
+		throw new Error('No open workspace root for route integration test.');
+	}
+
+	const testId = `route-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+	const docsDir = `ai-docs-${testId}`;
+	const sourceDir = `tmp-${testId}`;
+	const docsDirAbsolutePath = path.join(workspaceRoot, docsDir);
+	const sourceDirAbsolutePath = path.join(workspaceRoot, sourceDir);
+	const configPath = path.join(workspaceRoot, '.ai-dev.yaml');
+
+	let previousConfigContents: string | undefined;
+
+	try {
+		previousConfigContents = await fs.readFile(
+			configPath,
+			'utf8'
+		);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+			throw error;
+		}
+	}
+
+	await fs.mkdir(docsDirAbsolutePath, { recursive: true });
+	await fs.mkdir(sourceDirAbsolutePath, { recursive: true });
+	await fs.mkdir(
+		path.join(
+			workspaceRoot,
+			'ai-dev-core/workflows/answer-docs'
+		),
+		{ recursive: true }
+	);
+
+	await fs.writeFile(
+		path.join(
+			workspaceRoot,
+			'ai-dev-core/workflows/answer-docs/answer-from-ai-docs.md'
+		),
+		'# Workflow\nUse the provided context.',
+		'utf8'
+	);
+
+	await fs.writeFile(
+		configPath,
+		[
+			'aiDevCore:',
+			'  path: ./ai-dev-core',
+			'documentation:',
+			`  docsDir: ${docsDir}`,
+		].join('\n'),
+		'utf8'
+	);
+
+	try {
+		return await run({
+			workspaceRoot,
+			docsDir,
+			sourceDir,
+		});
+	} finally {
+		await fs.rm(docsDirAbsolutePath, {
+			recursive: true,
+			force: true,
+		});
+		await fs.rm(sourceDirAbsolutePath, {
+			recursive: true,
+			force: true,
+		});
+
+		if (previousConfigContents === undefined) {
+			await fs.rm(configPath, {
+				force: true,
+			});
+		} else {
+			await fs.writeFile(
+				configPath,
+				previousConfigContents,
+				'utf8'
+			);
+		}
 	}
 }
 
@@ -405,20 +501,20 @@ suite('Extension Test Suite', () => {
 
 	test('Slash command parser separates arguments and options', () => {
 		const parsed = parseSlashCommand(
-			'/ask --summary "Where is billing deployed?"'
+			'/ask --help "Where is billing deployed?"'
 		);
 
 		assert.strictEqual(parsed.name, 'ask');
 		assert.deepStrictEqual(parsed.arguments, ['Where is billing deployed?']);
-		assert.deepStrictEqual(parsed.options, ['--summary']);
+		assert.deepStrictEqual(parsed.options, ['--help']);
 	});
 
-	test('Slash command parser supports short options', () => {
-		const parsed = parseSlashCommand('/ask -k release approvals');
+	test('Slash command parser supports ask help short option', () => {
+		const parsed = parseSlashCommand('/ask -h release approvals');
 
 		assert.strictEqual(parsed.name, 'ask');
 		assert.deepStrictEqual(parsed.arguments, ['release', 'approvals']);
-		assert.deepStrictEqual(parsed.options, ['-k']);
+		assert.deepStrictEqual(parsed.options, ['-h']);
 	});
 
 	test('Slash command parser preserves quoted glob targets', () => {
@@ -435,142 +531,54 @@ suite('Extension Test Suite', () => {
 		assert.strictEqual(parseSlashCommand('/unknown').name, 'unknown');
 	});
 
-	test('Automatic routing uses summaries for project-relative questions', () => {
-		const projectQuestions = [
-			'What does this plugin do?',
-			'Where do we deploy the billing service?',
-			'How does our Jenkins pipeline work?',
-			'What is defined in src/extension.ts?',
-			'Explain the architecture of this repository.',
-		];
-
-		for (const question of projectQuestions) {
-			assert.strictEqual(
-				chooseAutomaticAssistantRoute(question),
-				'summary',
-				question
-			);
-		}
-	});
-
-	test('Automatic routing keeps general questions in chat', () => {
-		const generalQuestions = [
-			'What is eventual consistency?',
-			'Explain JavaScript closures.',
-			'How does photosynthesis work?',
-			'Tell me a joke.',
-		];
-
-		for (const question of generalQuestions) {
-			assert.strictEqual(
-				chooseAutomaticAssistantRoute(question),
-				'chat',
-				question
-			);
-		}
-	});
-
-	test('/ask defaults to auto routing', () => {
+	test('/ask accepts plain question with no route options', () => {
 		const resolved = resolveAskCommand(
 			parseSlashCommand('/ask Where is billing deployed?')
 		);
 
 		assert.deepStrictEqual(resolved, {
 			ok: true,
-			route: 'auto',
 			question: 'Where is billing deployed?',
 		});
 	});
 
-	test('/ask supports auto and chat short aliases', () => {
-		assert.deepStrictEqual(
-			resolveAskCommand(
-				parseSlashCommand('/ask -a What does this do?')
-			),
-			{
-				ok: true,
-				route: 'auto',
-				question: 'What does this do?',
-			}
-		);
-
-		assert.deepStrictEqual(
-			resolveAskCommand(
-				parseSlashCommand('/ask -c Explain closures')
-			),
-			{
-				ok: true,
-				route: 'chat',
-				question: 'Explain closures',
-			}
-		);
-	});
-
-	test('/ask supports summary route aliases', () => {
-		for (const option of ['--summary', '-s']) {
+	test('/ask rejects legacy public route options', () => {
+		for (const option of [
+			'--auto',
+			'-a',
+			'--summary',
+			'-s',
+			'--knowledgebase',
+			'-k',
+			'--chat',
+			'-c',
+		]) {
 			const resolved = resolveAskCommand(
 				parseSlashCommand(`/ask ${option} Where is billing deployed?`)
 			);
 
 			assert.deepStrictEqual(resolved, {
-				ok: true,
-				route: 'summary',
-				question: 'Where is billing deployed?',
+				ok: false,
+				error: `Unknown /ask option: ${option}`,
 			});
 		}
-	});
-
-	test('/ask supports knowledgebase route aliases', () => {
-		for (const option of ['--knowledgebase', '-k']) {
-			const resolved = resolveAskCommand(
-				parseSlashCommand(`/ask ${option} What is the release process?`)
-			);
-
-			assert.deepStrictEqual(resolved, {
-				ok: true,
-				route: 'knowledgebase',
-				question: 'What is the release process?',
-			});
-		}
-	});
-
-	test('/ask supports explicit chat routing', () => {
-		const resolved = resolveAskCommand(
-			parseSlashCommand('/ask --chat Explain closures')
-		);
-
-		assert.deepStrictEqual(resolved, {
-			ok: true,
-			route: 'chat',
-			question: 'Explain closures',
-		});
-	});
-
-	test('/ask rejects conflicting routes', () => {
-		const resolved = resolveAskCommand(
-			parseSlashCommand('/ask --summary --chat Explain billing')
-		);
-
-		assert.deepStrictEqual(resolved, {
-			ok: false,
-			error: 'Choose only one /ask route.',
-		});
 	});
 
 	test('/ask rejects unknown options', () => {
-		const resolved = resolveAskCommand(
-			parseSlashCommand('/ask --banana Explain billing')
+		assert.deepStrictEqual(
+			resolveAskCommand(
+				parseSlashCommand('/ask --banana Explain billing')
+			),
+			{
+				ok: false,
+				error: 'Unknown /ask option: --banana',
+			}
 		);
-
-		assert.deepStrictEqual(resolved, {
-			ok: false,
-			error: 'Unknown /ask option: --banana',
-		});
 	});
 
 	test('/ask requires a question', () => {
 		const resolved = resolveAskCommand(
-			parseSlashCommand('/ask --summary')
+			parseSlashCommand('/ask')
 		);
 
 		assert.strictEqual(resolved.ok, false);
@@ -2861,7 +2869,147 @@ suite('Extension Test Suite', () => {
 			/answer = 42/
 		);
 		assert.deepStrictEqual(result.warnings, []);
+		assert.deepStrictEqual(result.warningDetails, []);
 	});
+
+	test('File verification candidate predicate rejects non-path identifiers', () => {
+		for (const candidate of [
+			'AiDevLaunchBridgeProvider',
+			'aiDev.launcher',
+			'aiDev.launchAssistant',
+			'AssistantChatBackend',
+			'ASSISTANT_COMMAND_DEFINITIONS',
+			'ask',
+			'AssistantReportStore',
+		]) {
+			assert.strictEqual(
+				isFileVerificationCandidate({
+					candidate,
+				}),
+				false,
+				`Expected non-path identifier to be rejected: ${candidate}`
+			);
+		}
+	});
+
+	test('File verification candidate predicate accepts path-like references', () => {
+		for (const candidate of [
+			'ai-dev-vscode/src/assistantCommands.ts',
+			'README.md',
+			'scripts/build-vsix.sh',
+			'config/application.yaml',
+		]) {
+			assert.strictEqual(
+				isFileVerificationCandidate({
+					candidate,
+				}),
+				true,
+				`Expected path-like candidate to be accepted: ${candidate}`
+			);
+		}
+	});
+
+		test('Answer verification keeps clipping warnings informational', async () => {
+			const workspaceRoot = await fs.mkdtemp(
+				path.join(
+					os.tmpdir(),
+					'ai-dev-answer-verification-'
+				)
+			);
+
+			await fs.mkdir(
+				path.join(workspaceRoot, 'src'),
+				{ recursive: true }
+			);
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					'src/large.ts'
+				),
+				`export const large = '${'x'.repeat(13000)}';`,
+				'utf8'
+			);
+
+			const result =
+				await collectVerifiedAnswerSourceContext({
+					workspaceRoot,
+					docsDir: 'ai-docs',
+					summaryEvidence: [
+						{
+							path:
+								'ai-docs/src/summary.md',
+							contents:
+								'- `src/large.ts` — Large source excerpt.',
+						},
+					],
+					dependencyMap: {
+						version: 1,
+						edges: [],
+					},
+				});
+
+			assert.strictEqual(result.files.length, 1);
+			assert.strictEqual(result.files[0].path, 'src/large.ts');
+			assert.strictEqual(result.files[0].contents.length, 12000);
+			assert.ok(
+				result.warnings.includes(
+					'src/large.ts: verified source was clipped to 12000 characters.'
+				)
+			);
+			assert.ok(
+				result.warningDetails.some(
+					(warning) =>
+						warning.level === 'info'
+						&& warning.code === 'source_clipped'
+				)
+			);
+			assert.ok(
+				result.warningDetails.every(
+					(warning) => warning.level !== 'failure'
+				)
+			);
+		});
+
+		test('Missing referenced source is classified as a verification failure', async () => {
+			const workspaceRoot = await fs.mkdtemp(
+				path.join(
+					os.tmpdir(),
+					'ai-dev-answer-verification-'
+				)
+			);
+
+			const result =
+				await collectVerifiedAnswerSourceContext({
+					workspaceRoot,
+					docsDir: 'ai-docs',
+					summaryEvidence: [
+						{
+							path:
+								'ai-docs/src/summary.md',
+							contents:
+								'- `src/missing.ts` — Referenced source.',
+						},
+					],
+					dependencyMap: {
+						version: 1,
+						edges: [],
+					},
+				});
+
+			assert.deepStrictEqual(result.files, []);
+			assert.ok(
+				result.warningDetails.some(
+					(warning) =>
+						warning.level === 'failure'
+						&& warning.code === 'source_missing'
+				)
+			);
+			assert.ok(
+				result.warnings.some((warning) =>
+					warning.includes('referenced source path was not found')
+				)
+			);
+		});
 
 	test('Answer verification follows direct dependency edges', async () => {
 		const workspaceRoot = await fs.mkdtemp(
@@ -2989,6 +3137,15 @@ suite('Extension Test Suite', () => {
 							'- `jobs/config.xml` — Deploy job.',
 					},
 				],
+				knowledgebaseFilesConsidered: [
+					'knowledgebase/bootstrap/chatgpt.md',
+				],
+				knowledgebaseFilesIncluded: [
+					{
+						path: 'knowledgebase/bootstrap/chatgpt.md',
+						contents: '# Bootstrap',
+					},
+				],
 				verifiedSourceFiles: [
 					{
 						path: 'jobs/config.xml',
@@ -3011,6 +3168,516 @@ suite('Extension Test Suite', () => {
 		assert.match(
 			prompt,
 			/When summaries and verified source disagree/
+		);
+		assert.match(prompt, /Knowledgebase routing metadata:/);
+		assert.match(
+			prompt,
+			/Knowledgebase file:\s*knowledgebase\/bootstrap\/chatgpt\.md/
+		);
+	});
+
+	test('Project route diagnostics classify context deficits deterministically', () => {
+		const diagnostics = buildProjectRouteDiagnostics({
+			knowledgebaseMissing: true,
+			knowledgebaseEmpty: false,
+			knowledgebaseInsufficientCoverage: false,
+			rootSummaryPath: 'ai-docs/architecture-summary.md',
+			rootSummaryExists: false,
+			rootSummaryEmpty: false,
+			missingDocumentationPaths: ['ai-docs/src/missing.md'],
+			routedSummaryCount: 0,
+			fallbackSummaryCount: 0,
+			sourceVerificationFailures: [
+				{
+					level: 'failure',
+					code: 'dependency_unavailable',
+					message: 'src/example.ts: dependency source was unavailable',
+					path: 'src/example.ts',
+				},
+			],
+			knowledgebaseFilesConsidered: [],
+			knowledgebaseFilesIncluded: [],
+			verifiedSourceCount: 0,
+			fallbackReason: 'Root summary file is missing.',
+		});
+
+		assert.strictEqual(diagnostics.selectedRoute, 'project-aware');
+		assert.strictEqual(diagnostics.fallbackUsed, true);
+		assert.deepStrictEqual(
+			diagnostics.deficits.map((deficit) => deficit.category),
+			[
+				'missing_knowledgebase',
+				'missing_summary_context',
+				'missing_referenced_document',
+				'insufficient_routed_context',
+				'source_verification_failed',
+			]
+		);
+		assert.ok(diagnostics.remediationSuggestions.length >= 3);
+		assert.ok(
+			diagnostics.remediationSuggestions.includes(
+				'Refresh dependency/source mapping and verify referenced source paths are readable and current.'
+			)
+		);
+		assert.ok(
+			diagnostics.deficits.every(
+				(deficit) =>
+					!deficit.detail.toLowerCase().includes('relevant source material is absent')
+			)
+		);
+	});
+
+	test('Project route diagnostics do not treat clipping-only warnings as source verification failures', () => {
+		const diagnostics = buildProjectRouteDiagnostics({
+			knowledgebaseMissing: false,
+			knowledgebaseEmpty: false,
+			knowledgebaseInsufficientCoverage: false,
+			rootSummaryPath: 'ai-docs/architecture-summary.md',
+			rootSummaryExists: true,
+			rootSummaryEmpty: false,
+			missingDocumentationPaths: [],
+			routedSummaryCount: 1,
+			fallbackSummaryCount: 0,
+			sourceVerificationFailures: [],
+			knowledgebaseFilesConsidered: ['knowledgebase/bootstrap/chatgpt.md'],
+			knowledgebaseFilesIncluded: ['knowledgebase/bootstrap/chatgpt.md'],
+			verifiedSourceCount: 1,
+			fallbackReason: undefined,
+		});
+
+		assert.ok(
+			diagnostics.deficits.every(
+				(deficit) => deficit.category !== 'source_verification_failed'
+			)
+		);
+	});
+
+	test('Project route diagnostics emit source verification failure for missing sources', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		const verificationResult =
+			await collectVerifiedAnswerSourceContext({
+				workspaceRoot,
+				docsDir: 'ai-docs',
+				summaryEvidence: [
+					{
+						path:
+							'ai-docs/src/summary.md',
+						contents:
+							'- `src/missing.ts` — Referenced source.',
+					},
+				],
+				dependencyMap: {
+					version: 1,
+					edges: [],
+				},
+			});
+
+		const diagnostics = buildProjectRouteDiagnostics({
+			knowledgebaseMissing: false,
+			knowledgebaseEmpty: false,
+			knowledgebaseInsufficientCoverage: false,
+			rootSummaryPath: 'ai-docs/architecture-summary.md',
+			rootSummaryExists: true,
+			rootSummaryEmpty: false,
+			missingDocumentationPaths: [],
+			routedSummaryCount: 1,
+			fallbackSummaryCount: 0,
+			sourceVerificationFailures: collectVerifiedAnswerSourceFailures(
+				verificationResult.warningDetails
+			),
+			knowledgebaseFilesConsidered: ['knowledgebase/bootstrap/chatgpt.md'],
+			knowledgebaseFilesIncluded: ['knowledgebase/bootstrap/chatgpt.md'],
+			verifiedSourceCount: verificationResult.files.length,
+			fallbackReason: undefined,
+		});
+
+		assert.ok(
+			diagnostics.deficits.some(
+				(deficit) => deficit.category === 'source_verification_failed'
+			)
+		);
+		assert.ok(
+			diagnostics.remediationSuggestions.includes(
+				'Refresh dependency/source mapping and verify referenced source paths are readable and current.'
+			)
+		);
+	});
+
+		test('Summary answer route preserves clipping warnings without source_verification_failed deficit', async function () {
+			this.timeout(20000);
+
+			await withTemporaryWorkspace(async ({
+				workspaceRoot,
+				docsDir,
+				sourceDir,
+			}) => {
+				await fs.mkdir(
+					path.join(
+						workspaceRoot,
+						docsDir,
+						'service'
+					),
+					{ recursive: true }
+				);
+				await fs.writeFile(
+					path.join(
+						workspaceRoot,
+						docsDir,
+						'architecture-summary.md'
+					),
+					[
+						'# Architecture Summary',
+						'',
+						'## Summaries',
+						'',
+						`- \`${docsDir}/service/summary.md\``,
+					].join('\n'),
+					'utf8'
+				);
+				await fs.writeFile(
+					path.join(
+						workspaceRoot,
+						docsDir,
+						'service/summary.md'
+					),
+					`- \`${sourceDir}/large.ts\` contains deployment logic.`,
+					'utf8'
+				);
+				await fs.writeFile(
+					path.join(workspaceRoot, sourceDir, 'large.ts'),
+					'x'.repeat(13050),
+					'utf8'
+				);
+
+				const result = await buildSummaryAnswerRoute(
+					'Where is deployment configured?'
+				);
+
+				assert.ok(
+					result.warnings.some((warning) =>
+						warning.includes(
+							`${sourceDir}/large.ts: verified source was clipped to 12000 characters.`
+						)
+					)
+				);
+				assert.ok(
+					result.diagnostics.deficits.every(
+						(deficit) =>
+							deficit.category !== 'source_verification_failed'
+					)
+				);
+			});
+		});
+
+		test('Summary answer route emits source_verification_failed deficit for missing source verification failures', async function () {
+			this.timeout(20000);
+
+			await withTemporaryWorkspace(async ({
+				workspaceRoot,
+				docsDir,
+				sourceDir,
+			}) => {
+				await fs.mkdir(
+					path.join(
+						workspaceRoot,
+						docsDir,
+						'service'
+					),
+					{ recursive: true }
+				);
+				await fs.writeFile(
+					path.join(
+						workspaceRoot,
+						docsDir,
+						'architecture-summary.md'
+					),
+					[
+						'# Architecture Summary',
+						'',
+						'## Summaries',
+						'',
+						`- \`${docsDir}/service/summary.md\``,
+					].join('\n'),
+					'utf8'
+				);
+				await fs.writeFile(
+					path.join(
+						workspaceRoot,
+						docsDir,
+						'service/summary.md'
+					),
+					`- \`${sourceDir}/missing.ts\` contains deployment logic.`,
+					'utf8'
+				);
+
+				const result = await buildSummaryAnswerRoute(
+					'Where is deployment configured?'
+				);
+
+				assert.ok(
+					result.warnings.some((warning) =>
+						warning.includes(
+							`${sourceDir}/missing.ts: referenced source path was not found for answer verification.`
+						)
+					)
+				);
+				assert.ok(
+					result.diagnostics.deficits.some(
+						(deficit) =>
+							deficit.category === 'source_verification_failed'
+					)
+				);
+			});
+		});
+
+	test('Summary answer route mixed references verify only path candidates', async function () {
+		this.timeout(20000);
+
+		await withTemporaryWorkspace(async ({
+			workspaceRoot,
+			docsDir,
+		}) => {
+			await fs.mkdir(
+				path.join(
+					workspaceRoot,
+					'ai-dev-vscode/src'
+				),
+				{ recursive: true }
+			);
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					'ai-dev-vscode/src/assistantCommands.ts'
+				),
+				'export const routeMarker = true;\n',
+				'utf8'
+			);
+
+			await fs.mkdir(
+				path.join(
+					workspaceRoot,
+					docsDir,
+					'service'
+				),
+				{ recursive: true }
+			);
+
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					docsDir,
+					'architecture-summary.md'
+				),
+				[
+					'# Architecture Summary',
+					'',
+					'## Summaries',
+					'',
+					`- \`${docsDir}/service/summary.md\``,
+				].join('\n'),
+				'utf8'
+			);
+
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					docsDir,
+					'service/summary.md'
+				),
+				[
+					'- `ai-dev-vscode/src/assistantCommands.ts`',
+					'- `missing/path/example.ts`',
+					'- `AssistantChatBackend`',
+					'- `aiDev.launchAssistant`',
+					'- `ask`',
+				].join('\n'),
+				'utf8'
+			);
+
+			const result = await buildSummaryAnswerRoute(
+				'go?'
+			);
+
+			assert.strictEqual(result.diagnostics.verifiedSourceCount, 1);
+			assert.ok(
+				result.warnings.some((warning) =>
+					warning.includes(
+						'missing/path/example.ts: referenced source path was not found for answer verification.'
+					)
+				)
+			);
+			for (const nonPathIdentifier of [
+				'AssistantChatBackend',
+				'aiDev.launchAssistant',
+				'ask',
+			]) {
+				assert.ok(
+					result.warnings.every(
+						(warning) => !warning.includes(nonPathIdentifier)
+					),
+					`Unexpected warning for non-path identifier: ${nonPathIdentifier}`
+				);
+			}
+			assert.ok(
+				result.diagnostics.deficits.some(
+					(deficit) =>
+						deficit.category === 'source_verification_failed'
+				)
+			);
+		});
+	});
+
+	test('Knowledgebase selection includes only positively relevant candidates', () => {
+		const selected = selectRelevantKnowledgebaseCandidates(
+			[
+				{
+					relativePath: 'knowledgebase/a.md',
+					contents: 'A',
+					score: 3,
+				},
+				{
+					relativePath: 'knowledgebase/b.md',
+					contents: 'B',
+					score: 0,
+				},
+				{
+					relativePath: 'knowledgebase/c.md',
+					contents: 'C',
+					score: -1,
+				},
+			],
+			10
+		);
+
+		assert.deepStrictEqual(
+			selected.map((item) => item.relativePath),
+			['knowledgebase/a.md']
+		);
+	});
+
+	test('Knowledgebase selection includes none when only unrelated files exist', () => {
+		const selected = selectRelevantKnowledgebaseCandidates(
+			[
+				{
+					relativePath: 'knowledgebase/unrelated-a.md',
+					contents: 'A',
+					score: 0,
+				},
+				{
+					relativePath: 'knowledgebase/unrelated-b.md',
+					contents: 'B',
+					score: 0,
+				},
+			],
+			10
+		);
+
+		assert.deepStrictEqual(selected, []);
+	});
+
+	test('Diagnostics classify insufficient knowledgebase coverage separately', () => {
+		const diagnostics = buildProjectRouteDiagnostics({
+			knowledgebaseMissing: false,
+			knowledgebaseEmpty: false,
+			knowledgebaseInsufficientCoverage: true,
+			rootSummaryPath: 'ai-docs/architecture-summary.md',
+			rootSummaryExists: true,
+			rootSummaryEmpty: false,
+			missingDocumentationPaths: [],
+			routedSummaryCount: 1,
+			fallbackSummaryCount: 0,
+			sourceVerificationFailures: [],
+			knowledgebaseFilesConsidered: ['knowledgebase/bootstrap/chatgpt.md'],
+			knowledgebaseFilesIncluded: [],
+			verifiedSourceCount: 0,
+			fallbackReason: undefined,
+		});
+
+		assert.ok(
+			diagnostics.deficits.some(
+				(deficit) => deficit.category === 'insufficient_knowledgebase_coverage'
+			)
+		);
+	});
+
+	test('Knowledgebase-only context does not emit insufficient_routed_context', () => {
+		const diagnostics = buildProjectRouteDiagnostics({
+			knowledgebaseMissing: false,
+			knowledgebaseEmpty: false,
+			knowledgebaseInsufficientCoverage: false,
+			rootSummaryPath: 'ai-docs/architecture-summary.md',
+			rootSummaryExists: true,
+			rootSummaryEmpty: false,
+			missingDocumentationPaths: [],
+			routedSummaryCount: 0,
+			fallbackSummaryCount: 0,
+			sourceVerificationFailures: [],
+			knowledgebaseFilesConsidered: ['knowledgebase/bootstrap/chatgpt.md'],
+			knowledgebaseFilesIncluded: ['knowledgebase/bootstrap/chatgpt.md'],
+			verifiedSourceCount: 0,
+			fallbackReason: undefined,
+		});
+
+		assert.ok(
+			diagnostics.deficits.every(
+				(deficit) => deficit.category !== 'insufficient_routed_context'
+			)
+		);
+	});
+
+	test('Verified-source-only context does not emit insufficient_routed_context', () => {
+		const diagnostics = buildProjectRouteDiagnostics({
+			knowledgebaseMissing: false,
+			knowledgebaseEmpty: true,
+			knowledgebaseInsufficientCoverage: false,
+			rootSummaryPath: 'ai-docs/architecture-summary.md',
+			rootSummaryExists: true,
+			rootSummaryEmpty: false,
+			missingDocumentationPaths: [],
+			routedSummaryCount: 0,
+			fallbackSummaryCount: 0,
+			sourceVerificationFailures: [],
+			knowledgebaseFilesConsidered: [],
+			knowledgebaseFilesIncluded: [],
+			verifiedSourceCount: 1,
+			fallbackReason: undefined,
+		});
+
+		assert.ok(
+			diagnostics.deficits.every(
+				(deficit) => deficit.category !== 'insufficient_routed_context'
+			)
+		);
+	});
+
+	test('No usable context emits insufficient_routed_context', () => {
+		const diagnostics = buildProjectRouteDiagnostics({
+			knowledgebaseMissing: false,
+			knowledgebaseEmpty: true,
+			knowledgebaseInsufficientCoverage: false,
+			rootSummaryPath: 'ai-docs/architecture-summary.md',
+			rootSummaryExists: true,
+			rootSummaryEmpty: false,
+			missingDocumentationPaths: [],
+			routedSummaryCount: 0,
+			fallbackSummaryCount: 0,
+			sourceVerificationFailures: [],
+			knowledgebaseFilesConsidered: [],
+			knowledgebaseFilesIncluded: [],
+			verifiedSourceCount: 0,
+			fallbackReason: undefined,
+		});
+
+		assert.ok(
+			diagnostics.deficits.some(
+				(deficit) => deficit.category === 'insufficient_routed_context'
+			)
 		);
 	});
 
@@ -3534,11 +4201,8 @@ suite('Extension Test Suite', () => {
 
 		assert.match(help, /\/ask - Ask the assistant a question/);
 		assert.match(help, /Usage:/);
-		assert.match(help, /--auto, -a/);
-		assert.match(help, /--summary, -s/);
-		assert.match(help, /--knowledgebase, -k/);
-		assert.match(help, /--chat, -c/);
 		assert.match(help, /--help, -h/);
+		assert.doesNotMatch(help, /--auto|--summary|--knowledgebase|--chat/);
 	});
 
 	test('Common path prefix extends multiple matches', () => {
@@ -3639,16 +4303,12 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
-	test('/ask space lists route and help options', () => {
+	test('/ask space lists help option only', () => {
 		const lookup = getAssistantLookupItems('ask ');
 
 		assert.deepStrictEqual(
 			lookup.map((item) => item.display),
 			[
-				'--auto, -a - Choose the best route',
-				'--summary, -s - Use summary documentation only',
-				'--knowledgebase, -k - Use the knowledge base only',
-				'--chat, -c - Bypass project routing',
 				'--help, -h - Show command help',
 			]
 		);
@@ -3659,25 +4319,25 @@ suite('Extension Test Suite', () => {
 
 		assert.deepStrictEqual(
 			lookup.map((item) => item.value),
-			['ask --summary']
+			[]
 		);
 	});
 
 	test('Option lookup supports short aliases', () => {
-		const lookup = getAssistantLookupItems('ask -k');
+		const lookup = getAssistantLookupItems('ask -h');
 
 		assert.deepStrictEqual(
 			lookup.map((item) => item.value),
-			['ask --knowledgebase']
+			['ask --help']
 		);
 	});
 
-	test('Option lookup hides route alternatives after a route', () => {
-		const lookup = getAssistantLookupItems('ask --summary ');
+	test('Option lookup hides used help option', () => {
+		const lookup = getAssistantLookupItems('ask --help ');
 
 		assert.deepStrictEqual(
 			lookup.map((item) => item.value),
-			['ask --summary --help']
+			[]
 		);
 	});
 
@@ -4708,7 +5368,7 @@ suite('Extension Test Suite', () => {
 	});
 
 
-	test('Automatic project routing surfaces summary evidence warnings', async () => {
+	test('/ask keeps clipping warnings in reports without emitting incomplete-context terminal warning', async () => {
 		const outputChunks: string[] = [];
 		const reports: Array<ReturnType<typeof createAssistantReport>> = [];
 		const summaryQuestions: string[] = [];
@@ -4739,8 +5399,19 @@ suite('Extension Test Suite', () => {
 				return {
 					prompt: 'summary evidence prompt',
 					warnings: [
-						'Unable to verify the referenced Jenkinsfile.',
+						'src/example.ts: verified source was clipped to 12000 characters.',
 					],
+					diagnostics: {
+						selectedRoute: 'project-aware',
+						knowledgebaseFilesConsidered: ['knowledgebase/bootstrap/chatgpt.md'],
+						knowledgebaseFilesIncluded: ['knowledgebase/bootstrap/chatgpt.md'],
+						routedSummaryCount: 1,
+						fallbackSummaryCount: 0,
+						verifiedSourceCount: 0,
+						fallbackUsed: false,
+						deficits: [],
+						remediationSuggestions: [],
+					},
 				};
 			},
 			undefined,
@@ -4764,9 +5435,7 @@ suite('Extension Test Suite', () => {
 				)
 			);
 
-			pty.handleInput(
-				'Where do we deploy the billing service?'
-			);
+			pty.handleInput('/ask Where do we deploy the billing service?');
 			pty.handleInput('\r');
 
 			await waitForCondition(() =>
@@ -4784,26 +5453,172 @@ suite('Extension Test Suite', () => {
 				['summary evidence prompt']
 			);
 			assert.strictEqual(chatMessageCount, 0);
-			assert.match(
+			assert.doesNotMatch(
 				output,
-				/WARNING Unable to verify the referenced Jenkinsfile\./
+				/WARNING Project context is incomplete for this answer\./
 			);
 			assert.deepStrictEqual(
 				reports[0].warnings,
 				[
-					'Unable to verify the referenced Jenkinsfile.',
+					'src/example.ts: verified source was clipped to 12000 characters.',
 				]
 			);
+			assert.strictEqual(reports[0].route, 'project-aware');
+			assert.strictEqual(reports[0].title, 'AI Dev Project Answer');
 		} finally {
 			writeSubscription.dispose();
 			pty.close();
 		}
 	});
 
-	test('Automatic general chat avoids project routing warnings', async () => {
+	test('/ask routes general questions through the project route', async () => {
+		const outputChunks: string[] = [];
+		const summaryQuestions: string[] = [];
+		let chatMessageCount = 0;
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'Project Ask Model',
+			}),
+			sendMessage: async () => {
+				chatMessageCount += 1;
+				return 'Unexpected chat response';
+			},
+			sendIsolatedMessage: async () => 'Project-grounded answer.',
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend,
+			async (question) => {
+				summaryQuestions.push(question);
+				return {
+					prompt: 'project route prompt',
+					warnings: [],
+					diagnostics: {
+						selectedRoute: 'project-aware',
+						knowledgebaseFilesConsidered: [],
+						knowledgebaseFilesIncluded: [],
+						routedSummaryCount: 1,
+						fallbackSummaryCount: 0,
+						verifiedSourceCount: 0,
+						fallbackUsed: false,
+						deficits: [],
+						remediationSuggestions: [],
+					},
+				};
+			}
+		);
+
+		const writeSubscription = pty.onDidWrite((chunk) => {
+			outputChunks.push(chunk);
+		});
+
+		try {
+			pty.open({ columns: 120, rows: 30 });
+			await waitForCondition(() =>
+				outputChunks.join('').includes('Launched Project Ask Model')
+			);
+
+			pty.handleInput('/ask What is eventual consistency?');
+			pty.handleInput('\r');
+
+			await waitForCondition(() =>
+				outputChunks.join('').includes('Project-grounded answer.')
+			);
+
+			assert.deepStrictEqual(summaryQuestions, ['What is eventual consistency?']);
+			assert.strictEqual(chatMessageCount, 0);
+		} finally {
+			writeSubscription.dispose();
+			pty.close();
+		}
+	});
+
+	test('/ask context deficits render concise warning and store full diagnostics', async () => {
+		const outputChunks: string[] = [];
+		const reports: Array<ReturnType<typeof createAssistantReport>> = [];
+
+		const backend: AssistantChatBackend = {
+			startSession: async () => ({
+				modelName: 'Diagnostic Model',
+			}),
+			sendMessage: async () => 'Unexpected chat output.',
+			sendIsolatedMessage: async () => 'Partial answer.',
+			dispose: () => {},
+		};
+
+		const pty = new AiDevAssistantPseudoterminal(
+			() => {},
+			backend,
+			async () => ({
+				prompt: 'project route prompt',
+				warnings: [
+					'Context deficit (missing_knowledgebase): knowledgebase/ directory was not found.',
+				],
+				diagnostics: {
+					selectedRoute: 'project-aware',
+					knowledgebaseFilesConsidered: [],
+					knowledgebaseFilesIncluded: [],
+					routedSummaryCount: 0,
+					fallbackSummaryCount: 0,
+					verifiedSourceCount: 0,
+					fallbackUsed: true,
+					fallbackReason: 'Root summary file is missing.',
+					deficits: [
+						{
+							category: 'missing_knowledgebase',
+							detail: 'knowledgebase/ directory was not found.',
+							remediation: 'Add or update project documentation under knowledgebase/ for this topic.',
+						},
+					],
+					remediationSuggestions: [
+						'Add or update project documentation under knowledgebase/ for this topic.',
+					],
+				},
+			}),
+			undefined,
+			undefined,
+			(report) => {
+				reports.push(report);
+			}
+		);
+
+		const writeSubscription = pty.onDidWrite((chunk) => {
+			outputChunks.push(chunk);
+		});
+
+		try {
+			pty.open({ columns: 120, rows: 30 });
+			await waitForCondition(() =>
+				outputChunks.join('').includes('Launched Diagnostic Model')
+			);
+
+			pty.handleInput('/ask Where is billing deployed?');
+			pty.handleInput('\r');
+
+			await waitForCondition(() => reports.length === 1);
+
+			const output = outputChunks.join('');
+			assert.match(output, /WARNING Project context is incomplete for this answer\./);
+			assert.match(output, /Suggested next step: Add or update project documentation under knowledgebase\//);
+			assert.match(output, /\/showreport for full routing diagnostics/);
+			assert.doesNotMatch(output, /Context deficit \(missing_knowledgebase\)/);
+			assert.strictEqual(reports[0].route, 'project-aware');
+			assert.strictEqual(reports[0].title, 'AI Dev Project Answer');
+			assert.match(reports[0].rawResponse, /## Project Route Diagnostics/);
+			assert.match(reports[0].rawResponse, /missing_knowledgebase/);
+		} finally {
+			writeSubscription.dispose();
+			pty.close();
+		}
+	});
+
+	test('Ordinary chat bypasses project routing', async () => {
 		const outputChunks: string[] = [];
 		const chatPrompts: string[] = [];
-		let summaryRouteCalled = false;
+		let projectRouteCalled = false;
 		let isolatedMessageCalled = false;
 
 		const backend: AssistantChatBackend = {
@@ -4825,13 +5640,24 @@ suite('Extension Test Suite', () => {
 			() => {},
 			backend,
 			async () => {
-				summaryRouteCalled = true;
+				projectRouteCalled = true;
 
 				return {
-					prompt: 'unexpected summary prompt',
+					prompt: 'unexpected project route prompt',
 					warnings: [
 						'Unexpected routing warning.',
 					],
+					diagnostics: {
+						selectedRoute: 'project-aware',
+						knowledgebaseFilesConsidered: [],
+						knowledgebaseFilesIncluded: [],
+						routedSummaryCount: 0,
+						fallbackSummaryCount: 0,
+						verifiedSourceCount: 0,
+						fallbackUsed: false,
+						deficits: [],
+						remediationSuggestions: [],
+					},
 				};
 			}
 		);
@@ -4867,7 +5693,7 @@ suite('Extension Test Suite', () => {
 				chatPrompts,
 				['What is eventual consistency?']
 			);
-			assert.strictEqual(summaryRouteCalled, false);
+			assert.strictEqual(projectRouteCalled, false);
 			assert.strictEqual(
 				isolatedMessageCalled,
 				false
@@ -4882,24 +5708,20 @@ suite('Extension Test Suite', () => {
 		}
 	});
 
-	test('Explicit chat bypasses project routing and warnings', async () => {
+	test('/ask rejects legacy route flags as unknown options', async () => {
 		const outputChunks: string[] = [];
 		const chatPrompts: string[] = [];
-		let summaryRouteCalled = false;
-		let isolatedMessageCalled = false;
+		let projectRouteCalled = false;
 
 		const backend: AssistantChatBackend = {
 			startSession: async () => ({
-				modelName: 'Explicit Chat Model',
+				modelName: 'Ask Option Model',
 			}),
 			sendMessage: async (prompt) => {
 				chatPrompts.push(prompt);
-				return 'General Jenkins explanation.';
+				return 'Unexpected chat output.';
 			},
-			sendIsolatedMessage: async () => {
-				isolatedMessageCalled = true;
-				return '';
-			},
+			sendIsolatedMessage: async () => '',
 			dispose: () => {},
 		};
 
@@ -4907,13 +5729,24 @@ suite('Extension Test Suite', () => {
 			() => {},
 			backend,
 			async () => {
-				summaryRouteCalled = true;
+				projectRouteCalled = true;
 
 				return {
-					prompt: 'unexpected summary prompt',
+					prompt: 'unexpected project route prompt',
 					warnings: [
 						'Unexpected project evidence warning.',
 					],
+					diagnostics: {
+						selectedRoute: 'project-aware',
+						knowledgebaseFilesConsidered: [],
+						knowledgebaseFilesIncluded: [],
+						routedSummaryCount: 0,
+						fallbackSummaryCount: 0,
+						verifiedSourceCount: 0,
+						fallbackUsed: false,
+						deficits: [],
+						remediationSuggestions: [],
+					},
 				};
 			}
 		);
@@ -4928,36 +5761,24 @@ suite('Extension Test Suite', () => {
 
 			await waitForCondition(() =>
 				outputChunks.join('').includes(
-					'Launched Explicit Chat Model'
+					'Launched Ask Option Model'
 				)
 			);
 
-			pty.handleInput(
-				'/ask --chat How does our Jenkins pipeline work?'
-			);
+			pty.handleInput('/ask --chat How does our Jenkins pipeline work?');
 			pty.handleInput('\r');
 
 			await waitForCondition(() =>
 				outputChunks.join('').includes(
-					'General Jenkins explanation.'
+					'WARNING Unknown /ask option: --chat'
 				)
 			);
 
 			const output = outputChunks.join('');
 
-			assert.deepStrictEqual(
-				chatPrompts,
-				['How does our Jenkins pipeline work?']
-			);
-			assert.strictEqual(summaryRouteCalled, false);
-			assert.strictEqual(
-				isolatedMessageCalled,
-				false
-			);
-			assert.doesNotMatch(
-				output,
-				/Unexpected project evidence warning/
-			);
+			assert.deepStrictEqual(chatPrompts, []);
+			assert.strictEqual(projectRouteCalled, false);
+			assert.match(output, /WARNING Unknown \/ask option: --chat/);
 		} finally {
 			writeSubscription.dispose();
 			pty.close();
@@ -5275,7 +6096,7 @@ suite('Extension Test Suite', () => {
 		);
 	});
 
-	test('Plain assistant input uses automatic routing', async () => {
+	test('Plain assistant input uses ordinary chat routing', async () => {
 		const sourcePath = path.join(
 			__dirname,
 			'..',
@@ -5287,7 +6108,7 @@ suite('Extension Test Suite', () => {
 
 		assert.match(
 			source,
-			/await this\.submitAutomaticPrompt\(submitResult\.submittedText\)/
+			/await this\.submitChatPrompt\(submitResult\.submittedText\)/
 		);
 	});
 

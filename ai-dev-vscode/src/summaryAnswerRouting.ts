@@ -15,7 +15,9 @@ import {
 	readDependencyMap,
 } from './dependencyMap';
 import {
+	collectVerifiedAnswerSourceFailures,
 	collectVerifiedAnswerSourceContext,
+	type VerifiedAnswerSourceFailureWarning,
 } from './answerSourceVerification';
 import {
 	buildAnswerFromAiDocsDirectPromptMarkdown,
@@ -38,6 +40,76 @@ const MAX_ROUTED_DOC_TOTAL_CHARS = 90000;
 
 const MAX_FALLBACK_DISCOVERED_SUMMARIES = 6;
 
+const MAX_KNOWLEDGEBASE_FILES = 12;
+
+const MAX_KNOWLEDGEBASE_FILE_CHARS = 4000;
+
+export type ProjectContextDeficitCategory =
+	| 'missing_knowledgebase'
+	| 'insufficient_knowledgebase_coverage'
+	| 'missing_summary_context'
+	| 'missing_referenced_document'
+	| 'insufficient_routed_context'
+	| 'source_verification_failed';
+
+export interface ProjectContextDeficit {
+	category: ProjectContextDeficitCategory;
+	detail: string;
+	remediation: string;
+}
+
+export interface ProjectRouteDiagnostics {
+	selectedRoute: 'project-aware';
+	knowledgebaseFilesConsidered: string[];
+	knowledgebaseFilesIncluded: string[];
+	routedSummaryCount: number;
+	fallbackSummaryCount: number;
+	verifiedSourceCount: number;
+	fallbackUsed: boolean;
+	fallbackReason?: string;
+	deficits: ProjectContextDeficit[];
+	remediationSuggestions: string[];
+}
+
+interface KnowledgebaseFile {
+	absolutePath: string;
+	relativePath: string;
+	contents: string;
+	score: number;
+}
+
+export interface KnowledgebaseSelectionCandidate {
+	relativePath: string;
+	contents: string;
+	score: number;
+}
+
+export function selectRelevantKnowledgebaseCandidates(
+	candidates: KnowledgebaseSelectionCandidate[],
+	maxFiles: number
+): KnowledgebaseSelectionCandidate[] {
+	return candidates
+		.filter((candidate) => candidate.score > 0)
+		.slice(0, maxFiles);
+}
+
+export interface ProjectRouteDiagnosticsSignals {
+	knowledgebaseMissing: boolean;
+	knowledgebaseEmpty: boolean;
+	knowledgebaseInsufficientCoverage: boolean;
+	rootSummaryPath: string;
+	rootSummaryExists: boolean;
+	rootSummaryEmpty: boolean;
+	missingDocumentationPaths: string[];
+	routedSummaryCount: number;
+	fallbackSummaryCount: number;
+	sourceVerificationFailures: VerifiedAnswerSourceFailureWarning[];
+	knowledgebaseFilesConsidered: string[];
+	knowledgebaseFilesIncluded: string[];
+	verifiedSourceCount: number;
+	fallbackReason?: string;
+}
+
 interface RoutedDocumentationFile {
 	path: string;
 	kind: 'summary' | 'dependency-map' | 'routing-artifact';
@@ -59,6 +131,122 @@ interface DiscoveredSummaryFile {
 interface ParsedDocumentationReference {
 	label: string;
 	target: string;
+}
+
+function buildDeficit(params: {
+	category: ProjectContextDeficitCategory;
+	detail: string;
+}): ProjectContextDeficit {
+	const remediationByCategory: Record<ProjectContextDeficitCategory, string> = {
+		missing_knowledgebase:
+			'Add or update project documentation under knowledgebase/ for this topic.',
+		insufficient_knowledgebase_coverage:
+			'Add or refine topic-specific knowledgebase documentation for this question area.',
+		missing_summary_context:
+			'Generate or refresh ai-docs/architecture-summary.md and relevant summary.md files.',
+		missing_referenced_document:
+			'Repair or regenerate the missing routed documentation reference in the summary chain.',
+		insufficient_routed_context:
+			'Add or expand scoped subsystem summary.md coverage for the area this question targets.',
+		source_verification_failed:
+			'Refresh dependency/source mapping and verify referenced source paths are readable and current.',
+	};
+
+	return {
+		category: params.category,
+		detail: params.detail,
+		remediation: remediationByCategory[params.category],
+	};
+}
+
+export function buildProjectRouteDiagnostics(
+	signals: ProjectRouteDiagnosticsSignals
+): ProjectRouteDiagnostics {
+	const deficits: ProjectContextDeficit[] = [];
+
+	if (signals.knowledgebaseMissing) {
+		deficits.push(
+			buildDeficit({
+				category: 'missing_knowledgebase',
+				detail: 'knowledgebase/ directory was not found.',
+			})
+		);
+	} else if (signals.knowledgebaseEmpty) {
+		deficits.push(
+			buildDeficit({
+				category: 'missing_knowledgebase',
+				detail: 'No readable knowledgebase files were found under knowledgebase/.',
+			})
+		);
+	} else if (signals.knowledgebaseInsufficientCoverage) {
+		deficits.push(
+			buildDeficit({
+				category: 'insufficient_knowledgebase_coverage',
+				detail: 'Knowledgebase files are present, but routing found no relevant coverage for this question.',
+			})
+		);
+	}
+
+	if (!signals.rootSummaryExists || signals.rootSummaryEmpty) {
+		deficits.push(
+			buildDeficit({
+				category: 'missing_summary_context',
+				detail: !signals.rootSummaryExists
+					? `Root summary was not found at ${signals.rootSummaryPath}.`
+					: `Root summary at ${signals.rootSummaryPath} is empty.`,
+			})
+		);
+	}
+
+	for (const missingPath of signals.missingDocumentationPaths) {
+		deficits.push(
+			buildDeficit({
+				category: 'missing_referenced_document',
+				detail: `Routed documentation reference is missing: ${missingPath}`,
+			})
+		);
+	}
+
+	if (
+		signals.knowledgebaseFilesIncluded.length === 0
+		&& signals.verifiedSourceCount === 0
+		&&
+		signals.routedSummaryCount === 0
+		&& signals.fallbackSummaryCount === 0
+	) {
+		deficits.push(
+			buildDeficit({
+				category: 'insufficient_routed_context',
+				detail: 'Routing could not identify usable summary context for this question.',
+			})
+		);
+	}
+
+	if (signals.sourceVerificationFailures.length > 0) {
+		deficits.push(
+			buildDeficit({
+				category: 'source_verification_failed',
+				detail: 'Verified source checks reported gaps or read failures.',
+			})
+		);
+	}
+
+	const remediationSuggestions = [
+		...new Set(deficits.map((deficit) => deficit.remediation)),
+	];
+
+	return {
+		selectedRoute: 'project-aware',
+		knowledgebaseFilesConsidered: signals.knowledgebaseFilesConsidered,
+		knowledgebaseFilesIncluded: signals.knowledgebaseFilesIncluded,
+		routedSummaryCount: signals.routedSummaryCount,
+		fallbackSummaryCount: signals.fallbackSummaryCount,
+		verifiedSourceCount: signals.verifiedSourceCount,
+		fallbackUsed: Boolean(signals.fallbackReason),
+		fallbackReason: signals.fallbackReason,
+		deficits,
+		remediationSuggestions,
+	};
 }
 
 export function parseRoutedDocumentationReferences(
@@ -348,6 +536,139 @@ async function selectFallbackDiscoveredSummaries(params: {
 	return candidates.slice(0, Math.min(2, params.maxSummaries));
 }
 
+function isKnowledgebaseCandidate(fileName: string): boolean {
+	const lower = fileName.toLowerCase();
+	return lower.endsWith('.md')
+		|| lower.endsWith('.txt')
+		|| lower.endsWith('.yaml')
+		|| lower.endsWith('.yml')
+		|| lower.endsWith('.json');
+}
+
+async function collectKnowledgebaseContext(params: {
+	workspaceRoot: string;
+	userQuestion: string;
+}): Promise<{
+	consideredPaths: string[];
+	includedFiles: Array<{ path: string; contents: string }>;
+	missing: boolean;
+	empty: boolean;
+}> {
+	const knowledgebaseRoot = path.resolve(
+		params.workspaceRoot,
+		'knowledgebase'
+	);
+
+	let rootEntries: Dirent[];
+	try {
+		rootEntries = await fs.readdir(knowledgebaseRoot, {
+			withFileTypes: true,
+			encoding: 'utf8',
+		});
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+			return {
+				consideredPaths: [],
+				includedFiles: [],
+				missing: true,
+				empty: false,
+			};
+		}
+
+		throw error;
+	}
+
+	if (rootEntries.length === 0) {
+		return {
+			consideredPaths: [],
+			includedFiles: [],
+			missing: false,
+			empty: true,
+		};
+	}
+
+	const questionTokens = tokenizeQuestionForRouting(params.userQuestion);
+	const pendingDirectories: string[] = [knowledgebaseRoot];
+	const candidates: KnowledgebaseFile[] = [];
+
+	while (pendingDirectories.length > 0) {
+		const currentDirectory = pendingDirectories.pop();
+		if (!currentDirectory) {
+			continue;
+		}
+
+		let entries: Dirent[];
+		try {
+			entries = await fs.readdir(currentDirectory, {
+				withFileTypes: true,
+				encoding: 'utf8',
+			});
+		} catch {
+			continue;
+		}
+
+		for (const entry of entries) {
+			const entryPath = path.join(currentDirectory, entry.name);
+
+			if (entry.isDirectory()) {
+				pendingDirectories.push(entryPath);
+				continue;
+			}
+
+			if (!entry.isFile() || !isKnowledgebaseCandidate(entry.name)) {
+				continue;
+			}
+
+			const contents = await readOptionalTextFile(entryPath);
+			if (!contents || contents.trim().length === 0) {
+				continue;
+			}
+
+			const relativePath = normalizePathForMarkdown(
+				path.relative(params.workspaceRoot, entryPath)
+			);
+			const score = scoreDiscoveredSummaryRelevance(
+				relativePath,
+				contents,
+				questionTokens
+			);
+
+			candidates.push({
+				absolutePath: entryPath,
+				relativePath,
+				contents,
+				score,
+			});
+		}
+	}
+
+	candidates.sort((left, right) => {
+		if (left.score !== right.score) {
+			return right.score - left.score;
+		}
+
+		return left.relativePath.localeCompare(right.relativePath);
+	});
+
+	const consideredPaths = candidates.map((candidate) => candidate.relativePath);
+	const selected = selectRelevantKnowledgebaseCandidates(
+		candidates,
+		MAX_KNOWLEDGEBASE_FILES
+	);
+
+	const includedFiles = selected.map((candidate) => ({
+		path: candidate.relativePath,
+		contents: candidate.contents.slice(0, MAX_KNOWLEDGEBASE_FILE_CHARS),
+	}));
+
+	return {
+		consideredPaths,
+		includedFiles,
+		missing: false,
+		empty: candidates.length === 0,
+	};
+}
+
 export function resolveRoutedDocumentationPath(params: {
 	workspaceRoot: string;
 	docsDirAbsolutePath: string;
@@ -590,6 +911,7 @@ export async function buildSummaryAnswerRoute(
 ): Promise<{
 	prompt: string;
 	warnings: string[];
+	diagnostics: ProjectRouteDiagnostics;
 }> {
 	const workspaceRoot = getOpenWorkspaceRoot();
 	if (!workspaceRoot) {
@@ -707,6 +1029,11 @@ export async function buildSummaryAnswerRoute(
 		})
 		: [];
 
+	const knowledgebaseContext = await collectKnowledgebaseContext({
+		workspaceRoot,
+		userQuestion: trimmedUserQuestion,
+	});
+
 	const summaryEvidence = [
 		...routedDocumentationContext.routedFiles
 			.filter((file) => file.kind === 'summary')
@@ -739,6 +1066,10 @@ export async function buildSummaryAnswerRoute(
 			summaryEvidence,
 			dependencyMap,
 		});
+	const sourceVerificationFailures =
+		collectVerifiedAnswerSourceFailures(
+			verifiedSourceContext.warningDetails
+		);
 
 	const prompt = buildAnswerFromAiDocsDirectPromptMarkdown({
 		workspaceRoot,
@@ -768,9 +1099,35 @@ export async function buildSummaryAnswerRoute(
 			})),
 		missingDocumentationPaths:
 			routedDocumentationContext.missingPaths,
+		knowledgebaseFilesConsidered:
+			knowledgebaseContext.consideredPaths,
+		knowledgebaseFilesIncluded:
+			knowledgebaseContext.includedFiles,
 		verifiedSourceFiles:
 			verifiedSourceContext.files,
 		userQuestion: trimmedUserQuestion,
+	});
+
+	const diagnostics = buildProjectRouteDiagnostics({
+		knowledgebaseMissing: knowledgebaseContext.missing,
+		knowledgebaseEmpty: knowledgebaseContext.empty,
+		knowledgebaseInsufficientCoverage:
+			!knowledgebaseContext.missing
+			&& !knowledgebaseContext.empty
+			&& knowledgebaseContext.consideredPaths.length > 0
+			&& knowledgebaseContext.includedFiles.length === 0,
+		rootSummaryPath,
+		rootSummaryExists,
+		rootSummaryEmpty,
+		missingDocumentationPaths: routedDocumentationContext.missingPaths,
+		routedSummaryCount: routedDocumentationContext.routedFiles
+			.filter((file) => file.kind === 'summary').length,
+		fallbackSummaryCount: fallbackDiscoveredSummaries.length,
+		sourceVerificationFailures,
+		knowledgebaseFilesConsidered: knowledgebaseContext.consideredPaths,
+		knowledgebaseFilesIncluded: knowledgebaseContext.includedFiles.map((file) => file.path),
+		verifiedSourceCount: verifiedSourceContext.files.length,
+		fallbackReason: fallbackIncludedReason,
 	});
 
 	const warnings: string[] = [
@@ -803,8 +1160,19 @@ export async function buildSummaryAnswerRoute(
 		);
 	}
 
+	for (const deficit of diagnostics.deficits) {
+		warnings.push(
+			`Context deficit (${deficit.category}): ${deficit.detail}`
+		);
+	}
+
+	for (const suggestion of diagnostics.remediationSuggestions) {
+		warnings.push(`Remediation: ${suggestion}`);
+	}
+
 	return {
 		prompt,
 		warnings,
+		diagnostics,
 	};
 }

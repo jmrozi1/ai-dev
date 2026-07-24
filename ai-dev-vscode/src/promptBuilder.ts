@@ -423,6 +423,11 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		score: number;
 	}>;
 	missingDocumentationPaths?: string[];
+	knowledgebaseFilesConsidered?: string[];
+	knowledgebaseFilesIncluded?: Array<{
+		path: string;
+		contents: string;
+	}>;
 	verifiedSourceFiles?: Array<{
 		path: string;
 		role: 'primary-source' | 'dependency';
@@ -450,6 +455,8 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		routedDocumentationFiles,
 		fallbackDiscoveredSummaries,
 		missingDocumentationPaths,
+		knowledgebaseFilesConsidered,
+		knowledgebaseFilesIncluded,
 		verifiedSourceFiles,
 		userQuestion,
 	} = params;
@@ -528,6 +535,37 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 			'Linked documentation files that were referenced but unavailable:',
 			...missingDocumentationPaths.map((filePath) => `- ${filePath}`)
 		);
+	}
+
+	if (knowledgebaseFilesConsidered) {
+		lines.push(
+			'',
+			'Knowledgebase routing metadata:',
+			`- Considered knowledgebase files: ${knowledgebaseFilesConsidered.length}`,
+			`- Included knowledgebase files: ${knowledgebaseFilesIncluded?.length ?? 0}`
+		);
+
+		if (knowledgebaseFilesConsidered.length > 0) {
+			lines.push(
+				'Knowledgebase files considered:',
+				...knowledgebaseFilesConsidered.map((filePath) => `- ${filePath}`)
+			);
+		}
+	}
+
+	if (knowledgebaseFilesIncluded && knowledgebaseFilesIncluded.length > 0) {
+		lines.push('', 'Knowledgebase context:');
+		for (const file of knowledgebaseFilesIncluded) {
+			lines.push(
+				'',
+				'Knowledgebase file:',
+				file.path,
+				'',
+				'```markdown',
+				file.contents,
+				'```'
+			);
+		}
 	}
 
 	if (verifiedSourceFiles && verifiedSourceFiles.length > 0) {

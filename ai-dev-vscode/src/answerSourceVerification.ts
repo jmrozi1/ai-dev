@@ -31,17 +31,169 @@ export interface VerifiedAnswerSourceFile {
 	contents: string;
 }
 
+export type VerifiedAnswerSourceWarningLevel =
+	| 'info'
+	| 'failure';
+
+export type VerifiedAnswerSourceWarningCode =
+	| 'source_clipped'
+	| 'dependency_clipped'
+	| 'source_missing'
+	| 'source_unreadable'
+	| 'dependency_unresolved'
+	| 'dependency_unavailable'
+	| 'dependency_unreadable';
+
+export type VerifiedAnswerSourceFailureWarningCode =
+	| 'source_missing'
+	| 'source_unreadable'
+	| 'dependency_unresolved'
+	| 'dependency_unavailable'
+	| 'dependency_unreadable';
+
+export interface VerifiedAnswerSourceWarning {
+	level: VerifiedAnswerSourceWarningLevel;
+	code: VerifiedAnswerSourceWarningCode;
+	message: string;
+	path?: string;
+	primarySourcePath?: string;
+}
+
+export interface VerifiedAnswerSourceFailureWarning
+	extends VerifiedAnswerSourceWarning {
+	code: VerifiedAnswerSourceFailureWarningCode;
+}
+
 export interface VerifiedAnswerSourceContext {
 	files: VerifiedAnswerSourceFile[];
 	warnings: string[];
+	warningDetails: VerifiedAnswerSourceWarning[];
 }
 
-function extractBacktickedPathCandidates(
+interface ExtractedVerificationCandidate {
+	path: string;
+	markedAsSourcePath: boolean;
+}
+
+const VERIFIED_SOURCE_FILE_EXTENSIONS = [
+	'.ts',
+	'.tsx',
+	'.js',
+	'.jsx',
+	'.json',
+	'.md',
+	'.yaml',
+	'.yml',
+	'.xml',
+	'.sh',
+	'.bash',
+	'.groovy',
+	'.java',
+	'.py',
+	'.go',
+	'.rs',
+	'.cs',
+	'.cpp',
+	'.c',
+	'.h',
+	'.hpp',
+	'.html',
+	'.css',
+	'.scss',
+];
+
+const VERIFIED_SOURCE_FAILURE_CODES = new Set<VerifiedAnswerSourceFailureWarningCode>([
+	'source_missing',
+	'source_unreadable',
+	'dependency_unresolved',
+	'dependency_unavailable',
+	'dependency_unreadable',
+]);
+
+export function isVerifiedAnswerSourceFailureCode(
+	code: VerifiedAnswerSourceWarningCode
+): code is VerifiedAnswerSourceFailureWarningCode {
+	return VERIFIED_SOURCE_FAILURE_CODES.has(
+		code as VerifiedAnswerSourceFailureWarningCode
+	);
+}
+
+export function collectVerifiedAnswerSourceFailures(
+	warnings: VerifiedAnswerSourceWarning[]
+): VerifiedAnswerSourceFailureWarning[] {
+	return warnings.filter(
+		(warning): warning is VerifiedAnswerSourceFailureWarning =>
+			isVerifiedAnswerSourceFailureCode(
+				warning.code
+			)
+	);
+}
+
+function normalizeVerificationCandidatePath(
+	candidate: string
+): string {
+	return normalizePathForMarkdown(candidate)
+		.replace(/^\.\/+/, '')
+		.replace(/^\/+/, '');
+}
+
+export function isFileVerificationCandidate(params: {
+	candidate: string;
+	markedAsSourcePath?: boolean;
+}): boolean {
+	const candidate = params.candidate.trim();
+
+	if (!candidate) {
+		return false;
+	}
+
+	if (params.markedAsSourcePath) {
+		return true;
+	}
+
+	if (
+		candidate.includes('/')
+		|| candidate.includes('\\')
+	) {
+		return true;
+	}
+
+	const lowerCandidate = candidate.toLowerCase();
+
+	return VERIFIED_SOURCE_FILE_EXTENSIONS.some(
+		(extension) => lowerCandidate.endsWith(extension)
+	);
+}
+
+function extractVerificationCandidates(
 	contents: string
-): string[] {
-	const candidates: string[] = [];
+): ExtractedVerificationCandidate[] {
+	const candidates = new Map<string, ExtractedVerificationCandidate>();
 	const regex = /`([^`\r\n]+)`/g;
 	let match: RegExpExecArray | null;
+	const upsertCandidate = (
+		rawCandidate: string,
+		markedAsSourcePath: boolean
+	): void => {
+		const normalized = normalizeVerificationCandidatePath(rawCandidate.trim());
+
+		if (!normalized) {
+			return;
+		}
+
+		const existing = candidates.get(normalized);
+
+		if (existing) {
+			existing.markedAsSourcePath =
+				existing.markedAsSourcePath || markedAsSourcePath;
+			return;
+		}
+
+		candidates.set(normalized, {
+			path: normalized,
+			markedAsSourcePath,
+		});
+	};
 
 	while ((match = regex.exec(contents)) !== null) {
 		const candidate = match[1]?.trim();
@@ -57,14 +209,27 @@ function extractBacktickedPathCandidates(
 			continue;
 		}
 
-		candidates.push(
-			normalizePathForMarkdown(candidate)
-				.replace(/^\.\/+/, '')
-				.replace(/^\/+/, '')
-		);
+		upsertCandidate(candidate, false);
 	}
 
-	return [...new Set(candidates)];
+	const structuredPathRegex =
+		/(?:"(?:sourcePath|source_path|sourceFile|source_file)"\s*:\s*"([^"\r\n]+)")|(?:\b(?:sourcePath|source_path|sourceFile|source_file)\s*:\s*([^\s#`][^\r\n`]*))/g;
+	let structuredMatch: RegExpExecArray | null;
+
+	while ((structuredMatch = structuredPathRegex.exec(contents)) !== null) {
+		const metadataPath =
+			structuredMatch[1]
+			?? structuredMatch[2]
+			?? '';
+
+		if (!metadataPath) {
+			continue;
+		}
+
+		upsertCandidate(metadataPath, true);
+	}
+
+	return [...candidates.values()];
 }
 
 async function readVerifiedFile(params: {
@@ -74,10 +239,20 @@ async function readVerifiedFile(params: {
 	remainingChars: number;
 }): Promise<
 	| {
+		status: 'ok';
 		contents: string;
 		clipped: boolean;
 	}
-	| undefined
+	| {
+		status: 'missing';
+	}
+	| {
+		status: 'unreadable';
+		reason: string;
+	}
+	| {
+		status: 'excluded';
+	}
 > {
 	const absolutePath = path.resolve(
 		params.workspaceRoot,
@@ -94,25 +269,56 @@ async function readVerifiedFile(params: {
 			params.docsDirAbsolutePath
 		)
 	) {
-		return undefined;
+		return {
+			status: 'excluded',
+		};
 	}
 
 	let stat;
 
 	try {
 		stat = await fs.stat(absolutePath);
-	} catch {
-		return undefined;
+	} catch (error) {
+		const nodeError = error as NodeJS.ErrnoException;
+
+		if (nodeError?.code === 'ENOENT') {
+			return {
+				status: 'missing',
+			};
+		}
+
+		return {
+			status: 'unreadable',
+			reason:
+				error instanceof Error
+					? error.message
+					: String(error),
+		};
 	}
 
 	if (!stat.isFile()) {
-		return undefined;
+		return {
+			status: 'missing',
+		};
 	}
 
-	const contents = await fs.readFile(
-		absolutePath,
-		'utf8'
-	);
+	let contents: string;
+
+	try {
+		contents = await fs.readFile(
+			absolutePath,
+			'utf8'
+		);
+	} catch (error) {
+		return {
+			status: 'unreadable',
+			reason:
+				error instanceof Error
+					? error.message
+					: String(error),
+		};
+	}
+
 	const limit = Math.min(
 		MAX_VERIFIED_FILE_CHARS,
 		params.remainingChars
@@ -120,6 +326,7 @@ async function readVerifiedFile(params: {
 	const clippedContents = contents.slice(0, limit);
 
 	return {
+		status: 'ok',
 		contents: clippedContents,
 		clipped:
 			clippedContents.length < contents.length,
@@ -139,24 +346,55 @@ export async function collectVerifiedAnswerSourceContext(
 		params.docsDir
 	);
 	const files: VerifiedAnswerSourceFile[] = [];
-	const warnings: string[] = [];
+	const warningDetails: VerifiedAnswerSourceWarning[] = [];
+	const warningDetailKeys = new Set<string>();
 	const includedPaths = new Set<string>();
 	let totalChars = 0;
 
-	const candidatePaths = [
-		...new Set(
-			params.summaryEvidence.flatMap(
-				(evidence) =>
-					extractBacktickedPathCandidates(
-						evidence.contents
-					)
-			)
-		),
-	];
+	const addWarning = (
+		warning: VerifiedAnswerSourceWarning
+	): void => {
+		const key = `${warning.level}|${warning.code}|${warning.message}`;
+
+		if (warningDetailKeys.has(key)) {
+			return;
+		}
+
+		warningDetailKeys.add(key);
+		warningDetails.push(warning);
+	};
+
+	const candidatePathMap = new Map<string, ExtractedVerificationCandidate>();
+
+	for (const evidence of params.summaryEvidence) {
+		for (const candidate of extractVerificationCandidates(evidence.contents)) {
+			const existingCandidate = candidatePathMap.get(candidate.path);
+
+			if (existingCandidate) {
+				existingCandidate.markedAsSourcePath =
+					existingCandidate.markedAsSourcePath
+					|| candidate.markedAsSourcePath;
+				continue;
+			}
+
+			candidatePathMap.set(candidate.path, candidate);
+		}
+	}
+
+	const candidatePaths = [...candidatePathMap.values()];
 
 	let primaryFileCount = 0;
 
 	for (const candidatePath of candidatePaths) {
+		if (
+			!isFileVerificationCandidate({
+				candidate: candidatePath.path,
+				markedAsSourcePath: candidatePath.markedAsSourcePath,
+			})
+		) {
+			continue;
+		}
+
 		if (
 			primaryFileCount
 				>= MAX_VERIFIED_PRIMARY_SOURCE_FILES
@@ -168,43 +406,56 @@ export async function collectVerifiedAnswerSourceContext(
 		const remainingChars =
 			MAX_VERIFIED_TOTAL_CHARS - totalChars;
 
-		let verified;
+		const verified = await readVerifiedFile({
+			workspaceRoot: params.workspaceRoot,
+			docsDirAbsolutePath,
+			relativePath: candidatePath.path,
+			remainingChars,
+		});
 
-		try {
-			verified = await readVerifiedFile({
-				workspaceRoot: params.workspaceRoot,
-				docsDirAbsolutePath,
-				relativePath: candidatePath,
-				remainingChars,
-			});
-		} catch (error) {
-			warnings.push(
-				`${candidatePath}: unable to read source for answer verification: ${
-					error instanceof Error
-						? error.message
-						: String(error)
-				}`
-			);
+		if (verified.status === 'excluded') {
 			continue;
 		}
 
-		if (!verified) {
+		if (verified.status === 'missing') {
+			addWarning({
+				level: 'failure',
+				code: 'source_missing',
+				message:
+					`${candidatePath.path}: referenced source path was not found for answer verification.`,
+				path: candidatePath.path,
+			});
+			continue;
+		}
+
+		if (verified.status === 'unreadable') {
+			addWarning({
+				level: 'failure',
+				code: 'source_unreadable',
+				message:
+					`${candidatePath.path}: unable to read source for answer verification: ${verified.reason}`,
+				path: candidatePath.path,
+			});
 			continue;
 		}
 
 		files.push({
-			path: candidatePath,
+			path: candidatePath.path,
 			role: 'primary-source',
 			contents: verified.contents,
 		});
-		includedPaths.add(candidatePath);
+		includedPaths.add(candidatePath.path);
 		primaryFileCount += 1;
 		totalChars += verified.contents.length;
 
 		if (verified.clipped) {
-			warnings.push(
-				`${candidatePath}: verified source was clipped to ${MAX_VERIFIED_FILE_CHARS} characters.`
-			);
+			addWarning({
+				level: 'info',
+				code: 'source_clipped',
+				message:
+					`${candidatePath.path}: verified source was clipped to ${MAX_VERIFIED_FILE_CHARS} characters.`,
+				path: candidatePath.path,
+			});
 		}
 	}
 
@@ -227,11 +478,16 @@ export async function collectVerifiedAnswerSourceContext(
 				edge.resolution === 'ambiguous'
 				|| edge.resolution === 'unresolved'
 			) {
-				warnings.push(
-					`${primaryFile.path}: ${edge.evidence
-						.map((item) => item.detail)
-						.join(' ')}`
-				);
+				addWarning({
+					level: 'failure',
+					code: 'dependency_unresolved',
+					message:
+						`${primaryFile.path}: ${edge.evidence
+							.map((item) => item.detail)
+							.join(' ')}`,
+					path: primaryFile.path,
+					primarySourcePath: primaryFile.path,
+				});
 			}
 		}
 
@@ -265,30 +521,34 @@ export async function collectVerifiedAnswerSourceContext(
 			const remainingChars =
 				MAX_VERIFIED_TOTAL_CHARS - totalChars;
 
-			let verified;
+			const verified = await readVerifiedFile({
+				workspaceRoot: params.workspaceRoot,
+				docsDirAbsolutePath,
+				relativePath: dependencyPath,
+				remainingChars,
+			});
 
-			try {
-				verified = await readVerifiedFile({
-					workspaceRoot: params.workspaceRoot,
-					docsDirAbsolutePath,
-					relativePath: dependencyPath,
-					remainingChars,
+			if (verified.status === 'excluded' || verified.status === 'missing') {
+				addWarning({
+					level: 'failure',
+					code: 'dependency_unavailable',
+					message:
+						`${primaryFile.path}: dependency source was unavailable: ${dependencyPath}`,
+					path: dependencyPath,
+					primarySourcePath: primaryFile.path,
 				});
-			} catch (error) {
-				warnings.push(
-					`${primaryFile.path}: unable to read dependency ${dependencyPath}: ${
-						error instanceof Error
-							? error.message
-							: String(error)
-					}`
-				);
 				continue;
 			}
 
-			if (!verified) {
-				warnings.push(
-					`${primaryFile.path}: dependency source was unavailable: ${dependencyPath}`
-				);
+			if (verified.status === 'unreadable') {
+				addWarning({
+					level: 'failure',
+					code: 'dependency_unreadable',
+					message:
+						`${primaryFile.path}: unable to read dependency ${dependencyPath}: ${verified.reason}`,
+					path: dependencyPath,
+					primarySourcePath: primaryFile.path,
+				});
 				continue;
 			}
 
@@ -309,15 +569,21 @@ export async function collectVerifiedAnswerSourceContext(
 			totalChars += verified.contents.length;
 
 			if (verified.clipped) {
-				warnings.push(
-					`${dependencyPath}: verified dependency source was clipped to ${MAX_VERIFIED_FILE_CHARS} characters.`
-				);
+				addWarning({
+					level: 'info',
+					code: 'dependency_clipped',
+					message:
+						`${dependencyPath}: verified dependency source was clipped to ${MAX_VERIFIED_FILE_CHARS} characters.`,
+					path: dependencyPath,
+					primarySourcePath: primaryFile.path,
+				});
 			}
 		}
 	}
 
 	return {
 		files,
-		warnings: [...new Set(warnings)],
+		warnings: warningDetails.map((warning) => warning.message),
+		warningDetails,
 	};
 }

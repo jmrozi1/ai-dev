@@ -24,33 +24,9 @@ export const ASSISTANT_COMMAND_DEFINITIONS: AssistantCommandDefinition[] = [
 		name: '/ask',
 		description: 'Ask the assistant a question',
 		details:
-			'Ask AI Dev a question and optionally control where it looks for the answer.',
-		usage: '/ask [route] <question>',
+			'Ask AI Dev a project-aware question using repository context.',
+		usage: '/ask <question>',
 		options: [
-			{
-				long: '--auto',
-				short: '-a',
-				description: 'Choose the best route',
-				group: 'route',
-			},
-			{
-				long: '--summary',
-				short: '-s',
-				description: 'Use summary documentation only',
-				group: 'route',
-			},
-			{
-				long: '--knowledgebase',
-				short: '-k',
-				description: 'Use the knowledge base only',
-				group: 'route',
-			},
-			{
-				long: '--chat',
-				short: '-c',
-				description: 'Bypass project routing',
-				group: 'route',
-			},
 			HELP_OPTION,
 		],
 	},

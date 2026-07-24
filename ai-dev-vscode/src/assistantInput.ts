@@ -321,12 +321,9 @@ export function parseSlashCommand(input: string): ParsedSlashCommand {
 	};
 }
 
-export type AskRoute = 'auto' | 'summary' | 'knowledgebase' | 'chat';
-
 export type AskCommandResolution =
 	| {
 		ok: true;
-		route: AskRoute;
 		question: string;
 	}
 	| {
@@ -334,41 +331,13 @@ export type AskCommandResolution =
 		error: string;
 	};
 
-const ASK_ROUTE_OPTIONS: Record<string, AskRoute> = {
-	'--auto': 'auto',
-	'-a': 'auto',
-	'--summary': 'summary',
-	'-s': 'summary',
-	'--knowledgebase': 'knowledgebase',
-	'-k': 'knowledgebase',
-	'--chat': 'chat',
-	'-c': 'chat',
-};
-
 export function resolveAskCommand(
 	parsed: ParsedSlashCommand
 ): AskCommandResolution {
-	const unknownOptions = parsed.options.filter(
-		(option) => !(option in ASK_ROUTE_OPTIONS)
-	);
-
-	if (unknownOptions.length > 0) {
+	if (parsed.options.length > 0) {
 		return {
 			ok: false,
-			error: `Unknown /ask option: ${unknownOptions.join(', ')}`,
-		};
-	}
-
-	const requestedRoutes = [
-		...new Set(
-			parsed.options.map((option) => ASK_ROUTE_OPTIONS[option])
-		),
-	];
-
-	if (requestedRoutes.length > 1) {
-		return {
-			ok: false,
-			error: 'Choose only one /ask route.',
+			error: `Unknown /ask option: ${parsed.options.join(', ')}`,
 		};
 	}
 
@@ -376,13 +345,12 @@ export function resolveAskCommand(
 	if (!question) {
 		return {
 			ok: false,
-			error: 'Usage: /ask [--auto | --summary | --knowledgebase | --chat] <question>',
+			error: 'Usage: /ask <question>',
 		};
 	}
 
 	return {
 		ok: true,
-		route: requestedRoutes[0] ?? 'auto',
 		question,
 	};
 }

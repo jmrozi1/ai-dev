@@ -1,4 +1,5 @@
 export type AssistantReportRoute =
+	| 'project-aware'
 	| 'auto'
 	| 'summary'
 	| 'knowledgebase'

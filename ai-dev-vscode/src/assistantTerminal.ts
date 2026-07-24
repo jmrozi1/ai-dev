@@ -31,8 +31,8 @@ import {
 	type AssistantLookupItem,
 } from './assistantCommands';
 import {
-	chooseAutomaticAssistantRoute,
-} from './assistantRouting';
+	type ProjectRouteDiagnostics,
+} from './summaryAnswerRouting';
 
 const ANSI_RESET = '\x1b[0m';
 const ANSI_LIGHT_GRAY = '\x1b[90m';
@@ -272,14 +272,74 @@ export function formatModelResponseLines(
 	);
 }
 
-export interface AssistantSummaryRouteResult {
+export interface AssistantProjectRouteResult {
 	prompt: string;
 	warnings: string[];
+	diagnostics: ProjectRouteDiagnostics;
 }
 
-export type AssistantSummaryRoute = (
+export type AssistantProjectRoute = (
 	question: string
-) => Promise<AssistantSummaryRouteResult>;
+) => Promise<AssistantProjectRouteResult>;
+
+function buildProjectDiagnosticsMarkdown(
+	diagnostics: AssistantProjectRouteResult['diagnostics']
+): string {
+	const lines = [
+		'## Project Route Diagnostics',
+		'',
+		`- Selected route: ${diagnostics.selectedRoute}`,
+		`- Knowledgebase files considered: ${diagnostics.knowledgebaseFilesConsidered.length}`,
+		`- Knowledgebase files included: ${diagnostics.knowledgebaseFilesIncluded.length}`,
+		`- Routed summary count: ${diagnostics.routedSummaryCount}`,
+		`- Fallback summary count: ${diagnostics.fallbackSummaryCount}`,
+		`- Verified source count: ${diagnostics.verifiedSourceCount}`,
+		`- Fallback used: ${diagnostics.fallbackUsed}`,
+		`- Fallback reason: ${diagnostics.fallbackReason ?? 'none'}`,
+	];
+
+	if (diagnostics.knowledgebaseFilesConsidered.length > 0) {
+		lines.push(
+			'',
+			'### Knowledgebase Files Considered',
+			...diagnostics.knowledgebaseFilesConsidered.map(
+				(filePath) => `- ${filePath}`
+			)
+		);
+	}
+
+	if (diagnostics.knowledgebaseFilesIncluded.length > 0) {
+		lines.push(
+			'',
+			'### Knowledgebase Files Included',
+			...diagnostics.knowledgebaseFilesIncluded.map(
+				(filePath) => `- ${filePath}`
+			)
+		);
+	}
+
+	if (diagnostics.deficits.length > 0) {
+		lines.push('', '### Context Deficits');
+		for (const deficit of diagnostics.deficits) {
+			lines.push(
+				`- ${deficit.category}: ${deficit.detail}`,
+				`  Remediation: ${deficit.remediation}`
+			);
+		}
+	}
+
+	if (diagnostics.remediationSuggestions.length > 0) {
+		lines.push(
+			'',
+			'### Remediation Suggestions',
+			...diagnostics.remediationSuggestions.map(
+				(remediation) => `- ${remediation}`
+			)
+		);
+	}
+
+	return lines.join('\n');
+}
 
 export interface AssistantSummarizeDependencyContextFile {
 	primarySourcePath: string;
@@ -651,7 +711,7 @@ export class AiDevAssistantTerminalManager implements vscode.Disposable {
 		private readonly windowApi: TerminalWindowApi,
 		private readonly backendFactory: () => AssistantChatBackend =
 			() => new VsCodeAssistantChatBackend(),
-		private readonly summaryRoute?: AssistantSummaryRoute,
+		private readonly projectRoute?: AssistantProjectRoute,
 		private readonly summarizeRoute?: AssistantSummarizeRoute,
 		private readonly reviewRoute?: AssistantReviewRoute,
 		private readonly reportSink?: AssistantReportSink,
@@ -678,7 +738,7 @@ export class AiDevAssistantTerminalManager implements vscode.Disposable {
 				this.terminal?.dispose();
 			},
 			this.backendFactory(),
-			this.summaryRoute,
+			this.projectRoute,
 			this.summarizeRoute,
 			this.reviewRoute,
 			this.reportSink,
@@ -732,7 +792,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		private readonly onExitRequested: () => void,
 		private readonly chatBackend: AssistantChatBackend =
 			new VsCodeAssistantChatBackend(),
-		private readonly summaryRoute?: AssistantSummaryRoute,
+		private readonly projectRoute?: AssistantProjectRoute,
 		private readonly summarizeRoute?: AssistantSummarizeRoute,
 		private readonly reviewRoute?: AssistantReviewRoute,
 		private readonly reportSink?: AssistantReportSink,
@@ -906,7 +966,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 			return;
 		}
 
-		await this.submitAutomaticPrompt(submitResult.submittedText);
+		await this.submitChatPrompt(submitResult.submittedText);
 	}
 
 	private async runSummarizeSmokeTest(
@@ -1581,27 +1641,14 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 		}
 	}
 
-	private async submitAutomaticPrompt(
-		question: string
-	): Promise<void> {
-		const route = chooseAutomaticAssistantRoute(question);
-
-		if (route === 'summary' && this.summaryRoute) {
-			await this.submitSummaryPrompt(question);
-			return;
-		}
-
-		await this.submitChatPrompt(question);
-	}
-
-	private async submitSummaryPrompt(question: string): Promise<void> {
+	private async submitProjectAwarePrompt(question: string): Promise<void> {
 		const cancellation = new vscode.CancellationTokenSource();
 		this.requestCancellation = cancellation;
 		this.requestInFlight = true;
-		this.showEphemeralWithPrompt('Routing through summary documentation...');
+		this.showEphemeralWithPrompt('Routing through project-aware context...');
 
 		try {
-			const routeResult = await this.summaryRoute!(question);
+			const routeResult = await this.projectRoute!(question);
 
 			if (cancellation.token.isCancellationRequested) {
 				throw new Error('Assistant request cancelled.');
@@ -1622,27 +1669,33 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 				);
 			}
 
+			const diagnosticsMarkdown = buildProjectDiagnosticsMarkdown(
+				routeResult.diagnostics
+			);
+			const reportResponse = `${responseText.trim()}\n\n${diagnosticsMarkdown}`;
+
 			const report = createAssistantReport({
-				route: 'summary',
-				title: 'AI Dev Summary Answer',
+				route: 'project-aware',
+				title: 'AI Dev Project Answer',
 				question,
 				modelName: this.modelName,
 				warnings: reportWarnings,
-				rawResponse: responseText,
+				rawResponse: reportResponse,
 			});
 
 			this.reportSink?.(report);
 
-			for (const warning of reportWarnings) {
+			if (routeResult.diagnostics.deficits.length > 0) {
 				this.writePermanentLine(
-					`WARNING ${warning}`,
+					'WARNING Project context is incomplete for this answer.',
 					ANSI_YELLOW
 				);
-			}
-
-			if (reportWarnings.length > 0) {
 				this.writePermanentLine(
-					'  /showreport for details',
+					`  Suggested next step: ${routeResult.diagnostics.deficits[0].remediation}`,
+					ANSI_LIGHT_GRAY
+				);
+				this.writePermanentLine(
+					'  /showreport for full routing diagnostics',
 					ANSI_LIGHT_GRAY
 				);
 			}
@@ -1673,7 +1726,7 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					error instanceof Error ? error.message : String(error);
 
 				this.writePermanentLine(
-					`ERROR Summary route failed: ${message}`,
+					`ERROR Project-aware route failed: ${message}`,
 					ANSI_RED
 				);
 			}
@@ -1868,33 +1921,15 @@ export class AiDevAssistantPseudoterminal implements vscode.Pseudoterminal {
 					return true;
 				}
 
-				if (resolved.route === 'knowledgebase') {
+				if (!this.projectRoute) {
 					this.writePermanentLine(
-						'WARNING The knowledgebase route is not connected yet.',
+						'WARNING The project-aware /ask route is not connected yet.',
 						ANSI_YELLOW
 					);
 					return true;
 				}
 
-				if (resolved.route === 'summary') {
-					if (!this.summaryRoute) {
-						this.writePermanentLine(
-							'WARNING The summary route is not connected yet.',
-							ANSI_YELLOW
-						);
-						return true;
-					}
-
-					await this.submitSummaryPrompt(resolved.question);
-					return false;
-				}
-
-				if (resolved.route === 'auto') {
-					await this.submitAutomaticPrompt(resolved.question);
-					return false;
-				}
-
-				await this.submitChatPrompt(resolved.question);
+				await this.submitProjectAwarePrompt(resolved.question);
 				return false;
 			}
 
