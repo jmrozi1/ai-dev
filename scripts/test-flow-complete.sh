@@ -66,8 +66,108 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "$FLOW" "$@"
 	)
+}
+
+make_gh_mock() {
+	local mock_bin_dir="$1"
+	mkdir -p "$mock_bin_dir"
+	cat >"$mock_bin_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+python3 - "$@" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def fail(message):
+	print(message, file=sys.stderr)
+	sys.exit(1)
+
+
+def load_state(path):
+	if not path.exists():
+		return {'issues': {}}
+	return json.loads(path.read_text(encoding='utf-8'))
+
+
+def save_state(path, data):
+	path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+
+
+state_path_value = os.environ.get('GH_MOCK_STATE')
+if not state_path_value:
+	fail('GH_MOCK_STATE is required')
+state_path = Path(state_path_value)
+state_path.parent.mkdir(parents=True, exist_ok=True)
+
+state = load_state(state_path)
+if 'issues' not in state or not isinstance(state['issues'], dict):
+	state = {'issues': {}}
+
+log_path_value = os.environ.get('GH_MOCK_LOG', '')
+
+args = sys.argv[1:]
+if len(args) < 3 or args[0] != 'issue':
+	fail('unsupported command')
+
+command = args[1]
+issue_number = args[2]
+
+if command == 'close':
+	if os.environ.get('GH_MOCK_FAIL_CLOSE') == '1':
+		fail('mock close failure')
+	if issue_number not in state['issues']:
+		fail('issue not found')
+	state['issues'][issue_number]['state'] = 'closed'
+	save_state(state_path, state)
+	print(f'closed {issue_number}')
+	if log_path_value:
+		with open(log_path_value, 'a', encoding='utf-8') as log_handle:
+			log_handle.write(f"close:{issue_number}\\n")
+	sys.exit(0)
+
+fail('unsupported issue subcommand')
+PY
+EOF
+	chmod +x "$mock_bin_dir/gh"
+}
+
+write_gh_state() {
+	local state_path="$1"
+	local payload="$2"
+	cat >"$state_path" <<EOF
+$payload
+EOF
+}
+
+read_gh_issue_state() {
+	local state_path="$1"
+	local issue_number="$2"
+	python3 - "$state_path" "$issue_number" <<'PY'
+import json
+import sys
+
+state = json.loads(open(sys.argv[1], 'r', encoding='utf-8').read())
+issue = state.get('issues', {}).get(sys.argv[2], {})
+issue_state = issue.get('state', '')
+if not isinstance(issue_state, str):
+	issue_state = ''
+print(issue_state)
+PY
+}
+
+make_no_gh_bin() {
+	local no_gh_bin="$1"
+	mkdir -p "$no_gh_bin"
+	ln -sf "$(command -v bash)" "$no_gh_bin/bash"
+	ln -sf "$(command -v basename)" "$no_gh_bin/basename"
+	ln -sf "$(command -v git)" "$no_gh_bin/git"
+	ln -sf "$(command -v python3)" "$no_gh_bin/python3"
 }
 
 run_flow_capture() {
@@ -156,6 +256,13 @@ assert_repo_clean() {
 	assert_equals "$(cached_diff "$repo_root")" ''
 	assert_equals "$(worktree_diff "$repo_root")" ''
 }
+
+mock_bin_dir="$TMP_DIR/mock-bin"
+make_gh_mock "$mock_bin_dir"
+gh_state_file="$TMP_DIR/gh-state.json"
+gh_log_file="$TMP_DIR/gh.log"
+no_gh_bin="$TMP_DIR/no-gh-bin"
+make_no_gh_bin "$no_gh_bin"
 
 create_commit_on_current_branch() {
 	local repo_root="$1"
@@ -328,6 +435,13 @@ repo_ignored="$TMP_DIR/repo-ignored"
 init_repo "$repo_ignored"
 git -C "$repo_ignored" checkout -q -b scratch
 state_set "$repo_ignored/subdir" '{"activeIssueNumber":9,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+write_gh_state "$gh_state_file" '{
+	"issues": {
+		"9": {
+			"state": "open"
+		}
+	}
+}'
 ignored_output="$TMP_DIR/ignored-output"
 if run_flow_capture "$repo_ignored/subdir" "$ignored_output" complete; then
 	ignored_status=0
@@ -337,6 +451,7 @@ fi
 ignored_text="$(cat "$ignored_output")"
 assert_equals "$ignored_status" '0'
 assert_contains "$ignored_text" 'Completed issue 9'
+assert_equals "$(read_gh_issue_state "$gh_state_file" '9')" 'closed'
 
 repo_ahead="$TMP_DIR/repo-ahead"
 init_repo "$repo_ahead"
@@ -408,6 +523,13 @@ success_routed_output_path="$TMP_DIR/success-out.txt"
 track_config_file "$repo_success" "$success_routed_output_path"
 git -C "$repo_success" checkout -q -b scratch
 state_set "$repo_success/subdir" '{"activeIssueNumber":21,"activeIssueTitle":"Done title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/21","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+write_gh_state "$gh_state_file" '{
+	"issues": {
+		"21": {
+			"state": "open"
+		}
+	}
+}'
 success_branch_before="$(current_branch "$repo_success")"
 success_head_before="$(current_head "$repo_success")"
 success_main_before="$(branch_head "$repo_success" main)"
@@ -438,12 +560,89 @@ assert_equals "$(branch_head "$repo_success" scratch)" "$success_scratch_before"
 assert_equals "$(cached_diff "$repo_success")" "$success_index_before"
 assert_equals "$(worktree_diff "$repo_success")" "$success_worktree_before"
 assert_repo_clean "$repo_success"
+assert_equals "$(read_gh_issue_state "$gh_state_file" '21')" 'closed'
+
+repo_close_fail="$TMP_DIR/repo-close-fail"
+init_repo "$repo_close_fail"
+git -C "$repo_close_fail" checkout -q -b scratch
+state_set "$repo_close_fail/subdir" '{"activeIssueNumber":26,"activeIssueTitle":"Fail close","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/26","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+write_gh_state "$gh_state_file" '{
+  "issues": {
+    "26": {
+      "state": "open"
+    }
+  }
+}'
+close_fail_state_before="$(state_get "$repo_close_fail")"
+close_fail_output="$TMP_DIR/close-fail-output"
+if (
+	cd "$repo_close_fail/subdir"
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" GH_MOCK_FAIL_CLOSE=1 "$FLOW" complete
+) >"$close_fail_output" 2>&1; then
+	close_fail_status=0
+else
+	close_fail_status=$?
+fi
+close_fail_text="$(cat "$close_fail_output")"
+assert_equals "$close_fail_status" '1'
+assert_contains "$close_fail_text" 'failed to close GitHub issue 26'
+assert_equals "$(state_get "$repo_close_fail")" "$close_fail_state_before"
+assert_equals "$(read_gh_issue_state "$gh_state_file" '26')" 'open'
+
+repo_missing_gh="$TMP_DIR/repo-missing-gh"
+init_repo "$repo_missing_gh"
+git -C "$repo_missing_gh" checkout -q -b scratch
+state_set "$repo_missing_gh/subdir" '{"activeIssueNumber":27,"activeIssueTitle":"No gh","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/27","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+missing_gh_state_before="$(state_get "$repo_missing_gh")"
+missing_gh_output="$TMP_DIR/missing-gh-output"
+if (
+	cd "$repo_missing_gh/subdir"
+	PATH="$no_gh_bin" "$FLOW" complete
+) >"$missing_gh_output" 2>&1; then
+	missing_gh_status=0
+else
+	missing_gh_status=$?
+fi
+missing_gh_text="$(cat "$missing_gh_output")"
+assert_equals "$missing_gh_status" '1'
+assert_contains "$missing_gh_text" 'GitHub CLI (gh) is required for this command.'
+assert_equals "$(state_get "$repo_missing_gh")" "$missing_gh_state_before"
+
+repo_patch_complete="$TMP_DIR/repo-patch-complete"
+init_repo "$repo_patch_complete"
+git -C "$repo_patch_complete" checkout -q -b scratch
+state_set "$repo_patch_complete/subdir" '{"patchDescription":"Local patch","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+patch_complete_output="$TMP_DIR/patch-complete-output"
+if (
+	cd "$repo_patch_complete/subdir"
+	PATH="$no_gh_bin" "$FLOW" complete
+) >"$patch_complete_output" 2>&1; then
+	patch_complete_status=0
+else
+	patch_complete_status=$?
+fi
+patch_complete_text="$(cat "$patch_complete_output")"
+assert_equals "$patch_complete_status" '0'
+assert_contains "$patch_complete_text" 'Completed patch: Local patch'
+assert_contains "$patch_complete_text" 'Workflow: inactive'
+assert_equals "$(state_get "$repo_patch_complete")" $'{
+  "mainBranch": "main",
+  "scratchBranch": "scratch",
+  "checkpoint": 0
+}'
 
 repo_custom="$TMP_DIR/repo-custom"
 init_repo "$repo_custom"
 git -C "$repo_custom" branch -m main trunk
 git -C "$repo_custom" checkout -q -b sandbox
 state_set "$repo_custom/subdir" '{"activeIssueNumber":22,"activeIssueTitle":"Custom","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/22","mainBranch":"trunk","scratchBranch":"sandbox","checkpoint":0}' >/dev/null
+write_gh_state "$gh_state_file" '{
+  "issues": {
+    "22": {
+      "state": "open"
+    }
+  }
+}'
 custom_output="$TMP_DIR/custom-output"
 if run_flow_capture "$repo_custom/subdir" "$custom_output" complete; then
 	custom_status=0
@@ -458,11 +657,19 @@ assert_equals "$(state_get "$repo_custom")" $'{
   "scratchBranch": "sandbox",
   "checkpoint": 0
 }'
+assert_equals "$(read_gh_issue_state "$gh_state_file" '22')" 'closed'
 
 repo_subdir="$TMP_DIR/repo-subdir"
 init_repo "$repo_subdir"
 git -C "$repo_subdir" checkout -q -b scratch
 state_set "$repo_subdir/subdir" '{"activeIssueNumber":23,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+write_gh_state "$gh_state_file" '{
+	"issues": {
+		"23": {
+			"state": "open"
+		}
+	}
+}'
 subdir_output="$TMP_DIR/subdir-output"
 if run_flow_capture "$repo_subdir/subdir" "$subdir_output" complete; then
 	subdir_status=0
@@ -472,12 +679,20 @@ fi
 subdir_text="$(cat "$subdir_output")"
 assert_equals "$subdir_status" '0'
 assert_contains "$subdir_text" 'Completed issue 23'
+assert_equals "$(read_gh_issue_state "$gh_state_file" '23')" 'closed'
 
 repo_routing="$TMP_DIR/repo-routing"
 init_repo "$repo_routing"
 track_config_file "$repo_routing" "$TMP_DIR/complete-output.txt"
 git -C "$repo_routing" checkout -q -b scratch
 state_set "$repo_routing/subdir" '{"activeIssueNumber":24,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+write_gh_state "$gh_state_file" '{
+	"issues": {
+		"24": {
+			"state": "open"
+		}
+	}
+}'
 routing_terminal_output="$TMP_DIR/routing-terminal-output"
 if run_flow_capture "$repo_routing/subdir" "$routing_terminal_output" complete; then
 	routing_status=0
@@ -486,17 +701,25 @@ else
 fi
 routing_terminal_text="$(cat "$routing_terminal_output")"
 assert_equals "$routing_status" '0'
-assert_equals "$routing_terminal_text" "Output written to $TMP_DIR/complete-output.txt"
 routing_file_text="$(cat "$TMP_DIR/complete-output.txt")"
+assert_equals "$routing_terminal_text" "Output written to $TMP_DIR/complete-output.txt"
 assert_contains "$routing_file_text" 'Completed issue 24'
 assert_contains "$routing_file_text" 'Workflow: inactive'
 assert_contains "$routing_file_text" 'checkpoint: 0'
+assert_equals "$(read_gh_issue_state "$gh_state_file" '24')" 'closed'
 
 if [[ "$(id -u)" != '0' ]]; then
 	repo_state_fail="$TMP_DIR/repo-state-fail"
 	init_repo "$repo_state_fail"
 	git -C "$repo_state_fail" checkout -q -b scratch
 	state_set "$repo_state_fail/subdir" '{"activeIssueNumber":25,"activeIssueTitle":"Persist title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/25","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+	write_gh_state "$gh_state_file" '{
+	  "issues": {
+	    "25": {
+	      "state": "open"
+	    }
+	  }
+	}'
 	state_before="$(cat "$repo_state_fail/.ai-dev/workflow.json")"
 	head_before="$(current_head "$repo_state_fail")"
 	main_before="$(branch_head "$repo_state_fail" main)"

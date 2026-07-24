@@ -71,8 +71,92 @@ run_flow() {
 
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "$FLOW" "$@"
 	)
+}
+
+make_gh_mock() {
+	local mock_bin_dir="$1"
+	mkdir -p "$mock_bin_dir"
+	cat >"$mock_bin_dir/gh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+python3 - "$@" <<'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def fail(message):
+	print(message, file=sys.stderr)
+	sys.exit(1)
+
+
+def load_state(path):
+	if not path.exists():
+		return {'issues': {}}
+	return json.loads(path.read_text(encoding='utf-8'))
+
+
+def save_state(path, data):
+	path.write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+
+
+state_path_value = os.environ.get('GH_MOCK_STATE')
+if not state_path_value:
+	fail('GH_MOCK_STATE is required')
+state_path = Path(state_path_value)
+state_path.parent.mkdir(parents=True, exist_ok=True)
+
+state = load_state(state_path)
+if 'issues' not in state or not isinstance(state['issues'], dict):
+	state = {'issues': {}}
+
+args = sys.argv[1:]
+if len(args) < 3 or args[0] != 'issue':
+	fail('unsupported command')
+
+command = args[1]
+issue_number = args[2]
+
+if command == 'close':
+	if issue_number not in state['issues']:
+		fail('issue not found')
+	state['issues'][issue_number]['state'] = 'closed'
+	save_state(state_path, state)
+	print(f'closed {issue_number}')
+	sys.exit(0)
+
+fail('unsupported issue subcommand')
+PY
+EOF
+	chmod +x "$mock_bin_dir/gh"
+}
+
+write_gh_state() {
+	local state_path="$1"
+	local payload="$2"
+	cat >"$state_path" <<EOF
+$payload
+EOF
+}
+
+read_gh_issue_state() {
+	local state_path="$1"
+	local issue_number="$2"
+	python3 - "$state_path" "$issue_number" <<'PY'
+import json
+import sys
+
+state = json.loads(open(sys.argv[1], 'r', encoding='utf-8').read())
+issue = state.get('issues', {}).get(sys.argv[2], {})
+issue_state = issue.get('state', '')
+if not isinstance(issue_state, str):
+	issue_state = ''
+print(issue_state)
+PY
 }
 
 state_get() {
@@ -118,8 +202,19 @@ assert_repo_clean() {
 	assert_equals "$(repo_status "$repo_root")" ''
 }
 
+mock_bin_dir="$TMP_DIR/mock-bin"
+make_gh_mock "$mock_bin_dir"
+gh_state_file="$TMP_DIR/gh-state.json"
+
 lifecycle_repo="$TMP_DIR/lifecycle"
 init_repo "$lifecycle_repo"
+write_gh_state "$gh_state_file" '{
+	"issues": {
+		"123": {
+			"state": "open"
+		}
+	}
+}'
 
 start_output="$(run_flow "$lifecycle_repo/subdir" start 123)"
 assert_contains "$start_output" 'Started issue 123'
@@ -195,6 +290,7 @@ complete_output="$(run_flow "$lifecycle_repo/subdir" complete)"
 assert_contains "$complete_output" 'Completed issue 123'
 assert_contains "$complete_output" 'Workflow: inactive'
 assert_contains "$complete_output" 'checkpoint: 0'
+assert_equals "$(read_gh_issue_state "$gh_state_file" '123')" 'closed'
 
 status_after_complete="$(run_flow "$lifecycle_repo/subdir" status)"
 assert_contains "$status_after_complete" 'Workflow: inactive'

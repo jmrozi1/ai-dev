@@ -1560,6 +1560,22 @@ handle_complete() {
 		error "Cannot complete workflow: checkpoint must be 0 (current: ${checkpoint})."
 	fi
 
+	if [[ "$workflow_kind" == 'issue' ]]; then
+		if ! command -v gh >/dev/null 2>&1; then
+			error 'GitHub CLI (gh) is required for this command.'
+		fi
+
+		local close_output
+		local close_status=0
+		set +e
+		close_output="$(gh issue close "$active_issue_number" 2>&1)"
+		close_status=$?
+		set -e
+		if [[ "$close_status" -ne 0 ]]; then
+			error "Cannot complete workflow: failed to close GitHub issue ${active_issue_number}: ${close_output}"
+		fi
+	fi
+
 	local state_payload
 	state_payload="$(build_inactive_state_payload "$main_branch" "$scratch_branch")"
 	workflow_state_json_helper 'set' "$workflow_state_file" "$state_payload" >/dev/null
