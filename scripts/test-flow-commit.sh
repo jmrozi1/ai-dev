@@ -204,9 +204,10 @@ repo_inactive="$TMP_DIR/repo-inactive"
 init_repo "$repo_inactive"
 git -C "$repo_inactive" checkout -q -b scratch
 printf 'change\n' >> "$repo_inactive/tracked.txt"
-git -C "$repo_inactive" add tracked.txt
+printf 'untracked\n' > "$repo_inactive/new-file.txt"
 inactive_head_before="$(current_head "$repo_inactive")"
 inactive_state_before="$(state_get "$repo_inactive/subdir")"
+inactive_status_before="$(repo_status_porcelain "$repo_inactive")"
 inactive_output="$TMP_DIR/inactive-output"
 if run_flow_capture "$repo_inactive/subdir" "$inactive_output" commit; then
 	inactive_status=0
@@ -218,14 +219,16 @@ assert_equals "$inactive_status" '1'
 assert_contains "$inactive_text" 'no active issue is set'
 assert_equals "$(current_head "$repo_inactive")" "$inactive_head_before"
 assert_equals "$(state_get "$repo_inactive/subdir")" "$inactive_state_before"
+assert_equals "$(repo_status_porcelain "$repo_inactive")" "$inactive_status_before"
 
 repo_wrong_branch="$TMP_DIR/repo-wrong-branch"
 init_repo "$repo_wrong_branch"
 git -C "$repo_wrong_branch" branch scratch
 state_set "$repo_wrong_branch/subdir" '{"activeIssueNumber":2,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
 printf 'change\n' >> "$repo_wrong_branch/tracked.txt"
-git -C "$repo_wrong_branch" add tracked.txt
+printf 'untracked\n' > "$repo_wrong_branch/new-file.txt"
 wrong_branch_head_before="$(current_head "$repo_wrong_branch")"
+wrong_branch_status_before="$(repo_status_porcelain "$repo_wrong_branch")"
 wrong_branch_output="$TMP_DIR/wrong-branch-output"
 if run_flow_capture "$repo_wrong_branch/subdir" "$wrong_branch_output" commit; then
 	wrong_branch_status=0
@@ -236,6 +239,7 @@ fi
 assert_equals "$wrong_branch_status" '1'
 assert_contains "$wrong_branch_text" 'current branch main does not match scratchBranch scratch'
 assert_equals "$(current_head "$repo_wrong_branch")" "$wrong_branch_head_before"
+assert_equals "$(repo_status_porcelain "$repo_wrong_branch")" "$wrong_branch_status_before"
 
 repo_missing_main="$TMP_DIR/repo-missing-main"
 init_repo "$repo_missing_main"
@@ -286,24 +290,28 @@ assert_contains "$no_staged_text" 'no staged changes are available'
 assert_equals "$(current_head "$repo_no_staged")" "$no_staged_head_before"
 assert_equals "$(state_get "$repo_no_staged/subdir")" "$no_staged_state_before"
 
-repo_unstaged_only="$TMP_DIR/repo-unstaged-only"
-init_repo "$repo_unstaged_only"
-git -C "$repo_unstaged_only" checkout -q -b scratch
-state_set "$repo_unstaged_only/subdir" '{"activeIssueNumber":6,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
-printf 'unstaged\n' >> "$repo_unstaged_only/tracked.txt"
-unstaged_only_head_before="$(current_head "$repo_unstaged_only")"
-unstaged_only_state_before="$(state_get "$repo_unstaged_only/subdir")"
-unstaged_only_output="$TMP_DIR/unstaged-only-output"
-if run_flow_capture "$repo_unstaged_only/subdir" "$unstaged_only_output" commit; then
-	unstaged_only_status=0
+repo_modified_tracked="$TMP_DIR/repo-modified-tracked"
+init_repo "$repo_modified_tracked"
+git -C "$repo_modified_tracked" checkout -q -b scratch
+state_set "$repo_modified_tracked/subdir" '{"activeIssueNumber":6,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'modified tracked\n' >> "$repo_modified_tracked/tracked.txt"
+modified_tracked_head_before="$(current_head "$repo_modified_tracked")"
+modified_tracked_working_before="$(git -C "$repo_modified_tracked" diff --binary --no-ext-diff)"
+modified_tracked_output="$TMP_DIR/modified-tracked-output"
+if run_flow_capture "$repo_modified_tracked/subdir" "$modified_tracked_output" commit; then
+	modified_tracked_status=0
 else
-	unstaged_only_status=$?
+	modified_tracked_status=$?
 fi
-	unstaged_only_text="$(cat "$unstaged_only_output")"
-assert_equals "$unstaged_only_status" '1'
-assert_contains "$unstaged_only_text" 'unstaged tracked changes are present'
-assert_equals "$(current_head "$repo_unstaged_only")" "$unstaged_only_head_before"
-assert_equals "$(state_get "$repo_unstaged_only/subdir")" "$unstaged_only_state_before"
+	modified_tracked_text="$(cat "$modified_tracked_output")"
+assert_equals "$modified_tracked_status" '0'
+modified_tracked_head_after="$(current_head "$repo_modified_tracked")"
+assert_contains "$modified_tracked_text" 'Created checkpoint 1'
+assert_contains "$modified_tracked_text" "commit: $modified_tracked_head_after"
+assert_equals "$(current_message "$repo_modified_tracked")" '1'
+assert_equals "$(current_parent "$repo_modified_tracked")" "$modified_tracked_head_before"
+assert_equals "$(git -C "$repo_modified_tracked" diff "$modified_tracked_head_before" "$modified_tracked_head_after" --binary --no-ext-diff)" "$modified_tracked_working_before"
+assert_repo_clean "$repo_modified_tracked"
 
 repo_untracked_only="$TMP_DIR/repo-untracked-only"
 init_repo "$repo_untracked_only"
@@ -311,7 +319,6 @@ git -C "$repo_untracked_only" checkout -q -b scratch
 state_set "$repo_untracked_only/subdir" '{"activeIssueNumber":7,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
 printf 'untracked\n' > "$repo_untracked_only/new-file.txt"
 untracked_only_head_before="$(current_head "$repo_untracked_only")"
-untracked_only_state_before="$(state_get "$repo_untracked_only/subdir")"
 untracked_only_output="$TMP_DIR/untracked-only-output"
 if run_flow_capture "$repo_untracked_only/subdir" "$untracked_only_output" commit; then
 	untracked_only_status=0
@@ -319,52 +326,60 @@ else
 	untracked_only_status=$?
 fi
 	untracked_only_text="$(cat "$untracked_only_output")"
-assert_equals "$untracked_only_status" '1'
-assert_contains "$untracked_only_text" 'untracked files are present'
-assert_equals "$(current_head "$repo_untracked_only")" "$untracked_only_head_before"
-assert_equals "$(state_get "$repo_untracked_only/subdir")" "$untracked_only_state_before"
+assert_equals "$untracked_only_status" '0'
+assert_contains "$untracked_only_text" 'Created checkpoint 1'
+assert_equals "$(current_parent "$repo_untracked_only")" "$untracked_only_head_before"
+assert_equals "$(current_message "$repo_untracked_only")" '1'
+assert_equals "$(cat "$repo_untracked_only/new-file.txt")" 'untracked'
+git -C "$repo_untracked_only" ls-files --error-unmatch new-file.txt >/dev/null
+assert_repo_clean "$repo_untracked_only"
 
-repo_staged_unstaged="$TMP_DIR/repo-staged-unstaged"
-init_repo "$repo_staged_unstaged"
-git -C "$repo_staged_unstaged" checkout -q -b scratch
-state_set "$repo_staged_unstaged/subdir" '{"activeIssueNumber":8,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
-printf 'staged\n' >> "$repo_staged_unstaged/tracked.txt"
-git -C "$repo_staged_unstaged" add tracked.txt
-printf 'unstaged\n' >> "$repo_staged_unstaged/tracked.txt"
-staged_unstaged_head_before="$(current_head "$repo_staged_unstaged")"
-staged_unstaged_index_before="$(cached_diff "$repo_staged_unstaged")"
-staged_unstaged_output="$TMP_DIR/staged-unstaged-output"
-if run_flow_capture "$repo_staged_unstaged/subdir" "$staged_unstaged_output" commit; then
-	staged_unstaged_status=0
+repo_deleted_tracked="$TMP_DIR/repo-deleted-tracked"
+init_repo "$repo_deleted_tracked"
+git -C "$repo_deleted_tracked" checkout -q -b scratch
+state_set "$repo_deleted_tracked/subdir" '{"activeIssueNumber":8,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+rm "$repo_deleted_tracked/tracked.txt"
+deleted_tracked_head_before="$(current_head "$repo_deleted_tracked")"
+deleted_tracked_output="$TMP_DIR/deleted-tracked-output"
+if run_flow_capture "$repo_deleted_tracked/subdir" "$deleted_tracked_output" commit; then
+	deleted_tracked_status=0
 else
-	staged_unstaged_status=$?
+	deleted_tracked_status=$?
 fi
-	staged_unstaged_text="$(cat "$staged_unstaged_output")"
-assert_equals "$staged_unstaged_status" '1'
-assert_contains "$staged_unstaged_text" 'unstaged tracked changes are present'
-assert_equals "$(current_head "$repo_staged_unstaged")" "$staged_unstaged_head_before"
-assert_equals "$(cached_diff "$repo_staged_unstaged")" "$staged_unstaged_index_before"
+	deleted_tracked_text="$(cat "$deleted_tracked_output")"
+assert_equals "$deleted_tracked_status" '0'
+assert_contains "$deleted_tracked_text" 'Created checkpoint 1'
+assert_equals "$(current_parent "$repo_deleted_tracked")" "$deleted_tracked_head_before"
+assert_equals "$(current_message "$repo_deleted_tracked")" '1'
+assert_not_exists "$repo_deleted_tracked/tracked.txt"
+assert_contains "$(git -C "$repo_deleted_tracked" show --name-status --format= HEAD)" $'D\ttracked.txt'
+assert_repo_clean "$repo_deleted_tracked"
 
-repo_staged_untracked="$TMP_DIR/repo-staged-untracked"
-init_repo "$repo_staged_untracked"
-git -C "$repo_staged_untracked" checkout -q -b scratch
-state_set "$repo_staged_untracked/subdir" '{"activeIssueNumber":9,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
-printf 'staged\n' >> "$repo_staged_untracked/tracked.txt"
-git -C "$repo_staged_untracked" add tracked.txt
-printf 'untracked\n' > "$repo_staged_untracked/new-file.txt"
-staged_untracked_head_before="$(current_head "$repo_staged_untracked")"
-staged_untracked_index_before="$(cached_diff "$repo_staged_untracked")"
-staged_untracked_output="$TMP_DIR/staged-untracked-output"
-if run_flow_capture "$repo_staged_untracked/subdir" "$staged_untracked_output" commit; then
-	staged_untracked_status=0
+repo_mixed_changes="$TMP_DIR/repo-mixed-changes"
+init_repo "$repo_mixed_changes"
+git -C "$repo_mixed_changes" checkout -q -b scratch
+state_set "$repo_mixed_changes/subdir" '{"activeIssueNumber":9,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'staged\n' >> "$repo_mixed_changes/tracked.txt"
+git -C "$repo_mixed_changes" add tracked.txt
+printf 'unstaged\n' >> "$repo_mixed_changes/tracked.txt"
+printf 'untracked\n' > "$repo_mixed_changes/new-file.txt"
+mixed_changes_head_before="$(current_head "$repo_mixed_changes")"
+mixed_changes_output="$TMP_DIR/mixed-changes-output"
+if run_flow_capture "$repo_mixed_changes/subdir" "$mixed_changes_output" commit; then
+	mixed_changes_status=0
 else
-	staged_untracked_status=$?
+	mixed_changes_status=$?
 fi
-	staged_untracked_text="$(cat "$staged_untracked_output")"
-assert_equals "$staged_untracked_status" '1'
-assert_contains "$staged_untracked_text" 'untracked files are present'
-assert_equals "$(current_head "$repo_staged_untracked")" "$staged_untracked_head_before"
-assert_equals "$(cached_diff "$repo_staged_untracked")" "$staged_untracked_index_before"
+	mixed_changes_text="$(cat "$mixed_changes_output")"
+assert_equals "$mixed_changes_status" '0'
+assert_contains "$mixed_changes_text" 'Created checkpoint 1'
+assert_equals "$(current_parent "$repo_mixed_changes")" "$mixed_changes_head_before"
+assert_equals "$(current_message "$repo_mixed_changes")" '1'
+assert_contains "$(cat "$repo_mixed_changes/tracked.txt")" 'staged'
+assert_contains "$(cat "$repo_mixed_changes/tracked.txt")" 'unstaged'
+assert_equals "$(cat "$repo_mixed_changes/new-file.txt")" 'untracked'
+git -C "$repo_mixed_changes" ls-files --error-unmatch new-file.txt >/dev/null
+assert_repo_clean "$repo_mixed_changes"
 
 repo_success_zero="$TMP_DIR/repo-success-zero"
 init_repo "$repo_success_zero"

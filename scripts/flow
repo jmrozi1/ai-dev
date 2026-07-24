@@ -1237,18 +1237,12 @@ handle_commit() {
 		error "Cannot commit workflow: current branch ${current_branch} does not match scratchBranch ${scratch_branch}."
 	fi
 
+	git -C "$repo_root" add --all
+
 	local porcelain_status
 	porcelain_status="$(git -C "$repo_root" status --porcelain --untracked-files=all)"
 	local staged unstaged untracked working_tree
 	read -r staged unstaged untracked working_tree <<< "$(summarize_porcelain_status "$porcelain_status")"
-
-	if [[ "$unstaged" == 'yes' ]]; then
-		error 'Cannot commit workflow: unstaged tracked changes are present.'
-	fi
-
-	if [[ "$untracked" == 'yes' ]]; then
-		error 'Cannot commit workflow: untracked files are present.'
-	fi
 
 	if [[ "$staged" != 'yes' ]]; then
 		error 'Cannot commit workflow: no staged changes are available.'
