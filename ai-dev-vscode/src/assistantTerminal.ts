@@ -293,7 +293,21 @@ function buildProjectDiagnosticsMarkdown(
 		`- Knowledgebase files included: ${diagnostics.knowledgebaseFilesIncluded.length}`,
 		`- Routed summary count: ${diagnostics.routedSummaryCount}`,
 		`- Fallback summary count: ${diagnostics.fallbackSummaryCount}`,
-		`- Verified source count: ${diagnostics.verifiedSourceCount}`,
+		`- Verified source unique file count: ${diagnostics.verifiedSourceCount}`,
+		`- Verified source chunk count: ${diagnostics.verifiedSourceChunkCount ?? diagnostics.verifiedSourceCount}`,
+		`- Source targets discovered: ${diagnostics.sourceTargetsDiscovered ?? 0}`,
+		`- Source files read: ${diagnostics.sourceFilesRead ?? 0}`,
+		`- Source files considered: ${diagnostics.sourceFilesConsidered ?? 0}`,
+		`- Source chunk candidates: ${diagnostics.sourceChunkCandidates ?? 0}`,
+		`- Source chunks included: ${diagnostics.sourceChunksIncluded ?? 0}`,
+		`- Verified source characters included: ${diagnostics.verifiedSourceCharactersIncluded ?? 0}`,
+		`- Source chunks clipped by budget: ${diagnostics.sourceChunksClippedByBudget ?? 0}`,
+		`- Whole-file fallback chunks: ${diagnostics.wholeFileFallbackChunks ?? 0}`,
+		`- Source symbols requested: ${diagnostics.sourceSymbolsRequested ?? 0}`,
+		`- Source symbols resolved: ${diagnostics.sourceSymbolsResolved ?? 0}`,
+		`- Source unresolved symbols: ${diagnostics.sourceUnresolvedSymbols ?? 0}`,
+		`- Source declaration chunks generated: ${diagnostics.sourceDeclarationChunksGenerated ?? 0}`,
+		`- Source declaration chunks included: ${diagnostics.sourceDeclarationChunksIncluded ?? 0}`,
 		`- Fallback used: ${diagnostics.fallbackUsed}`,
 		`- Fallback reason: ${diagnostics.fallbackReason ?? 'none'}`,
 	];
@@ -334,6 +348,17 @@ function buildProjectDiagnosticsMarkdown(
 			'### Remediation Suggestions',
 			...diagnostics.remediationSuggestions.map(
 				(remediation) => `- ${remediation}`
+			)
+		);
+	}
+
+	if ((diagnostics.topRankedSourceTargets?.length ?? 0) > 0) {
+		lines.push(
+			'',
+			'### Top Ranked Source Targets',
+			...diagnostics.topRankedSourceTargets!.map(
+				(target) =>
+					`- ${target.path} | score=${target.targetScore} | authority=${target.authority} | included=${target.included}${target.symbol ? ` | symbol=${target.symbol}` : ''}${target.method ? ` | method=${target.method}` : ''}`
 			)
 		);
 	}

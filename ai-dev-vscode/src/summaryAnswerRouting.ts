@@ -64,7 +64,36 @@ export interface ProjectRouteDiagnostics {
 	knowledgebaseFilesIncluded: string[];
 	routedSummaryCount: number;
 	fallbackSummaryCount: number;
+	verifiedSourceChunkCount?: number;
 	verifiedSourceCount: number;
+	sourceTargetsDiscovered?: number;
+	sourceFilesRead?: number;
+	sourceFilesConsidered?: number;
+	sourceChunkCandidates?: number;
+	sourceChunksIncluded?: number;
+	verifiedSourceCharactersIncluded?: number;
+	sourceChunksClippedByBudget?: number;
+	wholeFileFallbackChunks?: number;
+	sourceSymbolsRequested?: number;
+	sourceSymbolsResolved?: number;
+	sourceDeclarationChunksGenerated?: number;
+	sourceDeclarationChunksIncluded?: number;
+	sourceUnresolvedSymbols?: number;
+	topRankedSourceTargets?: Array<{
+		path: string;
+		targetScore: number;
+		authority:
+			| 'implementation'
+			| 'test'
+			| 'generated-vendor'
+			| 'documentation-config';
+		symbol?: string;
+		method?:
+			| 'ts-declaration-span'
+			| 'text-line-window'
+			| 'whole-file-prefix-fallback';
+		included: boolean;
+	}>;
 	fallbackUsed: boolean;
 	fallbackReason?: string;
 	deficits: ProjectContextDeficit[];
@@ -106,7 +135,36 @@ export interface ProjectRouteDiagnosticsSignals {
 	sourceVerificationFailures: VerifiedAnswerSourceFailureWarning[];
 	knowledgebaseFilesConsidered: string[];
 	knowledgebaseFilesIncluded: string[];
+	verifiedSourceChunkCount?: number;
 	verifiedSourceCount: number;
+	sourceTargetsDiscovered?: number;
+	sourceFilesRead?: number;
+	sourceFilesConsidered?: number;
+	sourceChunkCandidates?: number;
+	sourceChunksIncluded?: number;
+	verifiedSourceCharactersIncluded?: number;
+	sourceChunksClippedByBudget?: number;
+	wholeFileFallbackChunks?: number;
+	sourceSymbolsRequested?: number;
+	sourceSymbolsResolved?: number;
+	sourceDeclarationChunksGenerated?: number;
+	sourceDeclarationChunksIncluded?: number;
+	sourceUnresolvedSymbols?: number;
+	topRankedSourceTargets?: Array<{
+		path: string;
+		targetScore: number;
+		authority:
+			| 'implementation'
+			| 'test'
+			| 'generated-vendor'
+			| 'documentation-config';
+		symbol?: string;
+		method?:
+			| 'ts-declaration-span'
+			| 'text-line-window'
+			| 'whole-file-prefix-fallback';
+		included: boolean;
+	}>;
 	fallbackReason?: string;
 }
 
@@ -241,7 +299,53 @@ export function buildProjectRouteDiagnostics(
 		knowledgebaseFilesIncluded: signals.knowledgebaseFilesIncluded,
 		routedSummaryCount: signals.routedSummaryCount,
 		fallbackSummaryCount: signals.fallbackSummaryCount,
+		verifiedSourceChunkCount:
+			signals.verifiedSourceChunkCount
+			?? signals.sourceChunksIncluded
+			?? signals.verifiedSourceCount,
 		verifiedSourceCount: signals.verifiedSourceCount,
+		sourceTargetsDiscovered:
+			signals.sourceTargetsDiscovered
+			?? 0,
+		sourceFilesRead:
+			signals.sourceFilesRead
+			?? 0,
+		sourceFilesConsidered:
+			signals.sourceFilesConsidered
+			?? 0,
+		sourceChunkCandidates:
+			signals.sourceChunkCandidates
+			?? 0,
+		sourceChunksIncluded:
+			signals.sourceChunksIncluded
+			?? 0,
+		verifiedSourceCharactersIncluded:
+			signals.verifiedSourceCharactersIncluded
+			?? 0,
+		sourceChunksClippedByBudget:
+			signals.sourceChunksClippedByBudget
+			?? 0,
+		wholeFileFallbackChunks:
+			signals.wholeFileFallbackChunks
+			?? 0,
+		sourceSymbolsRequested:
+			signals.sourceSymbolsRequested
+			?? 0,
+		sourceSymbolsResolved:
+			signals.sourceSymbolsResolved
+			?? 0,
+		sourceDeclarationChunksGenerated:
+			signals.sourceDeclarationChunksGenerated
+			?? 0,
+		sourceDeclarationChunksIncluded:
+			signals.sourceDeclarationChunksIncluded
+			?? 0,
+		sourceUnresolvedSymbols:
+			signals.sourceUnresolvedSymbols
+			?? 0,
+		topRankedSourceTargets:
+			signals.topRankedSourceTargets
+			?? [],
 		fallbackUsed: Boolean(signals.fallbackReason),
 		fallbackReason: signals.fallbackReason,
 		deficits,
@@ -1064,6 +1168,7 @@ export async function buildSummaryAnswerRoute(
 			workspaceRoot,
 			docsDir,
 			summaryEvidence,
+			userQuestion: trimmedUserQuestion,
 			dependencyMap,
 		});
 	const sourceVerificationFailures =
@@ -1126,7 +1231,22 @@ export async function buildSummaryAnswerRoute(
 		sourceVerificationFailures,
 		knowledgebaseFilesConsidered: knowledgebaseContext.consideredPaths,
 		knowledgebaseFilesIncluded: knowledgebaseContext.includedFiles.map((file) => file.path),
-		verifiedSourceCount: verifiedSourceContext.files.length,
+		verifiedSourceChunkCount: verifiedSourceContext.verifiedSourceChunkCount,
+		verifiedSourceCount: verifiedSourceContext.verifiedSourceUniqueFileCount,
+		sourceTargetsDiscovered: verifiedSourceContext.sourceTargetsDiscovered,
+		sourceFilesRead: verifiedSourceContext.sourceFilesRead,
+		sourceFilesConsidered: verifiedSourceContext.sourceFilesConsidered,
+		sourceChunkCandidates: verifiedSourceContext.sourceChunkCandidates,
+		sourceChunksIncluded: verifiedSourceContext.sourceChunksIncluded,
+		verifiedSourceCharactersIncluded: verifiedSourceContext.verifiedSourceCharactersIncluded,
+		sourceChunksClippedByBudget: verifiedSourceContext.sourceChunksClippedByBudget,
+		wholeFileFallbackChunks: verifiedSourceContext.wholeFileFallbackChunks,
+		sourceSymbolsRequested: verifiedSourceContext.sourceSymbolsRequested,
+		sourceSymbolsResolved: verifiedSourceContext.sourceSymbolsResolved,
+		sourceDeclarationChunksGenerated: verifiedSourceContext.sourceDeclarationChunksGenerated,
+		sourceDeclarationChunksIncluded: verifiedSourceContext.sourceDeclarationChunksIncluded,
+		sourceUnresolvedSymbols: verifiedSourceContext.sourceUnresolvedSymbols,
+		topRankedSourceTargets: verifiedSourceContext.topRankedTargets,
 		fallbackReason: fallbackIncludedReason,
 	});
 

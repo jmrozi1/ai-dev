@@ -431,10 +431,22 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 	verifiedSourceFiles?: Array<{
 		path: string;
 		role: 'primary-source' | 'dependency';
+		authority:
+			| 'implementation'
+			| 'test'
+			| 'generated-vendor'
+			| 'documentation-config';
 		primarySourcePath?: string;
 		relationshipKind?: string;
 		resolution?: 'exact' | 'inferred';
 		evidence?: string[];
+		symbol?: string;
+		startLine: number;
+		endLine: number;
+		extractionMethod:
+			| 'ts-declaration-span'
+			| 'text-line-window'
+			| 'whole-file-prefix-fallback';
 		contents: string;
 	}>;
 	userQuestion: string;
@@ -575,10 +587,19 @@ export function buildAnswerFromAiDocsDirectPromptMarkdown(params: {
 		);
 
 		for (const file of verifiedSourceFiles) {
+			const label =
+				file.extractionMethod === 'ts-declaration-span'
+					? 'Verified source declaration:'
+					: 'Verified source excerpt:';
+
 			lines.push(
 				'',
-				`Verified source: ${file.path}`,
+				label,
+				file.path,
+				...(file.symbol ? [`Symbol: ${file.symbol}`] : []),
 				`Role: ${file.role}`,
+				`Lines: ${file.startLine}-${file.endLine}`,
+				`Method: ${file.extractionMethod}`,
 			);
 
 			if (file.primarySourcePath) {

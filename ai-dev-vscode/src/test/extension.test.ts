@@ -132,6 +132,13 @@ import {
 	collectVerifiedAnswerSourceContext,
 	isFileVerificationCandidate,
 } from '../answerSourceVerification';
+import {
+	allocateSourceEvidenceChunks,
+	buildSourceEvidenceCandidatesForFile,
+	classifySourceEvidenceAuthority,
+	tokenizeSourceEvidenceQuestionTerms,
+	tokenizeSourceEvidenceTextTerms,
+} from '../answerSourceEvidence';
 // import * as myExtension from '../../extension';
 
 async function waitForCondition(
@@ -2926,7 +2933,7 @@ suite('Extension Test Suite', () => {
 					workspaceRoot,
 					'src/large.ts'
 				),
-				`export const large = '${'x'.repeat(13000)}';`,
+				`export const deployMarker = '${'x'.repeat(13000)}';`,
 				'utf8'
 			);
 
@@ -2942,6 +2949,7 @@ suite('Extension Test Suite', () => {
 								'- `src/large.ts` — Large source excerpt.',
 						},
 					],
+					userQuestion: 'Where is deployMarker defined?',
 					dependencyMap: {
 						version: 1,
 						edges: [],
@@ -2952,8 +2960,13 @@ suite('Extension Test Suite', () => {
 			assert.strictEqual(result.files[0].path, 'src/large.ts');
 			assert.strictEqual(result.files[0].contents.length, 12000);
 			assert.ok(
-				result.warnings.includes(
-					'src/large.ts: verified source was clipped to 12000 characters.'
+				result.warnings.some((warning) =>
+					warning.includes(
+						'src/large.ts: verified source excerpt lines'
+					)
+					&& warning.includes(
+						'was clipped by source evidence budget limits.'
+					)
 				)
 			);
 			assert.ok(
@@ -3010,6 +3023,835 @@ suite('Extension Test Suite', () => {
 				)
 			);
 		});
+
+	test('Answer verification uses text windows and keeps matches beyond 12000 characters', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+		const lines = Array.from({ length: 950 }, (_, index) =>
+			index === 700
+				? 'deploymarker line for evidence capture'
+				: `padding line ${index + 1} ${'x'.repeat(20)}`
+		);
+		await fs.writeFile(
+			path.join(workspaceRoot, 'src/large-window.ts'),
+			lines.join('\n'),
+			'utf8'
+		);
+
+		const result = await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir: 'ai-docs',
+			summaryEvidence: [
+				{
+					path: 'ai-docs/src/summary.md',
+					contents: '- `src/large-window.ts` — Deploy behavior.',
+				},
+			],
+			userQuestion: 'Where is deploymarker configured?',
+			dependencyMap: {
+				version: 1,
+				edges: [],
+			},
+		});
+
+		assert.strictEqual(result.files.length, 1);
+		assert.strictEqual(result.files[0].extractionMethod, 'text-line-window');
+		assert.match(result.files[0].contents, /deploymarker/);
+	});
+
+	test('Answer verification emits multiple chunks for separated matches in one file', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+		const lines = Array.from({ length: 90 }, (_, index) => {
+			if (index === 9) {
+				return 'alphaunique appears here';
+			}
+
+			if (index === 69) {
+				return 'betaunique appears here';
+			}
+
+			return `filler-${index + 1}`;
+		});
+		await fs.writeFile(
+			path.join(workspaceRoot, 'src/split.ts'),
+			lines.join('\n'),
+			'utf8'
+		);
+
+		const result = await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir: 'ai-docs',
+			summaryEvidence: [
+				{
+					path: 'ai-docs/src/summary.md',
+					contents: '- `src/split.ts` — Split logic.',
+				},
+			],
+			userQuestion: 'alphaunique betaunique',
+			dependencyMap: {
+				version: 1,
+				edges: [],
+			},
+		});
+
+		assert.strictEqual(result.files.length, 2);
+		assert.ok(result.files[0].endLine < result.files[1].startLine);
+		assert.ok(result.files.every((file) => file.extractionMethod === 'text-line-window'));
+	});
+
+	test('Answer verification merges overlapping windows into one chunk', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+		const lines = Array.from({ length: 60 }, (_, index) => {
+			if (index === 19) {
+				return 'alphamerge marker';
+			}
+
+			if (index === 23) {
+				return 'betamerge marker';
+			}
+
+			return `line-${index + 1}`;
+		});
+		await fs.writeFile(
+			path.join(workspaceRoot, 'src/merge.ts'),
+			lines.join('\n'),
+			'utf8'
+		);
+
+		const result = await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir: 'ai-docs',
+			summaryEvidence: [
+				{
+					path: 'ai-docs/src/summary.md',
+					contents: '- `src/merge.ts` — Merge logic.',
+				},
+			],
+			userQuestion: 'alphamerge betamerge',
+			dependencyMap: {
+				version: 1,
+				edges: [],
+			},
+		});
+
+		assert.strictEqual(result.files.length, 1);
+		assert.ok(result.files[0].startLine <= 20);
+		assert.ok(result.files[0].endLine >= 24);
+	});
+
+	test('Answer verification falls back to whole-file prefix when no match terms are found', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+		await fs.writeFile(
+			path.join(workspaceRoot, 'src/fallback.ts'),
+			['one', 'two', 'three', 'four'].join('\n'),
+			'utf8'
+		);
+
+		const result = await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir: 'ai-docs',
+			summaryEvidence: [
+				{
+					path: 'ai-docs/src/summary.md',
+					contents: '- `src/fallback.ts` — Fallback source.',
+				},
+			],
+			userQuestion: 'deploy service build pipeline',
+			dependencyMap: {
+				version: 1,
+				edges: [],
+			},
+		});
+
+		assert.strictEqual(result.files.length, 1);
+		assert.strictEqual(result.files[0].extractionMethod, 'whole-file-prefix-fallback');
+		assert.strictEqual(result.files[0].startLine, 1);
+		assert.strictEqual(result.files[0].endLine, 4);
+	});
+
+	test('Source evidence allocation enforces global 60000-character cap', () => {
+		const candidates = Array.from({ length: 8 }, (_, index) => ({
+			sourcePath: `src/budget-${index + 1}.ts`,
+			role: 'primary-source' as const,
+			authority: 'implementation' as const,
+			method: 'text-line-window' as const,
+			startLine: 1,
+			endLine: 1,
+			contents: 'x'.repeat(12000),
+			score: 100 - index,
+		}));
+
+		const result = allocateSourceEvidenceChunks({
+			candidates,
+			options: {
+				totalBudgetChars: 60000,
+				perFileCeilingChars: 20000,
+				perChunkCapChars: 12000,
+			},
+		});
+
+		assert.strictEqual(result.totalIncludedChars, 60000);
+		assert.strictEqual(result.chunks.length, 5);
+		assert.strictEqual(result.chunksClippedByBudget, 0);
+	});
+
+	test('Source evidence allocation enforces per-file 20000-character ceiling', () => {
+		const result = allocateSourceEvidenceChunks({
+			candidates: [
+				{
+					sourcePath: 'src/per-file.ts',
+					role: 'primary-source',
+					authority: 'implementation',
+					method: 'text-line-window',
+					startLine: 1,
+					endLine: 20,
+					contents: 'a'.repeat(12000),
+					score: 100,
+				},
+				{
+					sourcePath: 'src/per-file.ts',
+					role: 'primary-source',
+					authority: 'implementation',
+					method: 'text-line-window',
+					startLine: 40,
+					endLine: 60,
+					contents: 'b'.repeat(12000),
+					score: 99,
+				},
+			],
+			options: {
+				totalBudgetChars: 60000,
+				perFileCeilingChars: 20000,
+				perChunkCapChars: 12000,
+			},
+		});
+
+		assert.strictEqual(result.chunks.length, 2);
+		assert.strictEqual(result.totalIncludedChars, 20000);
+		assert.strictEqual(result.chunks[0].includedChars, 12000);
+		assert.strictEqual(result.chunks[1].includedChars, 8000);
+		assert.strictEqual(result.chunksClippedByBudget, 1);
+	});
+
+	test('Source evidence text tokenization splits camelCase and path components', () => {
+		const terms = tokenizeSourceEvidenceTextTerms('ai-dev-vscode/src/answerSourceEvidence.ts');
+
+		assert.ok(terms.includes('answer'));
+		assert.ok(terms.includes('source'));
+		assert.ok(terms.includes('evidence'));
+	});
+
+	test('Source evidence question tokenization normalizes phrase terms', () => {
+		const terms = tokenizeSourceEvidenceQuestionTerms(
+			'How does source verification choose which source excerpts to include?'
+		);
+
+		assert.ok(terms.includes('source'));
+		assert.ok(terms.includes('verification'));
+		assert.ok(terms.includes('excerpts'));
+	});
+
+	test('Authority classification distinguishes implementation and test files', () => {
+		assert.strictEqual(
+			classifySourceEvidenceAuthority('ai-dev-vscode/src/answerSourceEvidence.ts'),
+			'implementation'
+		);
+		assert.strictEqual(
+			classifySourceEvidenceAuthority('ai-dev-vscode/src/test/extension.test.ts'),
+			'test'
+		);
+	});
+
+	test('Distinct term matches outrank repeated single-term copies', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms(
+			'how source verification evidence allocation works'
+		);
+		const multiTermCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/impl.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				matchedTerms: questionTerms,
+				targetRelevanceScore: 20,
+			},
+			contents:
+				'source verification evidence allocation are implemented here.',
+			questionTerms,
+		});
+		const repeatedCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/repeated.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				matchedTerms: questionTerms,
+				targetRelevanceScore: 20,
+			},
+			contents: 'source '.repeat(200),
+			questionTerms,
+		});
+
+		assert.ok(multiTermCandidates.length > 0);
+		assert.ok(repeatedCandidates.length > 0);
+		assert.ok(multiTermCandidates[0].score > repeatedCandidates[0].score);
+	});
+
+	test('Implementation evidence outranks equally relevant test evidence', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms(
+			'how source verification evidence allocation works'
+		);
+		const implCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'ai-dev-vscode/src/answerSourceEvidence.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				matchedTerms: questionTerms,
+				targetRelevanceScore: 15,
+			},
+			contents:
+				'source verification evidence allocation implementation details',
+			questionTerms,
+		});
+		const testCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'ai-dev-vscode/src/test/extension.test.ts',
+				role: 'primary-source',
+				authority: 'test',
+				matchedTerms: questionTerms,
+				targetRelevanceScore: 15,
+			},
+			contents:
+				'source verification evidence allocation implementation details',
+			questionTerms,
+		});
+
+		assert.ok(implCandidates.length > 0);
+		assert.ok(testCandidates.length > 0);
+		assert.ok(implCandidates[0].score > testCandidates[0].score);
+	});
+
+	test('Answer verification allows a highly relevant ninth candidate to compete globally', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+		const summaryLines: string[] = [];
+
+		for (let index = 1; index <= 8; index += 1) {
+			const weakPath = `src/weak-${index}.ts`;
+			await fs.writeFile(
+				path.join(workspaceRoot, weakPath),
+				`export const weak${index} = '${'x'.repeat(15000)}';`,
+				'utf8'
+			);
+			summaryLines.push(`- \`${weakPath}\` — generic implementation note.`);
+		}
+
+		const strongPath = 'src/source-verification-ranking-allocation.ts';
+		await fs.writeFile(
+			path.join(workspaceRoot, strongPath),
+			[
+				'export function rankSourceEvidenceChunks(): void {',
+				"\tconst explanation = 'source verification ranking allocation picks global excerpts';",
+				"\tconsole.log(explanation);",
+				'}',
+			].join('\n'),
+			'utf8'
+		);
+		summaryLines.push(
+			`- \`${strongPath}\` — source verification ranking allocation and global excerpt selection logic.`
+		);
+
+		const result = await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir: 'ai-docs',
+			summaryEvidence: [
+				{
+					path: 'ai-docs/src/summary.md',
+					contents: summaryLines.join('\n'),
+				},
+			],
+			userQuestion:
+				'How does source verification choose which source excerpts to include and rank for allocation?',
+			dependencyMap: {
+				version: 1,
+				edges: [],
+			},
+		});
+
+		const includedPaths = new Set(result.files.map((file) => file.path));
+		const includedWeakCount = [...includedPaths].filter((filePath) =>
+			filePath.startsWith('src/weak-')
+		).length;
+
+		assert.ok(includedPaths.has(strongPath));
+		assert.ok(includedWeakCount < 8);
+		assert.ok(result.verifiedSourceCharactersIncluded <= 60000);
+	});
+
+	test('Answer verification prioritizes implementation evidence over repetitive test evidence', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(
+				os.tmpdir(),
+				'ai-dev-answer-verification-'
+			)
+		);
+
+		await fs.mkdir(path.join(workspaceRoot, 'ai-dev-vscode/src/test'), {
+			recursive: true,
+		});
+		await fs.writeFile(
+			path.join(workspaceRoot, 'ai-dev-vscode/src/answerSourceEvidence.ts'),
+			[
+				'export function allocateSourceEvidenceChunks(): void {',
+				"\tconst description = 'source verification evidence allocation ranking implementation';",
+				'\tconsole.log(description);',
+				'}',
+			].join('\n'),
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(workspaceRoot, 'ai-dev-vscode/src/answerSourceVerification.ts'),
+			[
+				'export function collectVerifiedAnswerSourceContext(): void {',
+				"\tconst description = 'source verification orchestrates ranked excerpts';",
+				'\tconsole.log(description);',
+				'}',
+			].join('\n'),
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(workspaceRoot, 'ai-dev-vscode/src/promptBuilder.ts'),
+			[
+				'export function renderPrompt(): void {',
+				"\tconst description = 'renders source excerpts into prompt';",
+				'\tconsole.log(description);',
+				'}',
+			].join('\n'),
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(workspaceRoot, 'ai-dev-vscode/src/test/extension.test.ts'),
+			[
+				'source verification source verification source verification source verification',
+				'source verification evidence evidence evidence allocation allocation'.repeat(500),
+			].join(' '),
+			'utf8'
+		);
+
+		const result = await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir: 'ai-docs',
+			summaryEvidence: [
+				{
+					path: 'ai-docs/src/summary.md',
+					contents: [
+						'- `ai-dev-vscode/src/answerSourceVerification.ts` — verification orchestration.',
+						'- `ai-dev-vscode/src/promptBuilder.ts` — consumer rendering.',
+						'- `ai-dev-vscode/src/test/extension.test.ts` — repeated term-heavy test coverage.',
+						'- `ai-dev-vscode/src/answerSourceEvidence.ts` — source evidence ranking and allocation implementation.',
+					].join('\n'),
+				},
+			],
+			userQuestion:
+				'How does source verification choose which source excerpts to include?',
+			dependencyMap: {
+				version: 1,
+				edges: [],
+			},
+		});
+
+		const includedPaths = new Set(result.files.map((file) => file.path));
+		assert.ok(includedPaths.has('ai-dev-vscode/src/answerSourceEvidence.ts'));
+		assert.ok(includedPaths.has('ai-dev-vscode/src/answerSourceVerification.ts'));
+		assert.ok(result.verifiedSourceCharactersIncluded <= 60000);
+
+		const evidenceTargetScore = result.topRankedTargets.find(
+			(target) => target.path === 'ai-dev-vscode/src/answerSourceEvidence.ts'
+		);
+		const testTargetScore = result.topRankedTargets.find(
+			(target) => target.path === 'ai-dev-vscode/src/test/extension.test.ts'
+		);
+
+		assert.ok(evidenceTargetScore);
+		assert.ok(testTargetScore);
+		assert.ok((evidenceTargetScore?.targetScore ?? 0) > (testTargetScore?.targetScore ?? 0));
+	});
+
+	test('Structured explicit source-path metadata outranks inferred reference', async () => {
+		const workspaceRoot = await fs.mkdtemp(
+			path.join(os.tmpdir(), 'ai-dev-answer-verification-')
+		);
+
+		await fs.mkdir(path.join(workspaceRoot, 'src'), { recursive: true });
+		await fs.writeFile(
+			path.join(workspaceRoot, 'src/explicit.ts'),
+			'export const value = 1;\n',
+			'utf8'
+		);
+		await fs.writeFile(
+			path.join(workspaceRoot, 'src/inferred.ts'),
+			'export const value = 2;\n',
+			'utf8'
+		);
+
+		const result = await collectVerifiedAnswerSourceContext({
+			workspaceRoot,
+			docsDir: 'ai-docs',
+			summaryEvidence: [
+				{
+					path: 'ai-docs/src/summary.md',
+					contents: [
+						'- sourcePath: src/explicit.ts',
+						'- `src/inferred.ts`',
+					].join('\n'),
+				},
+			],
+			userQuestion: 'how does source verification choose excerpts',
+			dependencyMap: {
+				version: 1,
+				edges: [],
+			},
+		});
+
+		const explicit = result.topRankedTargets.find(
+			(target) => target.path === 'src/explicit.ts'
+		);
+		const inferred = result.topRankedTargets.find(
+			(target) => target.path === 'src/inferred.ts'
+		);
+
+		assert.ok(explicit);
+		assert.ok(inferred);
+		assert.ok((explicit?.targetScore ?? 0) > (inferred?.targetScore ?? 0));
+	});
+
+	test('Allocation tie ordering remains stable by path', () => {
+		const result = allocateSourceEvidenceChunks({
+			candidates: [
+				{
+					sourcePath: 'src/zeta.ts',
+					role: 'primary-source',
+					authority: 'implementation',
+					method: 'text-line-window',
+					startLine: 1,
+					endLine: 3,
+					contents: 'abc',
+					score: 100,
+				},
+				{
+					sourcePath: 'src/alpha.ts',
+					role: 'primary-source',
+					authority: 'implementation',
+					method: 'text-line-window',
+					startLine: 1,
+					endLine: 3,
+					contents: 'abc',
+					score: 100,
+				},
+			],
+		});
+
+		assert.deepStrictEqual(
+			result.chunks.map((chunk) => chunk.sourcePath),
+			['src/alpha.ts', 'src/zeta.ts']
+		);
+	});
+
+	test('TS declaration extraction resolves function declaration spans', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms(
+			'How does allocation work?'
+		);
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/evidence.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'allocateSourceEvidenceChunks',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+				targetRelevanceScore: 20,
+			},
+			contents: [
+				'export function helper(): void {}',
+				'export function allocateSourceEvidenceChunks(): number {',
+				'\treturn 1;',
+				'}',
+			].join('\n'),
+			questionTerms,
+		});
+
+		assert.strictEqual(candidates[0].method, 'ts-declaration-span');
+		assert.strictEqual(candidates[0].symbol, 'allocateSourceEvidenceChunks');
+		assert.match(candidates[0].contents, /allocateSourceEvidenceChunks/);
+	});
+
+	test('TS declaration extraction resolves class declaration spans', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('class allocation behavior');
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/evidence.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'EvidenceAllocator',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+				targetRelevanceScore: 20,
+			},
+			contents: [
+				'class Other {}',
+				'export class EvidenceAllocator {',
+				'\tpublic allocate(): void {}',
+				'}',
+			].join('\n'),
+			questionTerms,
+		});
+
+		assert.strictEqual(candidates[0].method, 'ts-declaration-span');
+		assert.match(candidates[0].contents, /class EvidenceAllocator/);
+	});
+
+	test('TS declaration extraction resolves interface, type alias, and enum spans', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('shape config enum types');
+
+		const interfaceCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/types.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'EvidenceShape',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: 'export interface EvidenceShape { id: string; }',
+			questionTerms,
+		});
+		const typeCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/types.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'EvidenceMode',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: 'export type EvidenceMode = "strict" | "loose";',
+			questionTerms,
+		});
+		const enumCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/types.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'EvidenceKind',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: 'export enum EvidenceKind { Primary, Dependency }',
+			questionTerms,
+		});
+
+		assert.strictEqual(interfaceCandidates[0].method, 'ts-declaration-span');
+		assert.strictEqual(typeCandidates[0].method, 'ts-declaration-span');
+		assert.strictEqual(enumCandidates[0].method, 'ts-declaration-span');
+	});
+
+	test('TS declaration extraction resolves variable and class member symbols', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('config value method');
+		const variableCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/evidence.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'ALLOCATOR_LIMIT',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: 'export const ALLOCATOR_LIMIT = 60000;',
+			questionTerms,
+		});
+		const memberCandidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/evidence.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'Allocator.allocate',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: [
+				'export class Allocator {',
+				'\tallocate(): number {',
+				'\t\treturn 1;',
+				'\t}',
+				'}',
+			].join('\n'),
+			questionTerms,
+		});
+
+		assert.strictEqual(variableCandidates[0].method, 'ts-declaration-span');
+		assert.strictEqual(memberCandidates[0].method, 'ts-declaration-span');
+		assert.strictEqual(memberCandidates[0].symbol, 'Allocator.allocate');
+	});
+
+	test('Exact symbol match outranks normalized fallback', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('allocator path');
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/evidence.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'Allocator',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: [
+				'export class allocator {}',
+				'export class Allocator {}',
+			].join('\n'),
+			questionTerms,
+		});
+
+		assert.strictEqual(candidates[0].method, 'ts-declaration-span');
+		assert.match(candidates[0].contents, /class Allocator/);
+	});
+
+	test('Declaration extraction works beyond first 12000 characters and preserves lines', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('allocator declaration lines');
+		const prefix = '// pad\n'.repeat(2500);
+		const contents = `${prefix}export function deepAllocator(): number {\n\treturn 42;\n}`;
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/deep.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'deepAllocator',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents,
+			questionTerms,
+		});
+
+		assert.strictEqual(candidates[0].method, 'ts-declaration-span');
+		assert.ok(candidates[0].startLine > 2000);
+		assert.ok(candidates[0].endLine >= candidates[0].startLine);
+		assert.match(candidates[0].contents, /deepAllocator/);
+	});
+
+	test('Declaration extraction includes attached JSDoc and decorator where available', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('allocator class doc');
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/decorated.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'DecoratedAllocator',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: [
+				'/** Important allocator */',
+				'@sealed',
+				'export class DecoratedAllocator {}',
+			].join('\n'),
+			questionTerms,
+		});
+
+		assert.strictEqual(candidates[0].method, 'ts-declaration-span');
+		assert.match(candidates[0].contents, /Important allocator/);
+		assert.match(candidates[0].contents, /@sealed/);
+	});
+
+	test('Non-TS files continue using text line windows', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('allocate snippets');
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'docs/notes.md',
+				role: 'primary-source',
+				authority: 'documentation-config',
+				symbol: 'allocateSourceEvidenceChunks',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: 'allocate source evidence chunks here',
+			questionTerms,
+		});
+
+		assert.ok(candidates.every((candidate) => candidate.method !== 'ts-declaration-span'));
+		assert.ok(candidates.some((candidate) => candidate.method === 'text-line-window'));
+	});
+
+	test('No symbol metadata preserves line-window/fallback checkpoint behavior', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('allocator fallback');
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/plain.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				matchedTerms: questionTerms,
+			},
+			contents: 'allocator fallback snippet',
+			questionTerms,
+		});
+
+		assert.ok(candidates.every((candidate) => candidate.method !== 'ts-declaration-span'));
+	});
+
+	test('Multiple declarations with same symbol resolve deterministically by source order', () => {
+		const questionTerms = tokenizeSourceEvidenceQuestionTerms('allocator overload');
+		const candidates = buildSourceEvidenceCandidatesForFile({
+			target: {
+				sourcePath: 'src/overload.ts',
+				role: 'primary-source',
+				authority: 'implementation',
+				symbol: 'allocate',
+				symbolAssociation: 'explicit',
+				matchedTerms: questionTerms,
+			},
+			contents: [
+				'export function allocate(input: string): string;',
+				'export function allocate(input: number): number;',
+				'export function allocate(input: string | number): string | number {',
+				'\treturn input;',
+				'}',
+			].join('\n'),
+			questionTerms,
+		});
+
+		assert.strictEqual(candidates[0].method, 'ts-declaration-span');
+		assert.strictEqual(candidates[0].startLine, 1);
+	});
 
 	test('Answer verification follows direct dependency edges', async () => {
 		const workspaceRoot = await fs.mkdtemp(
@@ -3086,30 +3928,30 @@ suite('Extension Test Suite', () => {
 				},
 			});
 
-		assert.deepStrictEqual(
-			result.files.map((file) => [
-				file.role,
-				file.path,
-			]),
-			[
-				[
-					'primary-source',
-					'jobs/config.xml',
-				],
-				[
-					'dependency',
-					'pipelines/Jenkinsfile',
-				],
-			]
+		const primaryFile = result.files.find(
+			(file) =>
+				file.role === 'primary-source'
+				&& file.path === 'jobs/config.xml'
 		);
+		const dependencyFile = result.files.find(
+			(file) =>
+				file.role === 'dependency'
+				&& file.path === 'pipelines/Jenkinsfile'
+		);
+
+		assert.ok(primaryFile);
+		assert.ok(dependencyFile);
 		assert.match(
-			result.files[1].contents,
+			dependencyFile!.contents,
 			/stage\("Deploy"\)/
 		);
 		assert.strictEqual(
-			result.files[1].resolution,
+			dependencyFile!.resolution,
 			'inferred'
 		);
+		assert.deepStrictEqual(dependencyFile!.evidence, ['Unique suffix match.']);
+		assert.ok(dependencyFile!.startLine >= 1);
+		assert.ok(dependencyFile!.endLine >= dependencyFile!.startLine);
 	});
 
 	test('Answer prompts distinguish summaries from verified source', () => {
@@ -3150,6 +3992,10 @@ suite('Extension Test Suite', () => {
 					{
 						path: 'jobs/config.xml',
 						role: 'primary-source',
+						authority: 'implementation',
+						startLine: 1,
+						endLine: 1,
+						extractionMethod: 'text-line-window',
 						contents: '<flow-definition />',
 					},
 				],
@@ -3163,8 +4009,10 @@ suite('Extension Test Suite', () => {
 		);
 		assert.match(
 			prompt,
-			/Verified source: jobs\/config\.xml/
+			/Verified source excerpt:\s*jobs\/config\.xml/
 		);
+		assert.match(prompt, /Lines: 1-1/);
+		assert.match(prompt, /Method: text-line-window/);
 		assert.match(
 			prompt,
 			/When summaries and verified source disagree/
@@ -3351,7 +4199,7 @@ suite('Extension Test Suite', () => {
 				);
 				await fs.writeFile(
 					path.join(workspaceRoot, sourceDir, 'large.ts'),
-					'x'.repeat(13050),
+					`deployment ${'x'.repeat(13050)}`,
 					'utf8'
 				);
 
@@ -3362,10 +4210,13 @@ suite('Extension Test Suite', () => {
 				assert.ok(
 					result.warnings.some((warning) =>
 						warning.includes(
-							`${sourceDir}/large.ts: verified source was clipped to 12000 characters.`
+							`${sourceDir}/large.ts: verified source excerpt lines`
 						)
 					)
 				);
+				assert.match(result.prompt, /Lines: \d+-\d+/);
+				assert.ok((result.diagnostics.sourceChunkCandidates ?? 0) > 0);
+				assert.ok((result.diagnostics.verifiedSourceChunkCount ?? 0) > 0);
 				assert.ok(
 					result.diagnostics.deficits.every(
 						(deficit) =>
@@ -3435,6 +4286,117 @@ suite('Extension Test Suite', () => {
 				);
 			});
 		});
+
+	test('Summary answer route includes declaration span for allocateSourceEvidenceChunks', async function () {
+		this.timeout(20000);
+
+		await withTemporaryWorkspace(async ({
+			workspaceRoot,
+			docsDir,
+		}) => {
+			for (const file of [
+				'ai-dev-vscode/src/assistantTerminal.ts',
+				'ai-dev-vscode/src/summaryAnswerRouting.ts',
+				'ai-dev-vscode/src/promptBuilder.ts',
+				'ai-dev-vscode/src/answerSourceVerification.ts',
+				'ai-dev-vscode/src/answerSourceEvidence.ts',
+			]) {
+				await fs.mkdir(
+					path.dirname(path.join(workspaceRoot, file)),
+					{ recursive: true }
+				);
+			}
+
+			await fs.writeFile(
+				path.join(workspaceRoot, 'ai-dev-vscode/src/assistantTerminal.ts'),
+				'export const terminalHelper = true;\n',
+				'utf8'
+			);
+			await fs.writeFile(
+				path.join(workspaceRoot, 'ai-dev-vscode/src/summaryAnswerRouting.ts'),
+				'export const routingHelper = true;\n',
+				'utf8'
+			);
+			await fs.writeFile(
+				path.join(workspaceRoot, 'ai-dev-vscode/src/promptBuilder.ts'),
+				'export const promptHelper = true;\n',
+				'utf8'
+			);
+			await fs.writeFile(
+				path.join(workspaceRoot, 'ai-dev-vscode/src/answerSourceVerification.ts'),
+				'export const verificationHelper = true;\n',
+				'utf8'
+			);
+			await fs.writeFile(
+				path.join(workspaceRoot, 'ai-dev-vscode/src/answerSourceEvidence.ts'),
+				[
+					'export function allocateSourceEvidenceChunks(): void {',
+					"\tconst text = 'source excerpt ranking allocation logic';",
+					'\tconsole.log(text);',
+					'}',
+				].join('\n'),
+				'utf8'
+			);
+
+			await fs.mkdir(
+				path.join(
+					workspaceRoot,
+					docsDir,
+					'service'
+				),
+				{ recursive: true }
+			);
+
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					docsDir,
+					'architecture-summary.md'
+				),
+				[
+					'# Architecture Summary',
+					'',
+					'## Summaries',
+					'',
+					`- \`${docsDir}/service/summary.md\``,
+				].join('\n'),
+				'utf8'
+			);
+
+			await fs.writeFile(
+				path.join(
+					workspaceRoot,
+					docsDir,
+					'service/summary.md'
+				),
+				[
+					'- `ai-dev-vscode/src/assistantTerminal.ts` — terminal output.',
+					'- `ai-dev-vscode/src/summaryAnswerRouting.ts` — routing entry point.',
+					'- `ai-dev-vscode/src/promptBuilder.ts` — prompt rendering.',
+					'- `ai-dev-vscode/src/answerSourceVerification.ts` — verification orchestration.',
+					'- sourcePath: ai-dev-vscode/src/answerSourceEvidence.ts symbol: allocateSourceEvidenceChunks',
+					'- `ai-dev-vscode/src/answerSourceEvidence.ts` — `allocateSourceEvidenceChunks` exact ranking and allocation implementation for source evidence chunks.',
+				].join('\n'),
+				'utf8'
+			);
+
+			const result = await buildSummaryAnswerRoute(
+				'How does source verification choose which source excerpts to include?'
+			);
+
+			assert.match(
+				result.prompt,
+				/Verified source declaration:\s*ai-dev-vscode\/src\/answerSourceEvidence\.ts/
+			);
+			assert.match(result.prompt, /Symbol: allocateSourceEvidenceChunks/);
+			assert.match(result.prompt, /Method: ts-declaration-span/);
+			assert.strictEqual(result.diagnostics.sourceSymbolsRequested, 1);
+			assert.strictEqual(result.diagnostics.sourceSymbolsResolved, 1);
+			assert.ok((result.diagnostics.sourceDeclarationChunksIncluded ?? 0) >= 1);
+			assert.ok((result.diagnostics.sourceTargetsDiscovered ?? 0) >= 5);
+			assert.ok((result.diagnostics.sourceFilesRead ?? 0) >= 5);
+		});
+	});
 
 	test('Summary answer route mixed references verify only path candidates', async function () {
 		this.timeout(20000);
