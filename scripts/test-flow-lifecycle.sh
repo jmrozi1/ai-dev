@@ -233,6 +233,9 @@ printf 'checkpoint one\n' >> "$lifecycle_repo/tracked.txt"
 printf 'new file one\n' > "$lifecycle_repo/one.txt"
 
 review_one_output="$(run_flow "$lifecycle_repo/subdir" review)"
+assert_contains "$review_one_output" 'Issue: 123'
+assert_contains "$review_one_output" 'Review summary:'
+assert_contains "$review_one_output" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
 assert_contains "$review_one_output" 'diff --git a/one.txt b/one.txt'
 assert_contains "$review_one_output" 'diff --git a/tracked.txt b/tracked.txt'
 
@@ -251,7 +254,13 @@ printf 'checkpoint two\n' >> "$lifecycle_repo/tracked.txt"
 printf 'new file two\n' > "$lifecycle_repo/two.txt"
 
 review_two_output="$(run_flow "$lifecycle_repo/subdir" review)"
+assert_contains "$review_two_output" 'Issue: 123'
+assert_contains "$review_two_output" 'Review summary:'
+assert_contains "$review_two_output" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
 assert_contains "$review_two_output" 'diff --git a/two.txt b/two.txt'
+assert_contains "$review_two_output" ' checkpoint one'
+assert_contains "$review_two_output" '+checkpoint two'
+assert_not_contains "$review_two_output" '+checkpoint one'
 
 commit_two_output="$(run_flow "$lifecycle_repo/subdir" commit)"
 assert_contains "$commit_two_output" 'Created checkpoint 2'

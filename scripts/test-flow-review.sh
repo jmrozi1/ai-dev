@@ -136,6 +136,19 @@ cached_diff() {
 	git -C "$repo_root" diff --cached --binary --no-ext-diff
 }
 
+cached_shortstat() {
+	local repo_root="$1"
+	git -C "$repo_root" diff --cached --shortstat --binary --no-ext-diff | sed 's/^ *//'
+}
+
+expected_review_output() {
+	local repo_root="$1"
+	local label_line="$2"
+	local summary_text
+	summary_text="$(cached_shortstat "$repo_root")"
+	printf '%s\nReview summary: %s\nDiff legend: + added, - removed, unprefixed lines are unchanged context\n\n%s' "$label_line" "$summary_text" "$(cached_diff "$repo_root")"
+}
+
 cached_diff_names() {
 	local repo_root="$1"
 	git -C "$repo_root" diff --cached --name-only --no-ext-diff
@@ -286,7 +299,10 @@ else
 fi
 staged_text="$(cat "$staged_output")"
 assert_equals "$staged_status" '0'
-assert_equals "$staged_text" "$(cached_diff "$repo_staged")"
+assert_contains "$staged_text" 'Issue: 10'
+assert_contains "$staged_text" 'Review summary:'
+assert_contains "$staged_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$staged_text" "$(cached_diff "$repo_staged")"
 assert_all_changes_staged "$repo_staged"
 
 repo_unstaged="$TMP_DIR/repo-unstaged"
@@ -302,7 +318,10 @@ else
 fi
 unstaged_text="$(cat "$unstaged_output")"
 assert_equals "$unstaged_status" '0'
-assert_equals "$unstaged_text" "$(cached_diff "$repo_unstaged")"
+assert_contains "$unstaged_text" 'Issue: 11'
+assert_contains "$unstaged_text" 'Review summary:'
+assert_contains "$unstaged_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$unstaged_text" "$(cached_diff "$repo_unstaged")"
 assert_all_changes_staged "$repo_unstaged"
 
 repo_untracked="$TMP_DIR/repo-untracked"
@@ -318,7 +337,10 @@ else
 fi
 untracked_text="$(cat "$untracked_output")"
 assert_equals "$untracked_status" '0'
-assert_equals "$untracked_text" "$(cached_diff "$repo_untracked")"
+assert_contains "$untracked_text" 'Issue: 12'
+assert_contains "$untracked_text" 'Review summary:'
+assert_contains "$untracked_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$untracked_text" "$(cached_diff "$repo_untracked")"
 assert_contains "$untracked_text" 'diff --git a/new-file.txt b/new-file.txt'
 assert_all_changes_staged "$repo_untracked"
 git -C "$repo_untracked" check-ignore -q .ai-dev/workflow.json
@@ -337,7 +359,10 @@ else
 fi
 deleted_text="$(cat "$deleted_output")"
 assert_equals "$deleted_status" '0'
-assert_equals "$deleted_text" "$(cached_diff "$repo_deleted")"
+assert_contains "$deleted_text" 'Issue: 13'
+assert_contains "$deleted_text" 'Review summary:'
+assert_contains "$deleted_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$deleted_text" "$(cached_diff "$repo_deleted")"
 assert_contains "$deleted_text" 'deleted file mode'
 assert_all_changes_staged "$repo_deleted"
 
@@ -354,10 +379,32 @@ else
 fi
 renamed_text="$(cat "$renamed_output")"
 assert_equals "$renamed_status" '0'
-assert_equals "$renamed_text" "$(cached_diff "$repo_renamed")"
+assert_contains "$renamed_text" 'Issue: 14'
+assert_contains "$renamed_text" 'Review summary:'
+assert_contains "$renamed_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$renamed_text" "$(cached_diff "$repo_renamed")"
 assert_contains "$renamed_text" 'rename from tracked.txt'
 assert_contains "$renamed_text" 'rename to renamed.txt'
 assert_all_changes_staged "$repo_renamed"
+
+repo_binary="$TMP_DIR/repo-binary"
+init_repo "$repo_binary"
+git -C "$repo_binary" checkout -q -b scratch
+state_set "$repo_binary/subdir" '{"activeIssueNumber":18,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'binary\0payload\n' > "$repo_binary/blob.bin"
+git -C "$repo_binary" add blob.bin
+binary_output="$TMP_DIR/binary-output"
+if run_flow_capture "$repo_binary/subdir" "$binary_output" review; then
+	binary_status=0
+else
+	binary_status=$?
+fi
+binary_text="$(cat "$binary_output")"
+assert_equals "$binary_status" '0'
+assert_contains "$binary_text" 'Issue: 18'
+assert_contains "$binary_text" 'Review summary:'
+assert_contains "$binary_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$binary_text" 'GIT binary patch'
 
 repo_combo="$TMP_DIR/repo-combo"
 init_repo "$repo_combo"
@@ -380,7 +427,10 @@ else
 fi
 combo_text="$(cat "$combo_output")"
 assert_equals "$combo_status" '0'
-assert_equals "$combo_text" "$(cached_diff "$repo_combo")"
+assert_contains "$combo_text" 'Issue: 15 — Combo review'
+assert_contains "$combo_text" 'Review summary:'
+assert_contains "$combo_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$combo_text" "$(cached_diff "$repo_combo")"
 assert_all_changes_staged "$repo_combo"
 assert_equals "$(current_branch "$repo_combo")" "$combo_branch_before"
 assert_equals "$(current_head "$repo_combo")" "$combo_head_before"
@@ -404,7 +454,10 @@ fi
 routing_terminal_text="$(cat "$routing_terminal_output")"
 assert_equals "$routing_status" '0'
 assert_equals "$routing_terminal_text" "Output written to $routing_output_path"
-assert_equals "$(cat "$routing_output_path")" "$(cached_diff "$repo_routing")"
+assert_contains "$(cat "$routing_output_path")" 'Issue: 16'
+assert_contains "$(cat "$routing_output_path")" 'Review summary:'
+assert_contains "$(cat "$routing_output_path")" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$(cat "$routing_output_path")" "$(cached_diff "$repo_routing")"
 assert_all_changes_staged "$repo_routing"
 
 repo_write_fail="$TMP_DIR/repo-write-fail"

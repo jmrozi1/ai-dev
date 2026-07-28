@@ -120,6 +120,19 @@ cached_diff() {
 	git -C "$repo_root" diff --cached --binary --no-ext-diff
 }
 
+cached_shortstat() {
+	local repo_root="$1"
+	git -C "$repo_root" diff --cached --shortstat --binary --no-ext-diff | sed 's/^ *//'
+}
+
+expected_review_output() {
+	local repo_root="$1"
+	local label_line="$2"
+	local summary_text
+	summary_text="$(cached_shortstat "$repo_root")"
+	printf '%s\nReview summary: %s\nDiff legend: + added, - removed, unprefixed lines are unchanged context\n\n%s' "$label_line" "$summary_text" "$(cached_diff "$repo_root")"
+}
+
 worktree_diff() {
 	local repo_root="$1"
 	git -C "$repo_root" diff --binary --no-ext-diff
@@ -352,7 +365,9 @@ fi
 review_text="$(cat "$TMP_DIR/review-output")"
 assert_equals "$review_status" '0'
 assert_contains "$review_text" 'Patch: Patch review'
-assert_contains "$review_text" 'diff --git a/tracked.txt b/tracked.txt'
+assert_contains "$review_text" 'Review summary:'
+assert_contains "$review_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$review_text" "$(cached_diff "$repo_review")"
 
 # commit/promote/reset/complete support patch workflows
 repo_lifecycle="$TMP_DIR/repo-lifecycle"

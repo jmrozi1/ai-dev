@@ -1364,9 +1364,10 @@ def handle_review(command_name: str, arguments: list[str]) -> int:
         message = quiet_completed.stderr.strip() or quiet_completed.stdout.strip()
         raise FlowError(message)
 
-    if state.patch_description is not None:
-        print(f"Patch: {state.patch_description}")
-        print()
+    print(_review_workflow_label(state))
+    print(f"Review summary: {_review_summary(repo_root)}")
+    print("Diff legend: + added, - removed, unprefixed lines are unchanged context")
+    print()
 
     diff_completed = subprocess.run(
         ["git", "-C", str(repo_root), "diff", "--cached", "--binary", "--no-ext-diff"],
@@ -1385,12 +1386,45 @@ def handle_review(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
-def _workflow_preserved_label(state: WorkflowState) -> str:
+def _review_workflow_label(state: WorkflowState) -> str:
     if state.active_issue_number is not None:
-        return f"issue {state.active_issue_number}"
+        if state.active_issue_title is not None:
+            return f"Issue: {state.active_issue_number} — {state.active_issue_title}"
+
+        return f"Issue: {state.active_issue_number}"
 
     assert state.patch_description is not None
-    return f"patch {state.patch_description}"
+    return f"Patch: {state.patch_description}"
+
+
+def _review_summary(repo_root: Path) -> str:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--cached",
+            "--shortstat",
+            "--binary",
+            "--no-ext-diff",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip()
+        raise FlowError(message)
+
+    summary = completed.stdout.strip()
+    if not summary:
+        raise FlowError("No staged changes available for review.")
+
+    return summary
 
 
 def handle_reset(command_name: str, arguments: list[str]) -> int:
