@@ -109,6 +109,15 @@ state_set() {
 	)
 }
 
+write_blocked_payload() {
+	local repo_root="$1"
+	local payload="$2"
+	mkdir -p "$repo_root/.ai-dev"
+	cat >"$repo_root/.ai-dev/blocked-workflows.json" <<EOF
+$payload
+EOF
+}
+
 current_branch() {
 	local repo_root="$1"
 	git -C "$repo_root" branch --show-current
@@ -279,6 +288,44 @@ fi
 active_text="$(cat "$active_output")"
 assert_equals "$active_status" "1"
 assert_contains "$active_text" 'active issue 9 is already set'
+
+# blocked issue is rejected before git branch/reset operations or state mutation
+repo_blocked_issue="$TMP_DIR/repo-blocked-issue"
+init_repo "$repo_blocked_issue"
+git -C "$repo_blocked_issue" checkout -q -b scratch
+printf 'scratch diverged\n' > "$repo_blocked_issue/scratch-only.txt"
+git -C "$repo_blocked_issue" add scratch-only.txt
+git -C "$repo_blocked_issue" commit -q -m 'scratch diverged'
+git -C "$repo_blocked_issue" checkout -q main
+state_before_blocked_start="$(state_get "$repo_blocked_issue/subdir")"
+branch_before_blocked_start="$(current_branch "$repo_blocked_issue")"
+main_head_before_blocked_start="$(branch_head "$repo_blocked_issue" main)"
+scratch_head_before_blocked_start="$(branch_head "$repo_blocked_issue" scratch)"
+write_blocked_payload "$repo_blocked_issue" '{
+	"blockedWorkflows": [
+		{
+			"issueNumber": 9,
+			"issueTitle": "Issue 9",
+			"issueUrl": "https://github.com/jmrozi1/ai-dev/issues/9",
+			"reason": "waiting on dependency",
+			"blockedAt": "2026-07-23T00:00:00Z"
+		}
+	]
+}'
+blocked_issue_output="$TMP_DIR/blocked-issue-output"
+if run_flow_capture "$repo_blocked_issue/subdir" "$blocked_issue_output" start 9; then
+	blocked_issue_status=0
+else
+	blocked_issue_status=$?
+fi
+blocked_issue_text="$(cat "$blocked_issue_output")"
+assert_equals "$blocked_issue_status" "1"
+assert_contains "$blocked_issue_text" 'Cannot start workflow: issue 9 is blocked.'
+assert_contains "$blocked_issue_text" 'Use flow resume 9.'
+assert_equals "$(state_get "$repo_blocked_issue/subdir")" "$state_before_blocked_start"
+assert_equals "$(current_branch "$repo_blocked_issue")" "$branch_before_blocked_start"
+assert_equals "$(branch_head "$repo_blocked_issue" main)" "$main_head_before_blocked_start"
+assert_equals "$(branch_head "$repo_blocked_issue" scratch)" "$scratch_head_before_blocked_start"
 
 # missing local main branch
 repo_missing_main="$TMP_DIR/repo-missing-main"

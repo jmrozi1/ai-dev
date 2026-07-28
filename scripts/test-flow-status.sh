@@ -122,6 +122,15 @@ state_set() {
 	)
 }
 
+write_blocked_payload() {
+	local repo_root="$1"
+	local payload="$2"
+	mkdir -p "$repo_root/.ai-dev"
+	cat >"$repo_root/.ai-dev/blocked-workflows.json" <<EOF
+$payload
+EOF
+}
+
 write_config_file() {
 	local repo_root="$1"
 	local out_value="$2"
@@ -419,6 +428,28 @@ assert_contains "$verbose_active_output" '  scratch branch: scratch'
 assert_contains "$verbose_active_output" '  relation: scratch equals main'
 assert_contains "$verbose_active_output" 'Working tree:'
 assert_contains "$verbose_active_output" '  clean'
+
+# verbose output flags legacy contradictory state when active issue is also blocked
+repo_duplicate_state="$TMP_DIR/repo-duplicate-state"
+init_repo "$repo_duplicate_state"
+git -C "$repo_duplicate_state" checkout -q -b scratch
+state_set "$repo_duplicate_state/subdir" '{"activeIssueNumber":91,"activeIssueTitle":"Issue 91","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/91","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+write_blocked_payload "$repo_duplicate_state" '{
+	"blockedWorkflows": [
+		{
+			"issueNumber": 91,
+			"issueTitle": "Issue 91",
+			"issueUrl": "https://github.com/jmrozi1/ai-dev/issues/91",
+			"reason": "legacy duplicate",
+			"blockedAt": "2026-07-23T00:00:00Z"
+		}
+	]
+}'
+duplicate_state_output="$(run_flow "$repo_duplicate_state/subdir" status -v)"
+assert_contains "$duplicate_state_output" 'Validation:'
+assert_contains "$duplicate_state_output" 'invalid state: active issue 91 is also present in blocked workflows'
+assert_contains "$duplicate_state_output" 'Blocked workflows:'
+assert_contains "$duplicate_state_output" 'issue 91 - Issue 91'
 
 # verbose working-tree path listing, sorting, and rename representation
 repo_verbose_paths="$TMP_DIR/repo-verbose-paths"

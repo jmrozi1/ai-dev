@@ -141,7 +141,7 @@ Manage an issue-focused development workflow using permanent main history
 and disposable scratch checkpoints.
 
 Commands:
-  start      Begin work on an issue and reset scratch from main.
+	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
@@ -150,7 +150,7 @@ Commands:
   promote    Squash scratch into one permanent commit on main.
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
-	resume     Resume a previously blocked issue workflow.
+	resume     Reactivate a previously blocked issue workflow.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
@@ -169,8 +169,8 @@ expected_command_help() {
 			cat <<EOF
 Usage: ${command_name} start <issue-number>
 
-Begin work on an issue by resetting scratch to main, checking out scratch,
-and recording the active issue.
+Begin new work on an unblocked issue by resetting scratch to main,
+checking out scratch, and recording the active issue.
 
 Options:
   -h, --help  Show this help.
@@ -268,7 +268,7 @@ EOF
 			cat <<EOF
 Usage: ${command_name} resume <ticket-number>
 
-Resume a blocked issue workflow and restore it as the local active issue.
+Reactivate a blocked issue workflow as the local active issue.
 
 Options:
   -h, --help  Show this help.

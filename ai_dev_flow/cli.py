@@ -77,7 +77,7 @@ Manage an issue-focused development workflow using permanent main history
 and disposable scratch checkpoints.
 
 Commands:
-  start      Begin work on an issue and reset scratch from main.
+	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
@@ -86,7 +86,7 @@ Commands:
   promote    Squash scratch into one permanent commit on main.
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
-	resume     Resume a previously blocked issue workflow.
+	resume     Reactivate a previously blocked issue workflow.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
@@ -100,8 +100,8 @@ COMMAND_HELP: dict[str, str] = {
     "start": """\
 Usage: {command_name} start <issue-number>
 
-Begin work on an issue by resetting scratch to main, checking out scratch,
-and recording the active issue.
+Begin new work on an unblocked issue by resetting scratch to main,
+checking out scratch, and recording the active issue.
 
 Options:
   -h, --help  Show this help.
@@ -181,7 +181,7 @@ Options:
         "resume": """\
 Usage: {command_name} resume <ticket-number>
 
-Resume a blocked issue workflow and restore it as the local active issue.
+Reactivate a blocked issue workflow as the local active issue.
 
 Options:
     -h, --help  Show this help.
@@ -657,6 +657,35 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
             f"Cannot start workflow: active patch {state.patch_description} is already set."
         )
 
+    blocked_file = blocked_workflows_file_for_repo_root(repo_root)
+    blocked_record = get_blocked_workflow(blocked_file, issue_number)
+    if blocked_record is not None:
+        raise FlowError(
+            f"Cannot start workflow: issue {issue_number} is blocked. "
+            f"Use {command_name} resume {issue_number}."
+        )
+
+    issue_title = ""
+    issue_url = ""
+    try:
+        issue_title, issue_url = _resolve_issue_metadata(issue_number)
+    except FileNotFoundError:
+        issue_title, issue_url = "", ""
+
+    # Validate prospective state before any git mutation.
+    issue_state = WorkflowState(
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        checkpoint=0,
+        active_issue_number=issue_number,
+        active_issue_title=issue_title or None,
+        active_issue_url=issue_url or None,
+    )
+    issue_state = normalize_and_validate(
+        issue_state.to_dict(),
+        context="start command",
+    )
+
     _ensure_main_and_scratch_branches_differ(state)
 
     if not branch_exists(repo_root, state.main_branch):
@@ -682,21 +711,6 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
         right_branch=state.scratch_branch,
     )
 
-    issue_title = ""
-    issue_url = ""
-    try:
-        issue_title, issue_url = _resolve_issue_metadata(issue_number)
-    except FileNotFoundError:
-        issue_title, issue_url = "", ""
-
-    issue_state = WorkflowState(
-        main_branch=state.main_branch,
-        scratch_branch=state.scratch_branch,
-        checkpoint=0,
-        active_issue_number=issue_number,
-        active_issue_title=issue_title or None,
-        active_issue_url=issue_url or None,
-    )
     ensure_local_state_excluded(repo_root)
     save_state(state_path, issue_state)
 
@@ -1694,6 +1708,7 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
         )
 
     blocked_file = blocked_workflows_file_for_repo_root(repo_root)
+    blocked_before = load_blocked_workflows(blocked_file)
     blocked_record = get_blocked_workflow(blocked_file, issue_number)
     if blocked_record is None:
         raise FlowError(
@@ -1705,6 +1720,45 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
     except FileNotFoundError as exc:
         raise FlowError("GitHub CLI (gh) is required for this command.") from exc
 
+    issue_labels_before_active = list(issue_labels)
+
+    def _resume_label_rollback_error() -> str | None:
+        rollback_labels = list(issue_labels_before_active)
+        if "active" not in rollback_labels:
+            rollback_labels.append("active")
+        try:
+            _reconcile_github_workflow_label(issue_number, "blocked", rollback_labels)
+        except FlowError as exc:
+            return str(exc)
+        except OSError as exc:
+            message = str(exc).strip() or exc.__class__.__name__
+            return (
+                "GitHub invocation error during rollback "
+                f"({exc.__class__.__name__}): {message}"
+            )
+        return None
+
+    def _resume_transition_failure_message(
+        *,
+        primary_message: str,
+        blocked_restore_failure_message: str | None = None,
+    ) -> str:
+        detail_messages: list[str] = []
+        if blocked_restore_failure_message is not None:
+            detail_messages.append(blocked_restore_failure_message)
+
+        label_rollback_failure = _resume_label_rollback_error()
+        if label_rollback_failure is not None:
+            detail_messages.append(
+                "GitHub label rollback failed after local resume failure: "
+                f"{label_rollback_failure}"
+            )
+
+        if not detail_messages:
+            return primary_message
+
+        return primary_message + " Additional failures: " + " | ".join(detail_messages)
+
     _reconcile_github_workflow_label(issue_number, "active", issue_labels)
 
     resumed_state = WorkflowState(
@@ -1715,8 +1769,32 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
         active_issue_title=blocked_record.issue_title,
         active_issue_url=blocked_record.issue_url,
     )
-    save_state(state_path, resumed_state)
-    remove_blocked_workflow(blocked_file, issue_number)
+
+    try:
+        remove_blocked_workflow(blocked_file, issue_number)
+    except BlockedWorkflowsError as exc:
+        raise FlowError(
+            _resume_transition_failure_message(
+                primary_message="Cannot resume workflow: failed to update blocked workflow registry.",
+            )
+        ) from exc
+
+    try:
+        save_state(state_path, resumed_state)
+    except WorkflowStateError as exc:
+        blocked_restore_failure_message: str | None = None
+        try:
+            save_blocked_workflows(blocked_file, blocked_before)
+        except BlockedWorkflowsError:
+            blocked_restore_failure_message = (
+                f"failed to restore blocked workflow metadata for #{issue_number}"
+            )
+        raise FlowError(
+            _resume_transition_failure_message(
+                primary_message=f"Cannot resume workflow: failed to activate issue {issue_number}.",
+                blocked_restore_failure_message=blocked_restore_failure_message,
+            )
+        ) from exc
 
     print(f"Resumed issue {issue_number}")
     print(f"mainBranch: {state.main_branch}")
@@ -1850,8 +1928,17 @@ def handle_status(command_name: str, arguments: list[str]) -> int:
         _print_status_path_category("modified", modified_paths)
         _print_status_path_category("untracked", untracked_paths)
 
-    print("Blocked workflows:")
     blocked_file = blocked_workflows_file_for_repo_root(repo_root)
+    if workflow_type == "issue" and state.active_issue_number is not None:
+        duplicate_record = get_blocked_workflow(blocked_file, state.active_issue_number)
+        if duplicate_record is not None:
+            print("Validation:")
+            print(
+                "  invalid state: active issue "
+                f"{state.active_issue_number} is also present in blocked workflows"
+            )
+
+    print("Blocked workflows:")
     for line in format_blocked_summary_lines(blocked_file):
         print(line)
 

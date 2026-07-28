@@ -96,7 +96,7 @@ Manage an issue-focused development workflow using permanent main history
 and disposable scratch checkpoints.
 
 Commands:
-  start      Begin work on an issue and reset scratch from main.
+	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
@@ -105,7 +105,7 @@ Commands:
   promote    Squash scratch into one permanent commit on main.
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
-	resume     Resume a previously blocked issue workflow.
+	resume     Reactivate a previously blocked issue workflow.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
