@@ -1,0 +1,43 @@
+# AI tooling workspace data
+.ai-dev/
+
+# Local environment files
+.env
+.env.*
+*.local
+*.override
+
+# Secrets and credentials
+*.secret
+*.secrets
+*.key
+*.pem
+*.p12
+*.jks
+secrets/
+
+# Jenkins runtime state
+jenkins_home/
+jenkins-data/
+.jenkins/
+
+# Logs, caches, temp files, and generated output
+*.log
+logs/
+.cache/
+.tmp/
+tmp/
+temp/
+/out.txt
+out/
+build/
+dist/
+
+# Docker Compose runtime data
+compose-data/
+volumes/
+.docker/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
