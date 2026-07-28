@@ -16,3 +16,6 @@ out.txt
 
 # generated command output
 **/out.txt
+
+__pycache__/
+*.py[cod]

@@ -227,12 +227,7 @@ assert_equals "$(branch_head "$lifecycle_repo" main)" "$(branch_head "$lifecycle
 assert_repo_clean "$lifecycle_repo"
 
 status_after_start="$(run_flow "$lifecycle_repo/subdir" status)"
-assert_contains "$status_after_start" 'Workflow: active'
-assert_contains "$status_after_start" 'activeIssueNumber: 123'
-assert_contains "$status_after_start" 'checkpoint: 0'
-assert_contains "$status_after_start" 'currentBranch: scratch'
-assert_contains "$status_after_start" 'workingTree: clean'
-assert_contains "$status_after_start" 'branchState: scratch equal to main'
+assert_equals "$status_after_start" $'Issue 123\nBranch: scratch'
 
 printf 'checkpoint one\n' >> "$lifecycle_repo/tracked.txt"
 printf 'new file one\n' > "$lifecycle_repo/one.txt"
@@ -248,8 +243,9 @@ assert_equals "$(head_message "$lifecycle_repo")" '1'
 assert_repo_clean "$lifecycle_repo"
 
 status_after_commit_one="$(run_flow "$lifecycle_repo/subdir" status)"
-assert_contains "$status_after_commit_one" 'checkpoint: 1'
-assert_contains "$status_after_commit_one" 'branchState: scratch ahead of main by 1 commit(s)'
+assert_contains "$status_after_commit_one" 'Issue 123'
+assert_contains "$status_after_commit_one" 'Branch: scratch'
+assert_contains "$status_after_commit_one" '1 commit ahead of main'
 
 printf 'checkpoint two\n' >> "$lifecycle_repo/tracked.txt"
 printf 'new file two\n' > "$lifecycle_repo/two.txt"
@@ -281,10 +277,7 @@ assert_equals "$(current_branch "$lifecycle_repo")" 'scratch'
 assert_repo_clean "$lifecycle_repo"
 
 status_after_promote="$(run_flow "$lifecycle_repo/subdir" status)"
-assert_contains "$status_after_promote" 'Workflow: active'
-assert_contains "$status_after_promote" 'activeIssueNumber: 123'
-assert_contains "$status_after_promote" 'checkpoint: 0'
-assert_contains "$status_after_promote" 'branchState: scratch equal to main'
+assert_equals "$status_after_promote" $'Issue 123\nBranch: scratch'
 
 complete_output="$(run_flow "$lifecycle_repo/subdir" complete)"
 assert_contains "$complete_output" 'Completed issue 123'
@@ -293,10 +286,7 @@ assert_contains "$complete_output" 'checkpoint: 0'
 assert_equals "$(read_gh_issue_state "$gh_state_file" '123')" 'closed'
 
 status_after_complete="$(run_flow "$lifecycle_repo/subdir" status)"
-assert_contains "$status_after_complete" 'Workflow: inactive'
-assert_not_contains "$status_after_complete" 'activeIssueNumber:'
-assert_contains "$status_after_complete" 'checkpoint: 0'
-assert_contains "$status_after_complete" 'branchState: scratch equal to main'
+assert_equals "$status_after_complete" $'No active workflow.\nBranch: scratch'
 
 assert_equals "$(state_get "$lifecycle_repo/subdir")" $'{
   "mainBranch": "main",
@@ -343,10 +333,6 @@ if [[ -e "$reset_repo/untracked-dir" ]]; then
 fi
 
 reset_status="$(run_flow "$reset_repo/subdir" status)"
-assert_contains "$reset_status" 'Workflow: active'
-assert_contains "$reset_status" 'activeIssueNumber: 124'
-assert_contains "$reset_status" 'checkpoint: 0'
-assert_contains "$reset_status" 'workingTree: clean'
-assert_contains "$reset_status" 'branchState: scratch equal to main'
+assert_equals "$reset_status" $'Issue 124\nBranch: scratch'
 
 printf 'flow lifecycle tests passed\n'

@@ -109,6 +109,33 @@ Approval belongs to ChatGPT or the user, not to `flow` or the implementation wor
 
 ## Workflow commands
 
+Flow has one authoritative shared Python implementation in `ai_dev_flow`.
+
+* `scripts/flow` is the thin Linux launcher.
+* `scripts/flow.ps1` is the thin Windows launcher.
+* Platform wrappers handle interpreter/bootstrap concerns only.
+
+Current command surface:
+
+```text
+help
+status
+start
+patch
+review
+commit
+reset
+promote
+complete
+block
+resume
+get
+set
+unset
+```
+
+Windows runtime validation status for this migration slice: Linux suite is authoritative and passing; Windows launcher/bootstrap behavior remains pending final runtime revalidation on a Windows host.
+
 Use command-specific help for exact syntax and behavior:
 
 ```text

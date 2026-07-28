@@ -170,14 +170,14 @@ create_commit_on_current_branch() {
 help_repo="$TMP_DIR/repo-help"
 init_repo "$help_repo"
 help_output="$TMP_DIR/help-output"
-if run_flow_capture "$help_repo/subdir" "$help_output" help; then
+if run_flow_capture "$help_repo/subdir" "$help_output" promote --help; then
 	help_status=0
 else
 	help_status=$?
 fi
 help_text="$(cat "$help_output")"
 assert_equals "$help_status" '0'
-assert_contains "$help_text" 'flow promote "<commit-message>"'
+assert_contains "$help_text" 'Usage: flow promote "<commit-message>"'
 
 repo_missing_arg="$TMP_DIR/repo-missing-arg"
 init_repo "$repo_missing_arg"
