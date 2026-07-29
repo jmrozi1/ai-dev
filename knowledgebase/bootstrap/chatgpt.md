@@ -90,7 +90,8 @@ Passing tests do not override an incorrect diff or behavior.
 
 ## Review
 
-Use `flow review` to generate the cumulative review package.
+Use `flow review` to generate the review package for changes since the latest checkpoint baseline.
+Use `flow review --all` (or `flow review -a`) to include all changes in the active workflow since `main`.
 
 During review, verify:
 
@@ -149,6 +150,8 @@ The normal implementation lifecycle is:
 flow start <issue-number>
 # implement and test a bounded slice
 flow review
+# optionally include all active-workflow changes since main
+# flow review --all
 # review and correct the implementation
 flow commit
 flow promote "<meaningful commit message>"

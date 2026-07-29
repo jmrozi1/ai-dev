@@ -52,6 +52,22 @@ from .repository import (
 from .review import ReviewError, resolve_review_output_path
 from .editor_opening import build_editor_opener
 from .report_presentation import ReportPresentationError, build_report_presenter
+from .summarize_batching import SummarizeBatchingError, build_summarize_batches
+from .summarize_config import SummarizeConfigError, load_repository_summarize_config
+from .summarize_discovery import SummarizeDiscoveryError
+from .summarize_manifest import SummarizeManifestError
+from .summarize_planning import SummarizePlanningError, build_summarize_plan
+from .summarize_task_generation import (
+    SummarizeTaskGenerationError,
+    plan_summarize_task_artifacts,
+    prepare_summarize_task_artifacts,
+)
+from .summarize_verification import (
+    OVERALL_STATUS_COMPLETE,
+    SummarizeVerificationError,
+    resolve_current_summarize_plan_id,
+    run_summarize_verification,
+)
 from .blocked_workflows import (
     BlockedWorkflowRecord,
     BlockedWorkflowsError,
@@ -90,9 +106,11 @@ and disposable scratch checkpoints.
 Commands:
 	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
-	task-prepare  Prepare an immutable generated task artifact.
+    task-prepare  Prepare an immutable generated task artifact.
+    summarize  Prepare deterministic summarize task artifacts for source files.
+    summarize-verify  Verify summarize outputs for a prepared plan.
   status     Show the active issue and current repository state.
-  review     Generate the cumulative change package for review.
+  review     Generate a review package for proposed changes.
   commit     Create the next numbered checkpoint on scratch.
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.
@@ -144,6 +162,25 @@ Options:
   --expected-output <text>  Expected-output block text.
   -h, --help                Show this help.
 """,
+        "summarize": """\
+Usage: {command_name} summarize <glob>
+
+Prepare deterministic summarize task artifacts from matching source files,
+update current-task pointer, and deliver invocation via ai.delivery.
+
+Options:
+    -h, --help  Show this help.
+""",
+                "summarize-verify": """\
+Usage: {command_name} summarize-verify [<plan-id>]
+
+Verify summarize outputs against the immutable summarize manifest, write
+deterministic verification artifacts, and present verification.md using
+reports.presentation mode.
+
+Options:
+    -h, --help  Show this help.
+""",
     "status": """\
 Usage: {command_name} status [-v|--verbose]
 
@@ -154,12 +191,12 @@ Options:
   -h, --help     Show this help.
 """,
     "review": """\
-Usage: {command_name} review
+Usage: {command_name} review [-a|--all]
 
-Generate a cumulative review package for all scratch and working-tree
-changes relative to main.
+Generate a review package for proposed changes.
 
 Options:
+  -a, --all   Include all changes in the active workflow since main.
   -h, --help  Show this help.
 """,
     "commit": """\
@@ -271,6 +308,8 @@ KNOWN_COMMANDS = frozenset(
         "start",
         "patch",
         "task-prepare",
+        "summarize",
+        "summarize-verify",
         "status",
         "review",
         "commit",
@@ -320,6 +359,9 @@ def print_command_help(command_name: str, command: str) -> None:
 
     if command == "task-prepare":
         template = template.replace("\n    --", "\n  --")
+        template = template.replace("\n    -h, --help", "\n  -h, --help")
+
+    if command in {"summarize", "summarize-verify"}:
         template = template.replace("\n    -h, --help", "\n  -h, --help")
 
     print(template.format(command_name=command_name), end="")
@@ -1122,7 +1164,15 @@ def _task_prepare_usage(command_name: str) -> FlowError:
 
 
 def _review_usage(command_name: str) -> FlowError:
-    return FlowError(f"Usage: {command_name} review")
+    return FlowError(f"Usage: {command_name} review [-a|--all]")
+
+
+def _summarize_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} summarize <glob>")
+
+
+def _summarize_verify_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} summarize-verify [<plan-id>]")
 
 
 def _commit_usage(command_name: str) -> FlowError:
@@ -1271,6 +1321,90 @@ def handle_task_prepare(command_name: str, arguments: list[str]) -> int:
 
     print(f"Task file: {generated_task.repository_relative_path}")
     return 0
+
+
+def handle_summarize(command_name: str, arguments: list[str]) -> int:
+    if len(arguments) != 1:
+        raise _summarize_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    summarize_config = load_repository_summarize_config(repo_root)
+    plan = build_summarize_plan(repo_root, arguments[0])
+    batches = build_summarize_batches(plan, max_files=summarize_config.batch_max_files)
+    planned_artifacts = plan_summarize_task_artifacts(
+        repo_root=repo_root,
+        plan=plan,
+        batches=batches,
+    )
+
+    task_config = load_task_config(repo_root)
+    invocation = render_invocation(
+        task_config.invocation,
+        task_file=planned_artifacts.coordinator_planned.repository_relative_path,
+        task_id=planned_artifacts.coordinator_planned.task_id,
+        task_type="summarize",
+        config_path=task_config.invocation_source_path,
+        config_field_path=task_config.invocation_source_field or "ai.invocation",
+    )
+    adapter = build_delivery_adapter(task_config.delivery)
+
+    prepared = prepare_summarize_task_artifacts(
+        repo_root=repo_root,
+        plan=plan,
+        batches=batches,
+        planned_artifacts=planned_artifacts,
+    )
+    adapter.deliver(invocation)
+
+    print(
+        f"Prepared summarize tasks for plan {prepared.plan_id}: "
+        f"{prepared.batch_count} batch(es), {prepared.source_count} source file(s)."
+    )
+    print(f"Coordinator task: {prepared.coordinator_task_path}")
+    print(f"Manifest: {prepared.manifest_path}")
+    print(f"Task file: {prepared.coordinator_task_path}")
+    return 0
+
+
+def handle_summarize_verify(command_name: str, arguments: list[str]) -> int:
+    if len(arguments) > 1:
+        raise _summarize_verify_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    plan_id = arguments[0].strip() if arguments else ""
+    if arguments and not plan_id:
+        raise _summarize_verify_usage(command_name)
+
+    if not plan_id:
+        plan_id = resolve_current_summarize_plan_id(repo_root)
+
+    result, markdown_relative_path, json_relative_path = run_summarize_verification(
+        repo_root=repo_root,
+        plan_id=plan_id,
+    )
+
+    task_config = load_task_config(repo_root)
+    presenter = build_report_presenter(
+        task_config.report_presentation,
+        editor_opener=build_editor_opener(task_config.editor_command),
+    )
+
+    report_path = repo_root / markdown_relative_path
+    try:
+        presenter.present(report_path)
+    except ReportPresentationError as exc:
+        print(f"Warning: {exc}", file=sys.stderr)
+        print(f"Report path: {report_path}")
+
+    print(
+        f"Summarize verification status for plan {result.plan_id}: {result.overall_status}"
+    )
+    print(f"Verification report: {markdown_relative_path}")
+    print(f"Verification JSON: {json_relative_path}")
+
+    if result.overall_status == OVERALL_STATUS_COMPLETE:
+        return 0
+    return 1
 
 
 def _promote_excluded_paths(
@@ -1616,9 +1750,98 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
         return 1
 
 
-def handle_review(command_name: str, arguments: list[str]) -> int:
-    if arguments:
+REVIEW_SCOPE_CHECKPOINT = "checkpoint"
+REVIEW_SCOPE_WORKFLOW = "workflow"
+
+
+def _parse_review_scope(command_name: str, arguments: list[str]) -> str:
+    if not arguments:
+        return REVIEW_SCOPE_CHECKPOINT
+
+    if len(arguments) != 1:
         raise _review_usage(command_name)
+
+    option = arguments[0]
+    if option in {"-a", "--all"}:
+        return REVIEW_SCOPE_WORKFLOW
+
+    raise _review_usage(command_name)
+
+
+def _review_cached_diff(repo_root: Path) -> str:
+    diff_completed = subprocess.run(
+        ["git", "-C", str(repo_root), "diff", "--cached", "--binary", "--no-ext-diff"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if diff_completed.returncode != 0:
+        message = diff_completed.stderr.strip() or diff_completed.stdout.strip()
+        raise FlowError(message)
+
+    return diff_completed.stdout
+
+
+def _review_workflow_diff(repo_root: Path, *, main_branch: str, scratch_branch: str) -> str:
+    diff_completed = subprocess.run(
+        ["git", "-C", str(repo_root), "diff", "--binary", "--no-ext-diff", f"{main_branch}...{scratch_branch}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if diff_completed.returncode != 0:
+        message = diff_completed.stderr.strip() or diff_completed.stdout.strip()
+        raise FlowError(message)
+
+    return diff_completed.stdout
+
+
+def _review_workflow_summary(repo_root: Path, *, main_branch: str, scratch_branch: str) -> str:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--shortstat",
+            "--no-ext-diff",
+            f"{main_branch}...{scratch_branch}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.strip() or completed.stdout.strip()
+        raise FlowError(message)
+
+    return completed.stdout.strip()
+
+
+def _review_combined_summary(*, workflow_summary: str, working_tree_summary: str) -> str:
+    if workflow_summary and working_tree_summary:
+        return (
+            f"{workflow_summary}; "
+            f"plus staged working-tree changes: {working_tree_summary}"
+        )
+
+    if workflow_summary:
+        return workflow_summary
+
+    return working_tree_summary
+
+
+def handle_review(command_name: str, arguments: list[str]) -> int:
+    review_scope = _parse_review_scope(command_name, arguments)
 
     repo_root, state_path, state = _resolve_repo_state_context()
 
@@ -1633,10 +1856,53 @@ def handle_review(command_name: str, arguments: list[str]) -> int:
             f"Cannot review workflow: current branch {current_branch} does not match scratchBranch {state.scratch_branch}."
         )
 
-    if not git_status_short(repo_root):
+    if review_scope == REVIEW_SCOPE_CHECKPOINT and not git_status_short(repo_root):
         raise FlowError("No proposed changes to review.")
 
     stage_all_changes(repo_root)
+
+    if review_scope == REVIEW_SCOPE_WORKFLOW:
+        workflow_diff = _review_workflow_diff(
+            repo_root,
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+        )
+        working_tree_diff = _review_cached_diff(repo_root)
+
+        if not workflow_diff and not working_tree_diff:
+            raise FlowError("No proposed changes to review.")
+
+        workflow_summary = _review_workflow_summary(
+            repo_root,
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+        )
+        working_tree_summary = _review_summary(repo_root, allow_empty=True)
+        summary = _review_combined_summary(
+            workflow_summary=workflow_summary,
+            working_tree_summary=working_tree_summary,
+        )
+        if not summary:
+            raise FlowError("No proposed changes to review.")
+
+        print(_review_workflow_label(state))
+        print(f"Review summary: {summary}")
+        print("Diff legend: + added, - removed, unprefixed lines are unchanged context")
+        print()
+
+        if workflow_diff:
+            print(workflow_diff, end="")
+
+        if workflow_diff and working_tree_diff and not workflow_diff.endswith("\n"):
+            print()
+
+        if workflow_diff and working_tree_diff:
+            print()
+
+        if working_tree_diff:
+            print(working_tree_diff, end="")
+        return 0
+
     quiet_completed = subprocess.run(
         ["git", "-C", str(repo_root), "diff", "--cached", "--binary", "--no-ext-diff", "--quiet"],
         stdout=subprocess.PIPE,
@@ -1657,20 +1923,7 @@ def handle_review(command_name: str, arguments: list[str]) -> int:
     print("Diff legend: + added, - removed, unprefixed lines are unchanged context")
     print()
 
-    diff_completed = subprocess.run(
-        ["git", "-C", str(repo_root), "diff", "--cached", "--binary", "--no-ext-diff"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if diff_completed.returncode != 0:
-        message = diff_completed.stderr.strip() or diff_completed.stdout.strip()
-        raise FlowError(message)
-
-    print(diff_completed.stdout, end="")
+    print(_review_cached_diff(repo_root), end="")
     return 0
 
 
@@ -1685,7 +1938,7 @@ def _review_workflow_label(state: WorkflowState) -> str:
     return f"Patch: {state.patch_description}"
 
 
-def _review_summary(repo_root: Path) -> str:
+def _review_summary(repo_root: Path, *, allow_empty: bool = False) -> str:
     completed = subprocess.run(
         [
             "git",
@@ -1694,7 +1947,6 @@ def _review_summary(repo_root: Path) -> str:
             "diff",
             "--cached",
             "--shortstat",
-            "--binary",
             "--no-ext-diff",
         ],
         stdout=subprocess.PIPE,
@@ -1709,7 +1961,7 @@ def _review_summary(repo_root: Path) -> str:
         raise FlowError(message)
 
     summary = completed.stdout.strip()
-    if not summary:
+    if not summary and not allow_empty:
         raise FlowError("No staged changes available for review.")
 
     return summary
@@ -2353,6 +2605,12 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command == "task-prepare":
             return handle_task_prepare(command_name, command_arguments)
 
+        if command == "summarize":
+            return handle_summarize(command_name, command_arguments)
+
+        if command == "summarize-verify":
+            return handle_summarize_verify(command_name, command_arguments)
+
         if command == "start":
             return run_operational_command(command_name, "strict", handle_start, command_arguments)
 
@@ -2423,6 +2681,13 @@ def run() -> None:
         RepositoryError,
         ReviewError,
         ReportPresentationError,
+        SummarizeConfigError,
+        SummarizeBatchingError,
+        SummarizeDiscoveryError,
+        SummarizeManifestError,
+        SummarizePlanningError,
+        SummarizeTaskGenerationError,
+        SummarizeVerificationError,
         TaskArtifactError,
         TaskConfigError,
         WorkflowStateError,

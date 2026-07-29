@@ -98,9 +98,11 @@ and disposable scratch checkpoints.
 Commands:
 	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
-	task-prepare  Prepare an immutable generated task artifact.
+    task-prepare  Prepare an immutable generated task artifact.
+    summarize  Prepare deterministic summarize task artifacts for source files.
+    summarize-verify  Verify summarize outputs for a prepared plan.
   status     Show the active issue and current repository state.
-  review     Generate the cumulative change package for review.
+  review     Generate a review package for proposed changes.
   commit     Create the next numbered checkpoint on scratch.
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.

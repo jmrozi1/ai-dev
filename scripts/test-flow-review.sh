@@ -154,6 +154,16 @@ cached_diff_names() {
 	git -C "$repo_root" diff --cached --name-only --no-ext-diff
 }
 
+diff_header_paths_from_text() {
+	local text="$1"
+	printf '%s\n' "$text" | grep '^diff --git ' | sed -E 's#^diff --git a/([^ ]+) b/.*#\1#'
+}
+
+workflow_diff_all_changes() {
+	local repo_root="$1"
+	git -C "$repo_root" diff --binary --no-ext-diff main...scratch
+}
+
 assert_all_changes_staged() {
 	local repo_root="$1"
 	local status_text
@@ -184,6 +194,26 @@ extra_text="$(cat "$extra_output")"
 assert_equals "$extra_status" '1'
 assert_contains "$extra_text" 'Usage: flow review'
 
+unknown_flag_output="$TMP_DIR/unknown-flag-output"
+if run_flow_capture "$repo_args/subdir" "$unknown_flag_output" review --bogus; then
+	unknown_flag_status=0
+else
+	unknown_flag_status=$?
+fi
+unknown_flag_text="$(cat "$unknown_flag_output")"
+assert_equals "$unknown_flag_status" '1'
+assert_contains "$unknown_flag_text" 'Usage: flow review [-a|--all]'
+
+multiple_flags_output="$TMP_DIR/multiple-flags-output"
+if run_flow_capture "$repo_args/subdir" "$multiple_flags_output" review -a --all; then
+	multiple_flags_status=0
+else
+	multiple_flags_status=$?
+fi
+multiple_flags_text="$(cat "$multiple_flags_output")"
+assert_equals "$multiple_flags_status" '1'
+assert_contains "$multiple_flags_text" 'Usage: flow review [-a|--all]'
+
 empty_extra_output="$TMP_DIR/empty-extra-output"
 if run_flow_capture "$repo_args/subdir" "$empty_extra_output" review ''; then
 	empty_extra_status=0
@@ -206,6 +236,36 @@ outside_text="$(cat "$outside_output")"
 assert_equals "$outside_status" '1'
 assert_contains "$outside_text" 'Not inside a Git repository'
 
+repo_args_accept="$TMP_DIR/repo-args-accept"
+init_repo "$repo_args_accept"
+git -C "$repo_args_accept" checkout -q -b scratch
+state_set "$repo_args_accept/subdir" '{"activeIssueNumber":25,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'accept\n' > "$repo_args_accept/accept.txt"
+
+review_default_accept_output="$TMP_DIR/review-default-accept-output"
+if run_flow_capture "$repo_args_accept/subdir" "$review_default_accept_output" review; then
+	review_default_accept_status=0
+else
+	review_default_accept_status=$?
+fi
+assert_equals "$review_default_accept_status" '0'
+
+review_short_all_output="$TMP_DIR/review-short-all-output"
+if run_flow_capture "$repo_args_accept/subdir" "$review_short_all_output" review -a; then
+	review_short_all_status=0
+else
+	review_short_all_status=$?
+fi
+assert_equals "$review_short_all_status" '0'
+
+review_long_all_output="$TMP_DIR/review-long-all-output"
+if run_flow_capture "$repo_args_accept/subdir" "$review_long_all_output" review --all; then
+	review_long_all_status=0
+else
+	review_long_all_status=$?
+fi
+assert_equals "$review_long_all_status" '0'
+
 repo_inactive="$TMP_DIR/repo-inactive"
 init_repo "$repo_inactive"
 git -C "$repo_inactive" checkout -q -b scratch
@@ -223,6 +283,24 @@ assert_equals "$inactive_status" '1'
 assert_contains "$inactive_text" 'no active issue is set'
 assert_equals "$(repo_status_porcelain "$repo_inactive")" "$inactive_status_before"
 assert_equals "$(cached_diff "$repo_inactive")" "$inactive_index_before"
+
+repo_inactive_all="$TMP_DIR/repo-inactive-all"
+init_repo "$repo_inactive_all"
+git -C "$repo_inactive_all" checkout -q -b scratch
+all_inactive_output_path="$TMP_DIR/inactive-all-review.diff"
+printf 'preserve me\n' > "$all_inactive_output_path"
+track_config_file "$repo_inactive_all" "$all_inactive_output_path"
+printf 'change\n' >> "$repo_inactive_all/tracked.txt"
+inactive_all_output="$TMP_DIR/inactive-all-output"
+if run_flow_capture "$repo_inactive_all/subdir" "$inactive_all_output" review --all; then
+	inactive_all_status=0
+else
+	inactive_all_status=$?
+fi
+inactive_all_text="$(cat "$inactive_all_output")"
+assert_equals "$inactive_all_status" '1'
+assert_contains "$inactive_all_text" 'no active issue is set'
+assert_equals "$(cat "$all_inactive_output_path")" 'preserve me'
 
 repo_wrong_branch="$TMP_DIR/repo-wrong-branch"
 init_repo "$repo_wrong_branch"
@@ -437,6 +515,92 @@ assert_equals "$(current_head "$repo_combo")" "$combo_head_before"
 assert_equals "$(cat "$repo_combo/.ai-dev/workflow.json")" "$combo_workflow_before"
 assert_equals "$(cat "$repo_combo/tracked.txt")" "$combo_tracked_before"
 assert_equals "$(cat "$repo_combo/notes.txt")" "$combo_untracked_before"
+
+repo_default_scope="$TMP_DIR/repo-default-scope"
+init_repo "$repo_default_scope"
+git -C "$repo_default_scope" checkout -q -b scratch
+state_set "$repo_default_scope/subdir" '{"activeIssueNumber":19,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'checkpointed\n' > "$repo_default_scope/checkpoint.txt"
+run_flow "$repo_default_scope/subdir" commit >/dev/null
+
+default_scope_clean_output="$TMP_DIR/default-scope-clean-output"
+if run_flow_capture "$repo_default_scope/subdir" "$default_scope_clean_output" review; then
+	default_scope_clean_status=0
+else
+	default_scope_clean_status=$?
+fi
+default_scope_clean_text="$(cat "$default_scope_clean_output")"
+assert_equals "$default_scope_clean_status" '1'
+assert_contains "$default_scope_clean_text" 'No proposed changes to review'
+
+printf 'new work\n' > "$repo_default_scope/new-work.txt"
+default_scope_changed_output="$TMP_DIR/default-scope-changed-output"
+if run_flow_capture "$repo_default_scope/subdir" "$default_scope_changed_output" review; then
+	default_scope_changed_status=0
+else
+	default_scope_changed_status=$?
+fi
+default_scope_changed_text="$(cat "$default_scope_changed_output")"
+assert_equals "$default_scope_changed_status" '0'
+assert_contains "$default_scope_changed_text" 'diff --git a/new-work.txt b/new-work.txt'
+assert_not_contains "$default_scope_changed_text" 'diff --git a/checkpoint.txt b/checkpoint.txt'
+
+repo_all_scope="$TMP_DIR/repo-all-scope"
+init_repo "$repo_all_scope"
+git -C "$repo_all_scope" checkout -q -b scratch
+state_set "$repo_all_scope/subdir" '{"activeIssueNumber":20,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'checkpoint one\n' > "$repo_all_scope/c1.txt"
+run_flow "$repo_all_scope/subdir" commit >/dev/null
+printf 'checkpoint two\n' > "$repo_all_scope/c2.txt"
+run_flow "$repo_all_scope/subdir" commit >/dev/null
+printf 'working tree\n' > "$repo_all_scope/wip.txt"
+
+all_scope_workflow_before="$(cat "$repo_all_scope/.ai-dev/workflow.json")"
+all_scope_head_before="$(current_head "$repo_all_scope")"
+all_scope_committed_diff="$(workflow_diff_all_changes "$repo_all_scope")"
+
+all_scope_output="$TMP_DIR/all-scope-output"
+if run_flow_capture "$repo_all_scope/subdir" "$all_scope_output" review --all; then
+	all_scope_status=0
+else
+	all_scope_status=$?
+fi
+all_scope_text="$(cat "$all_scope_output")"
+assert_equals "$all_scope_status" '0'
+assert_contains "$all_scope_text" 'Issue: 20'
+assert_contains "$all_scope_text" 'Review summary:'
+assert_contains "$all_scope_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
+assert_contains "$all_scope_text" "$all_scope_committed_diff"
+assert_contains "$all_scope_text" 'diff --git a/wip.txt b/wip.txt'
+assert_not_contains "$all_scope_text" '.ai-dev/workflow.json'
+
+all_scope_expected_committed_count="$(git -C "$repo_all_scope" diff --name-only main...scratch | wc -l | tr -d ' ')"
+all_scope_expected_total_count=$((all_scope_expected_committed_count + 1))
+all_scope_actual_header_count="$(diff_header_paths_from_text "$all_scope_text" | wc -l | tr -d ' ')"
+assert_equals "$all_scope_actual_header_count" "$all_scope_expected_total_count"
+assert_equals "$(printf '%s\n' "$all_scope_text" | grep -c '^Diff legend:')" '1'
+assert_equals "$(printf '%s\n' "$all_scope_text" | grep -c '^Issue: ')" '1'
+assert_equals "$(printf '%s\n' "$all_scope_text" | grep -c '^Review summary:')" '1'
+while IFS= read -r committed_path; do
+	if [[ -z "$committed_path" ]]; then
+		continue
+	fi
+	assert_equals "$(diff_header_paths_from_text "$all_scope_text" | grep -xcF "$committed_path")" '1'
+done < <(git -C "$repo_all_scope" diff --name-only main...scratch)
+assert_equals "$(diff_header_paths_from_text "$all_scope_text" | grep -xcF 'wip.txt')" '1'
+
+assert_equals "$(cat "$repo_all_scope/.ai-dev/workflow.json")" "$all_scope_workflow_before"
+assert_equals "$(current_head "$repo_all_scope")" "$all_scope_head_before"
+
+all_scope_short_output="$TMP_DIR/all-scope-short-output"
+if run_flow_capture "$repo_all_scope/subdir" "$all_scope_short_output" review -a; then
+	all_scope_short_status=0
+else
+	all_scope_short_status=$?
+fi
+all_scope_short_text="$(cat "$all_scope_short_output")"
+assert_equals "$all_scope_short_status" '0'
+assert_equals "$all_scope_short_text" "$all_scope_text"
 
 repo_routing="$TMP_DIR/repo-routing"
 init_repo "$repo_routing"
