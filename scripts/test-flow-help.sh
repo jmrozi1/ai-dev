@@ -143,6 +143,7 @@ and disposable scratch checkpoints.
 Commands:
 	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
+	task-prepare  Prepare an immutable generated task artifact.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
   commit     Create the next numbered checkpoint on scratch.
@@ -151,9 +152,11 @@ Commands:
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
 	resume     Reactivate a previously blocked issue workflow.
+  config     Open user configuration in an editor.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
+  showreport Show the generated report from disk.
   help       Show this help.
 
 Run \`${command_name} <command> --help\` for command-specific help.
@@ -187,6 +190,21 @@ existing scratch work without changing commits, index, or working tree.
 Options:
   --adopt      Adopt existing work on scratch and preserve repository state.
   -h, --help   Show this help.
+EOF
+			;;
+		task-prepare)
+			cat <<EOF
+Usage: ${command_name} task-prepare <task-id> <task-type> <requested-command> (--body <text> | --body-file <path>) [--constraints <text>] [--expected-output <text>]
+
+Prepare an immutable task file under .ai-dev/tasks/, update
+.ai-dev/current-task.md atomically, and deliver invocation text per ai.delivery.
+
+Options:
+  --body <text>             Inline task body markdown.
+  --body-file <path>        Path to a markdown file used as task body.
+  --constraints <text>      Constraints block text.
+  --expected-output <text>  Expected-output block text.
+  -h, --help                Show this help.
 EOF
 			;;
 		status)
@@ -284,6 +302,17 @@ Options:
   -h, --help  Show this help.
 EOF
 			;;
+		config)
+			cat <<EOF
+Usage: ${command_name} config
+
+Create the user AI Dev YAML configuration file if missing, then open it.
+If parsing fails, open the same file with fallback editor resolution for repair.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
 		set)
 			cat <<EOF
 Usage: ${command_name} set out=<path>
@@ -299,6 +328,17 @@ EOF
 Usage: ${command_name} unset out
 
 Remove the configured operational output destination.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
+		showreport)
+			cat <<EOF
+Usage: ${command_name} showreport
+
+Present the report file from configured out path or default out.txt using
+reports.presentation mode.
 
 Options:
   -h, --help  Show this help.
@@ -344,7 +384,7 @@ help_command_verbose="$(cd "$help_repo/subdir" && "$symlink_path" help --help)"
 assert_equals "$help_command_output" "$help_command_verbose"
 
 # command-specific help for every public command
-for command in start patch status review commit reset promote complete block resume get set unset help; do
+for command in start patch task-prepare status review commit reset promote complete block resume config get set unset showreport help; do
 	command_help_short="$TMP_DIR/${command}-short.txt"
 	command_help_long="$TMP_DIR/${command}-long.txt"
 	if run_flow_capture "$help_repo/subdir" "$command_help_short" "$command" -h; then
@@ -366,7 +406,7 @@ for command in start patch status review commit reset promote complete block res
 # help works outside Git repositories and with malformed config
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
-for command in start patch status review commit reset promote complete block resume get set unset help; do
+for command in start patch task-prepare status review commit reset promote complete block resume config get set unset showreport help; do
 	for help_flag in -h --help; do
 		outside_output="$TMP_DIR/outside-${command}-${help_flag//-/}.txt"
 		if run_flow_capture "$outside_repo" "$outside_output" "$command" "$help_flag"; then
@@ -383,7 +423,7 @@ repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"
 mkdir -p "$repo_malformed/.ai-dev"
 printf '{ invalid json\n' > "$repo_malformed/.ai-dev/config.json"
-for command in start patch status review commit reset promote complete block resume get set unset help; do
+for command in start patch task-prepare status review commit reset promote complete block resume config get set unset showreport help; do
 	malformed_output="$TMP_DIR/malformed-${command}.txt"
 	if run_flow_capture "$repo_malformed/subdir" "$malformed_output" "$command" --help; then
 		malformed_status=0
@@ -402,7 +442,7 @@ git -C "$repo_bypass" checkout -q -b scratch
 state_set "$repo_bypass/subdir" '{"activeIssueNumber":99,"mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 git -C "$repo_bypass" checkout -q main
 printf '{ invalid workflow json\n' > "$repo_bypass/.ai-dev/workflow.json"
-for command in start patch status review commit reset promote complete block resume get set unset help; do
+for command in start patch task-prepare status review commit reset promote complete block resume config get set unset showreport help; do
 	bypass_output="$TMP_DIR/bypass-${command}.txt"
 	if run_flow_capture "$repo_bypass/subdir" "$bypass_output" "$command" -h; then
 		bypass_status=0
@@ -419,7 +459,7 @@ repo_routed="$TMP_DIR/repo-routed"
 init_repo "$repo_routed"
 set_repo_out="$TMP_DIR/help-output.txt"
 write_config_file "$repo_routed" "$set_repo_out"
-git -C "$repo_routed" add .ai-dev/config.json
+git -C "$repo_routed" add -f .ai-dev/config.json
 git -C "$repo_routed" commit -q -m 'track config'
 top_level_routed_output="$TMP_DIR/top-level-routed.txt"
 if run_flow_capture "$repo_routed/subdir" "$top_level_routed_output" help; then
@@ -442,7 +482,7 @@ assert_contains "$(cat "$command_help_routed_output")" 'Usage: flow status [-v|-
 assert_not_exists "$set_repo_out"
 
 # extra arguments combined with help are rejected
-for command in patch status review commit reset complete block resume get set unset help; do
+for command in patch task-prepare status review commit reset complete block resume config get set unset showreport help; do
 	extra_output="$TMP_DIR/${command}-extra.txt"
 	if run_flow_capture "$help_repo/subdir" "$extra_output" "$command" -h extra; then
 		extra_status=0
@@ -477,7 +517,7 @@ init_repo "$repo_read_only"
 git -C "$repo_read_only" checkout -q -b scratch
 state_set "$repo_read_only/subdir" '{"activeIssueNumber":17,"activeIssueTitle":"Read only","mainBranch":"main","scratchBranch":"scratch","checkpoint":3}' >/dev/null
 write_config_file "$repo_read_only" "$TMP_DIR/read-only-out.txt"
-git -C "$repo_read_only" add .ai-dev/config.json
+git -C "$repo_read_only" add -f .ai-dev/config.json
 git -C "$repo_read_only" commit -q -m 'track config'
 printf 'staged\n' >> "$repo_read_only/tracked.txt"
 git -C "$repo_read_only" add tracked.txt

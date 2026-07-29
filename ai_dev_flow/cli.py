@@ -50,6 +50,8 @@ from .repository import (
     workflow_state_file_for_repo_root,
 )
 from .review import ReviewError, resolve_review_output_path
+from .editor_opening import build_editor_opener
+from .report_presentation import ReportPresentationError, build_report_presenter
 from .blocked_workflows import (
     BlockedWorkflowRecord,
     BlockedWorkflowsError,
@@ -68,6 +70,15 @@ from .workflow_state import (
     normalize_and_validate,
     save_state,
 )
+from .task_artifacts import TaskArtifactError, create_generated_task, plan_generated_task
+from .task_config import (
+    TaskConfigError,
+    default_user_config_text,
+    load_task_config,
+    resolve_user_config_path,
+)
+from .task_delivery import build_delivery_adapter
+from .task_invocation import render_invocation
 
 
 TOP_LEVEL_HELP = """\
@@ -79,6 +90,7 @@ and disposable scratch checkpoints.
 Commands:
 	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
+	task-prepare  Prepare an immutable generated task artifact.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
   commit     Create the next numbered checkpoint on scratch.
@@ -87,9 +99,11 @@ Commands:
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
 	resume     Reactivate a previously blocked issue workflow.
+  config     Open user configuration in an editor.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
+  showreport Show the generated report from disk.
   help       Show this help.
 
 Run `{command_name} <command> --help` for command-specific help.
@@ -116,6 +130,19 @@ existing scratch work without changing commits, index, or working tree.
 Options:
   --adopt      Adopt existing work on scratch and preserve repository state.
   -h, --help   Show this help.
+""",
+        "task-prepare": """\
+Usage: {command_name} task-prepare <task-id> <task-type> <requested-command> (--body <text> | --body-file <path>) [--constraints <text>] [--expected-output <text>]
+
+Prepare an immutable task file under .ai-dev/tasks/, update
+.ai-dev/current-task.md atomically, and deliver invocation text per ai.delivery.
+
+Options:
+  --body <text>             Inline task body markdown.
+  --body-file <path>        Path to a markdown file used as task body.
+  --constraints <text>      Constraints block text.
+  --expected-output <text>  Expected-output block text.
+  -h, --help                Show this help.
 """,
     "status": """\
 Usage: {command_name} status [-v|--verbose]
@@ -194,6 +221,15 @@ Show the configured operational output destination.
 Options:
   -h, --help  Show this help.
 """,
+        "config": """\
+Usage: {command_name} config
+
+Create the user AI Dev YAML configuration file if missing, then open it.
+If parsing fails, open the same file with fallback editor resolution for repair.
+
+Options:
+  -h, --help  Show this help.
+""",
     "set": """\
 Usage: {command_name} set out=<path>
 
@@ -206,6 +242,15 @@ Options:
 Usage: {command_name} unset out
 
 Remove the configured operational output destination.
+
+Options:
+  -h, --help  Show this help.
+""",
+        "showreport": """\
+Usage: {command_name} showreport
+
+Present the report file from configured out path or default out.txt using
+reports.presentation mode.
 
 Options:
   -h, --help  Show this help.
@@ -225,6 +270,7 @@ KNOWN_COMMANDS = frozenset(
     {
         "start",
         "patch",
+        "task-prepare",
         "status",
         "review",
         "commit",
@@ -233,11 +279,15 @@ KNOWN_COMMANDS = frozenset(
         "complete",
         "block",
         "resume",
+        "config",
         "get",
         "set",
         "unset",
+        "showreport",
     }
 )
+
+DEFAULT_SHOWREPORT_PATH = "out.txt"
 
 
 class FlowError(Exception):
@@ -266,6 +316,10 @@ def print_command_help(command_name: str, command: str) -> None:
         raise FlowError(f"Unknown command help target: {command}")
 
     if command in {"block", "resume"}:
+        template = template.replace("\n    -h, --help", "\n  -h, --help")
+
+    if command == "task-prepare":
+        template = template.replace("\n    --", "\n  --")
         template = template.replace("\n    -h, --help", "\n  -h, --help")
 
     print(template.format(command_name=command_name), end="")
@@ -477,6 +531,93 @@ def handle_unset(command_name: str, arguments: list[str]) -> int:
     sync_local_excludes(repo_root)
 
     print("out: not configured")
+    return 0
+
+
+def _config_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} config")
+
+
+def _showreport_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} showreport")
+
+
+def handle_config(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _config_usage(command_name)
+
+    user_config_path = resolve_user_config_path()
+    created = False
+
+    try:
+        user_config_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise FlowError(f"Cannot create user config parent directory {user_config_path.parent}: {exc}") from exc
+
+    if not user_config_path.exists():
+        try:
+            user_config_path.write_text(default_user_config_text(), encoding="utf-8")
+            created = True
+        except OSError as exc:
+            raise FlowError(f"Cannot create user config file {user_config_path}: {exc}") from exc
+
+    repo_root = resolve_repo_root_if_available() or Path.cwd()
+    configured_editor_command: str | None = None
+    try:
+        task_config = load_task_config(repo_root)
+        configured_editor_command = task_config.editor_command
+    except TaskConfigError as exc:
+        print(
+            "Warning: user config could not be parsed for editor.command; "
+            f"falling back to VISUAL/EDITOR/platform defaults: {exc}",
+            file=sys.stderr,
+        )
+
+    editor_opener = build_editor_opener(configured_editor_command)
+    open_result = editor_opener.open_path(user_config_path)
+
+    if created:
+        print(f"Created user config: {user_config_path}")
+
+    if open_result.warning:
+        print(f"Warning: {open_result.warning}", file=sys.stderr)
+
+    if open_result.opened:
+        print(f"Opened user config: {user_config_path}")
+        return 0
+
+    print(f"User config path: {user_config_path}")
+    return 0
+
+
+def _resolve_showreport_path(repo_root: Path) -> Path:
+    configured_output = get_out(config_file_for_repo_root(repo_root))
+    if configured_output:
+        return resolve_output_destination(repo_root, configured_output)
+
+    return repo_root / DEFAULT_SHOWREPORT_PATH
+
+
+def handle_showreport(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _showreport_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    task_config = load_task_config(repo_root)
+    report_path = _resolve_showreport_path(repo_root)
+
+    presenter = build_report_presenter(
+        task_config.report_presentation,
+        editor_opener=build_editor_opener(task_config.editor_command),
+    )
+
+    try:
+        presenter.present(report_path)
+    except ReportPresentationError as exc:
+        print(f"Warning: {exc}", file=sys.stderr)
+        print(f"Report path: {report_path}")
+        return 1
+
     return 0
 
 
@@ -971,6 +1112,15 @@ def _status_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} status [-v|--verbose]")
 
 
+def _task_prepare_usage(command_name: str) -> FlowError:
+    return FlowError(
+        "Usage: "
+        f"{command_name} task-prepare <task-id> <task-type> <requested-command> "
+        "(--body <text> | --body-file <path>) "
+        "[--constraints <text>] [--expected-output <text>]"
+    )
+
+
 def _review_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} review")
 
@@ -997,6 +1147,130 @@ def _block_usage(command_name: str) -> FlowError:
 
 def _resume_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} resume <ticket-number>")
+
+
+def _parse_task_prepare_options(
+    command_name: str,
+    option_tokens: list[str],
+) -> tuple[str, str, str]:
+    body_text: str | None = None
+    body_supplied_by: str | None = None
+    constraints = "(none)"
+    expected_output = "(none)"
+    constraints_supplied = False
+    expected_output_supplied = False
+
+    index = 0
+    while index < len(option_tokens):
+        option = option_tokens[index]
+        index += 1
+
+        if option == "--body":
+            if index >= len(option_tokens):
+                raise _task_prepare_usage(command_name)
+
+            if body_supplied_by is not None:
+                raise FlowError(
+                    "Specify exactly one of --body or --body-file, and provide it only once."
+                )
+
+            body_text = option_tokens[index]
+            body_supplied_by = "--body"
+            index += 1
+            continue
+
+        if option == "--body-file":
+            if index >= len(option_tokens):
+                raise _task_prepare_usage(command_name)
+
+            if body_supplied_by is not None:
+                raise FlowError(
+                    "Specify exactly one of --body or --body-file, and provide it only once."
+                )
+
+            body_file_path = Path(option_tokens[index])
+            index += 1
+            try:
+                body_text = body_file_path.read_text(encoding="utf-8")
+            except OSError as exc:
+                raise FlowError(
+                    f"Cannot read task body file {body_file_path}: {exc}"
+                ) from exc
+            body_supplied_by = "--body-file"
+            continue
+
+        if option == "--constraints":
+            if index >= len(option_tokens):
+                raise _task_prepare_usage(command_name)
+            if constraints_supplied:
+                raise FlowError("--constraints may be provided at most once.")
+            constraints = option_tokens[index]
+            constraints_supplied = True
+            index += 1
+            continue
+
+        if option == "--expected-output":
+            if index >= len(option_tokens):
+                raise _task_prepare_usage(command_name)
+            if expected_output_supplied:
+                raise FlowError("--expected-output may be provided at most once.")
+            expected_output = option_tokens[index]
+            expected_output_supplied = True
+            index += 1
+            continue
+
+        raise _task_prepare_usage(command_name)
+
+    if body_supplied_by is None or body_text is None:
+        raise FlowError("Specify exactly one of --body or --body-file.")
+
+    return body_text, constraints, expected_output
+
+
+def handle_task_prepare(command_name: str, arguments: list[str]) -> int:
+    if len(arguments) < 3:
+        raise _task_prepare_usage(command_name)
+
+    task_id = arguments[0]
+    task_type = arguments[1]
+    requested_command = arguments[2]
+    body_text, constraints, expected_output = _parse_task_prepare_options(
+        command_name,
+        arguments[3:],
+    )
+
+    repo_root = resolve_repo_root()
+    task_config = load_task_config(repo_root)
+    planned_task = plan_generated_task(
+        repo_root=repo_root,
+        task_id=task_id,
+        task_type=task_type,
+        requested_command=requested_command,
+    )
+
+    invocation = render_invocation(
+        task_config.invocation,
+        task_file=planned_task.repository_relative_path,
+        task_id=planned_task.task_id,
+        task_type=planned_task.task_type,
+        config_path=task_config.invocation_source_path,
+        config_field_path=task_config.invocation_source_field or "ai.invocation",
+    )
+
+    generated_task = create_generated_task(
+        repo_root=repo_root,
+        task_id=planned_task.task_id,
+        task_type=planned_task.task_type,
+        requested_command=planned_task.requested_command,
+        task_body=body_text,
+        constraints=constraints,
+        expected_output=expected_output,
+    )
+    adapter = build_delivery_adapter(task_config.delivery)
+    adapter.deliver(invocation)
+
+    print(f"Task file: {generated_task.repository_relative_path}")
+    return 0
 
 
 def _promote_excluded_paths(
@@ -2064,6 +2338,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command == "get":
             return handle_get(command_name, command_arguments)
 
+        if command == "config":
+            return handle_config(command_name, command_arguments)
+
         if command == "set":
             return handle_set(command_name, command_arguments)
 
@@ -2072,6 +2349,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         if command == "patch":
             return run_operational_command(command_name, "strict", handle_patch, command_arguments)
+
+        if command == "task-prepare":
+            return handle_task_prepare(command_name, command_arguments)
 
         if command == "start":
             return run_operational_command(command_name, "strict", handle_start, command_arguments)
@@ -2106,6 +2386,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command == "resume":
             return run_operational_command(command_name, "strict", handle_resume, command_arguments)
 
+        if command == "showreport":
+            return handle_showreport(command_name, command_arguments)
+
         raise FlowError(
             f"Python implementation for '{command}' "
             "is not available yet."
@@ -2139,6 +2422,9 @@ def run() -> None:
         FlowError,
         RepositoryError,
         ReviewError,
+        ReportPresentationError,
+        TaskArtifactError,
+        TaskConfigError,
         WorkflowStateError,
     ) as exc:
         print(f"{resolve_command_name()}: {exc}", file=sys.stderr)

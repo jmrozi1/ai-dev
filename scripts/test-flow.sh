@@ -98,6 +98,7 @@ and disposable scratch checkpoints.
 Commands:
 	start      Begin new work on an unblocked issue and reset scratch from main.
 	patch      Begin or adopt a local patch workflow on scratch.
+	task-prepare  Prepare an immutable generated task artifact.
   status     Show the active issue and current repository state.
   review     Generate the cumulative change package for review.
   commit     Create the next numbered checkpoint on scratch.
@@ -106,9 +107,11 @@ Commands:
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
 	resume     Reactivate a previously blocked issue workflow.
+  config     Open user configuration in an editor.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
+  showreport Show the generated report from disk.
   help       Show this help.
 
 Run \`${command_name} <command> --help\` for command-specific help.

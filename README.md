@@ -30,3 +30,8 @@ code --install-extension artifacts/*.vsix --force
 - Documentation should be reviewable.
 - IDE wrappers should stay thin.
 - The VSIX should be installable without launching the extension from source.
+
+## Generated-Task Foundation
+
+- [docs/generated-task-foundation.md](docs/generated-task-foundation.md) - Issue #14 foundation behavior, configuration, delivery, editor, and report presentation.
+- [docs/native-platform-verification-checklist.md](docs/native-platform-verification-checklist.md) - Native Windows verification checklist and block-reason text for Issue #14.
