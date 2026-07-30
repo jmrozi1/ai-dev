@@ -4,11 +4,12 @@ import json
 import os
 import subprocess
 import tempfile
+import hashlib
 from pathlib import Path
 import sys
 from collections.abc import Sequence
 from contextlib import redirect_stdout
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from io import StringIO
 
@@ -50,6 +51,31 @@ from .repository import (
     workflow_state_file_for_repo_root,
 )
 from .review import ReviewError, resolve_review_output_path
+from .review_context import (
+    AcceptanceCriteriaSection,
+    ReviewContext,
+    ReviewContextError,
+    build_review_context,
+    build_review_id,
+    extract_acceptance_criteria_section,
+    read_local_issue_markdown,
+)
+from .review_package import ReviewPackageError, create_review_package, render_changes_diff
+from .review_paths import ReviewArtifactPaths, ReviewPathError, build_review_artifact_paths
+from .review_task_generation import (
+    PlannedReviewTask,
+    ReviewTaskGenerationError,
+    create_review_task_file,
+    plan_review_task,
+    render_review_task_markdown,
+    write_current_task_pointer,
+)
+from .review_manifest import ReviewManifestError, resolve_current_review_id
+from .review_verification import (
+    OVERALL_STATUS_COMPLETE as REVIEW_VERIFY_COMPLETE,
+    ReviewVerificationError,
+    run_review_verification,
+)
 from .editor_opening import build_editor_opener
 from .report_presentation import ReportPresentationError, build_report_presenter
 from .summarize_batching import SummarizeBatchingError, build_summarize_batches
@@ -86,6 +112,7 @@ from .workflow_state import (
     normalize_and_validate,
     save_state,
 )
+from .json_files import JsonFileError, write_text_atomic
 from .task_artifacts import TaskArtifactError, create_generated_task, plan_generated_task
 from .task_config import (
     TaskConfigError,
@@ -93,7 +120,7 @@ from .task_config import (
     load_task_config,
     resolve_user_config_path,
 )
-from .task_delivery import build_delivery_adapter
+from .task_delivery import ClipboardDeliveryError, build_delivery_adapter
 from .task_invocation import render_invocation
 
 
@@ -109,8 +136,9 @@ Commands:
     task-prepare  Prepare an immutable generated task artifact.
     summarize  Prepare deterministic summarize task artifacts for source files.
     summarize-verify  Verify summarize outputs for a prepared plan.
+    review-verify  Verify deterministic review report and package integrity.
   status     Show the active issue and current repository state.
-  review     Generate a review package for proposed changes.
+    review     Prepare a review package and generated review task for proposed changes.
   commit     Create the next numbered checkpoint on scratch.
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.
@@ -181,6 +209,16 @@ reports.presentation mode.
 Options:
     -h, --help  Show this help.
 """,
+    "review-verify": """\
+Usage: {command_name} review-verify [<review-id>]
+
+Verify review package/task/report integrity for a deterministic review,
+write verification artifacts, and present the canonical review report using
+reports.presentation mode.
+
+Options:
+    -h, --help  Show this help.
+""",
     "status": """\
 Usage: {command_name} status [-v|--verbose]
 
@@ -193,7 +231,7 @@ Options:
     "review": """\
 Usage: {command_name} review [-a|--all]
 
-Generate a review package for proposed changes.
+Prepare deterministic review package and generated review task for proposed changes.
 
 Options:
   -a, --all   Include all changes in the active workflow since main.
@@ -310,6 +348,7 @@ KNOWN_COMMANDS = frozenset(
         "task-prepare",
         "summarize",
         "summarize-verify",
+        "review-verify",
         "status",
         "review",
         "commit",
@@ -361,7 +400,7 @@ def print_command_help(command_name: str, command: str) -> None:
         template = template.replace("\n    --", "\n  --")
         template = template.replace("\n    -h, --help", "\n  -h, --help")
 
-    if command in {"summarize", "summarize-verify"}:
+    if command in {"summarize", "summarize-verify", "review-verify"}:
         template = template.replace("\n    -h, --help", "\n  -h, --help")
 
     print(template.format(command_name=command_name), end="")
@@ -1175,6 +1214,10 @@ def _summarize_verify_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} summarize-verify [<plan-id>]")
 
 
+def _review_verify_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} review-verify [<review-id>]")
+
+
 def _commit_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} commit")
 
@@ -1403,6 +1446,49 @@ def handle_summarize_verify(command_name: str, arguments: list[str]) -> int:
     print(f"Verification JSON: {json_relative_path}")
 
     if result.overall_status == OVERALL_STATUS_COMPLETE:
+        return 0
+    return 1
+
+
+def handle_review_verify(command_name: str, arguments: list[str]) -> int:
+    if len(arguments) > 1:
+        raise _review_verify_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    review_id = arguments[0].strip() if arguments else ""
+    if arguments and not review_id:
+        raise _review_verify_usage(command_name)
+
+    if not review_id:
+        review_id = resolve_current_review_id(repo_root)
+
+    result, markdown_relative_path, json_relative_path = run_review_verification(
+        repo_root=repo_root,
+        review_id=review_id,
+    )
+
+    review_report_path = repo_root / result.report_path
+    if result.overall_status == REVIEW_VERIFY_COMPLETE and result.report_state.status == "valid":
+        task_config = load_task_config(repo_root)
+        presenter = build_report_presenter(
+            task_config.report_presentation,
+            editor_opener=build_editor_opener(task_config.editor_command),
+        )
+        try:
+            presenter.present(review_report_path)
+        except ReportPresentationError as exc:
+            print(f"Warning: {exc}", file=sys.stderr)
+            print(f"Review report path: {review_report_path}")
+    else:
+        print(f"Review report path: {review_report_path}")
+
+    print(f"Review verification status for {result.review_id}: {result.overall_status}")
+    print(f"Review decision: {result.review_decision or '(unavailable)'}")
+    print(f"Review report: {result.report_path}")
+    print(f"Verification report: {markdown_relative_path}")
+    print(f"Verification JSON: {json_relative_path}")
+
+    if result.overall_status == REVIEW_VERIFY_COMPLETE:
         return 0
     return 1
 
@@ -1840,6 +1926,412 @@ def _review_combined_summary(*, workflow_summary: str, working_tree_summary: str
     return working_tree_summary
 
 
+def _review_diff_sha256(diff_text: str) -> str:
+    return hashlib.sha256(diff_text.encode("utf-8")).hexdigest()
+
+
+def _decode_nul_paths(raw_output: bytes) -> list[str]:
+    decoded = raw_output.decode("utf-8", errors="surrogateescape")
+    if not decoded:
+        return []
+
+    parts = decoded.split("\x00")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]
+
+    return [item for item in parts if item != ""]
+
+
+def _review_cached_paths(repo_root: Path) -> list[str]:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--cached",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise FlowError(message)
+    return _decode_nul_paths(completed.stdout)
+
+
+def _review_workflow_paths(repo_root: Path, *, main_branch: str, scratch_branch: str) -> list[str]:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "diff",
+            "--name-only",
+            "-z",
+            "--no-ext-diff",
+            f"{main_branch}...{scratch_branch}",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise FlowError(message)
+    return _decode_nul_paths(completed.stdout)
+
+
+def _review_instruction_reference_paths(repo_root: Path) -> list[str]:
+    candidates = [
+        repo_root / "ai-dev-core" / "workflows" / "review" / "review-documentation.md",
+        repo_root / "ai-dev-core" / "workflows" / "review" / "finding-template.md",
+        repo_root / "vendor" / "ai-dev-core" / "workflows" / "review" / "review-documentation.md",
+        repo_root / "vendor" / "ai-dev-core" / "workflows" / "review" / "finding-template.md",
+    ]
+
+    relative_paths: list[str] = []
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_file():
+            relative_paths.append(candidate.relative_to(repo_root).as_posix())
+
+    return sorted(set(relative_paths))
+
+
+@dataclass(frozen=True)
+class PreparedReviewPackage:
+    review_id: str
+    review_paths: ReviewArtifactPaths
+    context: ReviewContext
+    changes_diff_text: str
+
+
+def _plan_review_package(
+    *,
+    repo_root: Path,
+    command_name: str,
+    review_scope: str,
+    state: WorkflowState,
+    current_branch: str,
+    committed_diff_text: str,
+    overlay_diff_text: str,
+    committed_paths: list[str],
+    overlay_paths: list[str],
+) -> PreparedReviewPackage:
+    workflow_type = _active_workflow_type(state) or "none"
+    diagnostics: list[str] = []
+
+    issue_markdown: str | None = None
+    issue_source: str | None = None
+    issue_description_status = "not_applicable"
+    acceptance_criteria_status = "not_applicable"
+
+    if state.active_issue_number is not None:
+        issue_description_status = "unavailable_local"
+        acceptance_criteria_status = "unavailable_local"
+
+        issue_markdown, issue_source = read_local_issue_markdown(
+            repo_root,
+            state.active_issue_number,
+        )
+        if issue_markdown is not None:
+            issue_description_status = "available_local"
+            acceptance_criteria_status = "available_local"
+        else:
+            diagnostics.append(
+                "Issue body unavailable locally; acceptance criteria extraction skipped."
+            )
+
+    acceptance_criteria: AcceptanceCriteriaSection = extract_acceptance_criteria_section(
+        issue_markdown or ""
+    )
+    if acceptance_criteria_status == "available_local" and not acceptance_criteria.found:
+        acceptance_criteria_status = "unavailable_local"
+        diagnostics.append("Acceptance criteria heading not found in local issue metadata.")
+
+    committed_reference = f"{state.main_branch}...{state.scratch_branch}"
+    overlay_reference = "HEAD -> index"
+
+    all_paths = sorted(set(committed_paths + overlay_paths))
+
+    committed_diff_sha256 = (
+        _review_diff_sha256(committed_diff_text) if committed_diff_text else None
+    )
+    overlay_diff_sha256 = _review_diff_sha256(overlay_diff_text) if overlay_diff_text else None
+    instruction_reference_paths = _review_instruction_reference_paths(repo_root)
+
+    placeholder_id = "review-pending"
+    placeholder_paths = build_review_artifact_paths(repo_root, placeholder_id)
+
+    temporary_context = build_review_context(
+        scope=review_scope,
+        command=command_name,
+        workflow_type=workflow_type,
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        current_branch=current_branch,
+        checkpoint=state.checkpoint,
+        active_issue_number=state.active_issue_number,
+        active_issue_title=state.active_issue_title,
+        active_issue_url=state.active_issue_url,
+        patch_description=state.patch_description,
+        issue_description_status=issue_description_status,
+        issue_description_source=issue_source,
+        acceptance_criteria_status=acceptance_criteria_status,
+        acceptance_criteria_heading=acceptance_criteria.heading,
+        acceptance_criteria_lines=acceptance_criteria.lines,
+        committed_reference=committed_reference,
+        committed_paths=committed_paths,
+        committed_diff_text=committed_diff_text,
+        committed_diff_sha256=committed_diff_sha256,
+        overlay_reference=overlay_reference,
+        overlay_paths=overlay_paths,
+        overlay_diff_text=overlay_diff_text,
+        overlay_diff_sha256=overlay_diff_sha256,
+        all_paths=all_paths,
+        changes_diff_sha256="0" * 64,
+        instruction_reference_paths=instruction_reference_paths,
+        diagnostics=diagnostics,
+        review_root_path=placeholder_paths.review_root_relative_path,
+        package_markdown_path=placeholder_paths.package_markdown_relative_path,
+        package_json_path=placeholder_paths.package_json_relative_path,
+        changes_diff_path=placeholder_paths.changes_diff_relative_path,
+        canonical_report_path=placeholder_paths.canonical_report_relative_path,
+    )
+
+    changes_diff_text = render_changes_diff(temporary_context)
+    changes_diff_sha256 = _review_diff_sha256(changes_diff_text)
+
+    id_input_context = build_review_context(
+        scope=review_scope,
+        command=command_name,
+        workflow_type=workflow_type,
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        current_branch=current_branch,
+        checkpoint=state.checkpoint,
+        active_issue_number=state.active_issue_number,
+        active_issue_title=state.active_issue_title,
+        active_issue_url=state.active_issue_url,
+        patch_description=state.patch_description,
+        issue_description_status=issue_description_status,
+        issue_description_source=issue_source,
+        acceptance_criteria_status=acceptance_criteria_status,
+        acceptance_criteria_heading=acceptance_criteria.heading,
+        acceptance_criteria_lines=acceptance_criteria.lines,
+        committed_reference=committed_reference,
+        committed_paths=committed_paths,
+        committed_diff_text=committed_diff_text,
+        committed_diff_sha256=committed_diff_sha256,
+        overlay_reference=overlay_reference,
+        overlay_paths=overlay_paths,
+        overlay_diff_text=overlay_diff_text,
+        overlay_diff_sha256=overlay_diff_sha256,
+        all_paths=all_paths,
+        changes_diff_sha256=changes_diff_sha256,
+        instruction_reference_paths=instruction_reference_paths,
+        diagnostics=diagnostics,
+        review_root_path=placeholder_paths.review_root_relative_path,
+        package_markdown_path=placeholder_paths.package_markdown_relative_path,
+        package_json_path=placeholder_paths.package_json_relative_path,
+        changes_diff_path=placeholder_paths.changes_diff_relative_path,
+        canonical_report_path=placeholder_paths.canonical_report_relative_path,
+    )
+
+    review_id = build_review_id(id_input_context)
+    review_paths = build_review_artifact_paths(repo_root, review_id)
+
+    context = build_review_context(
+        scope=review_scope,
+        command=command_name,
+        workflow_type=workflow_type,
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        current_branch=current_branch,
+        checkpoint=state.checkpoint,
+        active_issue_number=state.active_issue_number,
+        active_issue_title=state.active_issue_title,
+        active_issue_url=state.active_issue_url,
+        patch_description=state.patch_description,
+        issue_description_status=issue_description_status,
+        issue_description_source=issue_source,
+        acceptance_criteria_status=acceptance_criteria_status,
+        acceptance_criteria_heading=acceptance_criteria.heading,
+        acceptance_criteria_lines=acceptance_criteria.lines,
+        committed_reference=committed_reference,
+        committed_paths=committed_paths,
+        committed_diff_text=committed_diff_text,
+        committed_diff_sha256=committed_diff_sha256,
+        overlay_reference=overlay_reference,
+        overlay_paths=overlay_paths,
+        overlay_diff_text=overlay_diff_text,
+        overlay_diff_sha256=overlay_diff_sha256,
+        all_paths=all_paths,
+        changes_diff_sha256=changes_diff_sha256,
+        instruction_reference_paths=instruction_reference_paths,
+        diagnostics=diagnostics,
+        review_root_path=review_paths.review_root_relative_path,
+        package_markdown_path=review_paths.package_markdown_relative_path,
+        package_json_path=review_paths.package_json_relative_path,
+        changes_diff_path=review_paths.changes_diff_relative_path,
+        canonical_report_path=review_paths.canonical_report_relative_path,
+    )
+
+    if build_review_id(context) != review_id:
+        raise ReviewPackageError(
+            "Deterministic review package ID mismatch between final context and artifact directory."
+        )
+
+    return PreparedReviewPackage(
+        review_id=review_id,
+        review_paths=review_paths,
+        context=context,
+        changes_diff_text=changes_diff_text,
+    )
+
+
+def _remove_file_if_exists(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _rollback_review_package(review_paths: ReviewArtifactPaths) -> list[str]:
+    failures: list[str] = []
+    for artifact_path in (
+        review_paths.package_markdown_absolute_path,
+        review_paths.package_json_absolute_path,
+        review_paths.changes_diff_absolute_path,
+    ):
+        try:
+            _remove_file_if_exists(artifact_path)
+        except OSError as exc:
+            failures.append(f"{artifact_path}: {exc}")
+
+    try:
+        review_paths.review_root_absolute_path.rmdir()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        failures.append(f"{review_paths.review_root_absolute_path}: {exc}")
+
+    return failures
+
+
+def _restore_current_task_pointer(
+    *,
+    pointer_path: Path,
+    previous_pointer_text: str | None,
+) -> list[str]:
+    failures: list[str] = []
+
+    if previous_pointer_text is None:
+        try:
+            _remove_file_if_exists(pointer_path)
+        except OSError as exc:
+            failures.append(f"{pointer_path}: {exc}")
+        return failures
+
+    try:
+        write_text_atomic(pointer_path, previous_pointer_text)
+    except JsonFileError as exc:
+        failures.append(f"{pointer_path}: {exc}")
+
+    return failures
+
+
+def _prepare_review_task_and_deliver(
+    *,
+    repo_root: Path,
+    package: PreparedReviewPackage,
+    planned_task: PlannedReviewTask,
+    invocation: str,
+    adapter,
+) -> None:
+    pointer_path = repo_root / ".ai-dev" / "current-task.md"
+    previous_pointer_text: str | None = None
+    if pointer_path.exists():
+        try:
+            previous_pointer_text = pointer_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise FlowError(
+                f"Cannot read current task pointer for rollback: {pointer_path}. {exc}"
+            ) from exc
+
+    package_preexisted = package.review_paths.review_root_absolute_path.exists()
+    package_created = False
+    task_created = False
+
+    try:
+        create_review_package(
+            repo_root=repo_root,
+            review_paths=package.review_paths,
+            review_id=package.review_id,
+            context=package.context,
+            changes_diff_text=package.changes_diff_text,
+        )
+        package_created = not package_preexisted
+
+        task_markdown = render_review_task_markdown(
+            planned_task=planned_task,
+            review_paths=package.review_paths,
+            context=package.context,
+        )
+        task_created = create_review_task_file(
+            planned_task=planned_task,
+            markdown_text=task_markdown,
+        )
+
+        write_current_task_pointer(repo_root=repo_root, planned_task=planned_task)
+
+        adapter.deliver(invocation)
+    except (ReviewPackageError, ReviewTaskGenerationError, ClipboardDeliveryError) as exc:
+        cleanup_failures: list[str] = []
+
+        cleanup_failures.extend(
+            _restore_current_task_pointer(
+                pointer_path=pointer_path,
+                previous_pointer_text=previous_pointer_text,
+            )
+        )
+
+        if task_created:
+            try:
+                _remove_file_if_exists(planned_task.absolute_path)
+            except OSError as cleanup_exc:
+                cleanup_failures.append(
+                    f"{planned_task.absolute_path}: {cleanup_exc}"
+                )
+
+        if package_created:
+            cleanup_failures.extend(_rollback_review_package(package.review_paths))
+
+        if cleanup_failures:
+            raise FlowError(
+                f"Review task preparation failed. {exc} Cleanup failures: "
+                + "; ".join(cleanup_failures)
+            ) from exc
+
+        raise FlowError(f"Review task preparation failed. {exc}") from exc
+
+
+def _print_review_preparation_metadata(
+    *,
+    package: PreparedReviewPackage,
+    planned_task: PlannedReviewTask,
+) -> None:
+    print(f"Prepared review task for {package.review_id}.")
+    print(f"Review task: {planned_task.repository_relative_path}")
+    print(f"Review package: {package.review_paths.package_markdown_relative_path}")
+    print(f"Changes: {package.review_paths.changes_diff_relative_path}")
+    print(f"Expected report: {package.review_paths.canonical_report_relative_path}")
+
+
 def handle_review(command_name: str, arguments: list[str]) -> int:
     review_scope = _parse_review_scope(command_name, arguments)
 
@@ -1859,6 +2351,8 @@ def handle_review(command_name: str, arguments: list[str]) -> int:
     if review_scope == REVIEW_SCOPE_CHECKPOINT and not git_status_short(repo_root):
         raise FlowError("No proposed changes to review.")
 
+    configured_output = get_out(config_file_for_repo_root(repo_root))
+    sync_local_excludes(repo_root, configured_output=configured_output)
     stage_all_changes(repo_root)
 
     if review_scope == REVIEW_SCOPE_WORKFLOW:
@@ -1885,9 +2379,60 @@ def handle_review(command_name: str, arguments: list[str]) -> int:
         if not summary:
             raise FlowError("No proposed changes to review.")
 
+        committed_paths = _review_workflow_paths(
+            repo_root,
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+        )
+        overlay_paths = _review_cached_paths(repo_root)
+
+        try:
+            package = _plan_review_package(
+                repo_root=repo_root,
+                command_name=f"{command_name} --all",
+                review_scope=review_scope,
+                state=state,
+                current_branch=current_branch,
+                committed_diff_text=workflow_diff,
+                overlay_diff_text=working_tree_diff,
+                committed_paths=committed_paths,
+                overlay_paths=overlay_paths,
+            )
+        except (ReviewContextError, ReviewPathError, ReviewPackageError) as exc:
+            raise FlowError(f"Cannot prepare deterministic review package. {exc}") from exc
+
+        planned_task = plan_review_task(
+            repo_root=repo_root,
+            review_id=package.review_id,
+            requested_command=package.context.command,
+        )
+
+        task_config = load_task_config(repo_root)
+        invocation = render_invocation(
+            task_config.invocation,
+            task_file=planned_task.repository_relative_path,
+            task_id=planned_task.task_id,
+            task_type=planned_task.task_type,
+            config_path=task_config.invocation_source_path,
+            config_field_path=task_config.invocation_source_field or "ai.invocation",
+        )
+        try:
+            adapter = build_delivery_adapter(task_config.delivery)
+        except ValueError as exc:
+            raise FlowError(f"Invalid delivery mode. {exc}") from exc
+
+        _prepare_review_task_and_deliver(
+            repo_root=repo_root,
+            package=package,
+            planned_task=planned_task,
+            invocation=invocation,
+            adapter=adapter,
+        )
+
         print(_review_workflow_label(state))
         print(f"Review summary: {summary}")
         print("Diff legend: + added, - removed, unprefixed lines are unchanged context")
+        _print_review_preparation_metadata(package=package, planned_task=planned_task)
         print()
 
         if workflow_diff:
@@ -1918,12 +2463,58 @@ def handle_review(command_name: str, arguments: list[str]) -> int:
         message = quiet_completed.stderr.strip() or quiet_completed.stdout.strip()
         raise FlowError(message)
 
+    checkpoint_diff = _review_cached_diff(repo_root)
+    overlay_paths = _review_cached_paths(repo_root)
+    try:
+        package = _plan_review_package(
+            repo_root=repo_root,
+            command_name=command_name,
+            review_scope=review_scope,
+            state=state,
+            current_branch=current_branch,
+            committed_diff_text="",
+            overlay_diff_text=checkpoint_diff,
+            committed_paths=[],
+            overlay_paths=overlay_paths,
+        )
+    except (ReviewContextError, ReviewPathError, ReviewPackageError) as exc:
+        raise FlowError(f"Cannot prepare deterministic review package. {exc}") from exc
+
+    planned_task = plan_review_task(
+        repo_root=repo_root,
+        review_id=package.review_id,
+        requested_command=package.context.command,
+    )
+
+    task_config = load_task_config(repo_root)
+    invocation = render_invocation(
+        task_config.invocation,
+        task_file=planned_task.repository_relative_path,
+        task_id=planned_task.task_id,
+        task_type=planned_task.task_type,
+        config_path=task_config.invocation_source_path,
+        config_field_path=task_config.invocation_source_field or "ai.invocation",
+    )
+    try:
+        adapter = build_delivery_adapter(task_config.delivery)
+    except ValueError as exc:
+        raise FlowError(f"Invalid delivery mode. {exc}") from exc
+
+    _prepare_review_task_and_deliver(
+        repo_root=repo_root,
+        package=package,
+        planned_task=planned_task,
+        invocation=invocation,
+        adapter=adapter,
+    )
+
     print(_review_workflow_label(state))
     print(f"Review summary: {_review_summary(repo_root)}")
     print("Diff legend: + added, - removed, unprefixed lines are unchanged context")
+    _print_review_preparation_metadata(package=package, planned_task=planned_task)
     print()
 
-    print(_review_cached_diff(repo_root), end="")
+    print(checkpoint_diff, end="")
     return 0
 
 
@@ -2611,6 +3202,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         if command == "summarize-verify":
             return handle_summarize_verify(command_name, command_arguments)
 
+        if command == "review-verify":
+            return handle_review_verify(command_name, command_arguments)
+
         if command == "start":
             return run_operational_command(command_name, "strict", handle_start, command_arguments)
 
@@ -2680,7 +3274,10 @@ def run() -> None:
         FlowError,
         RepositoryError,
         ReviewError,
+        ReviewManifestError,
         ReportPresentationError,
+        ReviewTaskGenerationError,
+        ReviewVerificationError,
         SummarizeConfigError,
         SummarizeBatchingError,
         SummarizeDiscoveryError,

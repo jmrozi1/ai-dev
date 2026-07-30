@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import hashlib
 import io
 import json
 import os
@@ -10,8 +11,10 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 from ai_dev_flow import cli
+from ai_dev_flow.review_context import build_review_context, build_review_id
 
 
 class FlowReviewTests(unittest.TestCase):
@@ -110,6 +113,64 @@ class FlowReviewTests(unittest.TestCase):
             left = line[len("diff --git a/") : line.index(" b/")]
             headers.append(left)
         return headers
+
+    def _review_package_dirs(self, repo_root: Path) -> list[Path]:
+        reviews_root = repo_root / ".ai-dev" / "reviews"
+        if not reviews_root.exists():
+            return []
+
+        return sorted(path for path in reviews_root.iterdir() if path.is_dir())
+
+    def _latest_review_dir(self, repo_root: Path) -> Path:
+        review_dirs = self._review_package_dirs(repo_root)
+        self.assertGreaterEqual(len(review_dirs), 1)
+        return review_dirs[-1]
+
+    def _review_id_from_payload(self, payload: dict[str, object]) -> str:
+        workflow = payload["workflow"]
+        ticket = payload["ticket"]
+        acceptance = payload["acceptance_criteria"]
+        changes = payload["changes"]
+        instructions = payload["instructions"]
+        artifacts = payload["artifacts"]
+        diagnostics = payload["diagnostics"]
+
+        context = build_review_context(
+            scope=payload["scope"],
+            command=payload["command"],
+            workflow_type=ticket["workflow_type"],
+            main_branch=workflow["main_branch"],
+            scratch_branch=workflow["scratch_branch"],
+            current_branch=workflow["current_branch"],
+            checkpoint=workflow["checkpoint"],
+            active_issue_number=ticket["issue_number"],
+            active_issue_title=ticket["issue_title"],
+            active_issue_url=ticket["issue_url"],
+            patch_description=ticket["patch_description"],
+            issue_description_status=ticket["issue_description_status"],
+            issue_description_source=ticket["issue_description_source"],
+            acceptance_criteria_status=acceptance["status"],
+            acceptance_criteria_heading=acceptance["heading"],
+            acceptance_criteria_lines=acceptance["lines"],
+            committed_reference=changes["committed_reference"],
+            committed_paths=changes["committed_paths"],
+            committed_diff_text="",
+            committed_diff_sha256=changes["committed_diff_sha256"],
+            overlay_reference=changes["overlay_reference"],
+            overlay_paths=changes["overlay_paths"],
+            overlay_diff_text="",
+            overlay_diff_sha256=changes["overlay_diff_sha256"],
+            all_paths=changes["all_paths"],
+            changes_diff_sha256=changes["changes_diff_sha256"],
+            instruction_reference_paths=instructions["reference_paths"],
+            diagnostics=diagnostics,
+            review_root_path=artifacts["review_root_path"],
+            package_markdown_path=artifacts["package_markdown_path"],
+            package_json_path=artifacts["package_json_path"],
+            changes_diff_path=artifacts["changes_diff_path"],
+            canonical_report_path=artifacts["canonical_report_path"],
+        )
+        return build_review_id(context)
 
     def test_review_help_includes_all_option(self) -> None:
         repo_root = self._init_repo("repo-review-help")
@@ -282,6 +343,231 @@ class FlowReviewTests(unittest.TestCase):
         if uncommitted_path not in committed_paths:
             expected_total += 1
         self.assertEqual(len(headers), expected_total)
+
+    def test_review_all_generates_review_package_artifacts(self) -> None:
+        repo_root = self._init_repo("repo-review-all-package-artifacts")
+        self._activate_issue_workflow(repo_root, issue_number=26)
+
+        (repo_root / "checkpoint-review.txt").write_text("checkpoint\n", encoding="utf-8")
+        commit_result = self._invoke(repo_root, "commit")
+        self.assertEqual(commit_result[0], 0)
+
+        (repo_root / "overlay-review.txt").write_text("overlay\n", encoding="utf-8")
+
+        code, out, err = self._invoke(repo_root, "review", "--all")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("Issue: 26", out)
+        self.assertIn("diff --git a/checkpoint-review.txt b/checkpoint-review.txt", out)
+        self.assertIn("diff --git a/overlay-review.txt b/overlay-review.txt", out)
+
+        latest = self._latest_review_dir(repo_root)
+        self.assertTrue((latest / "package.md").exists())
+        self.assertTrue((latest / "package.json").exists())
+        self.assertTrue((latest / "changes.diff").exists())
+
+        payload = json.loads((latest / "package.json").read_text(encoding="utf-8"))
+        derived_id = self._review_id_from_payload(payload)
+        self.assertEqual(payload["review_id"], derived_id)
+        self.assertEqual(latest.name, payload["review_id"])
+
+        changes_bytes = (latest / "changes.diff").read_bytes()
+        self.assertEqual(
+            payload["changes"]["changes_diff_sha256"],
+            hashlib.sha256(changes_bytes).hexdigest(),
+        )
+
+    def test_review_all_id_and_directory_are_stable_for_identical_state(self) -> None:
+        repo_root = self._init_repo("repo-review-id-stable")
+        self._activate_issue_workflow(repo_root, issue_number=34)
+
+        (repo_root / "checkpoint-review.txt").write_text("checkpoint\n", encoding="utf-8")
+        commit_result = self._invoke(repo_root, "commit")
+        self.assertEqual(commit_result[0], 0)
+
+        (repo_root / "overlay-review.txt").write_text("overlay\n", encoding="utf-8")
+
+        first_code, _, first_err = self._invoke(repo_root, "review", "--all")
+        self.assertEqual(first_code, 0)
+        self.assertEqual(first_err, "")
+        first_dir = self._latest_review_dir(repo_root)
+        first_payload = json.loads((first_dir / "package.json").read_text(encoding="utf-8"))
+
+        second_code, _, second_err = self._invoke(repo_root, "review", "--all")
+        self.assertEqual(second_code, 0)
+        self.assertEqual(second_err, "")
+        second_dir = self._latest_review_dir(repo_root)
+        second_payload = json.loads((second_dir / "package.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(first_payload["review_id"], second_payload["review_id"])
+        self.assertEqual(first_dir.name, second_dir.name)
+        self.assertEqual(len(self._review_package_dirs(repo_root)), 1)
+
+    def test_review_all_id_changes_when_authoritative_diff_changes(self) -> None:
+        repo_root = self._init_repo("repo-review-id-changes")
+        self._activate_issue_workflow(repo_root, issue_number=35)
+
+        (repo_root / "checkpoint-review.txt").write_text("checkpoint\n", encoding="utf-8")
+        commit_result = self._invoke(repo_root, "commit")
+        self.assertEqual(commit_result[0], 0)
+
+        (repo_root / "overlay-review.txt").write_text("overlay-a\n", encoding="utf-8")
+        first_code, _, first_err = self._invoke(repo_root, "review", "--all")
+        self.assertEqual(first_code, 0)
+        self.assertEqual(first_err, "")
+        first_payload = json.loads(
+            (self._latest_review_dir(repo_root) / "package.json").read_text(encoding="utf-8")
+        )
+
+        (repo_root / "overlay-review.txt").write_text("overlay-b\n", encoding="utf-8")
+        second_code, _, second_err = self._invoke(repo_root, "review", "--all")
+        self.assertEqual(second_code, 0)
+        self.assertEqual(second_err, "")
+        second_payload = json.loads(
+            (self._latest_review_dir(repo_root) / "package.json").read_text(encoding="utf-8")
+        )
+
+        self.assertNotEqual(first_payload["review_id"], second_payload["review_id"])
+
+    def test_review_package_generation_never_invokes_gh(self) -> None:
+        repo_root = self._init_repo("repo-review-offline-gh")
+        self._activate_issue_workflow(repo_root, issue_number=27)
+        (repo_root / "change.txt").write_text("content\n", encoding="utf-8")
+
+        real_run = subprocess.run
+
+        def guarded_run(*args: object, **kwargs: object) -> object:
+            command = args[0]
+            if isinstance(command, list) and command and command[0] == "gh":
+                raise AssertionError("review invoked gh unexpectedly")
+            return real_run(*args, **kwargs)
+
+        with patch("ai_dev_flow.cli.subprocess.run", side_effect=guarded_run):
+            code, out, err = self._invoke(repo_root, "review", "--all")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("Review summary:", out)
+
+    def test_review_package_records_local_metadata_diagnostic_when_issue_body_missing(self) -> None:
+        repo_root = self._init_repo("repo-review-missing-local-metadata")
+        self._activate_issue_workflow(repo_root, issue_number=28)
+        (repo_root / "change.txt").write_text("content\n", encoding="utf-8")
+
+        code, _, err = self._invoke(repo_root, "review", "--all")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+        latest = self._latest_review_dir(repo_root)
+        payload = json.loads((latest / "package.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["ticket"]["issue_number"], 28)
+        self.assertEqual(payload["ticket"]["issue_description_status"], "unavailable_local")
+        self.assertIn("Issue body unavailable locally", "\n".join(payload["diagnostics"]))
+
+    def test_review_path_fidelity_preserves_spaces_unicode_without_strip(self) -> None:
+        repo_root = self._init_repo("repo-review-path-fidelity")
+        self._activate_issue_workflow(repo_root, issue_number=29)
+
+        leading = " leading.txt"
+        trailing = "trailing .txt "
+        unicode_name = "unicodé.txt"
+
+        (repo_root / leading).write_text("lead\n", encoding="utf-8")
+        (repo_root / trailing).write_text("trail\n", encoding="utf-8")
+        (repo_root / unicode_name).write_text("uni\n", encoding="utf-8")
+
+        code, _, err = self._invoke(repo_root, "review")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+        latest = self._latest_review_dir(repo_root)
+        payload = json.loads((latest / "package.json").read_text(encoding="utf-8"))
+        overlay_paths = payload["changes"]["overlay_paths"]
+        self.assertIn(leading, overlay_paths)
+        self.assertIn(trailing, overlay_paths)
+        self.assertIn(unicode_name, overlay_paths)
+
+    def test_review_package_workflow_scope_preserves_committed_and_overlay_separately(self) -> None:
+        repo_root = self._init_repo("repo-review-scope-separation")
+        self._activate_issue_workflow(repo_root, issue_number=30)
+
+        same_path = "shared.txt"
+        (repo_root / same_path).write_text("committed\n", encoding="utf-8")
+        commit_result = self._invoke(repo_root, "commit")
+        self.assertEqual(commit_result[0], 0)
+
+        (repo_root / same_path).write_text("committed\noverlay\n", encoding="utf-8")
+
+        code, _, err = self._invoke(repo_root, "review", "--all")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+        latest = self._latest_review_dir(repo_root)
+        payload = json.loads((latest / "package.json").read_text(encoding="utf-8"))
+        self.assertIn(same_path, payload["changes"]["committed_paths"])
+        self.assertIn(same_path, payload["changes"]["overlay_paths"])
+        self.assertEqual(payload["changes"]["all_paths"].count(same_path), 1)
+
+        changes_text = (latest / "changes.diff").read_text(encoding="utf-8")
+        self.assertIn("## Committed workflow diff: main...scratch", changes_text)
+        self.assertIn("## Staged overlay diff: HEAD -> index", changes_text)
+
+    def test_review_package_checkpoint_scope_has_only_staged_section(self) -> None:
+        repo_root = self._init_repo("repo-review-checkpoint-scope")
+        self._activate_issue_workflow(repo_root, issue_number=31)
+        (repo_root / "wip.txt").write_text("wip\n", encoding="utf-8")
+
+        code, _, err = self._invoke(repo_root, "review")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+        latest = self._latest_review_dir(repo_root)
+        changes_text = (latest / "changes.diff").read_text(encoding="utf-8")
+        self.assertIn("# Scope: checkpoint", changes_text)
+        self.assertIn("## Staged checkpoint diff: HEAD -> index", changes_text)
+        self.assertNotIn("## Committed workflow diff:", changes_text)
+
+        payload = json.loads((latest / "package.json").read_text(encoding="utf-8"))
+        derived_id = self._review_id_from_payload(payload)
+        self.assertEqual(payload["review_id"], derived_id)
+        self.assertEqual(latest.name, payload["review_id"])
+        self.assertEqual(
+            payload["changes"]["changes_diff_sha256"],
+            hashlib.sha256((latest / "changes.diff").read_bytes()).hexdigest(),
+        )
+
+    def test_package_markdown_references_diff_without_embedding_patch(self) -> None:
+        repo_root = self._init_repo("repo-review-markdown-diff-reference")
+        self._activate_issue_workflow(repo_root, issue_number=32)
+        (repo_root / "snippet.txt").write_text("distinctive-line-123\n", encoding="utf-8")
+
+        code, _, err = self._invoke(repo_root, "review")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+
+        latest = self._latest_review_dir(repo_root)
+        package_text = (latest / "package.md").read_text(encoding="utf-8")
+        changes_text = (latest / "changes.diff").read_text(encoding="utf-8")
+        self.assertIn("distinctive-line-123", changes_text)
+        self.assertNotIn("distinctive-line-123", package_text)
+        self.assertIn("## Change Package", package_text)
+        self.assertIn("Changes-Diff-Path:", package_text)
+
+    def test_review_context_failures_are_surface_as_normal_cli_errors(self) -> None:
+        repo_root = self._init_repo("repo-review-context-error")
+        self._activate_issue_workflow(repo_root, issue_number=33)
+        (repo_root / "change.txt").write_text("content\n", encoding="utf-8")
+
+        with patch(
+            "ai_dev_flow.cli.build_review_context",
+            side_effect=cli.ReviewContextError("simulated context validation failure"),
+        ):
+            code, out, err = self._invoke(repo_root, "review")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("Cannot prepare deterministic review package.", err)
+        self.assertIn("simulated context validation failure", err)
 
     def test_review_all_fails_without_active_workflow_and_preserves_output(self) -> None:
         repo_root = self._init_repo("repo-review-all-inactive")

@@ -101,8 +101,9 @@ Commands:
     task-prepare  Prepare an immutable generated task artifact.
     summarize  Prepare deterministic summarize task artifacts for source files.
     summarize-verify  Verify summarize outputs for a prepared plan.
+    review-verify  Verify deterministic review report and package integrity.
   status     Show the active issue and current repository state.
-  review     Generate a review package for proposed changes.
+    review     Prepare a review package and generated review task for proposed changes.
   commit     Create the next numbered checkpoint on scratch.
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.

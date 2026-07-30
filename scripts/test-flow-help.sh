@@ -146,8 +146,9 @@ Commands:
     task-prepare  Prepare an immutable generated task artifact.
     summarize  Prepare deterministic summarize task artifacts for source files.
     summarize-verify  Verify summarize outputs for a prepared plan.
+    review-verify  Verify deterministic review report and package integrity.
   status     Show the active issue and current repository state.
-  review     Generate a review package for proposed changes.
+    review     Prepare a review package and generated review task for proposed changes.
   commit     Create the next numbered checkpoint on scratch.
   reset      Discard scratch work and restore it from main.
   promote    Squash scratch into one permanent commit on main.
@@ -232,6 +233,18 @@ Options:
   -h, --help  Show this help.
 EOF
 			;;
+		review-verify)
+			cat <<EOF
+Usage: ${command_name} review-verify [<review-id>]
+
+Verify review package/task/report integrity for a deterministic review,
+write verification artifacts, and present the canonical review report using
+reports.presentation mode.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
 		status)
 			cat <<EOF
 Usage: ${command_name} status [-v|--verbose]
@@ -247,7 +260,7 @@ EOF
 			cat <<EOF
 Usage: ${command_name} review [-a|--all]
 
-Generate a review package for proposed changes.
+Prepare deterministic review package and generated review task for proposed changes.
 
 Options:
   -a, --all   Include all changes in the active workflow since main.
@@ -409,7 +422,7 @@ help_command_verbose="$(cd "$help_repo/subdir" && "$symlink_path" help --help)"
 assert_equals "$help_command_output" "$help_command_verbose"
 
 # command-specific help for every public command
-for command in start patch task-prepare summarize summarize-verify status review commit reset promote complete block resume config get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config get set unset showreport help; do
 	command_help_short="$TMP_DIR/${command}-short.txt"
 	command_help_long="$TMP_DIR/${command}-long.txt"
 	if run_flow_capture "$help_repo/subdir" "$command_help_short" "$command" -h; then
@@ -431,7 +444,7 @@ for command in start patch task-prepare summarize summarize-verify status review
 # help works outside Git repositories and with malformed config
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
-for command in start patch task-prepare summarize summarize-verify status review commit reset promote complete block resume config get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config get set unset showreport help; do
 	for help_flag in -h --help; do
 		outside_output="$TMP_DIR/outside-${command}-${help_flag//-/}.txt"
 		if run_flow_capture "$outside_repo" "$outside_output" "$command" "$help_flag"; then
@@ -448,7 +461,7 @@ repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"
 mkdir -p "$repo_malformed/.ai-dev"
 printf '{ invalid json\n' > "$repo_malformed/.ai-dev/config.json"
-for command in start patch task-prepare summarize summarize-verify status review commit reset promote complete block resume config get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config get set unset showreport help; do
 	malformed_output="$TMP_DIR/malformed-${command}.txt"
 	if run_flow_capture "$repo_malformed/subdir" "$malformed_output" "$command" --help; then
 		malformed_status=0
@@ -467,7 +480,7 @@ git -C "$repo_bypass" checkout -q -b scratch
 state_set "$repo_bypass/subdir" '{"activeIssueNumber":99,"mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 git -C "$repo_bypass" checkout -q main
 printf '{ invalid workflow json\n' > "$repo_bypass/.ai-dev/workflow.json"
-for command in start patch task-prepare summarize summarize-verify status review commit reset promote complete block resume config get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config get set unset showreport help; do
 	bypass_output="$TMP_DIR/bypass-${command}.txt"
 	if run_flow_capture "$repo_bypass/subdir" "$bypass_output" "$command" -h; then
 		bypass_status=0
@@ -507,7 +520,7 @@ assert_contains "$(cat "$command_help_routed_output")" 'Usage: flow status [-v|-
 assert_not_exists "$set_repo_out"
 
 # extra arguments combined with help are rejected
-for command in patch task-prepare summarize summarize-verify status review commit reset complete block resume config get set unset showreport help; do
+for command in patch task-prepare summarize summarize-verify review-verify status review commit reset complete block resume config get set unset showreport help; do
 	extra_output="$TMP_DIR/${command}-extra.txt"
 	if run_flow_capture "$help_repo/subdir" "$extra_output" "$command" -h extra; then
 		extra_status=0
