@@ -155,7 +155,7 @@ Commands:
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
 	resume     Reactivate a previously blocked issue workflow.
-  config     Open user configuration in an editor.
+    config     Open or create editable user configuration.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
@@ -342,10 +342,14 @@ EOF
 			;;
 		config)
 			cat <<EOF
-Usage: ${command_name} config
+Usage: ${command_name} config [apply]
 
-Create the user AI Dev YAML configuration file if missing, then open it.
-If parsing fails, open the same file with fallback editor resolution for repair.
+Create the user AI Dev YAML configuration file if missing, then open it
+using editor.command, VISUAL, EDITOR, or platform defaults.
+If no editor can be launched, print the absolute path for manual editing.
+
+Run \`config apply\` to reconcile managed aliases from user config into
+shell/profile files and update the managed installation manifest.
 
 Options:
   -h, --help  Show this help.

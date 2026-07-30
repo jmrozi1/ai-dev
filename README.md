@@ -23,6 +23,22 @@ The build script vendors `ai-dev-core` into the VS Code extension package and wr
 code --install-extension artifacts/*.vsix --force
 ```
 
+## Install Canonical ai-dev Command
+
+Linux and macOS:
+
+```bash
+./scripts/bootstrap-ai-dev.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\scripts\bootstrap-ai-dev.ps1
+```
+
+Both wrappers delegate to `python -m ai_dev_flow.bootstrap`, which installs managed `ai-dev` launcher files under `~/.local/bin` and prints PATH guidance when needed.
+
 ## Design Principles
 
 - Source is truth.
@@ -41,3 +57,6 @@ code --install-extension artifacts/*.vsix --force
 - [docs/review-package-slice1.md](docs/review-package-slice1.md) - Issue #16 Slice 1 deterministic review planning/package foundation and immutable artifacts.
 - [docs/review-task-preparation-slice2.md](docs/review-task-preparation-slice2.md) - Issue #16 Slice 2 generated review task preparation, provider-neutral delivery, and current-task pointer integration.
 - [docs/review-verification-slice3.md](docs/review-verification-slice3.md) - Issue #16 Slice 3 deterministic review report validation, package/task integrity checks, and review verification presentation behavior.
+- [docs/editable-config-slice1.md](docs/editable-config-slice1.md) - Issue #17 Slice 1 user-editable config creation/open flow, editor precedence, and path-only fallback behavior.
+- [docs/managed-aliases-slice2.md](docs/managed-aliases-slice2.md) - Issue #17 Slice 2 managed command alias reconciliation, profile ownership, and manifest/rollback behavior.
+- [docs/bootstrap-slice3.md](docs/bootstrap-slice3.md) - Issue #17 Slice 3 cross-platform bootstrap and canonical ai-dev launcher installation behavior.

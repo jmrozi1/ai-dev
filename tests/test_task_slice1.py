@@ -13,6 +13,7 @@ from unittest.mock import patch
 from ai_dev_flow import cli
 from ai_dev_flow import task_artifacts as task_artifacts_module
 from ai_dev_flow.editor_opening import EditorOpenResult
+from ai_dev_flow.editor_selection import EditorLaunchResult
 from ai_dev_flow.json_files import JsonFileError
 from ai_dev_flow.task_artifacts import TaskArtifactError, create_generated_task
 from ai_dev_flow.task_config import TaskConfigError, load_task_config
@@ -215,7 +216,7 @@ class TaskSliceOneTests(unittest.TestCase):
         text = str(context.exception)
         self.assertIn(str(bad_path), text)
         self.assertIn("at <root>", text)
-        self.assertIn("Expected keys: ai, editor, reports", text)
+        self.assertIn("Expected keys: ai, aliases, editor, reports", text)
 
     def test_user_editor_command_is_loaded(self) -> None:
         repo_root = self._init_repo("repo-editor-config")
@@ -935,24 +936,24 @@ class TaskSliceOneTests(unittest.TestCase):
         repo_root = self._init_repo("repo-flow-config-create")
         user_config_path = self.tmp_path / "cfg" / "ai-dev" / "config.yaml"
 
-        opened_paths: list[Path] = []
-
-        class FakeOpener:
-            def open_path(self, target_path: Path) -> EditorOpenResult:
-                opened_paths.append(target_path)
-                return EditorOpenResult(opened=True)
-
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(user_config_path)}, clear=False),
-            patch("ai_dev_flow.cli.build_editor_opener", return_value=FakeOpener()),
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=True,
+                    status="opened",
+                    command_display="code --wait",
+                    warning=None,
+                ),
+            ),
         ):
             code, out, err = self._invoke(repo_root, "config")
 
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertIn(f"Created user config: {user_config_path}", out)
-        self.assertIn(f"Opened user config: {user_config_path}", out)
-        self.assertEqual(opened_paths, [user_config_path])
+        self.assertIn(f"Created AI Dev config: {user_config_path}", out)
+        self.assertIn("Opened config with: code --wait", out)
         self.assertTrue(user_config_path.exists())
         text = user_config_path.read_text(encoding="utf-8")
         self.assertIn("ai:", text)
@@ -966,38 +967,47 @@ class TaskSliceOneTests(unittest.TestCase):
         original_text = "ai:\n  delivery: file-only\n"
         user_config_path.write_text(original_text, encoding="utf-8")
 
-        class FakeOpener:
-            def open_path(self, target_path: Path) -> EditorOpenResult:
-                return EditorOpenResult(opened=True)
-
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(user_config_path)}, clear=False),
-            patch("ai_dev_flow.cli.build_editor_opener", return_value=FakeOpener()),
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=True,
+                    status="opened",
+                    command_display="vim",
+                    warning=None,
+                ),
+            ),
         ):
             code, out, err = self._invoke(repo_root, "config")
 
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertNotIn("Created user config", out)
+        self.assertNotIn("Created AI Dev config", out)
+        self.assertIn(f"AI Dev config: {user_config_path}", out)
         self.assertEqual(user_config_path.read_text(encoding="utf-8"), original_text)
 
     def test_flow_config_editor_unavailable_prints_path(self) -> None:
         repo_root = self._init_repo("repo-flow-config-fallback")
         user_config_path = self.tmp_path / "fallback" / "config.yaml"
 
-        class FakeOpener:
-            def open_path(self, target_path: Path) -> EditorOpenResult:
-                _ = target_path
-                return EditorOpenResult(opened=False, warning="editor unavailable")
-
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(user_config_path)}, clear=False),
-            patch("ai_dev_flow.cli.build_editor_opener", return_value=FakeOpener()),
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=False,
+                    status="no-editor-candidate",
+                    command_display=None,
+                    warning="editor unavailable",
+                ),
+            ),
         ):
             code, out, err = self._invoke(repo_root, "config")
 
         self.assertEqual(code, 0)
-        self.assertIn(f"User config path: {user_config_path}", out)
+        self.assertIn(f"Created AI Dev config: {user_config_path}", out)
+        self.assertIn("No editor could be launched. Edit this file manually.", out)
         self.assertIn("Warning: editor unavailable", err)
 
     def test_flow_config_malformed_yaml_still_opens_file_with_fallback_editor(self) -> None:
@@ -1007,24 +1017,23 @@ class TaskSliceOneTests(unittest.TestCase):
         original_text = "ai:\n  invocation: [\n"
         user_config_path.write_text(original_text, encoding="utf-8")
 
-        opened_paths: list[Path] = []
-
-        class FakeOpener:
-            def open_path(self, target_path: Path) -> EditorOpenResult:
-                opened_paths.append(target_path)
-                return EditorOpenResult(opened=True)
-
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(user_config_path)}, clear=False),
-            patch("ai_dev_flow.cli.build_editor_opener", return_value=FakeOpener()) as opener_builder,
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=True,
+                    status="opened",
+                    command_display="nano",
+                    warning=None,
+                ),
+            ),
         ):
             code, out, err = self._invoke(repo_root, "config")
 
         self.assertEqual(code, 0)
-        self.assertIn(f"Opened user config: {user_config_path}", out)
-        self.assertIn("could not be parsed for editor.command", err)
-        self.assertEqual(opener_builder.call_args.args[0], None)
-        self.assertEqual(opened_paths, [user_config_path])
+        self.assertIn("Opened config with: nano", out)
+        self.assertIn("Invalid YAML in AI Dev config", err)
         self.assertEqual(user_config_path.read_text(encoding="utf-8"), original_text)
 
     def test_flow_config_invalid_field_still_opens_file_with_fallback_editor(self) -> None:
@@ -1034,24 +1043,23 @@ class TaskSliceOneTests(unittest.TestCase):
         original_text = "editor:\n  command: \"   \"\n"
         user_config_path.write_text(original_text, encoding="utf-8")
 
-        opened_paths: list[Path] = []
-
-        class FakeOpener:
-            def open_path(self, target_path: Path) -> EditorOpenResult:
-                opened_paths.append(target_path)
-                return EditorOpenResult(opened=True)
-
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(user_config_path)}, clear=False),
-            patch("ai_dev_flow.cli.build_editor_opener", return_value=FakeOpener()) as opener_builder,
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=True,
+                    status="opened",
+                    command_display="vim",
+                    warning=None,
+                ),
+            ),
         ):
             code, out, err = self._invoke(repo_root, "config")
 
         self.assertEqual(code, 0)
-        self.assertIn(f"Opened user config: {user_config_path}", out)
-        self.assertIn("could not be parsed for editor.command", err)
-        self.assertEqual(opener_builder.call_args.args[0], None)
-        self.assertEqual(opened_paths, [user_config_path])
+        self.assertIn("Opened config with: vim", out)
+        self.assertIn("Invalid AI Dev config", err)
         self.assertEqual(user_config_path.read_text(encoding="utf-8"), original_text)
 
     def test_flow_config_broken_file_and_no_editor_prints_path(self) -> None:
@@ -1061,20 +1069,23 @@ class TaskSliceOneTests(unittest.TestCase):
         original_text = "ai:\n  delivery: invalid-mode\n"
         user_config_path.write_text(original_text, encoding="utf-8")
 
-        class FakeOpener:
-            def open_path(self, target_path: Path) -> EditorOpenResult:
-                _ = target_path
-                return EditorOpenResult(opened=False, warning="No editor command is available on this machine.")
-
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(user_config_path)}, clear=False),
-            patch("ai_dev_flow.cli.build_editor_opener", return_value=FakeOpener()),
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=False,
+                    status="no-editor-candidate",
+                    command_display=None,
+                    warning="No editor command is available on this machine.",
+                ),
+            ),
         ):
             code, out, err = self._invoke(repo_root, "config")
 
         self.assertEqual(code, 0)
-        self.assertIn(f"User config path: {user_config_path}", out)
-        self.assertIn("could not be parsed for editor.command", err)
+        self.assertIn(f"AI Dev config: {user_config_path}", out)
+        self.assertIn("No editor could be launched. Edit this file manually.", out)
         self.assertIn("No editor command is available on this machine.", err)
         self.assertEqual(user_config_path.read_text(encoding="utf-8"), original_text)
 

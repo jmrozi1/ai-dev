@@ -110,7 +110,7 @@ Commands:
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
 	resume     Reactivate a previously blocked issue workflow.
-  config     Open user configuration in an editor.
+    config     Open or create editable user configuration.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.

@@ -77,6 +77,14 @@ from .review_verification import (
     run_review_verification,
 )
 from .editor_opening import build_editor_opener
+from .alias_config import AliasConfigError, load_desired_alias_state
+from .alias_installation import AliasInstallationError, apply_alias_reconciliation
+from .editable_config import (
+    EditableConfigError,
+    ensure_editable_user_config,
+    resolve_configured_editor_command,
+)
+from .editor_selection import launch_selected_editor, select_editor_candidate
 from .report_presentation import ReportPresentationError, build_report_presenter
 from .summarize_batching import SummarizeBatchingError, build_summarize_batches
 from .summarize_config import SummarizeConfigError, load_repository_summarize_config
@@ -116,9 +124,7 @@ from .json_files import JsonFileError, write_text_atomic
 from .task_artifacts import TaskArtifactError, create_generated_task, plan_generated_task
 from .task_config import (
     TaskConfigError,
-    default_user_config_text,
     load_task_config,
-    resolve_user_config_path,
 )
 from .task_delivery import ClipboardDeliveryError, build_delivery_adapter
 from .task_invocation import render_invocation
@@ -145,7 +151,7 @@ Commands:
   complete   Clear the completed local workflow.
 	block      Block the active issue workflow and release the active slot.
 	resume     Reactivate a previously blocked issue workflow.
-  config     Open user configuration in an editor.
+    config     Open or create editable user configuration.
   get        Read a repository setting.
   set        Change a repository setting.
   unset      Remove a repository setting.
@@ -297,13 +303,17 @@ Options:
   -h, --help  Show this help.
 """,
         "config": """\
-Usage: {command_name} config
+Usage: {command_name} config [apply]
 
-Create the user AI Dev YAML configuration file if missing, then open it.
-If parsing fails, open the same file with fallback editor resolution for repair.
+Create the user AI Dev YAML configuration file if missing, then open it
+using editor.command, VISUAL, EDITOR, or platform defaults.
+If no editor can be launched, print the absolute path for manual editing.
+
+Run `config apply` to reconcile managed aliases from user config into
+shell/profile files and update the managed installation manifest.
 
 Options:
-  -h, --help  Show this help.
+    -h, --help  Show this help.
 """,
     "set": """\
 Usage: {command_name} set out=<path>
@@ -401,6 +411,9 @@ def print_command_help(command_name: str, command: str) -> None:
         template = template.replace("\n    -h, --help", "\n  -h, --help")
 
     if command in {"summarize", "summarize-verify", "review-verify"}:
+        template = template.replace("\n    -h, --help", "\n  -h, --help")
+
+    if command == "config":
         template = template.replace("\n    -h, --help", "\n  -h, --help")
 
     print(template.format(command_name=command_name), end="")
@@ -616,7 +629,7 @@ def handle_unset(command_name: str, arguments: list[str]) -> int:
 
 
 def _config_usage(command_name: str) -> FlowError:
-    return FlowError(f"Usage: {command_name} config")
+    return FlowError(f"Usage: {command_name} config [apply]")
 
 
 def _showreport_usage(command_name: str) -> FlowError:
@@ -625,49 +638,74 @@ def _showreport_usage(command_name: str) -> FlowError:
 
 def handle_config(command_name: str, arguments: list[str]) -> int:
     if arguments:
+        if len(arguments) == 1 and arguments[0] == "apply":
+            try:
+                config_state = ensure_editable_user_config()
+                desired = load_desired_alias_state(
+                    config_state.config_path,
+                    case_insensitive_names=(os.name == "nt"),
+                )
+                summary = apply_alias_reconciliation(desired)
+            except (AliasConfigError, AliasInstallationError, EditableConfigError) as exc:
+                raise FlowError(str(exc)) from exc
+
+            print(f"Managed aliases configured: {summary.aliases_configured}")
+            if summary.previous_alias_file_path is not None:
+                print(f"Previous alias file: {summary.previous_alias_file_path}")
+            if summary.previous_profile_path is not None:
+                print(f"Previous profile: {summary.previous_profile_path}")
+            if summary.alias_file_path is not None:
+                print(f"Alias file: {summary.alias_file_path}")
+            if summary.profile_path is not None:
+                print(f"Profile file: {summary.profile_path}")
+            print(f"Manifest: {summary.manifest_path}")
+            print(f"Result: {summary.outcome}")
+            changed_parts: list[str] = []
+            if summary.alias_file_changed:
+                changed_parts.append("alias-file")
+            if summary.profile_changed:
+                changed_parts.append("profile")
+            if summary.manifest_written:
+                changed_parts.append("manifest")
+            if summary.manifest_removed:
+                changed_parts.append("manifest-removed")
+
+            if changed_parts:
+                print(f"Updated: {', '.join(changed_parts)}")
+            else:
+                print("Updated: none")
+            return 0
+
         raise _config_usage(command_name)
 
-    user_config_path = resolve_user_config_path()
-    created = False
-
     try:
-        user_config_path.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        raise FlowError(f"Cannot create user config parent directory {user_config_path.parent}: {exc}") from exc
+        config_state = ensure_editable_user_config()
+    except EditableConfigError as exc:
+        raise FlowError(str(exc)) from exc
 
-    if not user_config_path.exists():
-        try:
-            user_config_path.write_text(default_user_config_text(), encoding="utf-8")
-            created = True
-        except OSError as exc:
-            raise FlowError(f"Cannot create user config file {user_config_path}: {exc}") from exc
+    configured_editor_command, parse_warning = resolve_configured_editor_command(
+        config_state.config_path
+    )
+    if parse_warning is not None:
+        print(f"Warning: {parse_warning}", file=sys.stderr)
 
-    repo_root = resolve_repo_root_if_available() or Path.cwd()
-    configured_editor_command: str | None = None
-    try:
-        task_config = load_task_config(repo_root)
-        configured_editor_command = task_config.editor_command
-    except TaskConfigError as exc:
-        print(
-            "Warning: user config could not be parsed for editor.command; "
-            f"falling back to VISUAL/EDITOR/platform defaults: {exc}",
-            file=sys.stderr,
-        )
+    selection = select_editor_candidate(configured_editor_command)
+    launch_result = launch_selected_editor(config_state.config_path, selection)
 
-    editor_opener = build_editor_opener(configured_editor_command)
-    open_result = editor_opener.open_path(user_config_path)
+    if config_state.created:
+        print(f"Created AI Dev config: {config_state.config_path}")
+    else:
+        print(f"AI Dev config: {config_state.config_path}")
 
-    if created:
-        print(f"Created user config: {user_config_path}")
+    if launch_result.warning:
+        print(f"Warning: {launch_result.warning}", file=sys.stderr)
 
-    if open_result.warning:
-        print(f"Warning: {open_result.warning}", file=sys.stderr)
-
-    if open_result.opened:
-        print(f"Opened user config: {user_config_path}")
+    if launch_result.opened:
+        command_display = launch_result.command_display or "(unknown)"
+        print(f"Opened config with: {command_display}")
         return 0
 
-    print(f"User config path: {user_config_path}")
+    print("No editor could be launched. Edit this file manually.")
     return 0
 
 

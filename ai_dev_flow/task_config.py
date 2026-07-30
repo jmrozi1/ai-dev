@@ -18,7 +18,13 @@ ALLOWED_REPORT_PRESENTATION_VALUES = frozenset(SUPPORTED_REPORT_PRESENTATION_VAL
 USER_SECTION_KEY = "ai"
 EDITOR_SECTION_KEY = "editor"
 REPORTS_SECTION_KEY = "reports"
-USER_ALLOWED_ROOT_KEYS = frozenset({USER_SECTION_KEY, EDITOR_SECTION_KEY, REPORTS_SECTION_KEY})
+ALIASES_SECTION_KEY = "aliases"
+USER_ALLOWED_ROOT_KEYS = frozenset({
+    USER_SECTION_KEY,
+    EDITOR_SECTION_KEY,
+    REPORTS_SECTION_KEY,
+    ALIASES_SECTION_KEY,
+})
 
 
 class TaskConfigError(Exception):
@@ -49,11 +55,26 @@ def resolve_user_config_path() -> Path:
 
 def default_user_config_text() -> str:
     return (
+        "# AI Dev user configuration\n"
+        "# Configure invocation delivery, report presentation, explicit editor,\n"
+        "# and future command aliases here.\n"
+        "\n"
         "ai:\n"
+        "  # Template used when emitting generated task invocation text.\n"
         f"  delivery: {DEFAULT_DELIVERY}\n"
+        "  # Available delivery modes: stdout, file-only, clipboard, clipboard+stdout.\n"
         f"  invocation: \"{DEFAULT_INVOCATION}\"\n"
+        "\n"
         "reports:\n"
-        f"  presentation: {DEFAULT_REPORT_PRESENTATION}\n"
+        "  # Available report presentation modes: stdout, editor, path-only.\n"
+        "  presentation: path-only\n"
+        "\n"
+        "editor:\n"
+        "  # Optional explicit editor command, for example: \"code --wait\".\n"
+        "  command: null\n"
+        "\n"
+        "# Reserved for future managed command aliases.\n"
+        "aliases: {}\n"
     )
 
 
@@ -196,6 +217,8 @@ def _validate_editor_section(
     normalized: dict[str, str] = {}
     if "command" in section_data:
         command = section_data["command"]
+        if command is None:
+            return normalized
         if not isinstance(command, str):
             raise TaskConfigError(
                 f"Invalid configuration in {path} at {EDITOR_SECTION_KEY}.command: expected string, got {_type_name(command)}."
@@ -210,6 +233,32 @@ def _validate_editor_section(
         normalized["command"] = normalized_command
 
     return normalized
+
+
+def _validate_aliases_section(
+    data: dict[str, Any],
+    *,
+    path: Path,
+) -> None:
+    aliases = data.get(ALIASES_SECTION_KEY, {})
+    if not isinstance(aliases, dict):
+        raise TaskConfigError(
+            f"Invalid configuration in {path} at {ALIASES_SECTION_KEY}: expected mapping, got {_type_name(aliases)}."
+        )
+
+    for key, value in aliases.items():
+        if not isinstance(key, str):
+            raise TaskConfigError(
+                f"Invalid configuration in {path} at {ALIASES_SECTION_KEY}: alias keys must be strings."
+            )
+        if not isinstance(value, str):
+            raise TaskConfigError(
+                f"Invalid configuration in {path} at {ALIASES_SECTION_KEY}.{key}: expected string, got {_type_name(value)}."
+            )
+        if not value.strip():
+            raise TaskConfigError(
+                f"Invalid configuration in {path} at {ALIASES_SECTION_KEY}.{key}: expected non-empty string."
+            )
 
 
 def _validate_reports_section(
@@ -271,6 +320,7 @@ def load_task_config(repo_root: Path) -> TaskConfig:
     )
     editor_values = _validate_editor_section(user_data, path=user_path)
     reports_values = _validate_reports_section(user_data, path=user_path)
+    _validate_aliases_section(user_data, path=user_path)
 
     # Keep reading repository config for compatibility with existing .ai-dev.yaml
     # usage, but machine-owned delivery/invocation preferences are user-only.

@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from ai_dev_flow import cli
 from ai_dev_flow.editor_opening import EditorOpenResult
+from ai_dev_flow.editor_selection import EditorLaunchResult
 from ai_dev_flow.task_delivery import ClipboardDeliveryError
 
 
@@ -242,15 +243,21 @@ class GeneratedTaskFoundationIntegrationTests(unittest.TestCase):
 
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(user_config_path)}, clear=False),
-            patch("ai_dev_flow.cli.build_editor_opener", return_value=fake_editor) as build_editor,
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=True,
+                    status="opened",
+                    command_display="nano",
+                    warning=None,
+                ),
+            ),
         ):
             code, out, err = self._invoke(repo_root, "config")
 
         self.assertEqual(code, 0)
-        self.assertIn(f"Opened user config: {user_config_path}", out)
-        self.assertIn("could not be parsed for editor.command", err)
-        self.assertEqual(build_editor.call_args.args[0], None)
-        self.assertEqual(fake_editor.opened_paths, [user_config_path])
+        self.assertIn("Opened config with: nano", out)
+        self.assertIn("Invalid YAML in AI Dev config", err)
         self.assertEqual(user_config_path.read_text(encoding="utf-8"), original)
 
     def test_report_flow_uses_configured_output_path_without_duplication(self) -> None:
@@ -328,13 +335,21 @@ class GeneratedTaskFoundationIntegrationTests(unittest.TestCase):
                 },
                 clear=False,
             ),
-            patch("ai_dev_flow.editor_opening.platform.system", return_value="Linux"),
-            patch("ai_dev_flow.editor_opening.shutil.which", return_value=None),
+            patch(
+                "ai_dev_flow.cli.launch_selected_editor",
+                return_value=EditorLaunchResult(
+                    opened=False,
+                    status="no-editor-candidate",
+                    command_display=None,
+                    warning="No editor command is available on this machine.",
+                ),
+            ),
         ):
             config_code, config_out, config_err = self._invoke(repo_root, "config")
 
         self.assertEqual(config_code, 0)
-        self.assertIn(f"User config path: {no_editor_config_path}", config_out)
+        self.assertIn(f"AI Dev config: {no_editor_config_path}", config_out)
+        self.assertIn("No editor could be launched. Edit this file manually.", config_out)
         self.assertIn("No editor command is available on this machine.", config_err)
         self.assertNotIn("Traceback", config_err)
 
