@@ -10,10 +10,10 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from ai_dev_flow import cli
-from ai_dev_flow.alias_installation import AliasInstallerPaths
+from ai_dev_flow.managed_installation import ManagedInstallationPaths
 
 
-class ConfigApplyCliTests(unittest.TestCase):
+class ApplyCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self._tmpdir.name)
@@ -53,179 +53,87 @@ class ConfigApplyCliTests(unittest.TestCase):
 
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_config_apply_succeeds_without_repo(self) -> None:
+    def test_apply_help_works_outside_repo(self) -> None:
+        outside = self.tmp_path / "outside"
+        outside.mkdir(parents=True)
+
+        code, out, err = self._invoke(outside, "apply", "--help")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("Usage: ai-dev apply", out)
+        self.assertIn("This command is idempotent", out)
+
+    def test_apply_succeeds_without_repo(self) -> None:
         outside = self.tmp_path / "outside"
         outside.mkdir(parents=True)
         config_path = self.tmp_path / "cfg" / "config.yaml"
         config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("aliases:\n  gs: status\n", encoding="utf-8")
-
-        profile_path = self.tmp_path / "profile.rc"
-        alias_path = self.tmp_path / "aliases.sh"
-        manifest_path = self.tmp_path / "manifest.json"
-
-        with (
-            patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_manifest_path",
-                return_value=manifest_path,
-            ),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_installer_paths",
-                return_value=AliasInstallerPaths(
-                    profile_path=profile_path,
-                    alias_file_path=alias_path,
-                    manifest_path=manifest_path,
-                ),
-            ),
-        ):
-            code, out, err = self._invoke(outside, "config", "apply")
-
-        self.assertEqual(code, 0)
-        self.assertEqual(err, "")
-        self.assertIn("Managed aliases configured: 1", out)
-        self.assertIn("Result: applied", out)
-        self.assertTrue(alias_path.exists())
-        self.assertTrue(profile_path.exists())
-        self.assertTrue(manifest_path.exists())
-
-    def test_config_apply_remove_all_result(self) -> None:
-        outside = self.tmp_path / "outside-remove"
-        outside.mkdir(parents=True)
-        config_path = self.tmp_path / "cfg-remove" / "config.yaml"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("aliases:\n  gs: status\n", encoding="utf-8")
-
-        profile_path = self.tmp_path / "profile-remove.rc"
-        alias_path = self.tmp_path / "aliases-remove.sh"
-        manifest_path = self.tmp_path / "manifest-remove.json"
-
-        with (
-            patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_manifest_path",
-                return_value=manifest_path,
-            ),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_installer_paths",
-                return_value=AliasInstallerPaths(
-                    profile_path=profile_path,
-                    alias_file_path=alias_path,
-                    manifest_path=manifest_path,
-                ),
-            ),
-        ):
-            first_code, _, first_err = self._invoke(outside, "config", "apply")
-            self.assertEqual(first_code, 0)
-            self.assertEqual(first_err, "")
-
-            config_path.write_text("aliases: {}\n", encoding="utf-8")
-            code, out, err = self._invoke(outside, "config", "apply")
-
-        self.assertEqual(code, 0)
-        self.assertEqual(err, "")
-        self.assertIn("Result: removed-all", out)
-        self.assertIn("Updated: alias-file, profile, manifest-removed", out)
-
-    def test_config_apply_noop_result(self) -> None:
-        outside = self.tmp_path / "outside-noop"
-        outside.mkdir(parents=True)
-        config_path = self.tmp_path / "cfg-noop" / "config.yaml"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("aliases:\n  gs: status\n", encoding="utf-8")
-
-        profile_path = self.tmp_path / "profile-noop.rc"
-        alias_path = self.tmp_path / "aliases-noop.sh"
-        manifest_path = self.tmp_path / "manifest-noop.json"
-
-        with (
-            patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_manifest_path",
-                return_value=manifest_path,
-            ),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_installer_paths",
-                return_value=AliasInstallerPaths(
-                    profile_path=profile_path,
-                    alias_file_path=alias_path,
-                    manifest_path=manifest_path,
-                ),
-            ),
-        ):
-            first_code, _, first_err = self._invoke(outside, "config", "apply")
-            self.assertEqual(first_code, 0)
-            self.assertEqual(first_err, "")
-
-            code, out, err = self._invoke(outside, "config", "apply")
-
-        self.assertEqual(code, 0)
-        self.assertEqual(err, "")
-        self.assertIn("Result: no-op", out)
-        self.assertIn("Updated: none", out)
-
-    def test_config_apply_reports_migrated_with_previous_paths(self) -> None:
-        outside = self.tmp_path / "outside-migrated"
-        outside.mkdir(parents=True)
-        config_path = self.tmp_path / "cfg-migrated" / "config.yaml"
-        config_path.parent.mkdir(parents=True, exist_ok=True)
-        config_path.write_text("aliases:\n  gs: status\n", encoding="utf-8")
-
-        home = self.tmp_path / "home-migrated"
-        old_paths = AliasInstallerPaths(
-            profile_path=home / ".bashrc",
-            alias_file_path=home / ".config" / "ai-dev" / "aliases.sh",
-            manifest_path=home / ".config" / "ai-dev" / "managed-aliases-manifest.json",
+        config_path.write_text(
+            "installation:\n"
+            "  aliases:\n"
+            "    commands:\n"
+            "      flow-status: \"ai-dev flow status\"\n"
+            "  shellPath:\n"
+            "    enabled: false\n",
+            encoding="utf-8",
         )
-        new_paths = AliasInstallerPaths(
-            profile_path=home / ".zshrc",
-            alias_file_path=home / ".config" / "ai-dev" / "aliases.sh",
-            manifest_path=home / ".config" / "ai-dev" / "managed-aliases-manifest.json",
+
+        paths = ManagedInstallationPaths(
+            launcher_directory=self.tmp_path / "bin",
+            manifest_path=self.tmp_path / "state" / "installation-manifest.json",
+            bashrc_path=self.tmp_path / ".bashrc",
+            windows=False,
         )
 
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
             patch(
-                "ai_dev_flow.alias_installation.resolve_manifest_path",
-                return_value=old_paths.manifest_path,
-            ),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_installer_paths",
-                return_value=old_paths,
+                "ai_dev_flow.managed_installation.resolve_managed_installation_paths",
+                return_value=paths,
             ),
         ):
-            first_code, _, first_err = self._invoke(outside, "config", "apply")
-            self.assertEqual(first_code, 0)
-            self.assertEqual(first_err, "")
+            code, out, err = self._invoke(outside, "apply")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("Managed launchers:", out)
+        self.assertIn("created: 1", out)
+        self.assertIn("Manifest:", out)
+
+    def test_config_apply_compatibility_route_still_works(self) -> None:
+        outside = self.tmp_path / "outside-compat"
+        outside.mkdir(parents=True)
+        config_path = self.tmp_path / "cfg-compat" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "installation:\n"
+            "  aliases:\n"
+            "    enabled: false\n"
+            "  shellPath:\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+
+        paths = ManagedInstallationPaths(
+            launcher_directory=self.tmp_path / "bin-compat",
+            manifest_path=self.tmp_path / "state-compat" / "installation-manifest.json",
+            bashrc_path=self.tmp_path / ".bashrc-compat",
+            windows=False,
+        )
 
         with (
             patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
             patch(
-                "ai_dev_flow.alias_installation.resolve_manifest_path",
-                return_value=new_paths.manifest_path,
-            ),
-            patch(
-                "ai_dev_flow.alias_installation.resolve_installer_paths",
-                return_value=new_paths,
+                "ai_dev_flow.managed_installation.resolve_managed_installation_paths",
+                return_value=paths,
             ),
         ):
             code, out, err = self._invoke(outside, "config", "apply")
 
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertIn("Result: migrated", out)
-        self.assertIn(f"Previous profile: {old_paths.profile_path}", out)
-        self.assertIn(f"Profile file: {new_paths.profile_path}", out)
-
-    def test_config_apply_usage_error(self) -> None:
-        outside = self.tmp_path / "outside-usage"
-        outside.mkdir(parents=True)
-
-        code, out, err = self._invoke(outside, "config", "nope")
-
-        self.assertEqual(code, 1)
-        self.assertEqual(out, "")
-        self.assertIn("Usage: ai-dev config [apply]", err)
+        self.assertIn("Managed launchers:", out)
 
 
 if __name__ == "__main__":

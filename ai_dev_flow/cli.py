@@ -77,8 +77,12 @@ from .review_verification import (
     run_review_verification,
 )
 from .editor_opening import build_editor_opener
-from .alias_config import AliasConfigError, load_desired_alias_state
-from .alias_installation import AliasInstallationError, apply_alias_reconciliation
+from .managed_installation import (
+    InstallationConfigError,
+    ManagedInstallationError,
+    apply_installation_reconciliation,
+    load_desired_installation_state,
+)
 from .editable_config import (
     EditableConfigError,
     ensure_editable_user_config,
@@ -276,6 +280,13 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         canonical_namespace="top",
         order=150,
         handler_key="config",
+    ),
+    CommandSpec(
+        name="apply",
+        description="Reconcile managed launchers, PATH state, and installation ownership.",
+        canonical_namespace="top",
+        order=155,
+        handler_key="apply",
     ),
     CommandSpec(
         name="get",
@@ -487,8 +498,19 @@ Create the user AI Dev YAML configuration file if missing, then open it
 using editor.command, VISUAL, EDITOR, or platform defaults.
 If no editor can be launched, print the absolute path for manual editing.
 
-Run `config apply` to reconcile managed aliases from user config into
-shell/profile files and update the managed installation manifest.
+Run `ai-dev apply` to reconcile managed launchers, PATH state,
+and installation ownership from user config.
+
+Options:
+  -h, --help  Show this help.
+""",
+    "apply": """\
+Usage: {command_name} apply
+
+Reconcile managed installation resources from user configuration:
+launcher files, Linux ~/.bashrc PATH marker block, and ownership manifest.
+
+This command is idempotent for unchanged configuration.
 
 Options:
   -h, --help  Show this help.
@@ -849,49 +871,56 @@ def _config_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} config [apply]")
 
 
+def _apply_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} apply")
+
+
 def _showreport_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} showreport")
+
+
+def _run_apply_command() -> int:
+    try:
+        config_state = ensure_editable_user_config()
+        desired = load_desired_installation_state(
+            config_state.config_path,
+            case_insensitive_names=(os.name == "nt"),
+        )
+        summary = apply_installation_reconciliation(desired)
+    except (
+        InstallationConfigError,
+        ManagedInstallationError,
+        EditableConfigError,
+    ) as exc:
+        raise FlowError(str(exc)) from exc
+
+    print("Managed launchers:")
+    print(f"  created: {summary.launchers_created}")
+    print(f"  updated: {summary.launchers_updated}")
+    print(f"  removed: {summary.launchers_removed}")
+    print(f"  unchanged: {summary.launchers_unchanged}")
+    print(f"  directory: {summary.launcher_directory}")
+    print("Managed PATH:")
+    print(f"  {summary.path_status}")
+    if summary.bashrc_path is not None:
+        print(f"  file: {summary.bashrc_path}")
+    print("Manifest:")
+    print(f"  {summary.manifest_status}")
+    print(f"  file: {summary.manifest_path}")
+    return 0
+
+
+def handle_apply(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _apply_usage(command_name)
+
+    return _run_apply_command()
 
 
 def handle_config(command_name: str, arguments: list[str]) -> int:
     if arguments:
         if len(arguments) == 1 and arguments[0] == "apply":
-            try:
-                config_state = ensure_editable_user_config()
-                desired = load_desired_alias_state(
-                    config_state.config_path,
-                    case_insensitive_names=(os.name == "nt"),
-                )
-                summary = apply_alias_reconciliation(desired)
-            except (AliasConfigError, AliasInstallationError, EditableConfigError) as exc:
-                raise FlowError(str(exc)) from exc
-
-            print(f"Managed aliases configured: {summary.aliases_configured}")
-            if summary.previous_alias_file_path is not None:
-                print(f"Previous alias file: {summary.previous_alias_file_path}")
-            if summary.previous_profile_path is not None:
-                print(f"Previous profile: {summary.previous_profile_path}")
-            if summary.alias_file_path is not None:
-                print(f"Alias file: {summary.alias_file_path}")
-            if summary.profile_path is not None:
-                print(f"Profile file: {summary.profile_path}")
-            print(f"Manifest: {summary.manifest_path}")
-            print(f"Result: {summary.outcome}")
-            changed_parts: list[str] = []
-            if summary.alias_file_changed:
-                changed_parts.append("alias-file")
-            if summary.profile_changed:
-                changed_parts.append("profile")
-            if summary.manifest_written:
-                changed_parts.append("manifest")
-            if summary.manifest_removed:
-                changed_parts.append("manifest-removed")
-
-            if changed_parts:
-                print(f"Updated: {', '.join(changed_parts)}")
-            else:
-                print("Updated: none")
-            return 0
+            return _run_apply_command()
 
         raise _config_usage(command_name)
 
@@ -3416,6 +3445,7 @@ def _resolve_command_handler(handler_key: str):
     "summarize-verify": handle_summarize_verify,
         "review-verify": handle_review_verify,
         "config": handle_config,
+        "apply": handle_apply,
         "get": handle_get,
         "set": handle_set,
         "unset": handle_unset,

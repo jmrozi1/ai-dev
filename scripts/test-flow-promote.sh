@@ -560,7 +560,8 @@ fi
 rm -f "$repo_switch_main_fail/.git/index.lock"
 switch_main_text="$(cat "$switch_main_output")"
 assert_equals "$switch_main_status" '1'
-assert_contains "$switch_main_text" 'failed to switch to main'
+assert_contains "$switch_main_text" 'Cannot promote workflow'
+assert_contains "$switch_main_text" 'index.lock'
 assert_equals "$(branch_head "$repo_switch_main_fail" main)" "$switch_main_head_before"
 assert_equals "$(branch_head "$repo_switch_main_fail" scratch)" "$switch_main_scratch_before"
 assert_equals "$(state_get "$repo_switch_main_fail/subdir")" "$switch_main_state_before"
@@ -590,7 +591,8 @@ rm -f "$repo_squash_fail/.git/index.lock"
 rm -f "$repo_squash_fail/.git/hooks/post-checkout"
 squash_text="$(cat "$squash_output")"
 assert_equals "$squash_status" '1'
-assert_contains "$squash_text" 'squash merge failed'
+assert_contains "$squash_text" 'Cannot promote workflow'
+assert_contains "$squash_text" 'index.lock'
 assert_equals "$(branch_head "$repo_squash_fail" main)" "$squash_main_before"
 assert_equals "$(branch_head "$repo_squash_fail" scratch)" "$squash_scratch_before"
 assert_equals "$(state_get "$repo_squash_fail")" "$squash_state_before"
@@ -618,7 +620,7 @@ fi
 commit_text="$(cat "$commit_output")"
 assert_equals "$commit_status" '1'
 assert_contains "$commit_text" 'hook failure'
-assert_contains "$commit_text" 'Git commit failed'
+assert_contains "$commit_text" 'Cannot promote workflow'
 assert_equals "$(branch_head "$repo_commit_fail" main)" "$commit_main_before"
 assert_equals "$(branch_head "$repo_commit_fail" scratch)" "$commit_scratch_before"
 assert_equals "$(state_get "$repo_commit_fail")" "$commit_state_before"
@@ -648,7 +650,9 @@ rm -f "$repo_switch_back_fail/.git/index.lock"
 rm -f "$repo_switch_back_fail/.git/hooks/post-commit"
 switch_back_text="$(cat "$switch_back_output")"
 assert_equals "$switch_back_status" '1'
-assert_contains "$switch_back_text" 'failed to switch back to scratch'
+assert_contains "$switch_back_text" 'Promotion partially completed.'
+assert_contains "$switch_back_text" 'Current branch: main'
+assert_contains "$switch_back_text" 'Workflow state updated: no'
 assert_not_equals "$(branch_head "$repo_switch_back_fail" main)" "$switch_back_main_before"
 assert_equals "$(branch_head "$repo_switch_back_fail" scratch)" "$switch_back_scratch_before"
 assert_equals "$(state_get "$repo_switch_back_fail")" "$switch_back_state_before"
@@ -683,7 +687,9 @@ rm -f "$repo_reset_fail/.git/index.lock"
 rm -f "$repo_reset_fail/.git/hooks/post-checkout"
 reset_text="$(cat "$reset_output")"
 assert_equals "$reset_status" '1'
-assert_contains "$reset_text" 'failed to reset scratch to promoted commit'
+assert_contains "$reset_text" 'Promotion partially completed.'
+assert_contains "$reset_text" 'Current branch: scratch'
+assert_contains "$reset_text" 'Workflow state updated: no'
 assert_not_equals "$(branch_head "$repo_reset_fail" main)" "$reset_main_before"
 assert_equals "$(branch_head "$repo_reset_fail" scratch)" "$reset_scratch_before"
 assert_equals "$(current_branch "$repo_reset_fail")" 'scratch'
@@ -706,7 +712,9 @@ if [[ "$(id -u)" != '0' ]]; then
 	chmod 700 "$repo_state_fail/.ai-dev"
 	state_fail_text="$(cat "$state_fail_output")"
 	assert_equals "$state_fail_status" '1'
-	assert_contains "$state_fail_text" 'Cannot write workflow state to'
+	assert_contains "$state_fail_text" 'Promotion partially completed.'
+	assert_contains "$state_fail_text" 'Current branch: scratch'
+	assert_contains "$state_fail_text" 'Workflow state updated: no'
 	assert_not_contains "$state_fail_text" 'Traceback'
 	assert_equals "$(branch_head "$repo_state_fail" main)" "$(branch_head "$repo_state_fail" scratch)"
 	assert_equals "$(current_branch "$repo_state_fail")" 'scratch'

@@ -89,6 +89,7 @@ class FlowNamespaceTests(unittest.TestCase):
 
         self.assertIn("Usage: ai-dev <command> [options]", stdout)
         self.assertIn("Commands:\n  flow", stdout)
+        self.assertIn("\n  apply", stdout)
         self.assertIn("Compatibility routes (temporary during Issue #19 migration):", stdout)
 
         commands_section = stdout.split("Commands:\n", 1)[1].split(

@@ -40,10 +40,15 @@ ai-dev summarize ...
 ai-dev summarize-verify ...
 ai-dev review-verify ...
 ai-dev config
-ai-dev config apply
+ai-dev apply
 ```
 
 Use `ai-dev config` as the supported configuration editing path.
+Use `ai-dev apply` to reconcile managed launchers and PATH configuration.
+
+On Linux, `ai-dev apply` manages executable convenience launchers in
+`~/.local/bin` rather than shell aliases in `.bashrc`, enabling normal
+`flow-<tab>` completion for launcher names such as `flow-commit`.
 
 During Issue #19 migration, top-level lifecycle routes such as
 `ai-dev start`, `ai-dev status`, and `ai-dev review` remain temporarily

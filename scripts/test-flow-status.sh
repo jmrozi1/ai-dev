@@ -238,7 +238,8 @@ assert_equals "$empty_arg_status" '1'
 assert_contains "$(cat "$empty_arg_output")" 'Usage: flow status [-v|--verbose]'
 
 help_output="$(run_flow "$repo_args/subdir" help)"
-assert_contains "$help_output" 'status     Show the active issue and current repository state.'
+assert_contains "$help_output" 'Compatibility routes (temporary during Issue #19 migration):'
+assert_contains "$help_output" 'status        Compatibility route to `ai-dev flow status`.'
 
 # outside repository
 outside_repo="$TMP_DIR/outside-repo"

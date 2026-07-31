@@ -101,6 +101,7 @@ Commands:
   summarize-verify  Verify summarize outputs for a prepared plan.
   review-verify     Verify deterministic review report and package integrity.
   config            Open or create editable user configuration.
+  apply             Reconcile managed launchers, PATH state, and installation ownership.
   get               Read a repository setting.
   set               Change a repository setting.
   unset             Remove a repository setting.

@@ -89,14 +89,15 @@ class TaskSliceOneTests(unittest.TestCase):
 
     def test_default_configuration(self) -> None:
         repo_root = self._init_repo("repo-default-config")
+        missing_user = self.tmp_path / "missing-user-config.yaml"
 
-        with patch.dict(os.environ, {}, clear=False):
+        with patch.dict(os.environ, {"AI_DEV_CONFIG": str(missing_user)}, clear=False):
             config = load_task_config(repo_root)
 
         self.assertEqual(config.delivery, "stdout")
         self.assertEqual(config.invocation, "Read and execute {task_file}")
         self.assertIsNone(config.editor_command)
-        self.assertEqual(config.report_presentation, "stdout")
+        self.assertEqual(config.report_presentation, "path-only")
 
     def test_user_configuration_loading(self) -> None:
         repo_root = self._init_repo("repo-user-config")
@@ -216,7 +217,7 @@ class TaskSliceOneTests(unittest.TestCase):
         text = str(context.exception)
         self.assertIn(str(bad_path), text)
         self.assertIn("at <root>", text)
-        self.assertIn("Expected keys: ai, aliases, editor, reports", text)
+        self.assertIn("Expected keys: ai, aliases, editor, installation, reports", text)
 
     def test_user_editor_command_is_loaded(self) -> None:
         repo_root = self._init_repo("repo-editor-config")
@@ -319,7 +320,7 @@ class TaskSliceOneTests(unittest.TestCase):
         self.assertEqual(config.delivery, "stdout")
         self.assertEqual(config.invocation, "Read and execute {task_file}")
         self.assertIsNone(config.editor_command)
-        self.assertEqual(config.report_presentation, "stdout")
+        self.assertEqual(config.report_presentation, "path-only")
         self.assertEqual(config.repository_config_path, repo_path)
 
     def test_repository_cannot_override_editor_or_reports_preferences(self) -> None:
@@ -336,7 +337,7 @@ class TaskSliceOneTests(unittest.TestCase):
             config = load_task_config(repo_root)
 
         self.assertIsNone(config.editor_command)
-        self.assertEqual(config.report_presentation, "stdout")
+        self.assertEqual(config.report_presentation, "path-only")
 
     def test_invalid_delivery_error_contains_expected_values(self) -> None:
         repo_root = self._init_repo("repo-invalid-delivery")
@@ -1089,7 +1090,7 @@ class TaskSliceOneTests(unittest.TestCase):
         self.assertIn("No editor command is available on this machine.", err)
         self.assertEqual(user_config_path.read_text(encoding="utf-8"), original_text)
 
-    def test_showreport_uses_default_output_path_and_stdout_mode_once(self) -> None:
+    def test_showreport_uses_default_output_path_and_path_only_mode(self) -> None:
         repo_root = self._init_repo("repo-showreport-default")
         report_path = repo_root / "out.txt"
         report_text = "Issue report\nline 2\n"
@@ -1100,8 +1101,7 @@ class TaskSliceOneTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertEqual(out, report_text)
-        self.assertEqual(out.count("Issue report"), 1)
+        self.assertEqual(out, f"Report path: {report_path}\n")
 
     def test_showreport_uses_configured_output_path(self) -> None:
         repo_root = self._init_repo("repo-showreport-configured")
@@ -1121,7 +1121,7 @@ class TaskSliceOneTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
-        self.assertEqual(out, "Configured report\n")
+        self.assertEqual(out, f"Report path: {report_path}\n")
 
     def test_showreport_path_only_mode(self) -> None:
         repo_root = self._init_repo("repo-showreport-path-only")
