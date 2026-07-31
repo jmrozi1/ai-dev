@@ -141,28 +141,55 @@ Manage an issue-focused development workflow using permanent main history
 and disposable scratch checkpoints.
 
 Commands:
-	start      Begin new work on an unblocked issue and reset scratch from main.
-	patch      Begin or adopt a local patch workflow on scratch.
-    task-prepare  Prepare an immutable generated task artifact.
-    summarize  Prepare deterministic summarize task artifacts for source files.
-    summarize-verify  Verify summarize outputs for a prepared plan.
-    review-verify  Verify deterministic review report and package integrity.
-  status     Show the active issue and current repository state.
-    review     Prepare a review package and generated review task for proposed changes.
-  commit     Create the next numbered checkpoint on scratch.
-  reset      Discard scratch work and restore it from main.
-  promote    Squash scratch into one permanent commit on main.
-  complete   Clear the completed local workflow.
-	block      Block the active issue workflow and release the active slot.
-	resume     Reactivate a previously blocked issue workflow.
-    config     Open or create editable user configuration.
-  get        Read a repository setting.
-  set        Change a repository setting.
-  unset      Remove a repository setting.
-  showreport Show the generated report from disk.
-  help       Show this help.
+  flow              Manage issue-focused development workflows.
+  summarize         Prepare deterministic summarize task artifacts for source files.
+  summarize-verify  Verify summarize outputs for a prepared plan.
+  review-verify     Verify deterministic review report and package integrity.
+  config            Open or create editable user configuration.
+  get               Read a repository setting.
+  set               Change a repository setting.
+  unset             Remove a repository setting.
+  showreport        Show the generated report from disk.
+  help              Show this help.
+
+Compatibility routes (temporary during Issue #19 migration):
+  start         Compatibility route to \`ai-dev flow start\`.
+  patch         Compatibility route to \`ai-dev flow patch\`.
+  task-prepare  Compatibility route to \`ai-dev flow task-prepare\`.
+  status        Compatibility route to \`ai-dev flow status\`.
+  review        Compatibility route to \`ai-dev flow review\`.
+  commit        Compatibility route to \`ai-dev flow commit\`.
+  reset         Compatibility route to \`ai-dev flow reset\`.
+  promote       Compatibility route to \`ai-dev flow promote\`.
+  complete      Compatibility route to \`ai-dev flow complete\`.
+  block         Compatibility route to \`ai-dev flow block\`.
+  resume        Compatibility route to \`ai-dev flow resume\`.
 
 Run \`${command_name} <command> --help\` for command-specific help.
+Run \`ai-dev flow --help\` for workflow lifecycle commands.
+EOF
+}
+
+expected_flow_help() {
+	cat <<EOF
+Usage: ai-dev flow <command> [options]
+
+Manage issue-focused workflow lifecycle operations.
+
+Commands:
+  start         Begin new work on an unblocked issue and reset scratch from main.
+  patch         Begin or adopt a local patch workflow on scratch.
+  task-prepare  Prepare an immutable generated task artifact.
+  status        Show the active issue and current repository state.
+  review        Prepare a review package and generated review task for proposed changes.
+  commit        Create the next numbered checkpoint on scratch.
+  reset         Discard scratch work and restore it from main.
+  promote       Squash scratch into one permanent commit on main.
+  complete      Clear the completed local workflow.
+  block         Block the active issue workflow and release the active slot.
+  resume        Reactivate a previously blocked issue workflow.
+
+Run \`ai-dev flow <command> --help\` for command-specific help.
 EOF
 }
 
@@ -409,13 +436,15 @@ assert_equals "$top_help_flow" "$(run_flow "$help_repo/subdir" )"
 assert_equals "$top_help_flow" "$(run_flow "$help_repo/subdir" -h)"
 assert_equals "$top_help_flow" "$(run_flow "$help_repo/subdir" --help)"
 assert_equals "$top_help_flow" "$(expected_top_help flow)"
-assert_contains "$top_help_flow" 'status     Show the active issue and current repository state.'
-assert_contains "$top_help_flow" 'help       Show this help.'
+assert_contains "$top_help_flow" 'flow              Manage issue-focused development workflows.'
+assert_contains "$top_help_flow" 'help              Show this help.'
+assert_contains "$top_help_flow" 'Compatibility routes (temporary during Issue #19 migration):'
+assert_not_contains "$top_help_flow" $'Commands:\n\tstart'
 
 top_help_symlink="$(cd "$help_repo/subdir" && "$symlink_path")"
 assert_equals "$top_help_symlink" "$(expected_top_help ai-dev-flow)"
 assert_contains "$top_help_symlink" 'Usage: ai-dev-flow <command> [options]'
-assert_contains "$top_help_symlink" 'Run `ai-dev-flow <command> --help` for command-specific help.'
+assert_contains "$top_help_symlink" 'Run `ai-dev flow --help` for workflow lifecycle commands.'
 
 help_command_output="$(cd "$help_repo/subdir" && "$symlink_path" help -h)"
 assert_equals "$help_command_output" "$(expected_command_help ai-dev-flow help)"
@@ -424,6 +453,24 @@ assert_contains "$help_command_output" 'Show top-level command help.'
 
 help_command_verbose="$(cd "$help_repo/subdir" && "$symlink_path" help --help)"
 assert_equals "$help_command_output" "$help_command_verbose"
+
+# flow namespace help and unknown handling
+flow_help_short="$(run_flow "$help_repo/subdir" flow -h)"
+flow_help_long="$(run_flow "$help_repo/subdir" flow --help)"
+flow_help_no_args="$(run_flow "$help_repo/subdir" flow)"
+assert_equals "$flow_help_short" "$(expected_flow_help)"
+assert_equals "$flow_help_long" "$(expected_flow_help)"
+assert_equals "$flow_help_no_args" "$(expected_flow_help)"
+
+flow_unknown_output="$TMP_DIR/flow-unknown.txt"
+if run_flow_capture "$help_repo/subdir" "$flow_unknown_output" flow nope; then
+	flow_unknown_status=0
+else
+	flow_unknown_status=$?
+fi
+assert_equals "$flow_unknown_status" '1'
+assert_contains "$(cat "$flow_unknown_output")" 'ai-dev flow: unknown command: nope'
+assert_contains "$(cat "$flow_unknown_output")" 'Run ai-dev flow --help for usage.'
 
 # command-specific help for every public command
 for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config get set unset showreport help; do
@@ -443,6 +490,26 @@ for command in start patch task-prepare summarize summarize-verify review-verify
 	assert_equals "$long_status" '0'
 	assert_equals "$(cat "$command_help_short")" "$(cat "$command_help_long")"
 	assert_equals "$(cat "$command_help_short")" "$(expected_command_help flow "$command")"
+	done
+
+# flow command-specific help reuses existing handlers under canonical namespace
+for command in start patch task-prepare status review commit reset promote complete block resume; do
+	namespace_help_short="$TMP_DIR/flow-${command}-short.txt"
+	namespace_help_long="$TMP_DIR/flow-${command}-long.txt"
+	if run_flow_capture "$help_repo/subdir" "$namespace_help_short" flow "$command" -h; then
+		namespace_short_status=0
+	else
+		namespace_short_status=$?
+	fi
+	if run_flow_capture "$help_repo/subdir" "$namespace_help_long" flow "$command" --help; then
+		namespace_long_status=0
+	else
+		namespace_long_status=$?
+	fi
+	assert_equals "$namespace_short_status" '0'
+	assert_equals "$namespace_long_status" '0'
+	assert_equals "$(cat "$namespace_help_short")" "$(cat "$namespace_help_long")"
+	assert_equals "$(cat "$namespace_help_short")" "$(expected_command_help 'ai-dev flow' "$command")"
 	done
 
 # help works outside Git repositories and with malformed config
