@@ -1,31 +1,13 @@
 # AI Dev
 
-AI Dev is a VS Code-assisted workflow system for generating, reviewing, and using AI navigation documentation.
+AI Dev is a CLI-first workflow system for generating, reviewing, and using AI navigation documentation.
 
 This repository combines:
 
 - `ai-dev-core` — shared workflows, templates, profiles, conventions, and schemas.
-- `ai-dev-vscode` — thin VS Code wrapper that exposes the workflows in the editor.
-- `scripts` — repository-level build and packaging scripts.
-- `artifacts` — generated deliverables such as installable `.vsix` files.
-
-## Build VSIX
-
-```bash
-./scripts/build-vsix.sh
-```
-
-The build script vendors `ai-dev-core` into the VS Code extension package and writes the final `.vsix` into `artifacts/`.
-
-## Install VSIX
-
-```bash
-code --install-extension artifacts/*.vsix --force
-```
+- `scripts` — repository-level launcher, bootstrap, and validation scripts.
 
 ## Install Canonical ai-dev Command
-
-Linux and macOS:
 
 ```bash
 ./scripts/bootstrap-ai-dev.sh
@@ -39,13 +21,24 @@ Windows PowerShell:
 
 Both wrappers delegate to `python -m ai_dev_flow.bootstrap`, which installs managed `ai-dev` launcher files under `~/.local/bin` and prints PATH guidance when needed.
 
+Primary workflows are CLI-first:
+
+```text
+ai-dev summarize ...
+ai-dev summarize-verify ...
+ai-dev review
+ai-dev review-verify ...
+ai-dev config
+ai-dev config apply
+```
+
+Use `ai-dev config` as the supported configuration editing path.
+
 ## Design Principles
 
 - Source is truth.
 - Documentation is an AI navigation layer.
 - Documentation should be reviewable.
-- IDE wrappers should stay thin.
-- The VSIX should be installable without launching the extension from source.
 
 ## Generated-Task Foundation
 
