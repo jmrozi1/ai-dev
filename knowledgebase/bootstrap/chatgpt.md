@@ -112,8 +112,8 @@ Approval belongs to ChatGPT or the user, not to `flow` or the implementation wor
 
 Flow has one authoritative shared Python implementation in `ai_dev_flow`.
 
-* `scripts/flow` is the thin Linux launcher.
-* `scripts/flow.ps1` is the thin Windows launcher.
+* `ai-dev (installed launcher)` is the thin Linux launcher.
+* `ai-dev (installed launcher on Windows)` is the thin Windows launcher.
 * Platform wrappers handle interpreter/bootstrap concerns only.
 
 Current command surface:

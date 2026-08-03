@@ -98,8 +98,8 @@ Unknown flow subcommand behavior is deterministic:
 ## Files Changed
 
 - `ai_dev_flow/cli.py`
-- `scripts/test-flow.sh`
-- `scripts/test-flow-help.sh`
+- `tests/shell/flow/test-flow.sh`
+- `tests/shell/flow/test-flow-help.sh`
 - `tests/test_flow_namespace.py`
 - `README.md`
 - `docs/productized-cli-checkpoint1.md`
@@ -110,16 +110,16 @@ Targeted checkpoint validations:
 
 - `python -m py_compile ai_dev_flow/cli.py` passed
 - `python -m unittest tests.test_flow_namespace` passed (6 tests)
-- `bash scripts/test-flow.sh` passed
-- `bash scripts/test-flow-help.sh` passed
+- `bash tests/shell/flow/test-flow.sh` passed
+- `bash tests/shell/flow/test-flow-help.sh` passed
 
 Broader suite observations during this checkpoint run:
 
 - `python -m unittest discover -s tests` failed with one unrelated existing failure:
   - `test_task_slice1.TaskSliceOneTests.test_default_configuration`
   - expected `report_presentation == "stdout"`, actual `"path-only"`
-- `bash scripts/test-flow-start.sh` failed at repo status expectation requiring untracked `.ai-dev/config.json` visibility in this environment
-- `bash scripts/test-flow-promote.sh` failed at an assertion expecting exact text `failed to switch to main` in a lockfile error scenario
+- `bash tests/shell/flow/test-flow-start.sh` failed at repo status expectation requiring untracked `.ai-dev/config.json` visibility in this environment
+- `bash tests/shell/flow/test-flow-promote.sh` failed at an assertion expecting exact text `failed to switch to main` in a lockfile error scenario
 
 These broader failures are outside the namespace/help scope of Issue #19 Checkpoint 1 changes.
 

@@ -90,12 +90,12 @@ Validation executed for this checkpoint correction:
 - Full Python suite: `python -m unittest discover -s tests` passed (401 tests, 4 skipped).
 - Targeted bootstrap/alias/config/summarize/review suites passed: `python -m unittest tests.test_bootstrap tests.test_bootstrap_cli tests.test_alias_config tests.test_alias_installation tests.test_config_open_cli tests.test_config_apply_cli tests.test_summarize_cli_preparation tests.test_summarize_planning tests.test_summarize_task_generation tests.test_summarize_verify_cli tests.test_review_cli_preparation tests.test_review_task_generation tests.test_review_verify_cli tests.test_flow_review`.
 - Shell suites:
-	- `scripts/test-bootstrap-linux.sh` passed.
-	- `scripts/test-flow-config.sh` passed.
-	- `scripts/test-flow-help.sh` passed.
-	- `scripts/test-flow-review.sh` passed.
-	- `scripts/test-flow-lifecycle.sh` passed.
-	- `scripts/test-flow-start.sh` remains environment-sensitive and failed with known `.ai-dev/config.json` visibility expectation mismatch.
+	- `tests/shell/bootstrap/test-bootstrap-linux.sh` passed.
+	- `tests/shell/flow/test-flow-config.sh` passed.
+	- `tests/shell/flow/test-flow-help.sh` passed.
+	- `tests/shell/flow/test-flow-review.sh` passed.
+	- `tests/shell/flow/test-flow-lifecycle.sh` passed.
+	- `tests/shell/flow/test-flow-start.sh` remains environment-sensitive and failed with known `.ai-dev/config.json` visibility expectation mismatch.
 - Repository stale-reference searches were run for removed extension/VSIX surfaces; remaining hits are historical checkpoint docs and explicit cleanup assertions.
 - Clean CLI smoke with no extension installed passed: `python -m ai_dev_flow.cli --help`, `python -m ai_dev_flow.cli config --help`, `python -m ai_dev_flow.cli summarize --help`, and `python -m ai_dev_flow.cli review --help`.
 - Extension compile/test/package smoke was intentionally not run because the extension package was removed.
@@ -104,7 +104,7 @@ Workflow coverage statement:
 
 - `ai-dev summarize ...` is validated by summarize planning/task/verification tests.
 - `ai-dev summarize-verify ...` is validated by summarize verification tests.
-- `ai-dev review` is validated by review tests.
+- `ai-dev flow review` is validated by review tests.
 - `ai-dev review-verify ...` is validated by review verification tests.
 - `ai-dev config` and `ai-dev config apply` are validated by config and bootstrap/alias tests.
 - Canonical Markdown task/report consumption works without any VS Code extension installed.

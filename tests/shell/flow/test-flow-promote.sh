@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -67,7 +71,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		"$AI_DEV_REAL" flow "$@"
 	)
 }
 
@@ -88,7 +92,7 @@ state_get() {
 	local cwd="$1"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-get
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-get
 	)
 }
 
@@ -97,7 +101,7 @@ state_set() {
 	local payload="$2"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-set "$payload"
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-set "$payload"
 	)
 }
 
@@ -177,7 +181,7 @@ else
 fi
 help_text="$(cat "$help_output")"
 assert_equals "$help_status" '0'
-assert_contains "$help_text" 'Usage: flow promote "<commit-message>"'
+assert_contains "$help_text" 'Usage: ai-dev flow promote "<commit-message>"'
 
 repo_missing_arg="$TMP_DIR/repo-missing-arg"
 init_repo "$repo_missing_arg"
@@ -189,7 +193,7 @@ else
 fi
 missing_text="$(cat "$missing_output")"
 assert_equals "$missing_status" '1'
-assert_contains "$missing_text" 'Usage: flow promote "<commit-message>"'
+assert_contains "$missing_text" 'Usage: ai-dev flow promote "<commit-message>"'
 
 empty_output="$TMP_DIR/empty-output"
 if run_flow_capture "$repo_missing_arg/subdir" "$empty_output" promote ''; then
@@ -199,7 +203,7 @@ else
 fi
 empty_text="$(cat "$empty_output")"
 assert_equals "$empty_status" '1'
-assert_contains "$empty_text" 'Usage: flow promote "<commit-message>"'
+assert_contains "$empty_text" 'Usage: ai-dev flow promote "<commit-message>"'
 
 extra_output="$TMP_DIR/extra-output"
 if run_flow_capture "$repo_missing_arg/subdir" "$extra_output" promote 'msg' extra; then
@@ -209,7 +213,7 @@ else
 fi
 extra_text="$(cat "$extra_output")"
 assert_equals "$extra_status" '1'
-assert_contains "$extra_text" 'Usage: flow promote "<commit-message>"'
+assert_contains "$extra_text" 'Usage: ai-dev flow promote "<commit-message>"'
 
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"

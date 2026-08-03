@@ -325,7 +325,7 @@ class BootstrapCoreTests(unittest.TestCase):
         self.assertNotIn("setx", guidance.lower())
 
     def test_bootstrap_powershell_wrapper_contains_no_exit(self) -> None:
-        wrapper_path = self.repo_root / "scripts" / "bootstrap-ai-dev.ps1"
+        wrapper_path = self.repo_root / "tools" / "compatibility" / "bootstrap-ai-dev.ps1"
         text = wrapper_path.read_text(encoding="utf-8")
         self.assertNotRegex(text, r"(?im)^\s*exit\b")
         self.assertNotIn("Invoke-Expression", text)
@@ -412,7 +412,7 @@ class BootstrapCoreTests(unittest.TestCase):
         if pwsh_path is None:
             self.skipTest("pwsh is not available")
 
-        wrapper = self.repo_root / "scripts" / "bootstrap-ai-dev.ps1"
+        wrapper = self.repo_root / "tools" / "compatibility" / "bootstrap-ai-dev.ps1"
         temp_home = self.tmp_path / "home-wrapper-ps"
         temp_home.mkdir(parents=True, exist_ok=True)
         script = (

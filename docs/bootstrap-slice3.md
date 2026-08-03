@@ -9,8 +9,8 @@ Implemented in this slice:
 - shared bootstrap core in `ai_dev_flow.bootstrap`
 - canonical launcher name: `ai-dev`
 - thin platform wrappers:
-  - `scripts/bootstrap-ai-dev.sh`
-  - `scripts/bootstrap-ai-dev.ps1`
+  - `tools/compatibility/bootstrap-ai-dev.sh`
+  - `tools/compatibility/bootstrap-ai-dev.ps1`
 - ownership marker and collision safety for managed launcher files
 - atomic launcher writes with rollback on failure
 - deterministic install reporting (installed/updated/up-to-date)

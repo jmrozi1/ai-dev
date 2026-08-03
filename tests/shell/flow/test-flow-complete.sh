@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -66,7 +70,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "$FLOW" "$@"
+		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "$AI_DEV_REAL" flow "$@"
 	)
 }
 
@@ -165,6 +169,7 @@ make_no_gh_bin() {
 	local no_gh_bin="$1"
 	mkdir -p "$no_gh_bin"
 	ln -sf "$(command -v bash)" "$no_gh_bin/bash"
+	ln -sf "$(command -v sh)" "$no_gh_bin/sh"
 	ln -sf "$(command -v basename)" "$no_gh_bin/basename"
 	ln -sf "$(command -v git)" "$no_gh_bin/git"
 	ln -sf "$(command -v python3)" "$no_gh_bin/python3"
@@ -187,7 +192,7 @@ state_get() {
 	local cwd="$1"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-get
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-get
 	)
 }
 
@@ -196,7 +201,7 @@ state_set() {
 	local payload="$2"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-set "$payload"
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-set "$payload"
 	)
 }
 
@@ -294,7 +299,7 @@ else
 fi
 extra_text="$(cat "$extra_output")"
 assert_equals "$extra_status" '1'
-assert_contains "$extra_text" 'Usage: flow complete'
+assert_contains "$extra_text" 'Usage: ai-dev flow complete'
 
 empty_extra_output="$TMP_DIR/empty-extra-output"
 if run_flow_capture "$repo_args/subdir" "$empty_extra_output" complete ''; then
@@ -304,7 +309,7 @@ else
 fi
 empty_extra_text="$(cat "$empty_extra_output")"
 assert_equals "$empty_extra_status" '1'
-assert_contains "$empty_extra_text" 'Usage: flow complete'
+assert_contains "$empty_extra_text" 'Usage: ai-dev flow complete'
 
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
@@ -577,7 +582,7 @@ close_fail_state_before="$(state_get "$repo_close_fail")"
 close_fail_output="$TMP_DIR/close-fail-output"
 if (
 	cd "$repo_close_fail/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" GH_MOCK_FAIL_CLOSE=1 "$FLOW" complete
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" GH_MOCK_FAIL_CLOSE=1 "$AI_DEV_REAL" flow complete
 ) >"$close_fail_output" 2>&1; then
 	close_fail_status=0
 else
@@ -597,7 +602,7 @@ missing_gh_state_before="$(state_get "$repo_missing_gh")"
 missing_gh_output="$TMP_DIR/missing-gh-output"
 if (
 	cd "$repo_missing_gh/subdir"
-	PATH="$no_gh_bin" "$FLOW" complete
+	PATH="$no_gh_bin" "$AI_DEV_REAL" flow complete
 ) >"$missing_gh_output" 2>&1; then
 	missing_gh_status=0
 else
@@ -615,7 +620,7 @@ state_set "$repo_patch_complete/subdir" '{"patchDescription":"Local patch","main
 patch_complete_output="$TMP_DIR/patch-complete-output"
 if (
 	cd "$repo_patch_complete/subdir"
-	PATH="$no_gh_bin" "$FLOW" complete
+	PATH="$no_gh_bin" "$AI_DEV_REAL" flow complete
 ) >"$patch_complete_output" 2>&1; then
 	patch_complete_status=0
 else

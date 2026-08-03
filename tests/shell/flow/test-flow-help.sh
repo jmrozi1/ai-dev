@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -69,7 +73,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		"$AI_DEV_REAL" "$@"
 	)
 }
 
@@ -91,7 +95,7 @@ state_set() {
 	local payload="$2"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-set "$payload"
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-set "$payload"
 	)
 }
 
@@ -459,26 +463,26 @@ EOF
 help_repo="$TMP_DIR/repo-help"
 init_repo "$help_repo"
 symlink_path="$TMP_DIR/ai-dev-flow"
-ln -s "$FLOW" "$symlink_path"
+ln -s "$AI_DEV_REAL" "$symlink_path"
 
 top_help_flow="$(run_flow "$help_repo/subdir" help)"
 assert_equals "$top_help_flow" "$(run_flow "$help_repo/subdir" )"
 assert_equals "$top_help_flow" "$(run_flow "$help_repo/subdir" -h)"
 assert_equals "$top_help_flow" "$(run_flow "$help_repo/subdir" --help)"
-assert_equals "$top_help_flow" "$(expected_top_help flow)"
+assert_equals "$top_help_flow" "$(expected_top_help ai-dev)"
 assert_contains "$top_help_flow" 'flow              Manage issue-focused development workflows.'
 assert_contains "$top_help_flow" 'help              Show this help.'
 assert_contains "$top_help_flow" 'Compatibility routes (temporary during Issue #19 migration):'
 assert_not_contains "$top_help_flow" $'Commands:\n\tstart'
 
 top_help_symlink="$(cd "$help_repo/subdir" && "$symlink_path")"
-assert_equals "$top_help_symlink" "$(expected_top_help ai-dev-flow)"
-assert_contains "$top_help_symlink" 'Usage: ai-dev-flow <command> [options]'
+assert_equals "$top_help_symlink" "$(expected_top_help ai-dev)"
+assert_contains "$top_help_symlink" 'Usage: ai-dev <command> [options]'
 assert_contains "$top_help_symlink" 'Run `ai-dev flow --help` for workflow lifecycle commands.'
 
 help_command_output="$(cd "$help_repo/subdir" && "$symlink_path" help -h)"
-assert_equals "$help_command_output" "$(expected_command_help ai-dev-flow help)"
-assert_contains "$help_command_output" 'Usage: ai-dev-flow help'
+assert_equals "$help_command_output" "$(expected_command_help ai-dev help)"
+assert_contains "$help_command_output" 'Usage: ai-dev help'
 assert_contains "$help_command_output" 'Show top-level command help.'
 
 help_command_verbose="$(cd "$help_repo/subdir" && "$symlink_path" help --help)"
@@ -519,7 +523,7 @@ for command in start patch task-prepare summarize summarize-verify review-verify
 	assert_equals "$short_status" '0'
 	assert_equals "$long_status" '0'
 	assert_equals "$(cat "$command_help_short")" "$(cat "$command_help_long")"
-	assert_equals "$(cat "$command_help_short")" "$(expected_command_help flow "$command")"
+	assert_equals "$(cat "$command_help_short")" "$(expected_command_help ai-dev "$command")"
 	done
 
 # flow command-specific help reuses existing handlers under canonical namespace
@@ -607,7 +611,7 @@ else
 	routed_status=$?
 fi
 assert_equals "$routed_status" '0'
-assert_equals "$(cat "$top_level_routed_output")" "$(expected_top_help flow)"
+assert_equals "$(cat "$top_level_routed_output")" "$(expected_top_help ai-dev)"
 assert_not_exists "$set_repo_out"
 
 command_help_routed_output="$TMP_DIR/command-help-routed.txt"
@@ -617,7 +621,7 @@ else
 	routed_command_status=$?
 fi
 assert_equals "$routed_command_status" '0'
-assert_contains "$(cat "$command_help_routed_output")" 'Usage: flow status [-v|--verbose]'
+assert_contains "$(cat "$command_help_routed_output")" 'Usage: ai-dev status [-v|--verbose]'
 assert_not_exists "$set_repo_out"
 
 # extra arguments combined with help are rejected
@@ -639,7 +643,7 @@ else
 	start_extra_status=$?
 fi
 assert_equals "$start_extra_status" '1'
-assert_contains "$(cat "$start_extra_output")" 'Usage: flow start <issue-number>'
+assert_contains "$(cat "$start_extra_output")" 'Usage: ai-dev start <issue-number>'
 
 promote_extra_output="$TMP_DIR/promote-extra.txt"
 if run_flow_capture "$help_repo/subdir" "$promote_extra_output" promote -h message; then
@@ -648,7 +652,7 @@ else
 	promote_extra_status=$?
 fi
 assert_equals "$promote_extra_status" '1'
-assert_contains "$(cat "$promote_extra_output")" 'Usage: flow promote "<commit-message>"'
+assert_contains "$(cat "$promote_extra_output")" 'Usage: ai-dev promote "<commit-message>"'
 
 # help does not modify workflow state, config, HEAD, refs, index, or working tree
 repo_read_only="$TMP_DIR/repo-read-only"

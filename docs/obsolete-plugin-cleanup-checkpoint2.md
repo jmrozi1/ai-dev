@@ -8,7 +8,7 @@ Primary workflows remain the canonical CLI interface:
 
 - `ai-dev summarize ...`
 - `ai-dev summarize-verify ...`
-- `ai-dev review`
+- `ai-dev flow review`
 - `ai-dev review-verify ...`
 - `ai-dev config`
 - `ai-dev config apply`

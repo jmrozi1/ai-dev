@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -88,7 +92,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		"$AI_DEV_REAL" flow "$@"
 	)
 }
 
@@ -109,7 +113,7 @@ state_get() {
 	local cwd="$1"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-get
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-get
 	)
 }
 
@@ -118,7 +122,7 @@ state_set() {
 	local payload="$2"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-set "$payload"
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-set "$payload"
 	)
 }
 
@@ -208,7 +212,7 @@ else
 	unknown_flag_status=$?
 fi
 assert_equals "$unknown_flag_status" '1'
-assert_contains "$(cat "$unknown_flag_output")" 'Usage: flow status [-v|--verbose]'
+assert_contains "$(cat "$unknown_flag_output")" 'Usage: ai-dev flow status [-v|--verbose]'
 
 positional_output="$TMP_DIR/positional-output"
 if run_flow_capture "$repo_args/subdir" "$positional_output" status detail; then
@@ -217,7 +221,7 @@ else
 	positional_status=$?
 fi
 assert_equals "$positional_status" '1'
-assert_contains "$(cat "$positional_output")" 'Usage: flow status [-v|--verbose]'
+assert_contains "$(cat "$positional_output")" 'Usage: ai-dev flow status [-v|--verbose]'
 
 multi_output="$TMP_DIR/multi-output"
 if run_flow_capture "$repo_args/subdir" "$multi_output" status -v --verbose; then
@@ -226,7 +230,7 @@ else
 	multi_status=$?
 fi
 assert_equals "$multi_status" '1'
-assert_contains "$(cat "$multi_output")" 'Usage: flow status [-v|--verbose]'
+assert_contains "$(cat "$multi_output")" 'Usage: ai-dev flow status [-v|--verbose]'
 
 empty_arg_output="$TMP_DIR/empty-arg-output"
 if run_flow_capture "$repo_args/subdir" "$empty_arg_output" status ''; then
@@ -235,11 +239,11 @@ else
 	empty_arg_status=$?
 fi
 assert_equals "$empty_arg_status" '1'
-assert_contains "$(cat "$empty_arg_output")" 'Usage: flow status [-v|--verbose]'
+assert_contains "$(cat "$empty_arg_output")" 'Usage: ai-dev flow status [-v|--verbose]'
 
-help_output="$(run_flow "$repo_args/subdir" help)"
-assert_contains "$help_output" 'Compatibility routes (temporary during Issue #19 migration):'
-assert_contains "$help_output" 'status        Compatibility route to `ai-dev flow status`.'
+help_output="$(run_flow "$repo_args/subdir" --help)"
+assert_contains "$help_output" 'Usage: ai-dev flow <command> [options]'
+assert_contains "$help_output" 'status        Show the active issue and current repository state.'
 
 # outside repository
 outside_repo="$TMP_DIR/outside-repo"

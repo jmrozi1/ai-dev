@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -60,7 +64,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		"$AI_DEV_REAL" flow "$@"
 	)
 }
 
@@ -81,7 +85,7 @@ state_get() {
 	local cwd="$1"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-get
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-get
 	)
 }
 
@@ -90,7 +94,7 @@ state_set() {
 	local payload="$2"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-set "$payload"
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-set "$payload"
 	)
 }
 
@@ -151,15 +155,15 @@ create_commit_on_current_branch() {
 # help
 repo_help="$TMP_DIR/repo-help"
 init_repo "$repo_help"
-help_text="$(run_flow "$repo_help/subdir" help)"
-assert_contains "$help_text" 'Compatibility routes (temporary during Issue #19 migration):'
-assert_contains "$help_text" 'patch         Compatibility route to `ai-dev flow patch`.'
+help_text="$(run_flow "$repo_help/subdir" --help)"
+assert_contains "$help_text" 'Usage: ai-dev flow <command> [options]'
+assert_contains "$help_text" 'patch         Begin or adopt a local patch workflow on scratch.'
 
 patch_help_short="$(run_flow "$repo_help/subdir" patch -h)"
 patch_help_long="$(run_flow "$repo_help/subdir" patch --help)"
 assert_equals "$patch_help_short" "$patch_help_long"
-assert_contains "$patch_help_short" 'Usage: flow patch "<description>"'
-assert_contains "$patch_help_short" 'flow patch --adopt "<description>"'
+assert_contains "$patch_help_short" 'Usage: ai-dev flow patch "<description>"'
+assert_contains "$patch_help_short" 'ai-dev flow patch --adopt "<description>"'
 assert_contains "$patch_help_short" 'without changing commits, index, or working tree'
 
 # clean patch start resets scratch and records patch state
@@ -225,7 +229,7 @@ else
 	adopt_missing_status=$?
 fi
 assert_equals "$adopt_missing_status" '1'
-assert_contains "$(cat "$TMP_DIR/adopt-missing-output")" 'Usage: flow patch [--adopt] "<description>"'
+assert_contains "$(cat "$TMP_DIR/adopt-missing-output")" 'Usage: ai-dev flow patch [--adopt] "<description>"'
 
 if run_flow_capture "$repo_args/subdir" "$TMP_DIR/ordering-output" patch 'desc' --adopt; then
 	ordering_status=0
@@ -233,7 +237,7 @@ else
 	ordering_status=$?
 fi
 assert_equals "$ordering_status" '1'
-assert_contains "$(cat "$TMP_DIR/ordering-output")" 'Usage: flow patch [--adopt] "<description>"'
+assert_contains "$(cat "$TMP_DIR/ordering-output")" 'Usage: ai-dev flow patch [--adopt] "<description>"'
 
 if run_flow_capture "$repo_args/subdir" "$TMP_DIR/extra-output" patch --adopt 'desc' extra; then
 	extra_status=0
@@ -241,7 +245,7 @@ else
 	extra_status=$?
 fi
 assert_equals "$extra_status" '1'
-assert_contains "$(cat "$TMP_DIR/extra-output")" 'Usage: flow patch [--adopt] "<description>"'
+assert_contains "$(cat "$TMP_DIR/extra-output")" 'Usage: ai-dev flow patch [--adopt] "<description>"'
 
 # active workflow conflict
 repo_conflict_issue="$TMP_DIR/repo-conflict-issue"

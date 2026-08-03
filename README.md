@@ -7,19 +7,74 @@ This repository combines:
 - `ai-dev-core` — shared workflows, templates, profiles, conventions, and schemas.
 - `scripts` — repository-level launcher, bootstrap, and validation scripts.
 
-## Install Canonical ai-dev Command
+## Public Script Entry Points
+
+Install:
 
 ```bash
-./scripts/bootstrap-ai-dev.sh
+./scripts/install.sh
 ```
 
 Windows PowerShell:
 
 ```powershell
-.\scripts\bootstrap-ai-dev.ps1
+.\scripts\install.ps1
 ```
 
-Both wrappers delegate to `python -m ai_dev_flow.bootstrap`, which installs managed `ai-dev` launcher files under `~/.local/bin` and prints PATH guidance when needed.
+Test entry points:
+
+```bash
+./scripts/test.sh
+```
+
+```powershell
+.\scripts\test.ps1
+```
+
+Canonical test suites:
+
+- `unit` (default): fast Python unit coverage
+- `bootstrap`: bootstrap-focused Python tests + shell bootstrap suites
+- `flow`: shell lifecycle suites discovered under `tests/shell/flow/`
+- `integration`: broader cross-component Python discovery
+- `all`: complete Python + shell matrix
+
+Examples:
+
+```bash
+./scripts/test.sh
+./scripts/test.sh --list
+./scripts/test.sh flow
+./scripts/test.sh integration -- -k review
+./scripts/test.sh all
+```
+
+```powershell
+.\scripts\test.ps1
+.\scripts\test.ps1 --list
+.\scripts\test.ps1 flow
+.\scripts\test.ps1 integration -- -k review
+.\scripts\test.ps1 all
+```
+
+On PowerShell, shell suites are executed through `bash` when available. If `bash`
+is unavailable, shell suites are explicitly reported as skipped.
+
+## Legacy Compatibility Install Wrappers
+
+Compatibility wrappers (retained during migration):
+
+```bash
+./tools/compatibility/bootstrap-ai-dev.sh
+```
+
+Windows PowerShell:
+
+```powershell
+.\tools\compatibility\bootstrap-ai-dev.ps1
+```
+
+Both wrappers are deprecated compatibility entry points. They print migration guidance and delegate to `scripts/install.sh` / `scripts/install.ps1`.
 
 Primary workflows are CLI-first:
 
@@ -50,8 +105,7 @@ On Linux, `ai-dev apply` manages executable convenience launchers in
 `~/.local/bin` rather than shell aliases in `.bashrc`, enabling normal
 `flow-<tab>` completion for launcher names such as `flow-commit`.
 
-During Issue #19 migration, top-level lifecycle routes such as
-`ai-dev start`, `ai-dev status`, and `ai-dev review` remain temporarily
+During Issue #19 migration, top-level lifecycle routes may remain temporarily
 supported as compatibility entry points. Canonical lifecycle usage is
 under `ai-dev flow ...`.
 

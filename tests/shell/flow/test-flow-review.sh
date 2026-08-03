@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -71,7 +75,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		"$AI_DEV_REAL" flow "$@"
 	)
 }
 
@@ -93,7 +97,7 @@ state_set() {
 	local payload="$2"
 	(
 		cd "$cwd"
-		FLOW_TEST_MODE=1 "$FLOW" __test-state-set "$payload"
+		FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-state-set "$payload"
 	)
 }
 
@@ -192,7 +196,7 @@ else
 fi
 extra_text="$(cat "$extra_output")"
 assert_equals "$extra_status" '1'
-assert_contains "$extra_text" 'Usage: flow review'
+assert_contains "$extra_text" 'Usage: ai-dev flow review'
 
 unknown_flag_output="$TMP_DIR/unknown-flag-output"
 if run_flow_capture "$repo_args/subdir" "$unknown_flag_output" review --bogus; then
@@ -202,7 +206,7 @@ else
 fi
 unknown_flag_text="$(cat "$unknown_flag_output")"
 assert_equals "$unknown_flag_status" '1'
-assert_contains "$unknown_flag_text" 'Usage: flow review [-a|--all]'
+assert_contains "$unknown_flag_text" 'Usage: ai-dev flow review [-a|--all]'
 
 multiple_flags_output="$TMP_DIR/multiple-flags-output"
 if run_flow_capture "$repo_args/subdir" "$multiple_flags_output" review -a --all; then
@@ -212,7 +216,7 @@ else
 fi
 multiple_flags_text="$(cat "$multiple_flags_output")"
 assert_equals "$multiple_flags_status" '1'
-assert_contains "$multiple_flags_text" 'Usage: flow review [-a|--all]'
+assert_contains "$multiple_flags_text" 'Usage: ai-dev flow review [-a|--all]'
 
 empty_extra_output="$TMP_DIR/empty-extra-output"
 if run_flow_capture "$repo_args/subdir" "$empty_extra_output" review ''; then
@@ -222,7 +226,7 @@ else
 fi
 empty_extra_text="$(cat "$empty_extra_output")"
 assert_equals "$empty_extra_status" '1'
-assert_contains "$empty_extra_text" 'Usage: flow review'
+assert_contains "$empty_extra_text" 'Usage: ai-dev flow review'
 
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"

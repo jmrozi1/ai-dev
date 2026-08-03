@@ -144,8 +144,8 @@ Checkpoint 3 preserves existing platform boundaries:
 - `tests/test_update_cli.py` (new)
 - `tests/test_bootstrap.py`
 - `tests/test_flow_namespace.py`
-- `scripts/test-flow-help.sh`
-- `scripts/test-flow.sh`
+- `tests/shell/flow/test-flow-help.sh`
+- `tests/shell/flow/test-flow.sh`
 
 ## Validation Matrix And Results
 
@@ -169,21 +169,21 @@ Full Python suite:
 
 Full shell matrix:
 
-- `bash scripts/test-flow-help.sh`
-- `bash scripts/test-flow.sh`
-- `bash scripts/test-flow-config.sh`
-- `bash scripts/test-flow-start.sh`
-- `bash scripts/test-flow-patch.sh`
-- `bash scripts/test-flow-status.sh`
-- `bash scripts/test-flow-review.sh`
-- `bash scripts/test-flow-commit.sh`
-- `bash scripts/test-flow-reset.sh`
-- `bash scripts/test-flow-promote.sh`
-- `bash scripts/test-flow-complete.sh`
-- `bash scripts/test-flow-lifecycle.sh`
-- `bash scripts/test-flow-state.sh`
-- `bash scripts/test-flow-block-resume.sh`
-- `bash scripts/test-bootstrap-linux.sh`
+- `bash tests/shell/flow/test-flow-help.sh`
+- `bash tests/shell/flow/test-flow.sh`
+- `bash tests/shell/flow/test-flow-config.sh`
+- `bash tests/shell/flow/test-flow-start.sh`
+- `bash tests/shell/flow/test-flow-patch.sh`
+- `bash tests/shell/flow/test-flow-status.sh`
+- `bash tests/shell/flow/test-flow-review.sh`
+- `bash tests/shell/flow/test-flow-commit.sh`
+- `bash tests/shell/flow/test-flow-reset.sh`
+- `bash tests/shell/flow/test-flow-promote.sh`
+- `bash tests/shell/flow/test-flow-complete.sh`
+- `bash tests/shell/flow/test-flow-lifecycle.sh`
+- `bash tests/shell/flow/test-flow-state.sh`
+- `bash tests/shell/flow/test-flow-block-resume.sh`
+- `bash tests/shell/bootstrap/test-bootstrap-linux.sh`
   - Result: all passed
 
 ## Follow-Up Work

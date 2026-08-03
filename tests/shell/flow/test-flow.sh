@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -70,7 +74,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		"$AI_DEV_REAL" "$@"
 	)
 }
 
@@ -181,7 +185,7 @@ else
 fi
 help_output="$(cat "$help_output_file")"
 assert_equals "$help_status" "0"
-assert_contains "$help_output" 'Usage: flow <command> [options]'
+assert_contains "$help_output" 'Usage: ai-dev <command> [options]'
 assert_contains "$help_output" 'Commands:'
 assert_contains "$help_output" '  help              Show this help.'
 assert_not_exists "$repo_unset/.ai-dev"
@@ -260,7 +264,7 @@ assert_contains "$malformed_get_output" 'Invalid JSON in'
 invalid_policy_output_file="$TMP_DIR/invalid-policy-output"
 if (
 	cd "$repo_unset/subdir"
-	FLOW_TEST_MODE=1 "$FLOW" __test-invalid-policy >"$invalid_policy_output_file" 2>&1
+	FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-invalid-policy >"$invalid_policy_output_file" 2>&1
 ); then
 	invalid_policy_status=0
 else
@@ -274,7 +278,7 @@ assert_contains "$invalid_policy_output" 'Unknown operational config policy: bog
 passthrough_output_file="$TMP_DIR/passthrough-output"
 if (
 	cd "$repo_unset/subdir"
-	FLOW_TEST_MODE=1 "$FLOW" __test-route-args '123' 'value with spaces' >"$passthrough_output_file" 2>&1
+	FLOW_TEST_MODE=1 "$AI_DEV_REAL" __test-route-args '123' 'value with spaces' >"$passthrough_output_file" 2>&1
 ); then
 	passthrough_status=0
 else
@@ -351,7 +355,7 @@ else
 fi
 help_routed_status_flag_output="$(cat "$help_routed_status_flag_file")"
 assert_equals "$help_routed_status_flag_status" "0"
-assert_contains "$help_routed_status_flag_output" 'Usage: flow status [-v|--verbose]'
+assert_contains "$help_routed_status_flag_output" 'Usage: ai-dev status [-v|--verbose]'
 assert_not_exists "$repo_routing/reports/help.txt"
 
 # restore configured out for subsequent routing checks
@@ -397,8 +401,8 @@ else
 fi
 unknown_output="$(cat "$unknown_output_file")"
 assert_equals "$unknown_status" "1"
-assert_contains "$unknown_output" 'flow: unknown command: gibberish'
-assert_contains "$unknown_output" 'Run flow help for usage.'
+assert_contains "$unknown_output" 'ai-dev: unknown command: gibberish'
+assert_contains "$unknown_output" 'Run ai-dev help for usage.'
 assert_not_contains "$unknown_output" 'Output written to'
 
 # routed commands preserve invalid-path behavior and generated-output recovery
@@ -454,7 +458,7 @@ assert_equals "$outside_output" "$help_output"
 mkdir -p "$repo_routing/reports"
 set_repo_out "$repo_routing" 'reports/alt-help.txt'
 symlink_path="$TMP_DIR/ai-dev-flow"
-ln -s "$FLOW" "$symlink_path"
+ln -s "$AI_DEV_REAL" "$symlink_path"
 symlink_terminal_output_file="$TMP_DIR/symlink-terminal-output"
 if (
 	cd "$repo_routing/subdir"
@@ -466,7 +470,7 @@ else
 fi
 symlink_terminal_output="$(cat "$symlink_terminal_output_file")"
 assert_equals "$symlink_status" "0"
-assert_equals "$symlink_terminal_output" "$(expected_top_help ai-dev-flow)"
+assert_equals "$symlink_terminal_output" "$(expected_top_help ai-dev)"
 assert_not_exists "$repo_routing/reports/alt-help.txt"
 
 printf 'flow CLI tests passed\n'

@@ -8,7 +8,7 @@ The user-facing surfaces that remain in place are:
 
 - `ai-dev summarize`
 - `ai-dev summarize-verify`
-- `ai-dev review`
+- `ai-dev flow review`
 - `ai-dev review-verify`
 - `ai-dev config`
 - `ai-dev config apply`
@@ -57,5 +57,7 @@ The production file count remains 35 because deleting `assistantChatBackend.ts` 
 ## Notes
 
 - This checkpoint is no longer about a compatibility shim or stateless adapter. The production backend is deleted.
-- Summarize and review remain as terminal-driven handoff flows that invoke the canonical `ai-dev summarize` and `ai-dev review` task-preparation commands. The extension does not define a separate task format.
+- Summarize and review remain as terminal-driven handoff flows that invoke the canonical `ai-dev summarize` and `ai-dev flow review` task-preparation commands. The extension does not define a separate task format.
+
+Historical note: this checkpoint originally retained top-level lifecycle compatibility routes during Issue #19 migration; canonical lifecycle usage is now `ai-dev flow ...`.
 - Checkpoint 2 has not started; terminal UI, VSIX, vendor, build, and `showreport` architecture remain in scope for later work.

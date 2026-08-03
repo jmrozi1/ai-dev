@@ -13,11 +13,13 @@ This slice adds managed command alias reconciliation through:
 
 Managed aliases forward all user arguments directly to `ai-dev` commands.
 
+Historical note: this checkpoint snapshot predates canonical lifecycle namespace hardening; lifecycle aliases should now target `ai-dev flow ...`.
+
 POSIX generated functions:
 
 ```sh
 review() {
-    command ai-dev review "$@"
+  command ai-dev flow review "$@"
 }
 ```
 
@@ -25,7 +27,7 @@ PowerShell generated functions:
 
 ```powershell
 function review {
-    & ai-dev review @args
+  & ai-dev flow review @args
 }
 ```
 

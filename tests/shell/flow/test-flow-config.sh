@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-FLOW="$ROOT/scripts/flow"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+AI_DEV_REAL="${AI_DEV_BIN:-$(command -v ai-dev || true)}"
+if [[ -z "$AI_DEV_REAL" ]]; then
+	printf 'ai-dev command not found on PATH.\n' >&2
+	exit 1
+fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
@@ -62,7 +66,7 @@ run_flow() {
 	shift
 	(
 		cd "$cwd"
-		"$FLOW" "$@"
+		"$AI_DEV_REAL" "$@"
 	)
 }
 
@@ -226,7 +230,7 @@ assert_contains "$empty_set_text" 'out value cannot be empty'
 
 # usage errors include the invoked command name
 alt_flow="$TMP_DIR/alt-flow"
-ln -s "$FLOW" "$alt_flow"
+ln -s "$AI_DEV_REAL" "$alt_flow"
 if (
 	cd "$repo_a/subdir"
 	"$alt_flow" get >"$TMP_DIR/alt-flow-usage-output" 2>&1
@@ -237,7 +241,7 @@ else
 fi
 alt_flow_usage_text="$(cat "$TMP_DIR/alt-flow-usage-output")"
 assert_equals "$alt_flow_usage_status" "1"
-assert_contains "$alt_flow_usage_text" 'alt-flow: Usage: alt-flow get out'
+assert_contains "$alt_flow_usage_text" 'ai-dev: Usage: ai-dev get out'
 
 # Restore repo_a to a valid config state after malformed/unknown-key checks.
 rm -rf "$repo_a/.ai-dev"
