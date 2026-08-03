@@ -19,6 +19,13 @@ from .alias_installation import (
 )
 from .editable_config import EditableConfigError, ensure_editable_user_config
 from .json_files import JsonFileError, write_text_atomic
+from .update_installation import (
+    DEFAULT_UPDATE_BRANCH,
+    DEFAULT_UPDATE_REMOTE,
+    UpdateInstallationError,
+    refresh_installation_source_record,
+    resolve_installation_source_path,
+)
 
 
 OWNERSHIP_MARKER = "AI_DEV_LAUNCHER_V1"
@@ -49,6 +56,9 @@ class BootstrapResult:
     profile_path: Path | None
     launcher_statuses: tuple[LauncherInstallStatus, ...]
     install_dir_on_path: bool
+    installation_source_path: Path
+    update_branch: str
+    update_remote: str
 
 
 @dataclass(frozen=True)
@@ -527,6 +537,8 @@ def run_bootstrap(
     user_profile: str | None = None,
     config_path: Path | None = None,
     path_value: str | None = None,
+    update_branch: str = DEFAULT_UPDATE_BRANCH,
+    update_remote: str = DEFAULT_UPDATE_REMOTE,
 ) -> BootstrapResult:
     _validate_command_name(command_name)
 
@@ -554,9 +566,21 @@ def run_bootstrap(
         else (home_path / ".local" / "bin").resolve()
     )
 
+    installation_source_path = resolve_installation_source_path(
+        os_name=os_name,
+        home=home_path,
+    )
+
+    canonical_repo_root = refresh_installation_source_record(
+        repo_root=repo_root_resolved,
+        metadata_path=installation_source_path,
+        branch=update_branch,
+        remote=update_remote,
+    )
+
     launcher_map = _build_launcher_map(
         platform=normalized_platform,
-        repo_root=repo_root_resolved,
+        repo_root=canonical_repo_root,
         python_executable=python_executable,
         install_directory=install_dir,
         command_name=command_name,
@@ -612,7 +636,7 @@ def run_bootstrap(
     return BootstrapResult(
         platform=normalized_platform,
         command_name=command_name,
-        repo_root=repo_root_resolved,
+        repo_root=canonical_repo_root,
         python_executable=python_executable,
         install_directory=install_dir,
         config_path=editable_config.config_path,
@@ -622,6 +646,9 @@ def run_bootstrap(
         profile_path=profile_path,
         launcher_statuses=statuses,
         install_dir_on_path=on_path,
+        installation_source_path=installation_source_path,
+        update_branch=update_branch,
+        update_remote=update_remote,
     )
 
 
@@ -674,6 +701,10 @@ def _print_result(result: BootstrapResult) -> None:
         windows = result.platform == "windows"
         print("PATH status: install directory is not on PATH")
         print(_render_path_guidance(result.install_directory, windows=windows))
+
+    print(f"Installation source metadata: {result.installation_source_path}")
+    print(f"Update branch: {result.update_branch}")
+    print(f"Update remote: {result.update_remote}")
 
     print(
         "Source binding: launcher points to this repository root. "
@@ -739,6 +770,16 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
         choices=(CANONICAL_COMMAND_NAME,),
         help="Launcher command name to install (default: ai-dev).",
     )
+    parser.add_argument(
+        "--update-branch",
+        default=DEFAULT_UPDATE_BRANCH,
+        help=f"Approved update branch to record (default: {DEFAULT_UPDATE_BRANCH}).",
+    )
+    parser.add_argument(
+        "--update-remote",
+        default=DEFAULT_UPDATE_REMOTE,
+        help=f"Approved update remote to record (default: {DEFAULT_UPDATE_REMOTE}).",
+    )
     return parser.parse_args(argv)
 
 
@@ -763,11 +804,13 @@ def main(argv: list[str] | None = None) -> int:
             user_profile=parsed.user_profile,
             config_path=(None if parsed.config_path is None else Path(parsed.config_path)),
             path_value=parsed.path_value,
+            update_branch=parsed.update_branch,
+            update_remote=parsed.update_remote,
         )
     except BootstrapError as exc:
         print(f"bootstrap: {exc}", file=sys.stderr)
         return 1
-    except (JsonFileError, EditableConfigError) as exc:
+    except (JsonFileError, EditableConfigError, UpdateInstallationError) as exc:
         print(f"bootstrap: {exc}", file=sys.stderr)
         return 1
 

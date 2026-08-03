@@ -102,6 +102,7 @@ Commands:
   review-verify     Verify deterministic review report and package integrity.
   config            Open or create editable user configuration.
   apply             Reconcile managed launchers, PATH state, and installation ownership.
+  update            Refresh source checkout, launcher bootstrap, and managed installation state.
   get               Read a repository setting.
   set               Change a repository setting.
   unset             Remove a repository setting.

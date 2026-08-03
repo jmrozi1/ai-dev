@@ -132,6 +132,11 @@ from .task_config import (
 )
 from .task_delivery import ClipboardDeliveryError, build_delivery_adapter
 from .task_invocation import render_invocation
+from .update_installation import (
+    UpdateInstallationError,
+    run_update_from_record,
+    resolve_installation_source_path,
+)
 
 
 FLOW_NAMESPACE_DESCRIPTION = "Manage issue-focused development workflows."
@@ -287,6 +292,13 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         canonical_namespace="top",
         order=155,
         handler_key="apply",
+    ),
+    CommandSpec(
+        name="update",
+        description="Refresh source checkout, launcher bootstrap, and managed installation state.",
+        canonical_namespace="top",
+        order=157,
+        handler_key="update",
     ),
     CommandSpec(
         name="get",
@@ -511,6 +523,19 @@ Reconcile managed installation resources from user configuration:
 launcher files, Linux ~/.bashrc PATH marker block, and ownership manifest.
 
 This command is idempotent for unchanged configuration.
+
+Options:
+  -h, --help  Show this help.
+""",
+    "update": """\
+Usage: {command_name} update
+
+Refresh AI Dev from recorded installation source metadata:
+validate source checkout safety, fetch and fast-forward configured remote branch,
+refresh launcher bootstrap, then run managed installation apply.
+
+This command refuses dirty checkouts and will not stash, reset, clean, merge,
+rebase, or force updates automatically.
 
 Options:
   -h, --help  Show this help.
@@ -875,6 +900,10 @@ def _apply_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} apply")
 
 
+def _update_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} update")
+
+
 def _showreport_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} showreport")
 
@@ -915,6 +944,50 @@ def handle_apply(command_name: str, arguments: list[str]) -> int:
         raise _apply_usage(command_name)
 
     return _run_apply_command()
+
+
+def handle_update(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _update_usage(command_name)
+
+    metadata_path = resolve_installation_source_path()
+    try:
+        result = run_update_from_record(metadata_path)
+    except UpdateInstallationError as exc:
+        raise FlowError(
+            "Update source:\n"
+            "  failed\n"
+            f"  metadata: {metadata_path}\n"
+            f"  detail: {exc}"
+        ) from exc
+
+    print("Update source:")
+    if result.source.source_status == "already up to date":
+        print("  already up to date")
+    elif result.source.source_status == "fast-forwarded":
+        print(
+            "  "
+            f"fast-forwarded {result.source.source_from} -> {result.source.source_to}"
+        )
+    else:
+        print(f"  {result.source.source_status}")
+    print(f"  repository: {result.source.source_repo}")
+    print(f"  branch: {result.source.branch}")
+    print(f"  remote: {result.source.remote}")
+
+    print("Launcher refresh:")
+    print(f"  {result.launcher.status}")
+    if result.launcher.detail:
+        print(f"  detail: {result.launcher.detail}")
+
+    print("Apply:")
+    print(f"  {result.apply.status}")
+    if result.apply.detail:
+        print(f"  detail: {result.apply.detail}")
+
+    if result.launcher.status == "failed" or result.apply.status == "failed":
+        return 1
+    return 0
 
 
 def handle_config(command_name: str, arguments: list[str]) -> int:
@@ -3446,6 +3519,7 @@ def _resolve_command_handler(handler_key: str):
         "review-verify": handle_review_verify,
         "config": handle_config,
         "apply": handle_apply,
+        "update": handle_update,
         "get": handle_get,
         "set": handle_set,
         "unset": handle_unset,
@@ -3580,6 +3654,7 @@ def run() -> None:
         SummarizePlanningError,
         SummarizeTaskGenerationError,
         SummarizeVerificationError,
+        UpdateInstallationError,
         TaskArtifactError,
         TaskConfigError,
         WorkflowStateError,

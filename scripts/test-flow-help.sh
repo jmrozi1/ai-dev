@@ -147,6 +147,7 @@ Commands:
   review-verify     Verify deterministic review report and package integrity.
   config            Open or create editable user configuration.
   apply             Reconcile managed launchers, PATH state, and installation ownership.
+  update            Refresh source checkout, launcher bootstrap, and managed installation state.
   get               Read a repository setting.
   set               Change a repository setting.
   unset             Remove a repository setting.
@@ -396,6 +397,21 @@ Options:
   -h, --help  Show this help.
 EOF
 			;;
+		update)
+			cat <<EOF
+Usage: ${command_name} update
+
+Refresh AI Dev from recorded installation source metadata:
+validate source checkout safety, fetch and fast-forward configured remote branch,
+refresh launcher bootstrap, then run managed installation apply.
+
+This command refuses dirty checkouts and will not stash, reset, clean, merge,
+rebase, or force updates automatically.
+
+Options:
+  -h, --help  Show this help.
+EOF
+			;;
 		set)
 			cat <<EOF
 Usage: ${command_name} set out=<path>
@@ -487,7 +503,7 @@ assert_contains "$(cat "$flow_unknown_output")" 'ai-dev flow: unknown command: n
 assert_contains "$(cat "$flow_unknown_output")" 'Run ai-dev flow --help for usage.'
 
 # command-specific help for every public command
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
 	command_help_short="$TMP_DIR/${command}-short.txt"
 	command_help_long="$TMP_DIR/${command}-long.txt"
 	if run_flow_capture "$help_repo/subdir" "$command_help_short" "$command" -h; then
@@ -529,7 +545,7 @@ for command in start patch task-prepare status review commit reset promote compl
 # help works outside Git repositories and with malformed config
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
 	for help_flag in -h --help; do
 		outside_output="$TMP_DIR/outside-${command}-${help_flag//-/}.txt"
 		if run_flow_capture "$outside_repo" "$outside_output" "$command" "$help_flag"; then
@@ -546,7 +562,7 @@ repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"
 mkdir -p "$repo_malformed/.ai-dev"
 printf '{ invalid json\n' > "$repo_malformed/.ai-dev/config.json"
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
 	malformed_output="$TMP_DIR/malformed-${command}.txt"
 	if run_flow_capture "$repo_malformed/subdir" "$malformed_output" "$command" --help; then
 		malformed_status=0
@@ -565,7 +581,7 @@ git -C "$repo_bypass" checkout -q -b scratch
 state_set "$repo_bypass/subdir" '{"activeIssueNumber":99,"mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 git -C "$repo_bypass" checkout -q main
 printf '{ invalid workflow json\n' > "$repo_bypass/.ai-dev/workflow.json"
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply get set unset showreport help; do
+for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
 	bypass_output="$TMP_DIR/bypass-${command}.txt"
 	if run_flow_capture "$repo_bypass/subdir" "$bypass_output" "$command" -h; then
 		bypass_status=0
@@ -605,7 +621,7 @@ assert_contains "$(cat "$command_help_routed_output")" 'Usage: flow status [-v|-
 assert_not_exists "$set_repo_out"
 
 # extra arguments combined with help are rejected
-for command in patch task-prepare summarize summarize-verify review-verify status review commit reset complete block resume config get set unset showreport help; do
+for command in patch task-prepare summarize summarize-verify review-verify status review commit reset complete block resume config apply update get set unset showreport help; do
 	extra_output="$TMP_DIR/${command}-extra.txt"
 	if run_flow_capture "$help_repo/subdir" "$extra_output" "$command" -h extra; then
 		extra_status=0

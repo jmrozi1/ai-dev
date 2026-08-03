@@ -22,6 +22,7 @@ from ai_dev_flow.bootstrap import (
     render_powershell_launcher,
     run_bootstrap,
 )
+from ai_dev_flow.update_installation import load_installation_source_record
 
 
 class BootstrapCoreTests(unittest.TestCase):
@@ -434,6 +435,75 @@ class BootstrapCoreTests(unittest.TestCase):
         match = re.search(r"LAST_AFTER=(-?\d+)", completed.stdout)
         self.assertIsNotNone(match)
         self.assertEqual(int(match.group(1)), 0)
+
+    def test_bootstrap_records_installation_source_metadata(self) -> None:
+        home = self.tmp_path / "home-meta"
+        install_dir = home / ".local" / "bin"
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            command_name="ai-dev",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            update_branch="main",
+            update_remote="origin",
+        )
+
+        record = load_installation_source_record(result.installation_source_path)
+        self.assertTrue(result.installation_source_path.exists())
+        self.assertEqual(record.source_repository, self.repo_root.resolve())
+        self.assertEqual(record.branch, "main")
+        self.assertEqual(record.remote, "origin")
+
+    def test_bootstrap_metadata_refresh_is_idempotent(self) -> None:
+        home = self.tmp_path / "home-meta-repeat"
+        install_dir = home / ".local" / "bin"
+
+        first = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            command_name="ai-dev",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        first_text = first.installation_source_path.read_text(encoding="utf-8")
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            command_name="ai-dev",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        second_text = second.installation_source_path.read_text(encoding="utf-8")
+
+        self.assertEqual(first.installation_source_path, second.installation_source_path)
+        self.assertEqual(first_text, second_text)
+
+    def test_bootstrap_records_canonical_git_root_from_symlink(self) -> None:
+        home = self.tmp_path / "home-subdir"
+        install_dir = home / ".local" / "bin"
+        symlink_root = self.tmp_path / "repo-link"
+        symlink_root.symlink_to(self.repo_root, target_is_directory=True)
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=symlink_root,
+            command_name="ai-dev",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        record = load_installation_source_record(result.installation_source_path)
+        self.assertEqual(record.source_repository, self.repo_root.resolve())
 
 
 if __name__ == "__main__":
