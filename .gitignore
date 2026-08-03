@@ -13,6 +13,9 @@ out.txt
 .ai-dev/workflow.json
 .ai-dev/config.json
 .ai-dev/blocked-workflows.json
+.ai-dev/review/
+.ai-dev/reviews/
+.ai-dev/tasks/review-*-task.md
 
 # generated command output
 **/out.txt

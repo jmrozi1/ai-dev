@@ -113,6 +113,35 @@ class FlowCommitTests(unittest.TestCase):
         self.assertIn("staged.txt", tracked_files)
         self.assertIn("untracked.txt", tracked_files)
 
+    def test_successful_commit_removes_rolling_review_workspace(self) -> None:
+        repo_root = self._init_repo("repo-commit-cleans-review")
+        review_root = repo_root / ".ai-dev" / "review"
+        review_root.mkdir(parents=True, exist_ok=True)
+        (review_root / "package.json").write_text('{"review_id":"review-0123456789abcdef"}\n', encoding="utf-8")
+        (review_root / "task.md").write_text("task\n", encoding="utf-8")
+
+        (repo_root / "staged.txt").write_text("staged\n", encoding="utf-8")
+        self._run_git(repo_root, "add", "staged.txt")
+
+        code, _, err = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertFalse(review_root.exists())
+
+    def test_failed_commit_preserves_rolling_review_workspace(self) -> None:
+        repo_root = self._init_repo("repo-commit-preserves-review-on-failure")
+        review_root = repo_root / ".ai-dev" / "review"
+        review_root.mkdir(parents=True, exist_ok=True)
+        marker = review_root / "package.json"
+        marker.write_text('{"review_id":"review-0123456789abcdef"}\n', encoding="utf-8")
+
+        code, out, err = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("no staged changes", err)
+        self.assertTrue(review_root.exists())
+        self.assertTrue(marker.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

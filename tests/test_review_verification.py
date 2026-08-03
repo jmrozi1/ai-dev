@@ -87,10 +87,10 @@ class ReviewVerificationTests(unittest.TestCase):
         code, _, err = self._invoke(repo_root, "review")
         self.assertEqual(code, 0, msg=err)
 
-        reviews_root = repo_root / ".ai-dev" / "reviews"
-        review_dirs = sorted(path for path in reviews_root.iterdir() if path.is_dir())
-        self.assertTrue(review_dirs)
-        return review_dirs[-1].name
+        payload = json.loads(
+            (repo_root / ".ai-dev" / "review" / "package.json").read_text(encoding="utf-8")
+        )
+        return payload["review_id"]
 
     def _invoke(self, cwd: Path, *arguments: str) -> tuple[int, str, str]:
         from ai_dev_flow import cli
@@ -221,7 +221,7 @@ class ReviewVerificationTests(unittest.TestCase):
         review_id = self._prepare_review(repo_root)
         self._write_report(repo_root, review_id, decision="pass")
 
-        task_path = repo_root / ".ai-dev" / "tasks" / f"{review_id}-task.md"
+        task_path = repo_root / ".ai-dev" / "review" / "task.md"
         original = task_path.read_text(encoding="utf-8")
         task_path.write_text(original.replace("- Review-ID: ", "- Review-ID: mismatch-", 1), encoding="utf-8")
 
@@ -378,7 +378,7 @@ class ReviewVerificationTests(unittest.TestCase):
         review_id = self._prepare_review(repo_root)
         self._write_report(repo_root, review_id, decision="pass")
 
-        task_path = repo_root / ".ai-dev" / "tasks" / f"{review_id}-task.md"
+        task_path = repo_root / ".ai-dev" / "review" / "task.md"
         original = task_path.read_text(encoding="utf-8")
         task_path.write_text(original + f"\n- Review-ID: {review_id}\n", encoding="utf-8")
 

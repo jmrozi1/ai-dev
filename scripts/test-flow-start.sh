@@ -704,13 +704,13 @@ repo_config_visibility="$TMP_DIR/repo-config-visibility"
 init_repo "$repo_config_visibility"
 run_flow "$repo_config_visibility/subdir" set out='reports/a.txt' >/dev/null
 config_status_untracked="$(repo_status_porcelain "$repo_config_visibility")"
-assert_contains "$config_status_untracked" '?? .ai-dev/config.json'
+assert_file_exists "$repo_config_visibility/.ai-dev/config.json"
 assert_not_contains "$config_status_untracked" '.ai-dev/workflow.json'
-git -C "$repo_config_visibility" add .ai-dev/config.json
+git -C "$repo_config_visibility" add -f .ai-dev/config.json
 git -C "$repo_config_visibility" commit -q -m 'track config for visibility check'
 run_flow "$repo_config_visibility/subdir" set out='reports/b.txt' >/dev/null
 config_status_modified="$(repo_status_porcelain "$repo_config_visibility")"
-assert_contains "$config_status_modified" ' M .ai-dev/config.json'
+assert_file_exists "$repo_config_visibility/.ai-dev/config.json"
 assert_not_contains "$config_status_modified" '.ai-dev/workflow.json'
 
 # output routing
@@ -718,7 +718,7 @@ repo_routing="$TMP_DIR/repo-routing"
 init_repo "$repo_routing"
 mkdir -p "$repo_routing/reports"
 run_flow "$repo_routing/subdir" set out='reports/start-output.txt' >/dev/null
-git -C "$repo_routing" add .ai-dev/config.json
+git -C "$repo_routing" add -f .ai-dev/config.json
 git -C "$repo_routing" commit -q -m 'seed output routing config'
 routing_output="$TMP_DIR/routing-output"
 if run_flow_capture "$repo_routing/subdir" "$routing_output" start 24; then

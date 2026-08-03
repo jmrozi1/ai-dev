@@ -41,22 +41,22 @@ Task ID convention:
 
 Task path convention:
 
-- `.ai-dev/tasks/<task-id>.md`
+- `.ai-dev/review/task.md`
 
 Review package relationship:
 
 - one deterministic review package yields one deterministic review task
-- identical replay resolves same review ID, task ID, and task path
-- materially different package content yields a different review ID and therefore a different task
+- identical replay resolves same review ID and task ID, with stable rolling task path
+- materially different package content yields a different review ID but reuses the same rolling task path
 
 ## Package, Task, and Report Relationship
 
-Review package artifacts remain:
+Review package artifacts are stored in a rolling workspace:
 
-- `.ai-dev/reviews/<review-id>/package.md`
-- `.ai-dev/reviews/<review-id>/package.json`
-- `.ai-dev/reviews/<review-id>/changes.diff`
-- `.ai-dev/reviews/<review-id>/report.md`
+- `.ai-dev/review/package.md`
+- `.ai-dev/review/package.json`
+- `.ai-dev/review/changes.diff`
+- `.ai-dev/review/report.md`
 
 Generated review task references package artifacts and report destination by path; it does not embed full patch content.
 
@@ -123,27 +123,21 @@ After successful task preparation, `.ai-dev/current-task.md` is updated to:
 
 - Task-ID: generated review task ID
 - Task-Type: `review`
-- Task-File: generated review task path
+- Task-File: `.ai-dev/review/task.md`
 
 Pointer never targets `package.md`.
 
-## Idempotency and Immutability
+## Rolling Replacement
 
-- identical replay succeeds without rewriting immutable artifacts
-- existing identical review package is reused
-- existing identical review task is reused
-- divergent content for the same deterministic ID is rejected
+- successful review generation builds in a temporary sibling directory and atomically replaces `.ai-dev/review/`
+- the rolling workspace is working state, not a retained archive
+- stale reviewer output files from prior reviews are not carried into the new workspace
 
 ## Failure Atomicity
 
 Pre-write failures (for example malformed invocation template, invalid delivery configuration, adapter construction failure) occur before persistent review package/task/current-pointer writes.
 
-Post-write failures roll back newly created artifacts from the current invocation:
-
-- remove new task artifact
-- remove new review package artifacts only if created by the current invocation
-- restore previous current-task pointer content
-- preserve pre-existing immutable package/task artifacts
+Post-write failures clean only the temporary workspace from the current invocation, restore previous task pointer content when needed, and preserve the last valid rolling review workspace.
 
 ## Checkpoint 3 Boundary
 

@@ -103,6 +103,7 @@ class ConfigOpenCliTests(unittest.TestCase):
         self.assertTrue(config_path.is_absolute())
         self.assertTrue(config_path.exists())
         created_text = config_path.read_text(encoding="utf-8")
+        self.assertIn("installation:", created_text)
         self.assertIn("aliases: {}", created_text)
         self.assertIn("presentation: path-only", created_text)
 

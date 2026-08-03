@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
 from pathlib import Path, PurePosixPath
 import re
 
@@ -9,18 +9,10 @@ from .review_task_generation import build_review_task_id
 
 
 REVIEW_ID_PATTERN = re.compile(r"^review-[0-9a-f]{16}$")
-_CURRENT_TASK_FIELD_PATTERN = re.compile(r"^- (Task-ID|Task-Type|Task-File):\s*(.+?)\s*$")
 
 
 class ReviewManifestError(Exception):
     """Raised for review manifest and pointer resolution errors."""
-
-
-@dataclass(frozen=True)
-class CurrentTaskPointer:
-    task_id: str
-    task_type: str
-    task_file: str
 
 
 def validate_review_id(review_id: str) -> str:
@@ -51,18 +43,18 @@ def expected_review_task_id(review_id: str) -> str:
 
 
 def expected_review_task_file(review_id: str) -> str:
-    task_id = expected_review_task_id(review_id)
-    return f".ai-dev/tasks/{task_id}.md"
+    _ = expected_review_task_id(review_id)
+    return ".ai-dev/review/task.md"
 
 
 def review_verification_markdown_path(review_id: str) -> str:
-    normalized = validate_review_id(review_id)
-    return f".ai-dev/reviews/{normalized}/verification.md"
+    _ = validate_review_id(review_id)
+    return ".ai-dev/review/verification.md"
 
 
 def review_verification_json_path(review_id: str) -> str:
-    normalized = validate_review_id(review_id)
-    return f".ai-dev/reviews/{normalized}/verification.json"
+    _ = validate_review_id(review_id)
+    return ".ai-dev/review/verification.json"
 
 
 def expected_review_artifact_paths(repo_root: Path, review_id: str):
@@ -73,72 +65,31 @@ def expected_review_artifact_paths(repo_root: Path, review_id: str):
         raise ReviewManifestError(str(exc)) from exc
 
 
-def _load_current_task_pointer(repo_root: Path) -> CurrentTaskPointer:
-    pointer_path = repo_root / ".ai-dev" / "current-task.md"
-    if not pointer_path.exists():
+def resolve_current_review_id(repo_root: Path) -> str:
+    package_path = repo_root / ".ai-dev" / "review" / "package.json"
+    if not package_path.exists():
+        raise ReviewManifestError("No current review found at .ai-dev/review/. Run `flow review` first.")
+    if not package_path.is_file():
         raise ReviewManifestError(
-            "Cannot resolve current review: .ai-dev/current-task.md does not exist."
+            "No current review found at .ai-dev/review/: package.json is not a regular file."
         )
 
     try:
-        text = pointer_path.read_text(encoding="utf-8")
-    except OSError as exc:
+        payload = json.loads(package_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ReviewManifestError(
-            f"Cannot resolve current review: failed to read .ai-dev/current-task.md: {exc}"
+            f"Cannot resolve current review from .ai-dev/review/package.json: {exc}"
         ) from exc
 
-    values: dict[str, str] = {}
-    for line in text.splitlines():
-        match = _CURRENT_TASK_FIELD_PATTERN.fullmatch(line)
-        if match is None:
-            continue
-        values[match.group(1)] = match.group(2)
-
-    missing = [field for field in ("Task-ID", "Task-Type", "Task-File") if field not in values]
-    if missing:
+    if not isinstance(payload, dict):
         raise ReviewManifestError(
-            "Cannot resolve current review: .ai-dev/current-task.md is missing field(s): "
-            + ", ".join(missing)
-            + "."
+            "Cannot resolve current review from .ai-dev/review/package.json: expected JSON object."
         )
 
-    return CurrentTaskPointer(
-        task_id=values["Task-ID"],
-        task_type=values["Task-Type"],
-        task_file=values["Task-File"],
-    )
-
-
-def resolve_current_review_id(repo_root: Path) -> str:
-    pointer = _load_current_task_pointer(repo_root)
-
-    if pointer.task_type != "review":
+    review_id = payload.get("review_id")
+    if not isinstance(review_id, str):
         raise ReviewManifestError(
-            "Current task is not review. Run `flow review` first. "
-            f"Task-Type is {pointer.task_type!r}."
+            "Cannot resolve current review from .ai-dev/review/package.json: missing review_id."
         )
 
-    task_id = pointer.task_id.strip()
-    if not task_id.endswith("-task"):
-        raise ReviewManifestError(
-            "Current review task pointer is malformed: Task-ID must end with '-task'."
-        )
-
-    review_id_candidate = task_id[: -len("-task")]
-    review_id = validate_review_id(review_id_candidate)
-    expected_task_id = expected_review_task_id(review_id)
-    if task_id != expected_task_id:
-        raise ReviewManifestError(
-            "Current review task pointer is inconsistent: "
-            f"expected Task-ID {expected_task_id!r}, got {task_id!r}."
-        )
-
-    task_file = validate_repo_relative_path(pointer.task_file, label="Task-File")
-    expected_file = expected_review_task_file(review_id)
-    if task_file != expected_file:
-        raise ReviewManifestError(
-            "Current review task pointer is inconsistent: "
-            f"expected Task-File {expected_file!r}, got {task_file!r}."
-        )
-
-    return review_id
+    return validate_review_id(review_id)

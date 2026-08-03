@@ -365,13 +365,13 @@ def build_review_id(context: ReviewContext) -> str:
     payload = review_context_payload(context)
     changes_payload = payload.get("changes")
     if isinstance(changes_payload, dict):
-        changes_payload["changes_diff_path"] = ".ai-dev/reviews/{review_id}/changes.diff"
+        changes_payload["changes_diff_path"] = ".ai-dev/review/changes.diff"
     payload["artifacts"] = {
-        "review_root_path": ".ai-dev/reviews/{review_id}",
-        "package_markdown_path": ".ai-dev/reviews/{review_id}/package.md",
-        "package_json_path": ".ai-dev/reviews/{review_id}/package.json",
-        "changes_diff_path": ".ai-dev/reviews/{review_id}/changes.diff",
-        "canonical_report_path": ".ai-dev/reviews/{review_id}/report.md",
+        "review_root_path": ".ai-dev/review",
+        "package_markdown_path": ".ai-dev/review/package.md",
+        "package_json_path": ".ai-dev/review/package.json",
+        "changes_diff_path": ".ai-dev/review/changes.diff",
+        "canonical_report_path": ".ai-dev/review/report.md",
     }
     digest = hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")

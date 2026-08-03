@@ -74,7 +74,7 @@ class ReviewTaskGenerationTests(unittest.TestCase):
         self.assertEqual(planned_first.task_id, "review-1234abcd5678ef90-task")
         self.assertEqual(
             planned_first.repository_relative_path,
-            ".ai-dev/tasks/review-1234abcd5678ef90-task.md",
+            ".ai-dev/review/task.md",
         )
         self.assertEqual(planned_first.task_id, planned_second.task_id)
         self.assertEqual(planned_first.repository_relative_path, planned_second.repository_relative_path)

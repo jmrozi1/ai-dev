@@ -115,11 +115,10 @@ class FlowReviewTests(unittest.TestCase):
         return headers
 
     def _review_package_dirs(self, repo_root: Path) -> list[Path]:
-        reviews_root = repo_root / ".ai-dev" / "reviews"
-        if not reviews_root.exists():
+        review_root = repo_root / ".ai-dev" / "review"
+        if not review_root.exists() or not review_root.is_dir():
             return []
-
-        return sorted(path for path in reviews_root.iterdir() if path.is_dir())
+        return [review_root]
 
     def _latest_review_dir(self, repo_root: Path) -> Path:
         review_dirs = self._review_package_dirs(repo_root)
@@ -369,7 +368,7 @@ class FlowReviewTests(unittest.TestCase):
         payload = json.loads((latest / "package.json").read_text(encoding="utf-8"))
         derived_id = self._review_id_from_payload(payload)
         self.assertEqual(payload["review_id"], derived_id)
-        self.assertEqual(latest.name, payload["review_id"])
+        self.assertEqual(latest.name, "review")
 
         changes_bytes = (latest / "changes.diff").read_bytes()
         self.assertEqual(
@@ -400,7 +399,7 @@ class FlowReviewTests(unittest.TestCase):
         second_payload = json.loads((second_dir / "package.json").read_text(encoding="utf-8"))
 
         self.assertEqual(first_payload["review_id"], second_payload["review_id"])
-        self.assertEqual(first_dir.name, second_dir.name)
+        self.assertEqual(first_dir, second_dir)
         self.assertEqual(len(self._review_package_dirs(repo_root)), 1)
 
     def test_review_all_id_changes_when_authoritative_diff_changes(self) -> None:
@@ -530,7 +529,7 @@ class FlowReviewTests(unittest.TestCase):
         payload = json.loads((latest / "package.json").read_text(encoding="utf-8"))
         derived_id = self._review_id_from_payload(payload)
         self.assertEqual(payload["review_id"], derived_id)
-        self.assertEqual(latest.name, payload["review_id"])
+        self.assertEqual(latest.name, "review")
         self.assertEqual(
             payload["changes"]["changes_diff_sha256"],
             hashlib.sha256((latest / "changes.diff").read_bytes()).hexdigest(),

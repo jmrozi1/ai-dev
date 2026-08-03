@@ -274,13 +274,12 @@ def _verify_review_package(
     artifacts = payload["artifacts"]
     assert isinstance(artifacts, dict)
 
-    expected_root = f".ai-dev/reviews/{review_id}"
     artifact_expected_paths = {
-        "review_root_path": expected_root,
+        "review_root_path": ".ai-dev/review",
         "package_markdown_path": package_path,
         "package_json_path": package_json_path,
         "changes_diff_path": changes_diff_path,
-        "canonical_report_path": f"{expected_root}/report.md",
+        "canonical_report_path": ".ai-dev/review/report.md",
     }
     for field_name, expected_value in artifact_expected_paths.items():
         raw_value = artifacts.get(field_name)
@@ -489,11 +488,11 @@ def _verify_review_task(
         ),
         "package-json-path": (
             "- Package-JSON-Path: ",
-            f"- Package-JSON-Path: .ai-dev/reviews/{review_id}/package.json",
+            "- Package-JSON-Path: .ai-dev/review/package.json",
         ),
         "changes-diff-path": (
             "- Changes-Diff-Path: ",
-            f"- Changes-Diff-Path: .ai-dev/reviews/{review_id}/changes.diff",
+            "- Changes-Diff-Path: .ai-dev/review/changes.diff",
         ),
         "review-report-path": (
             "- Review-Report-Path: ",

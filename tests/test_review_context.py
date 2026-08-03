@@ -44,11 +44,11 @@ class ReviewContextTests(unittest.TestCase):
                 "ai-dev-core/workflows/review/review-documentation.md",
             ],
             diagnostics=[],
-            review_root_path=".ai-dev/reviews/review-1234",
-            package_markdown_path=".ai-dev/reviews/review-1234/package.md",
-            package_json_path=".ai-dev/reviews/review-1234/package.json",
-            changes_diff_path=".ai-dev/reviews/review-1234/changes.diff",
-            canonical_report_path=".ai-dev/reviews/review-1234/report.md",
+            review_root_path=".ai-dev/review",
+            package_markdown_path=".ai-dev/review/package.md",
+            package_json_path=".ai-dev/review/package.json",
+            changes_diff_path=".ai-dev/review/changes.diff",
+            canonical_report_path=".ai-dev/review/report.md",
         )
 
     def test_acceptance_criteria_extraction_case_insensitive_stops_at_same_level(self) -> None:
@@ -113,11 +113,11 @@ class ReviewContextTests(unittest.TestCase):
                 "ai-dev-core/workflows/review/finding-template.md",
             ],
             diagnostics=[],
-            review_root_path=".ai-dev/reviews/review-alt",
-            package_markdown_path=".ai-dev/reviews/review-alt/package.md",
-            package_json_path=".ai-dev/reviews/review-alt/package.json",
-            changes_diff_path=".ai-dev/reviews/review-alt/changes.diff",
-            canonical_report_path=".ai-dev/reviews/review-alt/report.md",
+            review_root_path=".ai-dev/review",
+            package_markdown_path=".ai-dev/review/package.md",
+            package_json_path=".ai-dev/review/package.json",
+            changes_diff_path=".ai-dev/review/changes.diff",
+            canonical_report_path=".ai-dev/review/report.md",
         )
 
         self.assertEqual(build_review_id(context), build_review_id(altered))

@@ -7,7 +7,7 @@ Slice 3 adds deterministic post-execution verification for review workflows.
 Implemented in this slice:
 
 - new `flow review-verify [<review-id>]` command
-- current review resolution from `.ai-dev/current-task.md` when `<review-id>` is omitted
+- current review resolution from `.ai-dev/review/package.json` when `<review-id>` is omitted
 - explicit review ID validation (`review-<16 lowercase hex chars>`)
 - immutable review package/task/report integrity checks
 - deterministic verification artifacts (`verification.md`, `verification.json`)
@@ -31,15 +31,16 @@ flow review-verify [<review-id>]
 
 Resolution behavior:
 
-- if `<review-id>` is provided, verify that review directly
-- if omitted, resolve from `.ai-dev/current-task.md`
-- pointer must be `Task-Type: review` with consistent review task ID/path
+- rolling review workspace is the only verification target
+- if `<review-id>` is provided, it must match the current rolling review ID
+- if omitted, resolve from `.ai-dev/review/package.json`
+- if `.ai-dev/review/` is missing, verification fails with a no-current-review error
 
 Validation failures are surfaced as user-facing CLI errors without tracebacks.
 
 ## Verification Inputs
 
-Expected immutable artifacts under `.ai-dev/reviews/<review-id>/`:
+Expected artifacts under `.ai-dev/review/`:
 
 - `package.md`
 - `package.json`
@@ -48,7 +49,7 @@ Expected immutable artifacts under `.ai-dev/reviews/<review-id>/`:
 
 Expected generated task path:
 
-- `.ai-dev/tasks/<review-id>-task.md`
+- `.ai-dev/review/task.md`
 
 ## Integrity Model
 
@@ -75,12 +76,12 @@ Each marker must appear exactly once and must match expected value:
 - `# AI Dev Generated Task: <review-id>-task`
 - `- Task-ID: <review-id>-task`
 - `- Task-Type: review`
-- `- Task-File: .ai-dev/tasks/<review-id>-task.md`
+- `- Task-File: .ai-dev/review/task.md`
 - `- Review-ID: <review-id>`
-- `- Package-Markdown-Path: .ai-dev/reviews/<review-id>/package.md`
-- `- Package-JSON-Path: .ai-dev/reviews/<review-id>/package.json`
-- `- Changes-Diff-Path: .ai-dev/reviews/<review-id>/changes.diff`
-- `- Review-Report-Path: .ai-dev/reviews/<review-id>/report.md`
+- `- Package-Markdown-Path: .ai-dev/review/package.md`
+- `- Package-JSON-Path: .ai-dev/review/package.json`
+- `- Changes-Diff-Path: .ai-dev/review/changes.diff`
+- `- Review-Report-Path: .ai-dev/review/report.md`
 
 ### Report Contract Validation
 
@@ -89,7 +90,7 @@ Each marker must appear exactly once and must match expected value:
 - heading: `# AI Dev Review Report`
 - marker: `Review-ID: <review-id>`
 - marker: `Generated-By: external AI review`
-- marker: `Package-Path: .ai-dev/reviews/<review-id>/package.md`
+- marker: `Package-Path: .ai-dev/review/package.md`
 - decision line in `## Decision`: `- Status: pass | pass-with-notes | blocked`
 
 In addition, section structure is strict:
@@ -128,8 +129,8 @@ Exit code behavior:
 
 Each verification run writes:
 
-- `.ai-dev/reviews/<review-id>/verification.md`
-- `.ai-dev/reviews/<review-id>/verification.json`
+- `.ai-dev/review/verification.md`
+- `.ai-dev/review/verification.json`
 
 Properties:
 
@@ -154,3 +155,10 @@ This slice intentionally keeps existing commands unchanged:
 
 - `flow review` behavior remains unchanged
 - `flow showreport` behavior remains unchanged
+
+## Lifecycle and Retention
+
+- `.ai-dev/review/` is rolling working state, not an audit archive
+- successful `flow commit`, `flow reset`, `flow promote`, and `flow complete` remove `.ai-dev/review/`
+- failed lifecycle commands preserve the existing rolling review workspace
+- legacy `.ai-dev/reviews/` and legacy generated review task files are removed during successful rolling generation/cleanup

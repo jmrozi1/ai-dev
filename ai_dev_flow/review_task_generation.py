@@ -6,7 +6,6 @@ from pathlib import Path
 from .json_files import JsonFileError, write_text_atomic
 from .review_context import ReviewContext
 from .review_paths import ReviewArtifactPaths
-from .task_artifacts import PlannedGeneratedTask, TaskArtifactError, plan_generated_task
 
 
 class ReviewTaskGenerationError(Exception):
@@ -16,27 +15,11 @@ class ReviewTaskGenerationError(Exception):
 @dataclass(frozen=True)
 class PlannedReviewTask:
     review_id: str
-    planned_task: PlannedGeneratedTask
-
-    @property
-    def task_id(self) -> str:
-        return self.planned_task.task_id
-
-    @property
-    def task_type(self) -> str:
-        return self.planned_task.task_type
-
-    @property
-    def requested_command(self) -> str:
-        return self.planned_task.requested_command
-
-    @property
-    def repository_relative_path(self) -> str:
-        return self.planned_task.repository_relative_path
-
-    @property
-    def absolute_path(self) -> Path:
-        return self.planned_task.absolute_path
+    task_id: str
+    task_type: str
+    requested_command: str
+    repository_relative_path: str
+    absolute_path: Path
 
 
 @dataclass(frozen=True)
@@ -60,18 +43,19 @@ def plan_review_task(
     review_id: str,
     requested_command: str,
 ) -> PlannedReviewTask:
-    task_id = build_review_task_id(review_id)
-    try:
-        planned = plan_generated_task(
-            repo_root=repo_root,
-            task_id=task_id,
-            task_type="review",
-            requested_command=requested_command,
-        )
-    except TaskArtifactError as exc:
-        raise ReviewTaskGenerationError(str(exc)) from exc
+    normalized_requested_command = requested_command.strip()
+    if not normalized_requested_command:
+        raise ReviewTaskGenerationError("requested command cannot be empty.")
 
-    return PlannedReviewTask(review_id=review_id, planned_task=planned)
+    task_relative_path = ".ai-dev/review/task.md"
+    return PlannedReviewTask(
+        review_id=review_id,
+        task_id=build_review_task_id(review_id),
+        task_type="review",
+        requested_command=normalized_requested_command,
+        repository_relative_path=task_relative_path,
+        absolute_path=repo_root / task_relative_path,
+    )
 
 
 def _render_ticket_metadata(context: ReviewContext) -> list[str]:

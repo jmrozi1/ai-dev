@@ -96,28 +96,34 @@ Manage an issue-focused development workflow using permanent main history
 and disposable scratch checkpoints.
 
 Commands:
-	start      Begin new work on an unblocked issue and reset scratch from main.
-	patch      Begin or adopt a local patch workflow on scratch.
-    task-prepare  Prepare an immutable generated task artifact.
-    summarize  Prepare deterministic summarize task artifacts for source files.
-    summarize-verify  Verify summarize outputs for a prepared plan.
-    review-verify  Verify deterministic review report and package integrity.
-  status     Show the active issue and current repository state.
-    review     Prepare a review package and generated review task for proposed changes.
-  commit     Create the next numbered checkpoint on scratch.
-  reset      Discard scratch work and restore it from main.
-  promote    Squash scratch into one permanent commit on main.
-  complete   Clear the completed local workflow.
-	block      Block the active issue workflow and release the active slot.
-	resume     Reactivate a previously blocked issue workflow.
-    config     Open or create editable user configuration.
-  get        Read a repository setting.
-  set        Change a repository setting.
-  unset      Remove a repository setting.
-  showreport Show the generated report from disk.
-  help       Show this help.
+  flow              Manage issue-focused development workflows.
+  summarize         Prepare deterministic summarize task artifacts for source files.
+  summarize-verify  Verify summarize outputs for a prepared plan.
+  review-verify     Verify deterministic review report and package integrity.
+  config            Open or create editable user configuration.
+  apply             Reconcile managed launchers, PATH state, and installation ownership.
+  update            Refresh source checkout, launcher bootstrap, and managed installation state.
+  get               Read a repository setting.
+  set               Change a repository setting.
+  unset             Remove a repository setting.
+  showreport        Show the generated report from disk.
+  help              Show this help.
+
+Compatibility routes (temporary during Issue #19 migration):
+  start         Compatibility route to \`ai-dev flow start\`.
+  patch         Compatibility route to \`ai-dev flow patch\`.
+  task-prepare  Compatibility route to \`ai-dev flow task-prepare\`.
+  status        Compatibility route to \`ai-dev flow status\`.
+  review        Compatibility route to \`ai-dev flow review\`.
+  commit        Compatibility route to \`ai-dev flow commit\`.
+  reset         Compatibility route to \`ai-dev flow reset\`.
+  promote       Compatibility route to \`ai-dev flow promote\`.
+  complete      Compatibility route to \`ai-dev flow complete\`.
+  block         Compatibility route to \`ai-dev flow block\`.
+  resume        Compatibility route to \`ai-dev flow resume\`.
 
 Run \`${command_name} <command> --help\` for command-specific help.
+Run \`ai-dev flow --help\` for workflow lifecycle commands.
 EOF
 }
 
@@ -140,6 +146,33 @@ init_repo "$repo_malformed"
 repo_routing_branch="$(git -C "$repo_routing" symbolic-ref --quiet --short HEAD)"
 
 # top-level help bypasses routing and works without repo/config context
+compat_status_output_file="$TMP_DIR/compat-status-output"
+if run_flow_capture "$repo_routing/subdir" "$compat_status_output_file" status; then
+	compat_status_status=0
+else
+	compat_status_status=$?
+fi
+nested_status_output_file="$TMP_DIR/nested-status-output"
+if run_flow_capture "$repo_routing/subdir" "$nested_status_output_file" flow status; then
+	nested_status_status=0
+else
+	nested_status_status=$?
+fi
+assert_equals "$compat_status_status" '0'
+assert_equals "$nested_status_status" '0'
+assert_equals "$(cat "$nested_status_output_file")" "$(cat "$compat_status_output_file")"
+
+# unknown flow subcommand is deterministic and points to flow help
+unknown_flow_output_file="$TMP_DIR/unknown-flow-output"
+if run_flow_capture "$repo_routing/subdir" "$unknown_flow_output_file" flow nonsense; then
+	unknown_flow_status=0
+else
+	unknown_flow_status=$?
+fi
+unknown_flow_output="$(cat "$unknown_flow_output_file")"
+assert_equals "$unknown_flow_status" '1'
+assert_contains "$unknown_flow_output" 'ai-dev flow: unknown command: nonsense'
+assert_contains "$unknown_flow_output" 'Run ai-dev flow --help for usage.'
 help_output_file="$TMP_DIR/help-output"
 if run_flow_capture "$repo_unset/subdir" "$help_output_file" help; then
 	help_status=0
@@ -150,7 +183,7 @@ help_output="$(cat "$help_output_file")"
 assert_equals "$help_status" "0"
 assert_contains "$help_output" 'Usage: flow <command> [options]'
 assert_contains "$help_output" 'Commands:'
-assert_contains "$help_output" '  help       Show this help.'
+assert_contains "$help_output" '  help              Show this help.'
 assert_not_exists "$repo_unset/.ai-dev"
 
 # no-argument invocation matches help and top-level flags

@@ -152,7 +152,8 @@ create_commit_on_current_branch() {
 repo_help="$TMP_DIR/repo-help"
 init_repo "$repo_help"
 help_text="$(run_flow "$repo_help/subdir" help)"
-assert_contains "$help_text" 'patch      Begin or adopt a local patch workflow on scratch.'
+assert_contains "$help_text" 'Compatibility routes (temporary during Issue #19 migration):'
+assert_contains "$help_text" 'patch         Compatibility route to `ai-dev flow patch`.'
 
 patch_help_short="$(run_flow "$repo_help/subdir" patch -h)"
 patch_help_long="$(run_flow "$repo_help/subdir" patch --help)"

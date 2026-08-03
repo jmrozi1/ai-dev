@@ -8,7 +8,7 @@ Implemented in this slice:
 
 - deterministic review context model with explicit committed vs overlay scope metadata
 - deterministic review ID derived from stable structured payload
-- deterministic artifact layout under `.ai-dev/reviews/<review-id>/`
+- deterministic artifact layout under `.ai-dev/review/`
 - explicit `changes.diff` section boundaries and digest tracking
 - NUL-safe Git path collection for changed-path metadata
 - package markdown as metadata/navigation only (no embedded full patch)
@@ -72,6 +72,22 @@ Checkpoint scope (`flow review`) records only staged checkpoint changes; committ
 
 `package.json` stores `changes_diff_sha256` for the exact bytes written to `changes.diff`.
 
+## Rolling Review Workspace
+
+Review artifacts are working state, not a historical archive.
+
+Canonical paths:
+
+- `.ai-dev/review/task.md`
+- `.ai-dev/review/package.md`
+- `.ai-dev/review/package.json`
+- `.ai-dev/review/changes.diff`
+- `.ai-dev/review/report.md`
+- `.ai-dev/review/verification.md`
+- `.ai-dev/review/verification.json`
+
+`Review-ID` remains inside package/task/report/verification data for integrity checks, but it no longer selects a directory path.
+
 ## Package Markdown Boundary
 
 `package.md` does not embed full diff content.
@@ -103,11 +119,17 @@ It provides:
 
 No duplicate full-context copy is stored under alternate fields.
 
-## Immutability Semantics
+## Replacement and Failure Semantics
 
-- identical deterministic replay for the same review ID is idempotent and succeeds without rewrites
-- divergent content for an existing review ID is rejected
-- partial/corrupt existing package directories are rejected
+- every successful `flow review` builds artifacts in a temporary sibling workspace and atomically replaces `.ai-dev/review/`
+- replacement is all-or-nothing; no mixed old/new file sets are published
+- failed generation cleans only the temporary workspace and preserves the prior valid `.ai-dev/review/`
+- replacement starts without stale reviewer outputs from prior runs (`report.md`, `verification.md`, `verification.json`)
+
+Lifecycle cleanup:
+
+- successful `flow commit`, `flow reset`, `flow promote`, and `flow complete` remove `.ai-dev/review/`
+- if those commands fail before completion, the rolling review workspace is preserved
 
 ## Checkpoint 2 Boundary
 

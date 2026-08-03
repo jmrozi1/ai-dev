@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import hashlib
+import uuid
 from pathlib import Path
 import sys
 from collections.abc import Sequence
@@ -70,15 +72,19 @@ from .review_task_generation import (
     render_review_task_markdown,
     write_current_task_pointer,
 )
-from .review_manifest import ReviewManifestError, resolve_current_review_id
+from .review_manifest import ReviewManifestError, resolve_current_review_id, validate_review_id
 from .review_verification import (
     OVERALL_STATUS_COMPLETE as REVIEW_VERIFY_COMPLETE,
     ReviewVerificationError,
     run_review_verification,
 )
 from .editor_opening import build_editor_opener
-from .alias_config import AliasConfigError, load_desired_alias_state
-from .alias_installation import AliasInstallationError, apply_alias_reconciliation
+from .managed_installation import (
+    InstallationConfigError,
+    ManagedInstallationError,
+    apply_installation_reconciliation,
+    load_desired_installation_state,
+)
 from .editable_config import (
     EditableConfigError,
     ensure_editable_user_config,
@@ -128,38 +134,235 @@ from .task_config import (
 )
 from .task_delivery import ClipboardDeliveryError, build_delivery_adapter
 from .task_invocation import render_invocation
+from .update_installation import (
+    UpdateInstallationError,
+    run_update_from_record,
+    resolve_installation_source_path,
+)
 
 
-TOP_LEVEL_HELP = """\
-Usage: {command_name} <command> [options]
+FLOW_NAMESPACE_DESCRIPTION = "Manage issue-focused development workflows."
+CANONICAL_COMMAND_NAME = "ai-dev"
+CANONICAL_FLOW_PREFIX = f"{CANONICAL_COMMAND_NAME} flow"
 
-Manage an issue-focused development workflow using permanent main history
-and disposable scratch checkpoints.
 
-Commands:
-	start      Begin new work on an unblocked issue and reset scratch from main.
-	patch      Begin or adopt a local patch workflow on scratch.
-    task-prepare  Prepare an immutable generated task artifact.
-    summarize  Prepare deterministic summarize task artifacts for source files.
-    summarize-verify  Verify summarize outputs for a prepared plan.
-    review-verify  Verify deterministic review report and package integrity.
-  status     Show the active issue and current repository state.
-    review     Prepare a review package and generated review task for proposed changes.
-  commit     Create the next numbered checkpoint on scratch.
-  reset      Discard scratch work and restore it from main.
-  promote    Squash scratch into one permanent commit on main.
-  complete   Clear the completed local workflow.
-	block      Block the active issue workflow and release the active slot.
-	resume     Reactivate a previously blocked issue workflow.
-    config     Open or create editable user configuration.
-  get        Read a repository setting.
-  set        Change a repository setting.
-  unset      Remove a repository setting.
-  showreport Show the generated report from disk.
-  help       Show this help.
+@dataclass(frozen=True)
+class CommandSpec:
+    name: str
+    description: str
+    canonical_namespace: str
+    order: int
+    handler_key: str
+    operational_config_policy: str | None = None
+    echo_routed_output: bool = False
+    compatibility_top_level: bool = False
+    help_visible: bool = True
+    alias_eligible: bool = True
 
-Run `{command_name} <command> --help` for command-specific help.
-"""
+
+COMMAND_SPECS: tuple[CommandSpec, ...] = (
+    CommandSpec(
+        name="start",
+        description="Begin new work on an unblocked issue and reset scratch from main.",
+        canonical_namespace="flow",
+        order=10,
+        handler_key="start",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="patch",
+        description="Begin or adopt a local patch workflow on scratch.",
+        canonical_namespace="flow",
+        order=20,
+        handler_key="patch",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="task-prepare",
+        description="Prepare an immutable generated task artifact.",
+        canonical_namespace="flow",
+        order=30,
+        handler_key="task-prepare",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="status",
+        description="Show the active issue and current repository state.",
+        canonical_namespace="flow",
+        order=40,
+        handler_key="status",
+        operational_config_policy="strict",
+        echo_routed_output=True,
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="review",
+        description="Prepare a review package and generated review task for proposed changes.",
+        canonical_namespace="flow",
+        order=50,
+        handler_key="review",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="commit",
+        description="Create the next numbered checkpoint on scratch.",
+        canonical_namespace="flow",
+        order=60,
+        handler_key="commit",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="reset",
+        description="Discard scratch work and restore it from main.",
+        canonical_namespace="flow",
+        order=70,
+        handler_key="reset",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="promote",
+        description="Squash scratch into one permanent commit on main.",
+        canonical_namespace="flow",
+        order=80,
+        handler_key="promote",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="complete",
+        description="Clear the completed local workflow.",
+        canonical_namespace="flow",
+        order=90,
+        handler_key="complete",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="block",
+        description="Block the active issue workflow and release the active slot.",
+        canonical_namespace="flow",
+        order=100,
+        handler_key="block",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="resume",
+        description="Reactivate a previously blocked issue workflow.",
+        canonical_namespace="flow",
+        order=110,
+        handler_key="resume",
+        operational_config_policy="strict",
+        compatibility_top_level=True,
+    ),
+    CommandSpec(
+        name="summarize",
+        description="Prepare deterministic summarize task artifacts for source files.",
+        canonical_namespace="top",
+        order=120,
+        handler_key="summarize",
+    ),
+    CommandSpec(
+        name="summarize-verify",
+        description="Verify summarize outputs for a prepared plan.",
+        canonical_namespace="top",
+        order=130,
+        handler_key="summarize-verify",
+    ),
+    CommandSpec(
+        name="review-verify",
+        description="Verify deterministic review report and package integrity.",
+        canonical_namespace="top",
+        order=140,
+        handler_key="review-verify",
+    ),
+    CommandSpec(
+        name="config",
+        description="Open or create editable user configuration.",
+        canonical_namespace="top",
+        order=150,
+        handler_key="config",
+    ),
+    CommandSpec(
+        name="apply",
+        description="Reconcile managed launchers, PATH state, and installation ownership.",
+        canonical_namespace="top",
+        order=155,
+        handler_key="apply",
+    ),
+    CommandSpec(
+        name="update",
+        description="Refresh source checkout, launcher bootstrap, and managed installation state.",
+        canonical_namespace="top",
+        order=157,
+        handler_key="update",
+    ),
+    CommandSpec(
+        name="get",
+        description="Read a repository setting.",
+        canonical_namespace="top",
+        order=160,
+        handler_key="get",
+    ),
+    CommandSpec(
+        name="set",
+        description="Change a repository setting.",
+        canonical_namespace="top",
+        order=170,
+        handler_key="set",
+    ),
+    CommandSpec(
+        name="unset",
+        description="Remove a repository setting.",
+        canonical_namespace="top",
+        order=180,
+        handler_key="unset",
+    ),
+    CommandSpec(
+        name="showreport",
+        description="Show the generated report from disk.",
+        canonical_namespace="top",
+        order=190,
+        handler_key="showreport",
+    ),
+    CommandSpec(
+        name="help",
+        description="Show this help.",
+        canonical_namespace="top",
+        order=200,
+        handler_key="help",
+    ),
+)
+
+COMMAND_SPEC_BY_NAME: dict[str, CommandSpec] = {
+    spec.name: spec for spec in COMMAND_SPECS
+}
+
+FLOW_LIFECYCLE_COMMANDS: tuple[str, ...] = tuple(
+    spec.name
+    for spec in sorted(COMMAND_SPECS, key=lambda item: item.order)
+    if spec.canonical_namespace == "flow" and spec.help_visible
+)
+
+TOP_LEVEL_CANONICAL_COMMANDS: tuple[str, ...] = (
+    "flow",
+    *(
+        spec.name
+        for spec in sorted(COMMAND_SPECS, key=lambda item: item.order)
+        if spec.canonical_namespace == "top" and spec.help_visible
+    ),
+)
+
+TOP_LEVEL_COMPATIBILITY_COMMANDS: tuple[str, ...] = tuple(
+    spec.name
+    for spec in sorted(COMMAND_SPECS, key=lambda item: item.order)
+    if spec.compatibility_top_level and spec.help_visible
+)
 
 
 COMMAND_HELP: dict[str, str] = {
@@ -183,7 +386,7 @@ Options:
   --adopt      Adopt existing work on scratch and preserve repository state.
   -h, --help   Show this help.
 """,
-        "task-prepare": """\
+    "task-prepare": """\
 Usage: {command_name} task-prepare <task-id> <task-type> <requested-command> (--body <text> | --body-file <path>) [--constraints <text>] [--expected-output <text>]
 
 Prepare an immutable task file under .ai-dev/tasks/, update
@@ -196,16 +399,16 @@ Options:
   --expected-output <text>  Expected-output block text.
   -h, --help                Show this help.
 """,
-        "summarize": """\
+    "summarize": """\
 Usage: {command_name} summarize <glob>
 
 Prepare deterministic summarize task artifacts from matching source files,
 update current-task pointer, and deliver invocation via ai.delivery.
 
 Options:
-    -h, --help  Show this help.
+  -h, --help  Show this help.
 """,
-                "summarize-verify": """\
+    "summarize-verify": """\
 Usage: {command_name} summarize-verify [<plan-id>]
 
 Verify summarize outputs against the immutable summarize manifest, write
@@ -213,7 +416,7 @@ deterministic verification artifacts, and present verification.md using
 reports.presentation mode.
 
 Options:
-    -h, --help  Show this help.
+  -h, --help  Show this help.
 """,
     "review-verify": """\
 Usage: {command_name} review-verify [<review-id>]
@@ -223,7 +426,7 @@ write verification artifacts, and present the canonical review report using
 reports.presentation mode.
 
 Options:
-    -h, --help  Show this help.
+  -h, --help  Show this help.
 """,
     "status": """\
 Usage: {command_name} status [-v|--verbose]
@@ -277,22 +480,22 @@ Clear the active local workflow after scratch and main are synchronized.
 Options:
   -h, --help  Show this help.
 """,
-        "block": """\
+    "block": """\
 Usage: {command_name} block "<reason>"
 
 Block an active issue workflow, keep the issue open, and release the
 local active workflow slot.
 
 Options:
-    -h, --help  Show this help.
+  -h, --help  Show this help.
 """,
-        "resume": """\
+    "resume": """\
 Usage: {command_name} resume <ticket-number>
 
 Reactivate a blocked issue workflow as the local active issue.
 
 Options:
-    -h, --help  Show this help.
+  -h, --help  Show this help.
 """,
     "get": """\
 Usage: {command_name} get out
@@ -302,18 +505,42 @@ Show the configured operational output destination.
 Options:
   -h, --help  Show this help.
 """,
-        "config": """\
+    "config": """\
 Usage: {command_name} config [apply]
 
 Create the user AI Dev YAML configuration file if missing, then open it
 using editor.command, VISUAL, EDITOR, or platform defaults.
 If no editor can be launched, print the absolute path for manual editing.
 
-Run `config apply` to reconcile managed aliases from user config into
-shell/profile files and update the managed installation manifest.
+Run `ai-dev apply` to reconcile managed launchers, PATH state,
+and installation ownership from user config.
 
 Options:
-    -h, --help  Show this help.
+  -h, --help  Show this help.
+""",
+    "apply": """\
+Usage: {command_name} apply
+
+Reconcile managed installation resources from user configuration:
+launcher files, Linux ~/.bashrc PATH marker block, and ownership manifest.
+
+This command is idempotent for unchanged configuration.
+
+Options:
+  -h, --help  Show this help.
+""",
+    "update": """\
+Usage: {command_name} update
+
+Refresh AI Dev from recorded installation source metadata:
+validate source checkout safety, fetch and fast-forward configured remote branch,
+refresh launcher bootstrap, then run managed installation apply.
+
+This command refuses dirty checkouts and will not stash, reset, clean, merge,
+rebase, or force updates automatically.
+
+Options:
+  -h, --help  Show this help.
 """,
     "set": """\
 Usage: {command_name} set out=<path>
@@ -331,7 +558,7 @@ Remove the configured operational output destination.
 Options:
   -h, --help  Show this help.
 """,
-        "showreport": """\
+    "showreport": """\
 Usage: {command_name} showreport
 
 Present the report file from configured out path or default out.txt using
@@ -350,30 +577,6 @@ Options:
 """,
 }
 
-
-KNOWN_COMMANDS = frozenset(
-    {
-        "start",
-        "patch",
-        "task-prepare",
-        "summarize",
-        "summarize-verify",
-        "review-verify",
-        "status",
-        "review",
-        "commit",
-        "reset",
-        "promote",
-        "complete",
-        "block",
-        "resume",
-        "config",
-        "get",
-        "set",
-        "unset",
-        "showreport",
-    }
-)
 
 DEFAULT_SHOWREPORT_PATH = "out.txt"
 
@@ -394,8 +597,79 @@ def resolve_command_name() -> str:
     return invoked_name or "flow"
 
 
+def _format_help_rows(
+    command_names: Sequence[str],
+    descriptions: dict[str, str],
+) -> str:
+    if not command_names:
+        return ""
+
+    width = max(len(command) for command in command_names)
+    return "\n".join(
+        f"  {command.ljust(width)}  {descriptions[command]}"
+        for command in command_names
+    )
+
+
+def render_top_level_help(command_name: str) -> str:
+    top_level_descriptions: dict[str, str] = {
+        "flow": FLOW_NAMESPACE_DESCRIPTION,
+    }
+    top_level_descriptions.update(
+        {
+            spec.name: spec.description
+            for spec in COMMAND_SPECS
+            if spec.canonical_namespace == "top" and spec.help_visible
+        }
+    )
+
+    compatibility_descriptions = {
+        command: f"Compatibility route to `{CANONICAL_FLOW_PREFIX} {command}`."
+        for command in TOP_LEVEL_COMPATIBILITY_COMMANDS
+    }
+
+    top_rows = _format_help_rows(TOP_LEVEL_CANONICAL_COMMANDS, top_level_descriptions)
+    compatibility_rows = _format_help_rows(
+        TOP_LEVEL_COMPATIBILITY_COMMANDS,
+        compatibility_descriptions,
+    )
+
+    return (
+        f"Usage: {command_name} <command> [options]\n\n"
+        "Manage an issue-focused development workflow using permanent main history\n"
+        "and disposable scratch checkpoints.\n\n"
+        "Commands:\n"
+        f"{top_rows}\n\n"
+        "Compatibility routes (temporary during Issue #19 migration):\n"
+        f"{compatibility_rows}\n\n"
+        f"Run `{command_name} <command> --help` for command-specific help.\n"
+        f"Run `{CANONICAL_FLOW_PREFIX} --help` for workflow lifecycle commands.\n"
+    )
+
+
+def render_flow_help(command_name: str) -> str:
+    flow_descriptions = {
+        spec.name: spec.description
+        for spec in COMMAND_SPECS
+        if spec.canonical_namespace == "flow" and spec.help_visible
+    }
+    flow_rows = _format_help_rows(FLOW_LIFECYCLE_COMMANDS, flow_descriptions)
+
+    return (
+        f"Usage: {CANONICAL_FLOW_PREFIX} <command> [options]\n\n"
+        "Manage issue-focused workflow lifecycle operations.\n\n"
+        "Commands:\n"
+        f"{flow_rows}\n\n"
+        f"Run `{CANONICAL_FLOW_PREFIX} <command> --help` for command-specific help.\n"
+    )
+
+
 def print_top_level_help(command_name: str) -> None:
-    print(TOP_LEVEL_HELP.format(command_name=command_name), end="")
+    print(render_top_level_help(command_name), end="")
+
+
+def print_flow_help(command_name: str) -> None:
+    print(render_flow_help(command_name), end="")
 
 
 def print_command_help(command_name: str, command: str) -> None:
@@ -403,25 +677,17 @@ def print_command_help(command_name: str, command: str) -> None:
     if template is None:
         raise FlowError(f"Unknown command help target: {command}")
 
-    if command in {"block", "resume"}:
-        template = template.replace("\n    -h, --help", "\n  -h, --help")
-
-    if command == "task-prepare":
-        template = template.replace("\n    --", "\n  --")
-        template = template.replace("\n    -h, --help", "\n  -h, --help")
-
-    if command in {"summarize", "summarize-verify", "review-verify"}:
-        template = template.replace("\n    -h, --help", "\n  -h, --help")
-
-    if command == "config":
-        template = template.replace("\n    -h, --help", "\n  -h, --help")
-
     print(template.format(command_name=command_name), end="")
 
 
 def print_unknown_command(command_name: str, command: str) -> None:
     print(f"{command_name}: unknown command: {command}", file=sys.stderr)
     print(f"Run {command_name} help for usage.", file=sys.stderr)
+
+
+def print_unknown_flow_subcommand(command_name: str, command: str) -> None:
+    print(f"{CANONICAL_FLOW_PREFIX}: unknown command: {command}", file=sys.stderr)
+    print(f"Run {CANONICAL_FLOW_PREFIX} --help for usage.", file=sys.stderr)
 
 
 def resolve_repo_root_if_available() -> Path | None:
@@ -632,49 +898,104 @@ def _config_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} config [apply]")
 
 
+def _apply_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} apply")
+
+
+def _update_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} update")
+
+
 def _showreport_usage(command_name: str) -> FlowError:
     return FlowError(f"Usage: {command_name} showreport")
+
+
+def _run_apply_command() -> int:
+    try:
+        config_state = ensure_editable_user_config()
+        desired = load_desired_installation_state(
+            config_state.config_path,
+            case_insensitive_names=(os.name == "nt"),
+        )
+        summary = apply_installation_reconciliation(desired)
+    except (
+        InstallationConfigError,
+        ManagedInstallationError,
+        EditableConfigError,
+    ) as exc:
+        raise FlowError(str(exc)) from exc
+
+    print("Managed launchers:")
+    print(f"  created: {summary.launchers_created}")
+    print(f"  updated: {summary.launchers_updated}")
+    print(f"  removed: {summary.launchers_removed}")
+    print(f"  unchanged: {summary.launchers_unchanged}")
+    print(f"  directory: {summary.launcher_directory}")
+    print("Managed PATH:")
+    print(f"  {summary.path_status}")
+    if summary.bashrc_path is not None:
+        print(f"  file: {summary.bashrc_path}")
+    print("Manifest:")
+    print(f"  {summary.manifest_status}")
+    print(f"  file: {summary.manifest_path}")
+    return 0
+
+
+def handle_apply(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _apply_usage(command_name)
+
+    return _run_apply_command()
+
+
+def handle_update(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _update_usage(command_name)
+
+    metadata_path = resolve_installation_source_path()
+    try:
+        result = run_update_from_record(metadata_path)
+    except UpdateInstallationError as exc:
+        raise FlowError(
+            "Update source:\n"
+            "  failed\n"
+            f"  metadata: {metadata_path}\n"
+            f"  detail: {exc}"
+        ) from exc
+
+    print("Update source:")
+    if result.source.source_status == "already up to date":
+        print("  already up to date")
+    elif result.source.source_status == "fast-forwarded":
+        print(
+            "  "
+            f"fast-forwarded {result.source.source_from} -> {result.source.source_to}"
+        )
+    else:
+        print(f"  {result.source.source_status}")
+    print(f"  repository: {result.source.source_repo}")
+    print(f"  branch: {result.source.branch}")
+    print(f"  remote: {result.source.remote}")
+
+    print("Launcher refresh:")
+    print(f"  {result.launcher.status}")
+    if result.launcher.detail:
+        print(f"  detail: {result.launcher.detail}")
+
+    print("Apply:")
+    print(f"  {result.apply.status}")
+    if result.apply.detail:
+        print(f"  detail: {result.apply.detail}")
+
+    if result.launcher.status == "failed" or result.apply.status == "failed":
+        return 1
+    return 0
 
 
 def handle_config(command_name: str, arguments: list[str]) -> int:
     if arguments:
         if len(arguments) == 1 and arguments[0] == "apply":
-            try:
-                config_state = ensure_editable_user_config()
-                desired = load_desired_alias_state(
-                    config_state.config_path,
-                    case_insensitive_names=(os.name == "nt"),
-                )
-                summary = apply_alias_reconciliation(desired)
-            except (AliasConfigError, AliasInstallationError, EditableConfigError) as exc:
-                raise FlowError(str(exc)) from exc
-
-            print(f"Managed aliases configured: {summary.aliases_configured}")
-            if summary.previous_alias_file_path is not None:
-                print(f"Previous alias file: {summary.previous_alias_file_path}")
-            if summary.previous_profile_path is not None:
-                print(f"Previous profile: {summary.previous_profile_path}")
-            if summary.alias_file_path is not None:
-                print(f"Alias file: {summary.alias_file_path}")
-            if summary.profile_path is not None:
-                print(f"Profile file: {summary.profile_path}")
-            print(f"Manifest: {summary.manifest_path}")
-            print(f"Result: {summary.outcome}")
-            changed_parts: list[str] = []
-            if summary.alias_file_changed:
-                changed_parts.append("alias-file")
-            if summary.profile_changed:
-                changed_parts.append("profile")
-            if summary.manifest_written:
-                changed_parts.append("manifest")
-            if summary.manifest_removed:
-                changed_parts.append("manifest-removed")
-
-            if changed_parts:
-                print(f"Updated: {', '.join(changed_parts)}")
-            else:
-                print("Updated: none")
-            return 0
+            return _run_apply_command()
 
         raise _config_usage(command_name)
 
@@ -1493,12 +1814,18 @@ def handle_review_verify(command_name: str, arguments: list[str]) -> int:
         raise _review_verify_usage(command_name)
 
     repo_root = resolve_repo_root()
-    review_id = arguments[0].strip() if arguments else ""
-    if arguments and not review_id:
+    requested_review_id = arguments[0].strip() if arguments else ""
+    if arguments and not requested_review_id:
         raise _review_verify_usage(command_name)
 
-    if not review_id:
-        review_id = resolve_current_review_id(repo_root)
+    current_review_id = resolve_current_review_id(repo_root)
+    if requested_review_id and requested_review_id != current_review_id:
+        raise FlowError(
+            "Requested review ID does not match the current rolling review. "
+            f"Requested: {requested_review_id}. Current: {current_review_id}."
+        )
+
+    review_id = current_review_id
 
     result, markdown_relative_path, json_relative_path = run_review_verification(
         repo_root=repo_root,
@@ -1669,6 +1996,14 @@ def handle_commit(command_name: str, arguments: list[str]) -> int:
             f"Commit: {commit_hash}. {exc}"
         ) from exc
 
+    try:
+        _cleanup_rolling_review_workspace(repo_root)
+    except OSError as exc:
+        raise FlowError(
+            "Checkpoint commit created but review cleanup failed. "
+            f"Commit: {commit_hash}. {exc}"
+        ) from exc
+
     print(f"Created checkpoint {next_checkpoint}")
     print(f"commit: {commit_hash}")
     if workflow_type == "patch":
@@ -1836,6 +2171,13 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
             active_issue_number=state.active_issue_number,
             patch_description=state.patch_description,
         )
+
+        try:
+            _cleanup_rolling_review_workspace(repo_root)
+        except OSError as cleanup_exc:
+            raise FlowError(
+                f"Promoted workflow but review cleanup failed: {cleanup_exc}"
+            ) from cleanup_exc
         return 0
     except (RepositoryError, WorkflowStateError, FlowError) as exc:
         if not main_commit_created:
@@ -1876,6 +2218,8 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
 
 REVIEW_SCOPE_CHECKPOINT = "checkpoint"
 REVIEW_SCOPE_WORKFLOW = "workflow"
+ROLLING_REVIEW_RELATIVE_PATH = ".ai-dev/review"
+LEGACY_REVIEWS_RELATIVE_PATH = ".ai-dev/reviews"
 
 
 def _parse_review_scope(command_name: str, arguments: list[str]) -> str:
@@ -2239,26 +2583,41 @@ def _remove_file_if_exists(path: Path) -> None:
         pass
 
 
-def _rollback_review_package(review_paths: ReviewArtifactPaths) -> list[str]:
-    failures: list[str] = []
-    for artifact_path in (
-        review_paths.package_markdown_absolute_path,
-        review_paths.package_json_absolute_path,
-        review_paths.changes_diff_absolute_path,
-    ):
+def _remove_tree_if_exists(path: Path) -> None:
+    if not path.exists():
+        return
+    shutil.rmtree(path)
+
+
+def _cleanup_legacy_review_storage(repo_root: Path) -> None:
+    legacy_reviews_root = repo_root / LEGACY_REVIEWS_RELATIVE_PATH
+    if legacy_reviews_root.exists():
+        _remove_tree_if_exists(legacy_reviews_root)
+
+    tasks_root = repo_root / ".ai-dev" / "tasks"
+    if not tasks_root.exists() or not tasks_root.is_dir():
+        return
+
+    for path in tasks_root.iterdir():
+        if not path.is_file() or path.suffix != ".md":
+            continue
+        stem = path.stem
+        if not stem.endswith("-task"):
+            continue
+        review_id_candidate = stem[: -len("-task")]
         try:
-            _remove_file_if_exists(artifact_path)
-        except OSError as exc:
-            failures.append(f"{artifact_path}: {exc}")
+            validate_review_id(review_id_candidate)
+        except ReviewManifestError:
+            continue
+        _remove_file_if_exists(path)
 
-    try:
-        review_paths.review_root_absolute_path.rmdir()
-    except FileNotFoundError:
-        pass
-    except OSError as exc:
-        failures.append(f"{review_paths.review_root_absolute_path}: {exc}")
 
-    return failures
+def _cleanup_rolling_review_workspace(repo_root: Path) -> None:
+    rolling_root = repo_root / ROLLING_REVIEW_RELATIVE_PATH
+    if rolling_root.exists():
+        _remove_tree_if_exists(rolling_root)
+
+    _cleanup_legacy_review_storage(repo_root)
 
 
 def _restore_current_task_pointer(
@@ -2283,6 +2642,31 @@ def _restore_current_task_pointer(
     return failures
 
 
+def _replace_rolling_review_workspace(
+    *,
+    canonical_root: Path,
+    temp_root: Path,
+) -> Path | None:
+    backup_root = canonical_root.parent / f"{canonical_root.name}.bak-{uuid.uuid4().hex}"
+    moved_existing = False
+
+    try:
+        if canonical_root.exists():
+            canonical_root.rename(backup_root)
+            moved_existing = True
+
+        temp_root.rename(canonical_root)
+    except OSError as exc:
+        if moved_existing and backup_root.exists() and not canonical_root.exists():
+            try:
+                backup_root.rename(canonical_root)
+            except OSError:
+                pass
+        raise FlowError(f"Failed to replace rolling review workspace: {exc}") from exc
+
+    return backup_root if moved_existing else None
+
+
 def _prepare_review_task_and_deliver(
     *,
     repo_root: Path,
@@ -2301,35 +2685,80 @@ def _prepare_review_task_and_deliver(
                 f"Cannot read current task pointer for rollback: {pointer_path}. {exc}"
             ) from exc
 
-    package_preexisted = package.review_paths.review_root_absolute_path.exists()
-    package_created = False
-    task_created = False
+    canonical_root = package.review_paths.review_root_absolute_path
+    temp_root = canonical_root.parent / f"{canonical_root.name}.tmp-{uuid.uuid4().hex}"
+    temp_review_paths = replace(
+        package.review_paths,
+        review_root_absolute_path=temp_root,
+        task_markdown_absolute_path=temp_root / "task.md",
+        package_markdown_absolute_path=temp_root / "package.md",
+        package_json_absolute_path=temp_root / "package.json",
+        changes_diff_absolute_path=temp_root / "changes.diff",
+        canonical_report_absolute_path=temp_root / "report.md",
+        verification_markdown_absolute_path=temp_root / "verification.md",
+        verification_json_absolute_path=temp_root / "verification.json",
+    )
+    temp_planned_task = replace(planned_task, absolute_path=temp_review_paths.task_markdown_absolute_path)
+    backup_root: Path | None = None
+    published = False
+    published_and_delivered = False
 
     try:
         create_review_package(
             repo_root=repo_root,
-            review_paths=package.review_paths,
+            review_paths=temp_review_paths,
             review_id=package.review_id,
             context=package.context,
             changes_diff_text=package.changes_diff_text,
         )
-        package_created = not package_preexisted
 
         task_markdown = render_review_task_markdown(
-            planned_task=planned_task,
+            planned_task=temp_planned_task,
             review_paths=package.review_paths,
             context=package.context,
         )
-        task_created = create_review_task_file(
-            planned_task=planned_task,
+        create_review_task_file(
+            planned_task=temp_planned_task,
             markdown_text=task_markdown,
         )
+
+        backup_root = _replace_rolling_review_workspace(canonical_root=canonical_root, temp_root=temp_root)
+        published = True
 
         write_current_task_pointer(repo_root=repo_root, planned_task=planned_task)
 
         adapter.deliver(invocation)
-    except (ReviewPackageError, ReviewTaskGenerationError, ClipboardDeliveryError) as exc:
+        published_and_delivered = True
+    except (ReviewPackageError, ReviewTaskGenerationError, ClipboardDeliveryError, FlowError, OSError) as exc:
         cleanup_failures: list[str] = []
+        retained_backup_path: Path | None = None
+        backup_restore_succeeded = False
+
+        if published:
+            canonical_removed = False
+            if canonical_root.exists():
+                try:
+                    shutil.rmtree(canonical_root)
+                    canonical_removed = True
+                except OSError as cleanup_exc:
+                    cleanup_failures.append(f"{canonical_root}: {cleanup_exc}")
+            else:
+                canonical_removed = True
+
+            if backup_root is not None and backup_root.exists():
+                if canonical_removed and not canonical_root.exists():
+                    try:
+                        backup_root.rename(canonical_root)
+                        backup_restore_succeeded = True
+                    except OSError as cleanup_exc:
+                        retained_backup_path = backup_root
+                        cleanup_failures.append(f"{backup_root} -> {canonical_root}: {cleanup_exc}")
+                else:
+                    retained_backup_path = backup_root
+                    cleanup_failures.append(
+                        "Cannot restore previous rolling review because newly published "
+                        f"workspace could not be removed: {canonical_root}"
+                    )
 
         cleanup_failures.extend(
             _restore_current_task_pointer(
@@ -2338,16 +2767,23 @@ def _prepare_review_task_and_deliver(
             )
         )
 
-        if task_created:
+        if temp_root.exists():
             try:
-                _remove_file_if_exists(planned_task.absolute_path)
+                shutil.rmtree(temp_root)
             except OSError as cleanup_exc:
-                cleanup_failures.append(
-                    f"{planned_task.absolute_path}: {cleanup_exc}"
-                )
+                cleanup_failures.append(f"{temp_root}: {cleanup_exc}")
 
-        if package_created:
-            cleanup_failures.extend(_rollback_review_package(package.review_paths))
+        if backup_root is not None and backup_root.exists():
+            if backup_restore_succeeded:
+                try:
+                    shutil.rmtree(backup_root)
+                except OSError as cleanup_exc:
+                    cleanup_failures.append(f"{backup_root}: {cleanup_exc}")
+            else:
+                retained_backup_path = backup_root
+
+        if retained_backup_path is not None:
+            cleanup_failures.append(f"Retained backup workspace: {retained_backup_path}")
 
         if cleanup_failures:
             raise FlowError(
@@ -2356,6 +2792,34 @@ def _prepare_review_task_and_deliver(
             ) from exc
 
         raise FlowError(f"Review task preparation failed. {exc}") from exc
+
+    if published_and_delivered:
+        cleanup_failures: list[str] = []
+        retained_backup_path: Path | None = None
+
+        if backup_root is not None and backup_root.exists():
+            try:
+                shutil.rmtree(backup_root)
+            except OSError as exc:
+                retained_backup_path = backup_root
+                cleanup_failures.append(
+                    f"Failed to delete previous rolling review backup {backup_root}: {exc}"
+                )
+
+        try:
+            _cleanup_legacy_review_storage(repo_root)
+        except OSError as exc:
+            cleanup_failures.append(f"Legacy cleanup failed: {exc}")
+
+        if retained_backup_path is not None:
+            cleanup_failures.append(f"Retained backup workspace: {retained_backup_path}")
+
+        if cleanup_failures:
+            raise FlowError(
+                "Review task preparation succeeded, but post-commit cleanup failed. "
+                f"Published review remains available at {ROLLING_REVIEW_RELATIVE_PATH}. "
+                + "; ".join(cleanup_failures)
+            )
 
 
 def _print_review_preparation_metadata(
@@ -2645,6 +3109,11 @@ def handle_reset(command_name: str, arguments: list[str]) -> int:
             f"{exc}"
         ) from exc
 
+    try:
+        _cleanup_rolling_review_workspace(repo_root)
+    except OSError as exc:
+        raise FlowError(f"Scratch was reset but review cleanup failed. {exc}") from exc
+
     print(f"Reset {state.scratch_branch} to {state.main_branch}")
     print("checkpoint: 0")
     if state.patch_description is not None:
@@ -2732,6 +3201,11 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
         checkpoint=0,
     )
     save_state(state_path, inactive_state)
+
+    try:
+        _cleanup_rolling_review_workspace(repo_root)
+    except OSError as exc:
+        raise FlowError(f"Workflow completed but review cleanup failed: {exc}") from exc
 
     if state.patch_description is not None:
         print(f"Completed patch: {state.patch_description}")
@@ -3182,6 +3656,64 @@ def handle_test_state_clear(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
+def _resolve_command_handler(handler_key: str):
+    handlers = {
+        "start": handle_start,
+        "patch": handle_patch,
+        "task-prepare": handle_task_prepare,
+        "status": handle_status,
+        "review": handle_review,
+        "commit": handle_commit,
+        "reset": handle_reset,
+        "promote": handle_promote,
+        "complete": handle_complete,
+        "block": handle_block,
+    "resume": handle_resume,
+        "summarize": handle_summarize,
+    "summarize-verify": handle_summarize_verify,
+        "review-verify": handle_review_verify,
+        "config": handle_config,
+        "apply": handle_apply,
+        "update": handle_update,
+        "get": handle_get,
+        "set": handle_set,
+        "unset": handle_unset,
+        "showreport": handle_showreport,
+    }
+    return handlers.get(handler_key)
+
+
+def _dispatch_command(
+    invocation_name: str,
+    spec: CommandSpec,
+    arguments: list[str],
+) -> int:
+    if len(arguments) == 1 and arguments[0] in {"-h", "--help"}:
+        print_command_help(invocation_name, spec.name)
+        return 0
+
+    handler = _resolve_command_handler(spec.handler_key)
+    if handler is None:
+        raise FlowError(
+            f"Python implementation for '{spec.name}' is not available yet."
+        )
+
+    if spec.operational_config_policy is None:
+        return handler(invocation_name, arguments)
+
+    return run_operational_command(
+        invocation_name,
+        spec.operational_config_policy,
+        handler,
+        arguments,
+        echo_routed_output=spec.echo_routed_output,
+    )
+
+
+def _flow_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} flow <command> [options]")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     command_name = resolve_command_name()
@@ -3211,78 +3743,32 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         raise FlowError(f"Usage: {command_name} help")
 
-    if command in KNOWN_COMMANDS:
-        if len(command_arguments) == 1 and command_arguments[0] in {"-h", "--help"}:
-            print_command_help(command_name, command)
+    if command == "flow":
+        if not command_arguments:
+            print_flow_help(command_name)
             return 0
 
-        if command == "get":
-            return handle_get(command_name, command_arguments)
+        if command_arguments[0] in {"-h", "--help"}:
+            if len(command_arguments) > 1:
+                raise _flow_usage(command_name)
+            print_flow_help(command_name)
+            return 0
 
-        if command == "config":
-            return handle_config(command_name, command_arguments)
+        flow_command = command_arguments[0]
+        flow_arguments = command_arguments[1:]
+        flow_spec = COMMAND_SPEC_BY_NAME.get(flow_command)
+        if flow_spec is None or flow_spec.canonical_namespace != "flow":
+            print_unknown_flow_subcommand(command_name, flow_command)
+            return 1
 
-        if command == "set":
-            return handle_set(command_name, command_arguments)
+        return _dispatch_command(CANONICAL_FLOW_PREFIX, flow_spec, flow_arguments)
 
-        if command == "unset":
-            return handle_unset(command_name, command_arguments)
-
-        if command == "patch":
-            return run_operational_command(command_name, "strict", handle_patch, command_arguments)
-
-        if command == "task-prepare":
-            return handle_task_prepare(command_name, command_arguments)
-
-        if command == "summarize":
-            return handle_summarize(command_name, command_arguments)
-
-        if command == "summarize-verify":
-            return handle_summarize_verify(command_name, command_arguments)
-
-        if command == "review-verify":
-            return handle_review_verify(command_name, command_arguments)
-
-        if command == "start":
-            return run_operational_command(command_name, "strict", handle_start, command_arguments)
-
-        if command == "status":
-            return run_operational_command(
-                command_name,
-                "strict",
-                handle_status,
-                command_arguments,
-                echo_routed_output=True,
-            )
-
-        if command == "review":
-            return run_operational_command(command_name, "strict", handle_review, command_arguments)
-
-        if command == "commit":
-            return run_operational_command(command_name, "strict", handle_commit, command_arguments)
-
-        if command == "promote":
-            return run_operational_command(command_name, "strict", handle_promote, command_arguments)
-
-        if command == "reset":
-            return run_operational_command(command_name, "strict", handle_reset, command_arguments)
-
-        if command == "complete":
-            return run_operational_command(command_name, "strict", handle_complete, command_arguments)
-
-        if command == "block":
-            return run_operational_command(command_name, "strict", handle_block, command_arguments)
-
-        if command == "resume":
-            return run_operational_command(command_name, "strict", handle_resume, command_arguments)
-
-        if command == "showreport":
-            return handle_showreport(command_name, command_arguments)
-
-        raise FlowError(
-            f"Python implementation for '{command}' "
-            "is not available yet."
-        )
+    command_spec = COMMAND_SPEC_BY_NAME.get(command)
+    if command_spec is not None:
+        if command_spec.canonical_namespace == "flow" and not command_spec.compatibility_top_level:
+            print_unknown_command(command_name, command)
+            return 1
+        return _dispatch_command(command_name, command_spec, command_arguments)
 
     if command == "__test-state-get":
         return handle_test_state_get(command_name, command_arguments)
@@ -3323,6 +3809,7 @@ def run() -> None:
         SummarizePlanningError,
         SummarizeTaskGenerationError,
         SummarizeVerificationError,
+        UpdateInstallationError,
         TaskArtifactError,
         TaskConfigError,
         WorkflowStateError,

@@ -116,9 +116,10 @@ class ReviewVerifyCliTests(unittest.TestCase):
         self.assertEqual(code, 0, msg=err)
         self.assertIn("Review task:", out)
 
-        review_dirs = sorted(path for path in (repo_root / ".ai-dev" / "reviews").iterdir() if path.is_dir())
-        self.assertTrue(review_dirs)
-        return review_dirs[-1].name
+        payload = json.loads(
+            (repo_root / ".ai-dev" / "review" / "package.json").read_text(encoding="utf-8")
+        )
+        return payload["review_id"]
 
     def _write_report(self, repo_root: Path, review_id: str, *, decision: str) -> None:
         paths = build_review_artifact_paths(repo_root, review_id)
@@ -155,11 +156,11 @@ class ReviewVerifyCliTests(unittest.TestCase):
         self.assertIn("Review verification status for", out)
         self.assertIn("complete", out)
         self.assertIn("Review decision: pass", out)
-        self.assertIn(f"Review report: .ai-dev/reviews/{review_id}/report.md", out)
-        self.assertIn("Verification report: .ai-dev/reviews/", out)
-        self.assertIn("Verification JSON: .ai-dev/reviews/", out)
+        self.assertIn("Review report: .ai-dev/review/report.md", out)
+        self.assertIn("Verification report: .ai-dev/review/verification.md", out)
+        self.assertIn("Verification JSON: .ai-dev/review/verification.json", out)
 
-    def test_omitted_review_id_uses_current_review_pointer(self) -> None:
+    def test_omitted_review_id_uses_current_rolling_review(self) -> None:
         repo_root = self._init_repo("repo-review-verify-current")
         self._activate_issue_workflow(repo_root, issue_number=202)
         review_id = self._prepare_review(repo_root)
@@ -196,21 +197,23 @@ class ReviewVerifyCliTests(unittest.TestCase):
         self.assertIn("complete", out)
         self.assertIn("Review decision: pass-with-notes", out)
 
-    def test_current_task_not_review_is_rejected(self) -> None:
+    def test_explicit_review_id_mismatch_is_rejected(self) -> None:
+        repo_root = self._init_repo("repo-review-verify-id-mismatch")
+        self._activate_issue_workflow(repo_root, issue_number=214)
+        self._prepare_review(repo_root)
+
+        code, out, err = self._invoke(repo_root, "review-verify", "review-0000000000000000")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("does not match the current rolling review", err)
+
+    def test_missing_rolling_review_is_rejected(self) -> None:
         repo_root = self._init_repo("repo-review-verify-not-review")
-        (repo_root / ".ai-dev").mkdir(parents=True, exist_ok=True)
-        (repo_root / ".ai-dev" / "current-task.md").write_text(
-            "# Current AI Dev Task\n\n"
-            "- Task-ID: summarize-sample-coordinator\n"
-            "- Task-Type: summarize\n"
-            "- Task-File: .ai-dev/tasks/summarize-sample-coordinator.md\n",
-            encoding="utf-8",
-        )
 
         code, out, err = self._invoke(repo_root, "review-verify")
         self.assertEqual(code, 1)
         self.assertEqual(out, "")
-        self.assertIn("Current task is not review", err)
+        self.assertIn("No current review", err)
 
     def test_invalid_report_contract_returns_one(self) -> None:
         repo_root = self._init_repo("repo-review-verify-invalid-report")
@@ -264,7 +267,7 @@ class ReviewVerifyCliTests(unittest.TestCase):
         review_id = self._prepare_review(repo_root)
         self._write_report(repo_root, review_id, decision="pass")
 
-        task_path = repo_root / ".ai-dev" / "tasks" / f"{review_id}-task.md"
+        task_path = repo_root / ".ai-dev" / "review" / "task.md"
         original = task_path.read_text(encoding="utf-8")
         task_path.write_text(original.replace("- Review-ID: ", "- Review-ID: mismatch-", 1), encoding="utf-8")
 
@@ -312,8 +315,8 @@ class ReviewVerifyCliTests(unittest.TestCase):
         self.assertIn("incomplete", out)
         self.assertIn("Review report path:", out)
 
-        verification_md = repo_root / ".ai-dev" / "reviews" / review_id / "verification.md"
-        verification_json = repo_root / ".ai-dev" / "reviews" / review_id / "verification.json"
+        verification_md = repo_root / ".ai-dev" / "review" / "verification.md"
+        verification_json = repo_root / ".ai-dev" / "review" / "verification.json"
         self.assertTrue(verification_md.exists())
         self.assertTrue(verification_json.exists())
 

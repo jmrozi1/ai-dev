@@ -14,6 +14,8 @@ class ReviewArtifactPaths:
     review_id: str
     review_root_relative_path: str
     review_root_absolute_path: Path
+    task_markdown_relative_path: str
+    task_markdown_absolute_path: Path
     package_markdown_relative_path: str
     package_markdown_absolute_path: Path
     package_json_relative_path: str
@@ -22,6 +24,10 @@ class ReviewArtifactPaths:
     changes_diff_absolute_path: Path
     canonical_report_relative_path: str
     canonical_report_absolute_path: Path
+    verification_markdown_relative_path: str
+    verification_markdown_absolute_path: Path
+    verification_json_relative_path: str
+    verification_json_absolute_path: Path
 
 
 def _validate_review_id(review_id: str) -> str:
@@ -58,8 +64,10 @@ def _validate_repo_relative_path(path_text: str) -> str:
 
 def build_review_artifact_paths(repo_root: Path, review_id: str) -> ReviewArtifactPaths:
     normalized_review_id = _validate_review_id(review_id)
-    review_root_relative_path = _validate_repo_relative_path(
-        f".ai-dev/reviews/{normalized_review_id}"
+    review_root_relative_path = _validate_repo_relative_path(".ai-dev/review")
+
+    task_markdown_relative_path = _validate_repo_relative_path(
+        f"{review_root_relative_path}/task.md"
     )
 
     package_markdown_relative_path = _validate_repo_relative_path(
@@ -74,11 +82,19 @@ def build_review_artifact_paths(repo_root: Path, review_id: str) -> ReviewArtifa
     canonical_report_relative_path = _validate_repo_relative_path(
         f"{review_root_relative_path}/report.md"
     )
+    verification_markdown_relative_path = _validate_repo_relative_path(
+        f"{review_root_relative_path}/verification.md"
+    )
+    verification_json_relative_path = _validate_repo_relative_path(
+        f"{review_root_relative_path}/verification.json"
+    )
 
     return ReviewArtifactPaths(
         review_id=normalized_review_id,
         review_root_relative_path=review_root_relative_path,
         review_root_absolute_path=repo_root / review_root_relative_path,
+        task_markdown_relative_path=task_markdown_relative_path,
+        task_markdown_absolute_path=repo_root / task_markdown_relative_path,
         package_markdown_relative_path=package_markdown_relative_path,
         package_markdown_absolute_path=repo_root / package_markdown_relative_path,
         package_json_relative_path=package_json_relative_path,
@@ -87,4 +103,8 @@ def build_review_artifact_paths(repo_root: Path, review_id: str) -> ReviewArtifa
         changes_diff_absolute_path=repo_root / changes_diff_relative_path,
         canonical_report_relative_path=canonical_report_relative_path,
         canonical_report_absolute_path=repo_root / canonical_report_relative_path,
+        verification_markdown_relative_path=verification_markdown_relative_path,
+        verification_markdown_absolute_path=repo_root / verification_markdown_relative_path,
+        verification_json_relative_path=verification_json_relative_path,
+        verification_json_absolute_path=repo_root / verification_json_relative_path,
     )
