@@ -931,6 +931,19 @@ def _run_apply_command() -> int:
     print(f"  removed: {summary.launchers_removed}")
     print(f"  unchanged: {summary.launchers_unchanged}")
     print(f"  directory: {summary.launcher_directory}")
+    print("Expansion:")
+    print(f"  expanded roots: {len(summary.expanded_root_aliases)}")
+    if summary.expanded_root_aliases:
+        print(f"  expanded root aliases: {', '.join(summary.expanded_root_aliases)}")
+    print(f"  generated descendants: {len(summary.generated_descendant_aliases)}")
+    if summary.generated_descendant_aliases:
+        print(f"  descendants: {', '.join(summary.generated_descendant_aliases)}")
+    print(f"  suppressed descendants: {len(summary.suppressed_descendant_aliases)}")
+    if summary.suppressed_descendant_aliases:
+        print(f"  suppressed: {', '.join(summary.suppressed_descendant_aliases)}")
+    print(f"  no authoritative expansion source: {len(summary.expansion_unavailable_root_aliases)}")
+    if summary.expansion_unavailable_root_aliases:
+        print(f"  roots without source: {', '.join(summary.expansion_unavailable_root_aliases)}")
     print("Managed PATH:")
     print(f"  {summary.path_status}")
     if summary.bashrc_path is not None:

@@ -9,7 +9,7 @@ from unittest.mock import patch
 import yaml
 
 from ai_dev_flow.editable_config import EditableConfigError, ensure_editable_user_config
-from ai_dev_flow.task_config import load_task_config, resolve_user_config_path
+from ai_dev_flow.task_config import default_user_config_text, load_task_config, resolve_user_config_path
 
 
 class EditableConfigTests(unittest.TestCase):
@@ -34,7 +34,18 @@ class EditableConfigTests(unittest.TestCase):
         loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         self.assertIsInstance(loaded, dict)
         assert isinstance(loaded, dict)
-        self.assertEqual(loaded.get("aliases"), {})
+        installation = loaded.get("installation")
+        self.assertIsInstance(installation, dict)
+        assert isinstance(installation, dict)
+        aliases = installation.get("aliases")
+        self.assertIsInstance(aliases, dict)
+        assert isinstance(aliases, dict)
+        self.assertEqual(aliases.get("enabled"), True)
+        self.assertEqual(aliases.get("expand_subcommands"), True)
+        self.assertIsInstance(aliases.get("commands"), dict)
+        commands = aliases.get("commands")
+        assert isinstance(commands, dict)
+        self.assertEqual(commands.get("flow"), "ai-dev flow")
 
     def test_existing_file_is_preserved_byte_for_byte(self) -> None:
         config_path = self.tmp_path / "cfg" / "existing.yaml"
@@ -105,6 +116,20 @@ class EditableConfigTests(unittest.TestCase):
         self.assertEqual(config.invocation, "Read and execute {task_file}")
         self.assertEqual(config.report_presentation, "path-only")
         self.assertIsNone(config.editor_command)
+
+    def test_default_config_text_has_managed_alias_block_without_stale_legacy_phrase(self) -> None:
+        text = default_user_config_text()
+        stale_phrase = "Reserved for future managed command " + "aliases"
+        self.assertIn("installation:\n", text)
+        self.assertIn("  aliases:\n", text)
+        self.assertIn("    commands:\n", text)
+        self.assertIn("      flow: \"ai-dev flow\"\n", text)
+        self.assertNotIn(stale_phrase, text)
+
+        loaded = yaml.safe_load(text)
+        self.assertIsInstance(loaded, dict)
+        assert isinstance(loaded, dict)
+        self.assertNotIn("aliases", loaded)
 
     def test_atomic_write_failure_leaves_no_partial_file(self) -> None:
         config_path = self.tmp_path / "cfg" / "atomic-failure.yaml"

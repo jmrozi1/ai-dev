@@ -118,7 +118,12 @@ class BootstrapCoreTests(unittest.TestCase):
         install_dir = home / ".local" / "bin"
         home.mkdir(parents=True)
         self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text("aliases: {}\n", encoding="utf-8")
+        self.config_path.write_text(
+            "installation:\n"
+            "  aliases:\n"
+            "    commands: {}\n",
+            encoding="utf-8",
+        )
 
         first = run_bootstrap(
             platform="posix",

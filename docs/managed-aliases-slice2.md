@@ -1,193 +1,246 @@
-# Managed Aliases Slice 2 (Issue #17 Checkpoint 2)
+# Managed Launcher Aliases (Checkpoint 2 Expansion)
 
-This slice adds managed command alias reconciliation through:
+This document defines the managed alias configuration model consumed by `ai-dev apply`.
 
-- `ai-dev config apply`
-- user-config alias validation (`aliases` mapping in user config)
-- deterministic alias-file rendering (POSIX and PowerShell)
-- managed profile-block ownership with begin/end markers
-- installation manifest ownership validation
-- transactional apply/remove-all behavior with rollback reporting
+## Adding managed command aliases
 
-## Generated Alias Functions
+Managed launcher config is edited in the AI Dev user config file:
 
-Managed aliases forward all user arguments directly to `ai-dev` commands.
+- Open the file with `ai-dev config`.
+- Linux default path: `~/.config/ai-dev/config.yaml`.
+- Windows default path: `%APPDATA%/ai-dev/config.yaml`.
 
-Historical note: this checkpoint snapshot predates canonical lifecycle namespace hardening; lifecycle aliases should now target `ai-dev flow ...`.
+Add managed aliases under `installation.aliases`.
 
-POSIX generated functions:
-
-```sh
-review() {
-  command ai-dev flow review "$@"
-}
-```
-
-PowerShell generated functions:
-
-```powershell
-function review {
-  & ai-dev flow review @args
-}
-```
-
-Notes:
-
-- POSIX generated files do not set shell options such as `set -e`.
-- PowerShell generated files do not use `Invoke-Expression`.
-
-## Shell/Profile Resolution
-
-`config apply` resolves a single profile target deterministically:
-
-- `$SHELL` basename `bash` -> `~/.bashrc`
-- `$SHELL` basename `zsh` -> `~/.zshrc`
-- unsupported shell -> actionable error asking for `bash` or `zsh`
-
-Windows profile target remains:
-
-- `~/Documents/WindowsPowerShell/Microsoft.PowerShell_profile.ps1`
-
-Manifest path resolution is independent from profile selection:
-
-- POSIX: `~/.config/ai-dev/managed-aliases-manifest.json`
-- Windows: `~/.ai-dev/managed-aliases-manifest.json`
-
-Path resolution is injectable in tests through explicit installer paths.
-
-## User Config
-
-Aliases are read from user config under:
+Copyable example:
 
 ```yaml
-aliases:
-  gs: status
-  gstart: start
+installation:
+  aliases:
+    enabled: true
+    expand_subcommands: true
+    commands:
+      flow: "ai-dev flow"
+      my-alias: "ai-dev some-command"
 ```
 
-Validation rules:
+  Example result:
 
-- alias names must match `^[A-Za-z_][A-Za-z0-9_]*$`
-- hyphens are rejected (no automatic normalization)
-- alias names must not contain shell metacharacters or whitespace
-- alias targets must be a single supported `ai-dev` top-level command
-- on Windows normalization, aliases are checked case-insensitively for collisions
+  - `my-alias` -> `ai-dev some-command`
 
-## Profile Path Escaping
+  After saving the config, run:
 
-Profile source lines keep paths literal and apply shell-native single-quote escaping.
+  ```text
+  ai-dev apply
+  ```
 
-POSIX escaping:
+  This creates and reconciles managed launcher files.
 
-- input: `/home/o'brien/x`
-- rendered: `'/home/o'"'"'brien/x'`
+Plain meaning of each level:
 
-PowerShell escaping:
+- `enabled`: whether configured aliases are installed/reconciled.
+- `expand_subcommands`: global descendant expansion policy.
+- `commands`: alias-name to command mapping.
+- String syntax is the normal form.
+- Argv arrays are the exact-token advanced form (tokens are stored exactly as provided).
 
-- input: `C:\Users\O'Brien\x`
-- rendered: `'C:\Users\O''Brien\x'`
+Existing-config migration example:
 
-No shell evaluation or `Invoke-Expression` is used.
+```yaml
+# Remove or ignore this legacy top-level block:
+aliases: {}
 
-## Manifest Ownership Checks
+# Add managed launcher configuration here:
+installation:
+  aliases:
+    enabled: true
+    expand_subcommands: true
+    commands:
+      flow: "ai-dev flow"
+```
 
-Manifest load validates:
+Top-level `aliases` is an obsolete configuration field retained in some older user config files. It is not used for managed launchers, and `ai-dev apply` ignores it.
 
-- path fields are absolute and normalized
-- digest fields are lowercase 64-character SHA-256 strings
+Unsupported targets still install their root launcher, but do not receive generated descendants because no authoritative command model is available.
 
-Before overwriting/removing an existing generated alias file, apply verifies one of:
+`ai-dev config` preserves an existing config file byte-for-byte.
+It creates a default file only when missing, so stale comments/layout in existing files are not automatically replaced or migrated.
 
-- alias file matches prior manifest path+digest
-- alias file clearly contains AI Dev generated ownership header
+Checkpoint 2 scope in this issue:
 
-If neither is true, apply refuses to modify a divergent user-owned alias file.
+- schema + validation from checkpoint 1
+- implemented direct-subcommand expansion for eligible roots
+- deterministic suppression/reporting and owned-resource reconciliation for generated descendants
 
-For migration/remove-all cleanup of old artifacts, alias ownership is stricter:
+Checkpoint 2 non-goal:
 
-- old alias file path must match prior manifest alias path
-- old alias file digest must match prior manifest digest
-- divergent/missing old alias file causes safe failure with manual recovery guidance
+- do not recursively expand nested command trees
 
-## Reconciliation and Transactionality
+## What Is A Managed Command Alias
 
-`config apply` performs:
+A managed command alias is a generated launcher file owned and reconciled by AI Dev.
+Launchers are regular executables (`~/.local/bin/<name>` on POSIX, `<name>.cmd` on Windows), so normal shell completion discovers names such as `flow-status`.
 
-1. Ensure user config exists.
-2. Load and validate desired alias state.
-3. Resolve manifest path first and load previous manifest.
-4. For non-empty aliases, resolve desired current installer paths.
-5. Build either same-path apply plan or manifest-driven migration plan.
-6. Execute the plan transactionally.
-7. Persist/update/remove manifest last.
+Each alias maps to a command and is normalized to argv internally. At runtime, launcher invocations forward user arguments unchanged.
 
-When prior manifest paths differ from desired current paths, apply performs migration:
+Example:
 
-- validate old alias ownership/digest against prior manifest
-- remove the managed block from old profile path
-- remove old generated alias file
-- install/update new alias file and new profile block
-- write new manifest last
+```yaml
+installation:
+  aliases:
+    enabled: true
+    expand_subcommands: true
+    commands:
+      flow: "ai-dev flow"
+```
 
-Strict old-alias verification is applied for every migration, including profile-only migrations where alias-file path is unchanged.
+Advanced exact-token form is also accepted:
 
-No successful migration leaves both old and new profile integrations active.
+```yaml
+installation:
+  aliases:
+    commands:
+      example:
+        - ai-dev
+        - command
+        - "one argument"
+```
 
-Both non-empty apply/migrate and remove-all are transactional:
+Both forms normalize to argv internally.
+For argv-array form, tokens are preserved verbatim (including intentional leading/trailing spaces).
 
-- snapshot all touched old/new alias/profile files plus manifest state before mutation
-- execute requested mutation sequence
-- on failure, restore snapshot best-effort
-- if rollback has failures, report original failure plus rollback failures including exact path/operation details
+## Final YAML Schema
 
-The implementation does not silently swallow rollback errors.
+Managed alias configuration lives under `installation.aliases`:
 
-## Remove-All Across Shell Changes
+```yaml
+installation:
+  aliases:
+    enabled: <boolean>
+    expand_subcommands: <boolean>
+    commands:
+      <alias-name>: <string-or-argv-array>
+  shellPath:
+    enabled: <boolean>
+```
 
-When desired aliases are empty and a prior manifest exists, cleanup uses manifest-recorded paths, not current shell detection:
+Rules:
 
-- remove managed block from manifest profile path
-- remove manifest alias-file path (digest-verified)
-- remove manifest last
+- `installation.aliases` must be a mapping
+- only `enabled`, `expand_subcommands`, and `commands` are allowed under `installation.aliases`
+- `enabled` must be boolean when present (default: `true`)
+- `expand_subcommands` must be boolean when present (default: `true`)
+- `commands` must be a mapping when present
+- alias names must match `^[A-Za-z_][A-Za-z0-9_-]*$` and are checked against reserved names (`ai-dev`, `aidev`, `ai_dev`)
+- each command value may be either:
+  - a non-empty string command
+  - a non-empty argv array of non-empty string tokens
+- argv-array token validation checks `token.strip()` for emptiness, but stores the original token text unchanged
 
-This works even if current `$SHELL` is unsupported or empty.
+## Global Subcommand Expansion Policy
 
-## Managed Profile Block Semantics
+`expand_subcommands` is one global policy for all configured aliases.
 
-The profile block is owned only between markers:
+- `false`: install only root aliases explicitly listed in `commands`
+- `true`: install root aliases and generated direct-subcommand descendants for each root alias
 
-- `# >>> ai-dev managed aliases >>>`
-- `# <<< ai-dev managed aliases <<<`
+There is no per-alias expansion toggle.
 
-Updates remove/replace only the managed block plus the AI Dev-owned separator newline directly attached to the block. Bytes outside the owned block are preserved.
+Users needing selective behavior should disable expansion and define explicit aliases.
 
-This includes preservation across:
+`enabled` remains semantically distinct from `commands: {}`:
 
-- beginning/middle/end placement
-- no-final-newline files
-- adjacent blank lines
-- idempotent re-apply behavior
+- `enabled: false`: keep definitions in config but skip managed install/reconcile.
+- `enabled: true` with `commands: {}`: no managed alias definitions are present.
 
-## CLI Result Semantics
+## Descendant Naming And Scope
 
-`config apply` reports:
+Generated descendants use `<root>-<subcommand>` naming.
 
-- `Result: applied`
-- `Result: migrated`
-- `Result: no-op`
-- `Result: removed-all`
+Example intent:
 
-Manifest reporting distinguishes write vs removal:
+- `flow` -> `ai-dev flow`
+- `flow-help` -> `ai-dev flow --help`
+- `flow-start` -> `ai-dev flow start`
+- `flow-status` -> `ai-dev flow status`
 
-- `manifest` listed in updates only when written
-- `manifest-removed` listed in updates only when remove-all deleted it
+Scope is direct subcommands only. Nested command trees are not recursively expanded.
 
-## Testing
+Authoritative subcommand discovery should come from AI Dev's internal command model when possible, not by scraping human-formatted help output.
 
-Focused test modules for this slice:
+Implemented authoritative source:
 
-- `tests/test_alias_config.py`
-- `tests/test_profile_blocks.py`
-- `tests/test_installation_manifest.py`
-- `tests/test_alias_installation.py`
-- `tests/test_config_apply_cli.py`
+- `ai-dev flow` descendants are derived from registry metadata in `COMMAND_SPECS` / `FLOW_LIFECYCLE_COMMANDS`
+- `flow-help` maps to `ai-dev flow --help`
+- lifecycle descendants map to `ai-dev flow <subcommand>`
+
+## Collision And Ownership Semantics
+
+Managed launchers are ownership-tracked and reconciled by `ai-dev apply`.
+
+- AI Dev updates/removes only launchers it owns (manifest + marker validated)
+- stale AI Dev-managed launchers no longer desired are removed
+- unmanaged/user-owned collisions fail closed with a clear error
+- non-managed files are never claimed silently
+
+When expansion is active, explicit aliases in `commands` are the source of truth for roots.
+Implemented checkpoint 2 collision policy:
+
+- explicit aliases in `commands` win over generated descendants
+- the generated descendant is omitted
+- `ai-dev apply` reports the suppression clearly
+
+Generated descendants are fully managed resources and follow the same ownership checks as explicit managed launchers.
+Stale generated descendants are removed when expansion disables, roots are removed, roots change to non-expandable targets, or command-model descendants change.
+
+## Platform Behavior
+
+POSIX:
+
+- generated launchers are executable files in `~/.local/bin`
+- launchers exec configured argv and forward `"$@"`
+
+Windows `.cmd` launchers:
+
+- generated launchers are `.cmd` files in `%LOCALAPPDATA%/ai-dev/bin` (home fallback when unset)
+- launchers forward `%*`
+
+Linux PATH block management remains controlled by `installation.shellPath.enabled` and reconciled by `ai-dev apply`.
+
+## Applying Changes
+
+After editing config, run:
+
+```text
+ai-dev apply
+```
+
+`ai-dev apply` is idempotent and reconciles managed launchers, ownership manifest, and Linux PATH marker state.
+
+## Compatibility Decision
+
+Supported:
+
+- `commands.<name>: "..."` string form (documented normal syntax)
+- `commands.<name>: ["...", "..."]` argv array form (advanced exact-token syntax)
+
+Eligibility rule for descendant expansion:
+
+- expansion is attempted only when an authoritative model exists for the configured root command target
+- checkpoint 2 guarantees this for `ai-dev flow`
+- unrecognized external commands still install root aliases but do not generate descendants
+
+Rejected with clear validation error:
+
+- unknown keys under `installation.aliases`
+- malformed command values (empty/unknown/non-string tokens)
+
+This keeps migration practical without silently reinterpreting ambiguous structures.
+
+## Validation Matrix (Checkpoint 3)
+
+- Linux unit coverage: managed launcher planning, expansion eligibility, suppression precedence, stale cleanup, manifest reconciliation, ownership safety.
+- Linux integration coverage: generated launcher execution, argument forwarding, exit-status propagation, executable-bit checks, idempotent re-apply behavior.
+- Linux shell completion validation: command-name discovery validated via Bash `compgen -c flow-` with managed launcher directory on `PATH` (no custom completion scripts).
+- Windows mocked coverage: deterministic `.cmd` rendering, `%*` forwarding, percent escaping, embedded quote escaping, spaces/backslashes in tokens, case-insensitive collisions.
+- Native Windows validation status: not performed in this environment.

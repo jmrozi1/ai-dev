@@ -9,6 +9,9 @@ import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
+import yaml
+import subprocess
+
 from ai_dev_flow import cli
 from ai_dev_flow.managed_installation import ManagedInstallationPaths
 
@@ -109,7 +112,7 @@ class ApplyCliTests(unittest.TestCase):
         config_path.write_text(
             "installation:\n"
             "  aliases:\n"
-            "    enabled: false\n"
+            "    commands: {}\n"
             "  shellPath:\n"
             "    enabled: false\n",
             encoding="utf-8",
@@ -134,6 +137,132 @@ class ApplyCliTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
         self.assertIn("Managed launchers:", out)
+
+    def test_apply_reports_explicit_descendant_suppression(self) -> None:
+        outside = self.tmp_path / "outside-suppression"
+        outside.mkdir(parents=True)
+        config_path = self.tmp_path / "cfg-suppression" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "installation:\n"
+            "  aliases:\n"
+            "    commands:\n"
+            "      flow: \"ai-dev flow\"\n"
+            "      flow-status: \"ai-dev flow review\"\n"
+            "  shellPath:\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+
+        paths = ManagedInstallationPaths(
+            launcher_directory=self.tmp_path / "bin-suppression",
+            manifest_path=self.tmp_path / "state-suppression" / "installation-manifest.json",
+            bashrc_path=self.tmp_path / ".bashrc-suppression",
+            windows=False,
+        )
+
+        with (
+            patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
+            patch(
+                "ai_dev_flow.managed_installation.resolve_managed_installation_paths",
+                return_value=paths,
+            ),
+        ):
+            code, out, err = self._invoke(outside, "apply")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("suppressed descendants: 1", out)
+        self.assertIn("suppressed: flow-status", out)
+
+    def test_apply_reports_missing_authoritative_expansion_source(self) -> None:
+        outside = self.tmp_path / "outside-unavailable"
+        outside.mkdir(parents=True)
+        config_path = self.tmp_path / "cfg-unavailable" / "config.yaml"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            "installation:\n"
+            "  aliases:\n"
+            "    commands:\n"
+            "      custom: \"python -m mytool\"\n"
+            "  shellPath:\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+
+        paths = ManagedInstallationPaths(
+            launcher_directory=self.tmp_path / "bin-unavailable",
+            manifest_path=self.tmp_path / "state-unavailable" / "installation-manifest.json",
+            bashrc_path=self.tmp_path / ".bashrc-unavailable",
+            windows=False,
+        )
+
+        with (
+            patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
+            patch(
+                "ai_dev_flow.managed_installation.resolve_managed_installation_paths",
+                return_value=paths,
+            ),
+        ):
+            code, out, err = self._invoke(outside, "apply")
+
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("no authoritative expansion source: 1", out)
+        self.assertIn("roots without source: custom", out)
+
+    def test_apply_creates_default_config_and_reapply_is_noop(self) -> None:
+        outside = self.tmp_path / "outside-default"
+        outside.mkdir(parents=True)
+        config_path = self.tmp_path / "cfg-default" / "config.yaml"
+
+        paths = ManagedInstallationPaths(
+            launcher_directory=self.tmp_path / "bin-default",
+            manifest_path=self.tmp_path / "state-default" / "installation-manifest.json",
+            bashrc_path=self.tmp_path / ".bashrc-default",
+            windows=False,
+        )
+
+        with (
+            patch.dict(os.environ, {"AI_DEV_CONFIG": str(config_path)}, clear=False),
+            patch(
+                "ai_dev_flow.managed_installation.resolve_managed_installation_paths",
+                return_value=paths,
+            ),
+        ):
+            first_code, first_out, first_err = self._invoke(outside, "apply")
+            second_code, second_out, second_err = self._invoke(outside, "apply")
+
+        self.assertEqual(first_code, 0)
+        self.assertEqual(first_err, "")
+        self.assertTrue(config_path.exists())
+        loaded = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        self.assertEqual(loaded["installation"]["aliases"]["enabled"], True)
+        self.assertEqual(loaded["installation"]["aliases"]["expand_subcommands"], True)
+        self.assertEqual(set(loaded["installation"]["aliases"]["commands"].keys()), {"flow"})
+        self.assertIn("created: 13", first_out)
+        self.assertTrue((paths.launcher_directory / "flow-status").exists())
+
+        completion = subprocess.run(
+            [
+                "bash",
+                "-lc",
+                f'PATH="{paths.launcher_directory}:$PATH"; compgen -c flow- | sort -u',
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+        )
+        discovered = set(line.strip() for line in completion.stdout.splitlines() if line.strip())
+        self.assertIn("flow-status", discovered)
+
+        self.assertEqual(second_code, 0)
+        self.assertEqual(second_err, "")
+        self.assertIn("created: 0", second_out)
+        self.assertIn("updated: 0", second_out)
+        self.assertIn("removed: 0", second_out)
 
 
 if __name__ == "__main__":

@@ -101,6 +101,68 @@ ai-dev apply
 Use `ai-dev config` as the supported configuration editing path.
 Use `ai-dev apply` to reconcile managed launchers and PATH configuration.
 
+## Adding managed command aliases
+
+Edit your user config file and add aliases under `installation.aliases`.
+
+- Open or create the file with `ai-dev config`.
+- Linux default path: `~/.config/ai-dev/config.yaml`.
+- Windows default path: `%APPDATA%/ai-dev/config.yaml`.
+
+Copyable example:
+
+```yaml
+installation:
+  aliases:
+    enabled: true
+    expand_subcommands: true
+    commands:
+      flow: "ai-dev flow"
+      my-alias: "ai-dev some-command"
+```
+
+  Example result:
+
+  - `my-alias` -> `ai-dev some-command`
+
+  After saving the config, run:
+
+  ```text
+  ai-dev apply
+  ```
+
+  This creates and reconciles managed launcher files.
+
+Field meanings:
+
+- `enabled`: whether configured aliases are installed/reconciled.
+- `expand_subcommands`: global descendant expansion policy for configured roots.
+- `commands`: alias-name to command mapping.
+- String command syntax is the normal form.
+- Argv arrays are the advanced exact-token form (tokens are preserved verbatim).
+
+Existing-config migration example:
+
+```yaml
+# Remove or ignore this legacy top-level block:
+aliases: {}
+
+# Add managed launcher configuration here:
+installation:
+  aliases:
+    enabled: true
+    expand_subcommands: true
+    commands:
+      flow: "ai-dev flow"
+```
+
+Top-level `aliases` is an obsolete configuration field retained in some older user config files. It is not used for managed launchers, and `ai-dev apply` ignores it.
+
+Unsupported targets still install their root launcher, but do not receive generated descendants because no authoritative command model is available.
+
+`ai-dev config` preserves existing config files byte-for-byte.
+If an existing file still contains stale comments or old layout, the command will not rewrite or migrate it automatically.
+
 On Linux, `ai-dev apply` manages executable convenience launchers in
 `~/.local/bin` rather than shell aliases in `.bashrc`, enabling normal
 `flow-<tab>` completion for launcher names such as `flow-commit`.
@@ -108,6 +170,26 @@ On Linux, `ai-dev apply` manages executable convenience launchers in
 During Issue #19 migration, top-level lifecycle routes may remain temporarily
 supported as compatibility entry points. Canonical lifecycle usage is
 under `ai-dev flow ...`.
+
+Managed alias config for `ai-dev apply` lives under `installation.aliases`:
+
+```yaml
+installation:
+  aliases:
+    enabled: true
+    expand_subcommands: true
+    commands:
+      flow: "ai-dev flow"
+```
+
+Global expansion policy:
+
+- `enabled: false` keeps alias definitions in config but skips managed alias install/reconcile.
+- `enabled: true` reconciles managed aliases normally.
+- `expand_subcommands: false` installs only configured root aliases.
+- `expand_subcommands: true` enables root + direct-subcommand descendant generation using AI Dev's internal command registry (implemented in checkpoint 2).
+
+Use explicit aliases in `commands` for selective behavior.
 
 ## Design Principles
 

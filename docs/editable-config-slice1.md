@@ -59,7 +59,9 @@ When missing, the command creates a documented YAML file with safe defaults:
 - `ai.invocation: "Read and execute {task_file}"`
 - `reports.presentation: path-only`
 - `editor.command: null`
-- `aliases: {}`
+- `installation.aliases.enabled: true`
+- `installation.aliases.expand_subcommands: true`
+- `installation.aliases.commands.flow: "ai-dev flow"`
 
 The file is valid for the current config loader and avoids machine-specific paths.
 

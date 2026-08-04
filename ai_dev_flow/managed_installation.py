@@ -24,19 +24,8 @@ MANIFEST_VERSION = 1
 ALIAS_NAME_PATTERN = r"^[A-Za-z_][A-Za-z0-9_-]*$"
 _RESERVED_ALIAS_NAMES = frozenset({"ai-dev", "aidev", "ai_dev"})
 
-DEFAULT_MANAGED_ALIAS_COMMANDS: dict[str, str] = {
-    "flow": "ai-dev flow",
-    "flow-start": "ai-dev flow start",
-    "flow-patch": "ai-dev flow patch",
-    "flow-task-prepare": "ai-dev flow task-prepare",
-    "flow-status": "ai-dev flow status",
-    "flow-review": "ai-dev flow review",
-    "flow-commit": "ai-dev flow commit",
-    "flow-reset": "ai-dev flow reset",
-    "flow-promote": "ai-dev flow promote",
-    "flow-complete": "ai-dev flow complete",
-    "flow-block": "ai-dev flow block",
-    "flow-resume": "ai-dev flow resume",
+DEFAULT_MANAGED_ALIAS_COMMANDS: dict[str, tuple[str, ...]] = {
+    "flow": ("ai-dev", "flow"),
 }
 
 
@@ -51,7 +40,8 @@ class ManagedInstallationError(Exception):
 @dataclass(frozen=True)
 class DesiredInstallationState:
     aliases_enabled: bool
-    alias_commands: dict[str, str]
+    expand_subcommands: bool
+    alias_commands: dict[str, tuple[str, ...]]
     shell_path_enabled: bool
 
 
@@ -69,6 +59,10 @@ class ManagedInstallationSummary:
     launchers_updated: int
     launchers_removed: int
     launchers_unchanged: int
+    expanded_root_aliases: tuple[str, ...]
+    generated_descendant_aliases: tuple[str, ...]
+    suppressed_descendant_aliases: tuple[str, ...]
+    expansion_unavailable_root_aliases: tuple[str, ...]
     path_status: str
     manifest_status: str
     launcher_directory: Path
@@ -143,6 +137,24 @@ def _require_mapping(value: Any, *, path: Path, field_path: str) -> dict[str, An
     return value
 
 
+def _reject_unknown_keys(
+    mapping: dict[str, Any],
+    *,
+    allowed_keys: set[str],
+    path: Path,
+    field_path: str,
+) -> None:
+    unknown = sorted(key for key in mapping if key not in allowed_keys)
+    if not unknown:
+        return
+
+    allowed = ", ".join(sorted(allowed_keys))
+    raise InstallationConfigError(
+        f"Invalid configuration in {path} at {field_path}: unknown key(s): {', '.join(unknown)}. "
+        f"Expected keys: {allowed}."
+    )
+
+
 def _require_bool(value: Any, *, path: Path, field_path: str) -> bool:
     if not isinstance(value, bool):
         raise InstallationConfigError(
@@ -171,7 +183,7 @@ def _validate_alias_name(name: str, *, path: Path, field_path: str) -> str:
     return normalized
 
 
-def _parse_command_tokens(command_text: str, *, path: Path, field_path: str) -> list[str]:
+def _parse_command_tokens(command_text: str, *, path: Path, field_path: str) -> tuple[str, ...]:
     normalized = command_text.strip()
     if not normalized:
         raise InstallationConfigError(
@@ -196,7 +208,75 @@ def _parse_command_tokens(command_text: str, *, path: Path, field_path: str) -> 
                 f"Invalid configuration in {path} at {field_path}: command mapping contains NUL bytes."
             )
 
-    return tokens
+    return tuple(tokens)
+
+
+def _parse_command_argv(
+    raw_command: Any,
+    *,
+    path: Path,
+    field_path: str,
+) -> tuple[str, ...]:
+    if isinstance(raw_command, str):
+        # String form is normal syntax; parse to stable argv representation.
+        return _parse_command_tokens(raw_command, path=path, field_path=field_path)
+
+    if not isinstance(raw_command, list):
+        raise InstallationConfigError(
+            f"Invalid configuration in {path} at {field_path}: command must be a string or "
+            "a non-empty array of non-empty strings."
+        )
+
+    if not raw_command:
+        raise InstallationConfigError(
+            f"Invalid configuration in {path} at {field_path}: command must be a non-empty array."
+        )
+
+    argv: list[str] = []
+    for index, token in enumerate(raw_command):
+        token_path = f"{field_path}[{index}]"
+        if not isinstance(token, str):
+            raise InstallationConfigError(
+                f"Invalid configuration in {path} at {token_path}: expected string token."
+            )
+
+        if not token.strip():
+            raise InstallationConfigError(
+                f"Invalid configuration in {path} at {token_path}: token must be non-empty."
+            )
+        if "\x00" in token:
+            raise InstallationConfigError(
+                f"Invalid configuration in {path} at {token_path}: token contains NUL bytes."
+            )
+        argv.append(token)
+
+    return tuple(argv)
+
+
+def _flow_direct_subcommands() -> tuple[str, ...]:
+    # Runtime import avoids import-cycle problems because cli.py imports this module.
+    from .cli import FLOW_LIFECYCLE_COMMANDS
+
+    return FLOW_LIFECYCLE_COMMANDS
+
+
+def _expandable_descendant_specs(command_argv: tuple[str, ...]) -> tuple[tuple[str, tuple[str, ...]], ...] | None:
+    # Checkpoint 2 eligibility: only canonical ai-dev flow roots are expanded from
+    # the authoritative internal command registry.
+    if command_argv != ("ai-dev", "flow"):
+        return None
+
+    descendants: list[tuple[str, tuple[str, ...]]] = [("help", ("ai-dev", "flow", "--help"))]
+    for subcommand in _flow_direct_subcommands():
+        descendants.append((subcommand, ("ai-dev", "flow", subcommand)))
+
+    return tuple(descendants)
+
+
+def _effective_alias_key(alias_name: str, *, windows: bool) -> str:
+    if windows:
+        return alias_name.casefold()
+    return alias_name
 
 
 def load_desired_installation_state(
@@ -211,15 +291,33 @@ def load_desired_installation_state(
         path=config_path,
         field_path="installation",
     )
+    _reject_unknown_keys(
+        installation,
+        allowed_keys={"aliases", "shellPath"},
+        path=config_path,
+        field_path="installation",
+    )
 
     aliases_section = _require_mapping(
         installation.get("aliases"),
         path=config_path,
         field_path="installation.aliases",
     )
+    _reject_unknown_keys(
+        aliases_section,
+        allowed_keys={"enabled", "expand_subcommands", "commands"},
+        path=config_path,
+        field_path="installation.aliases",
+    )
 
     shell_path_section = _require_mapping(
         installation.get("shellPath"),
+        path=config_path,
+        field_path="installation.shellPath",
+    )
+    _reject_unknown_keys(
+        shell_path_section,
+        allowed_keys={"enabled"},
         path=config_path,
         field_path="installation.shellPath",
     )
@@ -232,6 +330,14 @@ def load_desired_installation_state(
             field_path="installation.aliases.enabled",
         )
 
+    expand_subcommands = True
+    if "expand_subcommands" in aliases_section:
+        expand_subcommands = _require_bool(
+            aliases_section["expand_subcommands"],
+            path=config_path,
+            field_path="installation.aliases.expand_subcommands",
+        )
+
     shell_path_enabled = True
     if "enabled" in shell_path_section:
         shell_path_enabled = _require_bool(
@@ -241,7 +347,7 @@ def load_desired_installation_state(
         )
 
     commands_raw = aliases_section.get("commands")
-    commands_map: dict[str, str]
+    commands_map: dict[str, tuple[str, ...]]
     if commands_raw is None:
         commands_map = dict(DEFAULT_MANAGED_ALIAS_COMMANDS) if aliases_enabled else {}
     else:
@@ -257,14 +363,10 @@ def load_desired_installation_state(
                 raise InstallationConfigError(
                     f"Invalid configuration in {config_path} at installation.aliases.commands: alias names must be strings."
                 )
-            if not isinstance(raw_command, str):
-                raise InstallationConfigError(
-                    f"Invalid configuration in {config_path} at installation.aliases.commands.{raw_name}: command mappings must be strings."
-                )
 
             field_path = f"installation.aliases.commands.{raw_name}"
             alias_name = _validate_alias_name(raw_name, path=config_path, field_path=field_path)
-            _parse_command_tokens(raw_command, path=config_path, field_path=field_path)
+            parsed_argv = _parse_command_argv(raw_command, path=config_path, field_path=field_path)
             name_key = alias_name.casefold() if case_insensitive_names else alias_name
             existing = normalized_name_index.get(name_key)
             if existing is not None and existing != alias_name:
@@ -273,12 +375,13 @@ def load_desired_installation_state(
                     f"{existing!r}, {alias_name!r}."
                 )
             normalized_name_index[name_key] = alias_name
-            commands_map[alias_name] = raw_command.strip()
+            commands_map[alias_name] = parsed_argv
 
         commands_map = dict(sorted(commands_map.items(), key=lambda item: item[0]))
 
     return DesiredInstallationState(
         aliases_enabled=aliases_enabled,
+        expand_subcommands=expand_subcommands,
         alias_commands=commands_map,
         shell_path_enabled=shell_path_enabled,
     )
@@ -394,9 +497,8 @@ def _quote_posix_single(value: str) -> str:
     return "'" + value.replace("'", "'\"'\"'") + "'"
 
 
-def _render_posix_launcher(command_text: str) -> str:
-    tokens = shlex.split(command_text, posix=True)
-    quoted = " ".join(_quote_posix_single(token) for token in tokens)
+def _render_posix_launcher(argv: tuple[str, ...]) -> str:
+    quoted = " ".join(_quote_posix_single(token) for token in argv)
     return (
         "#!/usr/bin/env sh\n"
         f"# {MANAGED_LAUNCHER_MARKER}\n"
@@ -409,9 +511,8 @@ def _escape_cmd_token(token: str) -> str:
     return token.replace("%", "%%").replace('"', '""')
 
 
-def _render_cmd_launcher(command_text: str) -> str:
-    tokens = shlex.split(command_text, posix=True)
-    command = " ".join(f'"{_escape_cmd_token(token)}"' for token in tokens)
+def _render_cmd_launcher(argv: tuple[str, ...]) -> str:
+    command = " ".join(f'"{_escape_cmd_token(token)}"' for token in argv)
     return (
         "@echo off\n"
         f":: {MANAGED_LAUNCHER_MARKER}\n"
@@ -593,19 +694,72 @@ def apply_installation_reconciliation(
     manifest = _load_manifest(resolved_paths.manifest_path)
 
     desired_launchers: dict[Path, str] = {}
+    expanded_roots: list[str] = []
+    generated_descendants: list[str] = []
+    suppressed_descendants: list[str] = []
+    expansion_unavailable_roots: list[str] = []
     if desired.aliases_enabled:
-        for alias_name, command_text in desired.alias_commands.items():
-            _parse_command_tokens(
-                command_text,
-                path=resolved_paths.manifest_path,
-                field_path=f"installation.aliases.commands.{alias_name}",
-            )
+        explicit_aliases = set(desired.alias_commands.keys())
+        explicit_alias_key_to_name: dict[str, str] = {
+            _effective_alias_key(alias_name, windows=resolved_paths.windows): alias_name
+            for alias_name in explicit_aliases
+        }
+
+        # Always materialize explicitly configured root aliases.
+        launch_plan: dict[str, tuple[str, ...]] = dict(desired.alias_commands)
+        launch_plan_key_to_name: dict[str, str] = {
+            _effective_alias_key(alias_name, windows=resolved_paths.windows): alias_name
+            for alias_name in launch_plan
+        }
+
+        if desired.expand_subcommands:
+            for alias_name, command_argv in desired.alias_commands.items():
+                descendant_specs = _expandable_descendant_specs(command_argv)
+                if descendant_specs is None:
+                    expansion_unavailable_roots.append(alias_name)
+                    continue
+
+                expanded_roots.append(alias_name)
+                for suffix, descendant_argv in descendant_specs:
+                    descendant_alias = f"{alias_name}-{suffix}"
+                    descendant_key = _effective_alias_key(descendant_alias, windows=resolved_paths.windows)
+                    explicit_winner = explicit_alias_key_to_name.get(descendant_key)
+                    if explicit_winner is not None:
+                        suppressed_descendants.append(explicit_winner)
+                        continue
+
+                    existing_name = launch_plan_key_to_name.get(descendant_key)
+                    if existing_name is not None:
+                        existing = launch_plan[existing_name]
+                        if existing != descendant_argv:
+                            raise ManagedInstallationError(
+                                "Generated descendant alias collision between configured roots: "
+                                f"{existing_name}."
+                            )
+                        continue
+
+                    launch_plan[descendant_alias] = descendant_argv
+                    launch_plan_key_to_name[descendant_key] = descendant_alias
+                    generated_descendants.append(descendant_alias)
+
+        planned_destination_keys: dict[str, str] = {}
+        for alias_name in sorted(launch_plan.keys()):
+            destination_key = _effective_alias_key(alias_name, windows=resolved_paths.windows)
+            existing_name = planned_destination_keys.get(destination_key)
+            if existing_name is not None and existing_name != alias_name:
+                        raise ManagedInstallationError(
+                            "Managed launcher destination collision after platform normalization: "
+                            f"{existing_name}, {alias_name}."
+                        )
+            planned_destination_keys[destination_key] = alias_name
+
+        for alias_name, command_argv in sorted(launch_plan.items(), key=lambda item: item[0]):
             launcher_name = f"{alias_name}.cmd" if resolved_paths.windows else alias_name
             target_path = (resolved_paths.launcher_directory / launcher_name).resolve()
             if resolved_paths.windows:
-                rendered = _render_cmd_launcher(command_text)
+                rendered = _render_cmd_launcher(command_argv)
             else:
-                rendered = _render_posix_launcher(command_text)
+                rendered = _render_posix_launcher(command_argv)
             desired_launchers[target_path] = rendered
 
     manifest_launchers: dict[Path, str] = {
@@ -743,6 +897,10 @@ def apply_installation_reconciliation(
         launchers_updated=updated,
         launchers_removed=removed,
         launchers_unchanged=unchanged,
+        expanded_root_aliases=tuple(sorted(expanded_roots)),
+        generated_descendant_aliases=tuple(sorted(generated_descendants)),
+        suppressed_descendant_aliases=tuple(sorted(suppressed_descendants)),
+        expansion_unavailable_root_aliases=tuple(sorted(expansion_unavailable_roots)),
         path_status=path_status,
         manifest_status=manifest_status,
         launcher_directory=resolved_paths.launcher_directory,

@@ -21,7 +21,7 @@ Intentionally excluded from checkpoint 2:
 - Removal of temporary top-level lifecycle compatibility routes introduced in checkpoint 1
 - Full Windows shell PATH integration (PATH block management remains Linux-only in checkpoint 2)
 
-## Final User Config Schema (Checkpoint 2)
+## Final User Config Schema (Current)
 
 `ai-dev apply` reads user config from `AI_DEV_CONFIG` override or platform default path and consumes:
 
@@ -29,19 +29,9 @@ Intentionally excluded from checkpoint 2:
 installation:
   aliases:
     enabled: true
+    expand_subcommands: true
     commands:
       flow: "ai-dev flow"
-      flow-start: "ai-dev flow start"
-      flow-patch: "ai-dev flow patch"
-      flow-task-prepare: "ai-dev flow task-prepare"
-      flow-status: "ai-dev flow status"
-      flow-review: "ai-dev flow review"
-      flow-commit: "ai-dev flow commit"
-      flow-reset: "ai-dev flow reset"
-      flow-promote: "ai-dev flow promote"
-      flow-complete: "ai-dev flow complete"
-      flow-block: "ai-dev flow block"
-      flow-resume: "ai-dev flow resume"
   shellPath:
     enabled: true
 ```
@@ -49,11 +39,33 @@ installation:
 Validation highlights:
 
 - `installation`, `installation.aliases`, and `installation.shellPath` must be mappings
-- `enabled` fields must be booleans
+- only `enabled`, `expand_subcommands`, and `commands` are allowed under `installation.aliases`
+- `enabled` must be boolean when present
+- `expand_subcommands` must be boolean when present
 - alias names must match `^[A-Za-z_][A-Za-z0-9_-]*$`
 - reserved alias names are rejected: `ai-dev`, `aidev`, `ai_dev`
-- alias command mappings must parse via shell tokenization and cannot be empty
+- alias command values may be either non-empty command strings or non-empty argv arrays of non-empty strings
+- both forms normalize to argv internally
 - duplicate alias names after case-folding are rejected on case-insensitive platforms
+
+Implemented expansion behavior:
+
+- expansion runs only when `installation.aliases.enabled` and `installation.aliases.expand_subcommands` are both true
+- expansion uses authoritative internal command-model metadata; no help-output scraping
+- checkpoint 2 authoritative target: `ai-dev flow`
+- `flow-help` maps to `ai-dev flow --help`
+- generated lifecycle descendants map to `ai-dev flow <subcommand>` for each direct flow lifecycle command
+- explicit aliases under `commands` override colliding generated descendants
+- colliding generated descendants are omitted and reported in apply output
+- unrecognized external commands still install root launchers but do not generate descendants; this is reported
+
+## Validation Matrix (Checkpoint 3)
+
+- Linux unit tests: expansion planning, suppression precedence, stale cleanup, ownership checks, and deterministic reconciliation behavior.
+- Linux integration tests: generated POSIX launcher execution, argument forwarding, exit-status propagation, and idempotent re-apply.
+- Linux shell-discovery validation: Bash command-name discovery (`compgen -c flow-`) with managed launcher directory on `PATH`; no custom completion scripts.
+- Windows mocked tests: deterministic Windows `.cmd` launcher rendering, `%*` forwarding, percent/quote escaping, spaces/backslashes, and case-insensitive collision handling.
+- Native Windows runtime validation: not performed in this Linux-only environment.
 
 ## Managed Resource Definition
 
