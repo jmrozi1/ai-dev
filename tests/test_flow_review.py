@@ -80,8 +80,25 @@ class FlowReviewTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
 
+        lifecycle_commands = {
+            "start",
+            "patch",
+            "task-prepare",
+            "status",
+            "review",
+            "commit",
+            "reset",
+            "promote",
+            "complete",
+            "block",
+            "resume",
+        }
+        invocation_arguments = list(arguments)
+        if invocation_arguments and invocation_arguments[0] in lifecycle_commands:
+            invocation_arguments = ["flow", *invocation_arguments]
+
         os.environ["FLOW_COMMAND_NAME"] = "flow"
-        sys.argv = ["flow", *arguments]
+        sys.argv = ["flow", *invocation_arguments]
         os.chdir(cwd)
 
         try:
@@ -177,7 +194,7 @@ class FlowReviewTests(unittest.TestCase):
         short_code, short_out, short_err = self._invoke(repo_root, "review", "-h")
         self.assertEqual(short_code, 0)
         self.assertEqual(short_err, "")
-        self.assertIn("Usage: flow review [-a|--all]", short_out)
+        self.assertIn("Usage: ai-dev flow review [-a|--all]", short_out)
         self.assertIn("all changes in the active workflow since main", short_out)
 
         long_code, long_out, long_err = self._invoke(repo_root, "review", "--help")
@@ -201,15 +218,15 @@ class FlowReviewTests(unittest.TestCase):
 
         reject_unknown = self._invoke(repo_root, "review", "--bogus")
         self.assertEqual(reject_unknown[0], 1)
-        self.assertIn("Usage: flow review [-a|--all]", reject_unknown[2])
+        self.assertIn("Usage: ai-dev flow review [-a|--all]", reject_unknown[2])
 
         reject_multiple = self._invoke(repo_root, "review", "-a", "--all")
         self.assertEqual(reject_multiple[0], 1)
-        self.assertIn("Usage: flow review [-a|--all]", reject_multiple[2])
+        self.assertIn("Usage: ai-dev flow review [-a|--all]", reject_multiple[2])
 
         reject_positional = self._invoke(repo_root, "review", "extra")
         self.assertEqual(reject_positional[0], 1)
-        self.assertIn("Usage: flow review [-a|--all]", reject_positional[2])
+        self.assertIn("Usage: ai-dev flow review [-a|--all]", reject_positional[2])
 
     def test_default_review_behavior_after_checkpoint(self) -> None:
         repo_root = self._init_repo("repo-review-default-scope")

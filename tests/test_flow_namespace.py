@@ -79,7 +79,7 @@ class FlowNamespaceTests(unittest.TestCase):
 
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_top_level_help_emphasizes_flow_and_separates_compatibility(self) -> None:
+    def test_top_level_help_emphasizes_flow_without_compatibility_routes(self) -> None:
         outside = self.tmp_path / "outside"
         outside.mkdir(parents=True)
 
@@ -91,7 +91,7 @@ class FlowNamespaceTests(unittest.TestCase):
         self.assertIn("Commands:\n  flow", stdout)
         self.assertIn("\n  apply", stdout)
         self.assertIn("\n  update", stdout)
-        self.assertIn("Compatibility routes (temporary during Issue #19 migration):", stdout)
+        self.assertNotIn("Compatibility routes", stdout)
 
         apply_index = stdout.index("  apply")
         update_index = stdout.index("  update")
@@ -100,9 +100,10 @@ class FlowNamespaceTests(unittest.TestCase):
         self.assertLess(update_index, get_index)
 
         commands_section = stdout.split("Commands:\n", 1)[1].split(
-            "\n\nCompatibility routes", 1
+            "\n\nRun `ai-dev <command> --help`", 1
         )[0]
         self.assertNotIn("\n  start", commands_section)
+        self.assertNotIn("\n  status", commands_section)
 
     def test_flow_help_lists_lifecycle_commands_in_deterministic_order(self) -> None:
         outside = self.tmp_path / "outside-flow"
@@ -148,20 +149,63 @@ class FlowNamespaceTests(unittest.TestCase):
         self.assertIn("ai-dev flow: unknown command: unknown", stderr)
         self.assertIn("Run ai-dev flow --help for usage.", stderr)
 
-    def test_nested_and_compatibility_routes_match_for_status(self) -> None:
+    def test_flow_status_dispatches_successfully(self) -> None:
         repo_root = self._init_repo("repo-status")
 
-        compatibility_code, compatibility_stdout, compatibility_stderr = self._invoke(
-            repo_root, "status"
-        )
-        nested_code, nested_stdout, nested_stderr = self._invoke(
-            repo_root, "flow", "status"
+        code, stdout, stderr = self._invoke(repo_root, "flow", "status")
+        self.assertEqual(code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("No active workflow.", stdout)
+
+    def test_removed_top_level_lifecycle_routes_are_rejected(self) -> None:
+        outside = self.tmp_path / "outside-removed"
+        outside.mkdir(parents=True)
+
+        removed_commands = (
+            "start",
+            "patch",
+            "task-prepare",
+            "status",
+            "review",
+            "commit",
+            "reset",
+            "promote",
+            "complete",
+            "block",
+            "resume",
         )
 
-        self.assertEqual(compatibility_code, 0)
-        self.assertEqual(nested_code, 0)
-        self.assertEqual(nested_stdout, compatibility_stdout)
-        self.assertEqual(nested_stderr, compatibility_stderr)
+        for command in removed_commands:
+            with self.subTest(command=command):
+                code, stdout, stderr = self._invoke(outside, command, "--help")
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn(f"ai-dev: unknown command: {command}", stderr)
+
+    def test_flow_lifecycle_commands_remain_recognized(self) -> None:
+        outside = self.tmp_path / "outside-flow-recognized"
+        outside.mkdir(parents=True)
+
+        for command in cli.FLOW_LIFECYCLE_COMMANDS:
+            with self.subTest(command=command):
+                code, stdout, stderr = self._invoke(outside, "flow", command, "--help")
+                self.assertEqual(code, 0)
+                self.assertEqual(stderr, "")
+                self.assertIn(f"Usage: ai-dev flow {command}", stdout)
+
+    def test_task_prepare_is_flow_only(self) -> None:
+        outside = self.tmp_path / "outside-task-prepare"
+        outside.mkdir(parents=True)
+
+        top_code, top_stdout, top_stderr = self._invoke(outside, "task-prepare", "--help")
+        self.assertEqual(top_code, 1)
+        self.assertEqual(top_stdout, "")
+        self.assertIn("ai-dev: unknown command: task-prepare", top_stderr)
+
+        flow_code, flow_stdout, flow_stderr = self._invoke(outside, "flow", "task-prepare", "--help")
+        self.assertEqual(flow_code, 0)
+        self.assertEqual(flow_stderr, "")
+        self.assertIn("Usage: ai-dev flow task-prepare", flow_stdout)
 
     def test_registry_metadata_drives_help_lists(self) -> None:
         outside = self.tmp_path / "outside-registry"
@@ -181,12 +225,7 @@ class FlowNamespaceTests(unittest.TestCase):
         for command in cli.FLOW_LIFECYCLE_COMMANDS:
             self.assertIn(f"  {command}", flow_stdout)
 
-        expected_compatibility = tuple(
-            spec.name
-            for spec in sorted(cli.COMMAND_SPECS, key=lambda item: item.order)
-            if spec.compatibility_top_level and spec.help_visible
-        )
-        self.assertEqual(cli.TOP_LEVEL_COMPATIBILITY_COMMANDS, expected_compatibility)
+        self.assertEqual(cli.TOP_LEVEL_COMPATIBILITY_COMMANDS, ())
 
 
 if __name__ == "__main__":

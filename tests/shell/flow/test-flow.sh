@@ -113,19 +113,6 @@ Commands:
   showreport        Show the generated report from disk.
   help              Show this help.
 
-Compatibility routes (temporary during Issue #19 migration):
-  start         Compatibility route to \`ai-dev flow start\`.
-  patch         Compatibility route to \`ai-dev flow patch\`.
-  task-prepare  Compatibility route to \`ai-dev flow task-prepare\`.
-  status        Compatibility route to \`ai-dev flow status\`.
-  review        Compatibility route to \`ai-dev flow review\`.
-  commit        Compatibility route to \`ai-dev flow commit\`.
-  reset         Compatibility route to \`ai-dev flow reset\`.
-  promote       Compatibility route to \`ai-dev flow promote\`.
-  complete      Compatibility route to \`ai-dev flow complete\`.
-  block         Compatibility route to \`ai-dev flow block\`.
-  resume        Compatibility route to \`ai-dev flow resume\`.
-
 Run \`${command_name} <command> --help\` for command-specific help.
 Run \`ai-dev flow --help\` for workflow lifecycle commands.
 EOF
@@ -149,7 +136,7 @@ init_repo "$repo_malformed"
 )
 repo_routing_branch="$(git -C "$repo_routing" symbolic-ref --quiet --short HEAD)"
 
-# top-level help bypasses routing and works without repo/config context
+# top-level lifecycle command is rejected while flow namespace status works
 compat_status_output_file="$TMP_DIR/compat-status-output"
 if run_flow_capture "$repo_routing/subdir" "$compat_status_output_file" status; then
 	compat_status_status=0
@@ -162,9 +149,10 @@ if run_flow_capture "$repo_routing/subdir" "$nested_status_output_file" flow sta
 else
 	nested_status_status=$?
 fi
-assert_equals "$compat_status_status" '0'
+assert_equals "$compat_status_status" '1'
+assert_contains "$(cat "$compat_status_output_file")" 'ai-dev: unknown command: status'
 assert_equals "$nested_status_status" '0'
-assert_equals "$(cat "$nested_status_output_file")" "$(cat "$compat_status_output_file")"
+assert_contains "$(cat "$nested_status_output_file")" 'No active workflow.'
 
 # unknown flow subcommand is deterministic and points to flow help
 unknown_flow_output_file="$TMP_DIR/unknown-flow-output"
@@ -188,6 +176,7 @@ assert_equals "$help_status" "0"
 assert_contains "$help_output" 'Usage: ai-dev <command> [options]'
 assert_contains "$help_output" 'Commands:'
 assert_contains "$help_output" '  help              Show this help.'
+assert_not_contains "$help_output" 'Compatibility routes (temporary during Issue #19 migration):'
 assert_not_exists "$repo_unset/.ai-dev"
 
 # no-argument invocation matches help and top-level flags
@@ -294,7 +283,7 @@ mkdir -p "$repo_routing/reports"
 status_routed_path="$TMP_DIR/status-routed.txt"
 set_repo_out "$repo_routing" "$status_routed_path"
 status_routed_output_file="$TMP_DIR/status-routed-output"
-if run_flow_capture "$repo_routing/subdir" "$status_routed_output_file" status; then
+if run_flow_capture "$repo_routing/subdir" "$status_routed_output_file" flow status; then
 	status_routed_status=0
 else
 	status_routed_status=$?
@@ -311,7 +300,7 @@ assert_equals "$status_routed_output_without_confirmation" "$status_routed_file_
 assert_equals "$status_routed_output_confirmation" "Output written to $status_routed_path"
 assert_not_contains "$status_routed_file_output" 'Output written to'
 
-if run_flow_capture "$repo_routing/subdir" "$TMP_DIR/status-routed-output-2" status; then
+if run_flow_capture "$repo_routing/subdir" "$TMP_DIR/status-routed-output-2" flow status; then
 	status_routed_status_2=0
 else
 	status_routed_status_2=$?
@@ -348,14 +337,14 @@ assert_equals "$help_routed_no_args_output" "$help_output"
 assert_not_exists "$repo_routing/reports/help.txt"
 
 help_routed_status_flag_file="$TMP_DIR/help-routed-status-help-output"
-if run_flow_capture "$repo_routing/subdir" "$help_routed_status_flag_file" status --help; then
+if run_flow_capture "$repo_routing/subdir" "$help_routed_status_flag_file" summarize --help; then
 	help_routed_status_flag_status=0
 else
 	help_routed_status_flag_status=$?
 fi
 help_routed_status_flag_output="$(cat "$help_routed_status_flag_file")"
 assert_equals "$help_routed_status_flag_status" "0"
-assert_contains "$help_routed_status_flag_output" 'Usage: ai-dev status [-v|--verbose]'
+assert_contains "$help_routed_status_flag_output" 'Usage: ai-dev summarize <glob>'
 assert_not_exists "$repo_routing/reports/help.txt"
 
 # restore configured out for subsequent routing checks
@@ -408,7 +397,7 @@ assert_not_contains "$unknown_output" 'Output written to'
 # routed commands preserve invalid-path behavior and generated-output recovery
 set_repo_out "$repo_routing" 'missing-parent/help.txt'
 missing_parent_output_file="$TMP_DIR/missing-parent-output"
-if run_flow_capture "$repo_routing/subdir" "$missing_parent_output_file" status; then
+if run_flow_capture "$repo_routing/subdir" "$missing_parent_output_file" flow status; then
 	missing_parent_status=0
 else
 	missing_parent_status=$?
@@ -426,7 +415,7 @@ if [[ "$(id -u)" != '0' ]]; then
 	chmod 500 "$repo_routing/no-write"
 	set_repo_out "$repo_routing" 'no-write/help.txt'
 	unwritable_output_file="$TMP_DIR/unwritable-output"
-	if run_flow_capture "$repo_routing/subdir" "$unwritable_output_file" status; then
+	if run_flow_capture "$repo_routing/subdir" "$unwritable_output_file" flow status; then
 		unwritable_status=0
 	else
 		unwritable_status=$?

@@ -64,8 +64,25 @@ class TaskSliceOneTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
 
+        lifecycle_commands = {
+            "start",
+            "patch",
+            "task-prepare",
+            "status",
+            "review",
+            "commit",
+            "reset",
+            "promote",
+            "complete",
+            "block",
+            "resume",
+        }
+        invocation_arguments = list(arguments)
+        if invocation_arguments and invocation_arguments[0] in lifecycle_commands:
+            invocation_arguments = ["flow", *invocation_arguments]
+
         os.environ["FLOW_COMMAND_NAME"] = "flow"
-        sys.argv = ["flow", *arguments]
+        sys.argv = ["flow", *invocation_arguments]
         os.chdir(cwd)
 
         try:

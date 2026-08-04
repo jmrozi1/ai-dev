@@ -168,7 +168,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=10,
         handler_key="start",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="patch",
@@ -177,7 +176,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=20,
         handler_key="patch",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="task-prepare",
@@ -185,7 +183,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         canonical_namespace="flow",
         order=30,
         handler_key="task-prepare",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="status",
@@ -195,7 +192,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         handler_key="status",
         operational_config_policy="strict",
         echo_routed_output=True,
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="review",
@@ -204,7 +200,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=50,
         handler_key="review",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="commit",
@@ -213,7 +208,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=60,
         handler_key="commit",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="reset",
@@ -222,7 +216,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=70,
         handler_key="reset",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="promote",
@@ -231,7 +224,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=80,
         handler_key="promote",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="complete",
@@ -240,7 +232,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=90,
         handler_key="complete",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="block",
@@ -249,7 +240,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=100,
         handler_key="block",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="resume",
@@ -258,7 +248,6 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         order=110,
         handler_key="resume",
         operational_config_policy="strict",
-        compatibility_top_level=True,
     ),
     CommandSpec(
         name="summarize",
@@ -623,16 +612,7 @@ def render_top_level_help(command_name: str) -> str:
         }
     )
 
-    compatibility_descriptions = {
-        command: f"Compatibility route to `{CANONICAL_FLOW_PREFIX} {command}`."
-        for command in TOP_LEVEL_COMPATIBILITY_COMMANDS
-    }
-
     top_rows = _format_help_rows(TOP_LEVEL_CANONICAL_COMMANDS, top_level_descriptions)
-    compatibility_rows = _format_help_rows(
-        TOP_LEVEL_COMPATIBILITY_COMMANDS,
-        compatibility_descriptions,
-    )
 
     return (
         f"Usage: {command_name} <command> [options]\n\n"
@@ -640,8 +620,6 @@ def render_top_level_help(command_name: str) -> str:
         "and disposable scratch checkpoints.\n\n"
         "Commands:\n"
         f"{top_rows}\n\n"
-        "Compatibility routes (temporary during Issue #19 migration):\n"
-        f"{compatibility_rows}\n\n"
         f"Run `{command_name} <command> --help` for command-specific help.\n"
         f"Run `{CANONICAL_FLOW_PREFIX} --help` for workflow lifecycle commands.\n"
     )

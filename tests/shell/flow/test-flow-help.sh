@@ -158,19 +158,6 @@ Commands:
   showreport        Show the generated report from disk.
   help              Show this help.
 
-Compatibility routes (temporary during Issue #19 migration):
-  start         Compatibility route to \`ai-dev flow start\`.
-  patch         Compatibility route to \`ai-dev flow patch\`.
-  task-prepare  Compatibility route to \`ai-dev flow task-prepare\`.
-  status        Compatibility route to \`ai-dev flow status\`.
-  review        Compatibility route to \`ai-dev flow review\`.
-  commit        Compatibility route to \`ai-dev flow commit\`.
-  reset         Compatibility route to \`ai-dev flow reset\`.
-  promote       Compatibility route to \`ai-dev flow promote\`.
-  complete      Compatibility route to \`ai-dev flow complete\`.
-  block         Compatibility route to \`ai-dev flow block\`.
-  resume        Compatibility route to \`ai-dev flow resume\`.
-
 Run \`${command_name} <command> --help\` for command-specific help.
 Run \`ai-dev flow --help\` for workflow lifecycle commands.
 EOF
@@ -472,7 +459,7 @@ assert_equals "$top_help_flow" "$(run_flow "$help_repo/subdir" --help)"
 assert_equals "$top_help_flow" "$(expected_top_help ai-dev)"
 assert_contains "$top_help_flow" 'flow              Manage issue-focused development workflows.'
 assert_contains "$top_help_flow" 'help              Show this help.'
-assert_contains "$top_help_flow" 'Compatibility routes (temporary during Issue #19 migration):'
+assert_not_contains "$top_help_flow" 'Compatibility routes (temporary during Issue #19 migration):'
 assert_not_contains "$top_help_flow" $'Commands:\n\tstart'
 
 top_help_symlink="$(cd "$help_repo/subdir" && "$symlink_path")"
@@ -507,7 +494,7 @@ assert_contains "$(cat "$flow_unknown_output")" 'ai-dev flow: unknown command: n
 assert_contains "$(cat "$flow_unknown_output")" 'Run ai-dev flow --help for usage.'
 
 # command-specific help for every public command
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
+for command in summarize summarize-verify review-verify config apply update get set unset showreport help; do
 	command_help_short="$TMP_DIR/${command}-short.txt"
 	command_help_long="$TMP_DIR/${command}-long.txt"
 	if run_flow_capture "$help_repo/subdir" "$command_help_short" "$command" -h; then
@@ -549,7 +536,7 @@ for command in start patch task-prepare status review commit reset promote compl
 # help works outside Git repositories and with malformed config
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
+for command in summarize summarize-verify review-verify config apply update get set unset showreport help; do
 	for help_flag in -h --help; do
 		outside_output="$TMP_DIR/outside-${command}-${help_flag//-/}.txt"
 		if run_flow_capture "$outside_repo" "$outside_output" "$command" "$help_flag"; then
@@ -566,7 +553,7 @@ repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"
 mkdir -p "$repo_malformed/.ai-dev"
 printf '{ invalid json\n' > "$repo_malformed/.ai-dev/config.json"
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
+for command in summarize summarize-verify review-verify config apply update get set unset showreport help; do
 	malformed_output="$TMP_DIR/malformed-${command}.txt"
 	if run_flow_capture "$repo_malformed/subdir" "$malformed_output" "$command" --help; then
 		malformed_status=0
@@ -585,7 +572,7 @@ git -C "$repo_bypass" checkout -q -b scratch
 state_set "$repo_bypass/subdir" '{"activeIssueNumber":99,"mainBranch":"main","scratchBranch":"scratch","checkpoint":4}' >/dev/null
 git -C "$repo_bypass" checkout -q main
 printf '{ invalid workflow json\n' > "$repo_bypass/.ai-dev/workflow.json"
-for command in start patch task-prepare summarize summarize-verify review-verify status review commit reset promote complete block resume config apply update get set unset showreport help; do
+for command in summarize summarize-verify review-verify config apply update get set unset showreport help; do
 	bypass_output="$TMP_DIR/bypass-${command}.txt"
 	if run_flow_capture "$repo_bypass/subdir" "$bypass_output" "$command" -h; then
 		bypass_status=0
@@ -615,17 +602,17 @@ assert_equals "$(cat "$top_level_routed_output")" "$(expected_top_help ai-dev)"
 assert_not_exists "$set_repo_out"
 
 command_help_routed_output="$TMP_DIR/command-help-routed.txt"
-if run_flow_capture "$repo_routed/subdir" "$command_help_routed_output" status --help; then
+if run_flow_capture "$repo_routed/subdir" "$command_help_routed_output" summarize --help; then
 	routed_command_status=0
 else
 	routed_command_status=$?
 fi
 assert_equals "$routed_command_status" '0'
-assert_contains "$(cat "$command_help_routed_output")" 'Usage: ai-dev status [-v|--verbose]'
+assert_contains "$(cat "$command_help_routed_output")" 'Usage: ai-dev summarize <glob>'
 assert_not_exists "$set_repo_out"
 
 # extra arguments combined with help are rejected
-for command in patch task-prepare summarize summarize-verify review-verify status review commit reset complete block resume config apply update get set unset showreport help; do
+for command in summarize summarize-verify review-verify config apply update get set unset showreport help; do
 	extra_output="$TMP_DIR/${command}-extra.txt"
 	if run_flow_capture "$help_repo/subdir" "$extra_output" "$command" -h extra; then
 		extra_status=0
@@ -635,24 +622,6 @@ for command in patch task-prepare summarize summarize-verify review-verify statu
 	assert_equals "$extra_status" '1'
 	assert_contains "$(cat "$extra_output")" 'Usage:'
 	done
-
-start_extra_output="$TMP_DIR/start-extra.txt"
-if run_flow_capture "$help_repo/subdir" "$start_extra_output" start 2 -h; then
-	start_extra_status=0
-else
-	start_extra_status=$?
-fi
-assert_equals "$start_extra_status" '1'
-assert_contains "$(cat "$start_extra_output")" 'Usage: ai-dev start <issue-number>'
-
-promote_extra_output="$TMP_DIR/promote-extra.txt"
-if run_flow_capture "$help_repo/subdir" "$promote_extra_output" promote -h message; then
-	promote_extra_status=0
-else
-	promote_extra_status=$?
-fi
-assert_equals "$promote_extra_status" '1'
-assert_contains "$(cat "$promote_extra_output")" 'Usage: ai-dev promote "<commit-message>"'
 
 # help does not modify workflow state, config, HEAD, refs, index, or working tree
 repo_read_only="$TMP_DIR/repo-read-only"
@@ -678,7 +647,7 @@ tracked_before="$(cat "$repo_read_only/tracked.txt")"
 untracked_before="$(cat "$repo_read_only/untracked.txt")"
 
 run_flow "$repo_read_only/subdir" help >/dev/null
-run_flow "$repo_read_only/subdir" status -h >/dev/null
+run_flow "$repo_read_only/subdir" summarize -h >/dev/null
 run_flow "$repo_read_only/subdir" help --help >/dev/null
 
 assert_equals "$(cat "$repo_read_only/.ai-dev/workflow.json")" "$state_before"
