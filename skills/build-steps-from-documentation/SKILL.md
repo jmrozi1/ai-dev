@@ -1,12 +1,10 @@
 ---
 name: build-steps-from-documentation
 description: >-
-  Review project documentation to determine how to complete a requested task,
-  identify the decisions, assumptions, alternatives, and prerequisites that
-  affect which instructions apply, and produce sourced step-by-step instructions
-  with file and heading references. Use when the user asks how to install,
-  configure, deploy, operate, test, upgrade, recover, or otherwise perform a task
-  according to project documentation.
+  Use whenever the user asks what project documentation says to do, how the
+  documentation says to perform a task, or requests instructions based on the
+  documentation. Identify material choices, assumptions, prerequisites, and
+  unresolved decisions, and cite the source file and heading for each step.
 ---
 
 # Build Steps From Documentation
