@@ -1,11 +1,11 @@
 ---
 name: propose-documentation-changes
 description: >-
-  Convert documentation walkthrough findings, defect reports, verified task
-  procedures, and current documentation into a constrained file-by-file change
-  proposal. Specify what should be added, moved, removed, or rewritten and why,
-  without modifying files unless the user explicitly selects direct edits or
-  parallel proposed copies.
+  Use when the user asks to correct, reorganize, or improve project documentation
+  and a documentation walkthrough report or equivalent recorded findings are
+  available. Use the recorded evidence to produce a file-by-file proposal
+  describing what to add, move, remove, or rewrite before offering direct edits
+  or parallel -proposed files.
 ---
 
 # Propose Documentation Changes
