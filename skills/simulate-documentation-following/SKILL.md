@@ -1,12 +1,11 @@
 ---
 name: simulate-documentation-following
 description: >-
-  Simulate an engineer following project documentation incrementally from its
-  stated entry point, preserving the reader-visible journey and recording the
-  documents consulted, decisions made, assumptions introduced, actions attempted,
-  results observed, failures encountered, and documentation defects discovered.
-  Use for read-only documentation walkthroughs or, when explicitly requested,
-  active attempts to follow and verify documented instructions.
+  Use when the user asks you to follow, walk through, test, validate, or evaluate
+  project documentation or documented instructions, especially when the path
+  taken, reader experience, failures, ambiguities, or missing information should
+  be recorded. Ask whether to use a read-only walkthrough or an active walkthrough
+  only when the requested mode is unclear.
 ---
 
 # Simulate Documentation Following
