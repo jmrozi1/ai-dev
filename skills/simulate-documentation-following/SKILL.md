@@ -163,6 +163,18 @@ When recovery begins:
 5. In active mode, clearly separate recovery commands or edits from the documented procedure.
 6. Continue logging chronologically.
 
+## Overall rating
+
+End the report with a qualitative A-F rating of the documentation for the requested task.
+
+- **A:** A competent engineer can follow the documentation without undocumented assumptions, meaningful ambiguity, recovery searches, broken navigation, or known defects.
+- **B:** The task is achievable, but minor ambiguities, organization problems, or assumptions create friction without materially threatening success.
+- **C:** Meaningful inference, recovery investigation, hidden prerequisites, or correction of non-blocking defects is required.
+- **D:** Major defects or missing information make successful completion unlikely without outside knowledge.
+- **F:** The documented path is fundamentally unusable, incorrect, or blocked.
+
+Use judgment rather than a numerical point system. Keep the A standard strict: documentation earns an A only when the documented path itself reliably supports the task. Any rating below A must list the specific defects, ambiguities, assumptions, organization problems, recovery steps, or verification gaps that caused the lower rating.
+
 ## Required output
 
 Write the following report to the configured report file and return a concise summary with its path. Use this structure unless the user requests another format:
@@ -233,13 +245,22 @@ For each breakpoint:
 - Severity:
 - Suggested direction:
 
-## Final state
+## Report summary
 
+- Overall rating: A | B | C | D | F
 - Task completed:
 - Execution attempted:
+- Defects identified:
+- Ambiguities identified:
+- Assumptions required:
+- Recovery investigation required:
 - Verified behavior:
 - Unverified behavior:
 - Remaining blockers:
+
+### Reasons for rating
+
+- <Specific reason the documentation did not earn an A, or state that no deductions were identified.>
 
 ## Next action
 
@@ -258,5 +279,6 @@ The work is complete when:
 - documentation defects are tied to observed reader impact;
 - read-only and active behavior are clearly distinguished;
 - verified and unverified outcomes are separated;
+- the report includes an overall rating and specific reasons for every rating below A;
 - the completed report is written to the configured path;
 - and the report reflects what a real reader could discover progressively, not what became obvious after reading everything.
