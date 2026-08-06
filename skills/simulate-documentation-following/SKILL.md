@@ -97,6 +97,9 @@ For every meaningful transition or action, record:
 - **Expected result:** what the documentation implies should happen
 - **Actual result:** what happened in active mode, or the predicted outcome in read-only mode
 - **Status:** continued, ambiguous, blocked, failed, recovered, or verified
+- **Plain-language interpretation:** a short paragraph explaining the reader's experience at that moment
+
+The plain-language interpretation should explain what is clear, what is confusing, and why a reasonable engineer would continue, hesitate, or become blocked. Synthesize the structured fields rather than merely restating them.
 
 Keep the log chronological.
 
@@ -194,6 +197,10 @@ For each material choice:
 - Actual or predicted result:
 - Status:
 
+**Plain-language interpretation:**
+
+<Short paragraph explaining what this means to an engineer following the documentation, including what is clear or confusing and why they would continue, hesitate, or become blocked.>
+
 ### 2. <next action or document>
 
 ...
@@ -245,6 +252,7 @@ The work is complete when:
 
 - the chronological documentation path is preserved;
 - each transition has a visible reason;
+- each journey step includes a plain-language interpretation of the reader experience;
 - decisions and assumptions are recorded when they occur;
 - failures and recovery searches are not hidden;
 - documentation defects are tied to observed reader impact;
