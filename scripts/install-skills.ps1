@@ -1,11 +1,11 @@
-$ErrorActionPreference = 'Stop'
-
 param(
     [Alias('f')]
     [switch]$Force,
     [Alias('h')]
     [switch]$Help
 )
+
+$ErrorActionPreference = 'Stop'
 
 function Show-Help {
     @'
