@@ -262,6 +262,10 @@ For each breakpoint:
 
 - <Specific reason the documentation did not earn an A, or state that no deductions were identified.>
 
+## User notes
+
+<Optional user-added guidance for the later documentation-change proposal. Preserve this section so the user can add corrections, priorities, constraints, rejected findings, or additional context after the walkthrough.>
+
 ## Next action
 
 State that no further action was taken. In read-only mode, offer an active walkthrough. In active mode, offer no additional execution unless a specific unresolved continuation remains.
@@ -280,5 +284,6 @@ The work is complete when:
 - read-only and active behavior are clearly distinguished;
 - verified and unverified outcomes are separated;
 - the report includes an overall rating and specific reasons for every rating below A;
+- the report ends with a `User notes` section that may be edited after generation;
 - the completed report is written to the configured path;
 - and the report reflects what a real reader could discover progressively, not what became obvious after reading everything.
