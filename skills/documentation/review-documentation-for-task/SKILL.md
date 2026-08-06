@@ -13,6 +13,8 @@ description: >-
 
 Review whether an engineer can start from the documented entrypoint and reliably accomplish a specific task. Evaluate the documentation as one system rather than as isolated files or findings.
 
+Do as much analysis as necessary, but expose only information that helps the user understand whether the documentation is good, what is wrong, what the correct procedure is, and what should change. Do not make the final report mirror the internal reasoning process.
+
 ## Specializations
 
 Use these focused specializations as internal phases:
@@ -55,26 +57,13 @@ Inspect the primary `README.md`, documentation indexes, linked task documents, a
 
 Do not recursively treat every Markdown file as equally relevant. Keep peripheral files as candidates and inspect them when links, references, missing concepts, or recovery needs make them relevant.
 
-Record:
-
-- entrypoints and indexes;
-- apparent task documents;
-- discoverable links between them;
-- potentially relevant but unlinked documents;
-- and obvious scope boundaries.
+Track entrypoints, apparent task documents, discoverable links, potentially relevant but unlinked documents, and scope boundaries as working context. Do not emit a standalone inventory unless it materially explains a finding.
 
 ### 3. Model the task before evaluating instructions
 
 Identify every decision that materially changes the procedure, including environment, deployment method, topology, inventory, target, optional components, security boundary, and supported platform or version.
 
-Separate:
-
-- path-selection decisions;
-- prerequisites;
-- configuration;
-- execution;
-- verification;
-- troubleshooting and recovery.
+Separate path-selection decisions, prerequisites, configuration, execution, verification, troubleshooting, and recovery while reasoning about the task.
 
 Do not present or evaluate a single procedure until materially different paths are exposed. If a path must be selected for simulation, use an explicit user choice, documented default, strong environment evidence, or ask the user when ambiguity remains.
 
@@ -106,14 +95,9 @@ This procedure is the comparison baseline, not necessarily the structure current
 
 ### 7. Compare documented journey with required procedure
 
-For each required decision, prerequisite, configuration item, action, and verification step, compare:
+For each required decision, prerequisite, configuration item, action, and verification step, compare when it should become known with when or whether the documented path exposes it.
 
-- when it should become known;
-- when or whether the documented path exposes it;
-- what the reader is encouraged to do before knowing it;
-- and the consequence of the mismatch.
-
-Classify failures such as:
+Classify material failures such as:
 
 - missing or unclear scope;
 - unreachable path;
@@ -147,38 +131,56 @@ If accepted, use the procedure as the execution checklist and let that skill cre
 - Ask when a material choice or evidence source is ambiguous; do not compensate with broad speculative investigation.
 - Preserve the current documentation approach where possible, but do not preserve an organization that prevents a reliable reader path.
 - Prefer the smallest coherent set of changes over many local patches.
-- Keep verified facts, inferred structure, assumptions, and user guidance distinct.
+- Keep verified facts, inferred structure, assumptions, and user guidance distinct while reasoning, but do not expose separate metadata fields unless they matter to the user.
 - Never claim the revised documentation works unless the path was actually validated.
+- Prefer a short, decisive report over an exhaustive audit artifact.
 
 ## Output
 
-Produce one integrated review containing:
+The report must answer the user's main question immediately. Lead with an A-F rating and a short explanation of why.
 
-1. requested task and selected path;
-2. documentation inventory and entrypoints;
-3. task decisions, prerequisites, and dependency model;
-4. current documented reader path;
-5. required dependency-ordered path;
-6. reader-simulation findings;
-7. architecture and comparison findings;
-8. overall A-F rating with reasons for every rating below A;
-9. proposed reader path;
-10. file-by-file change proposal;
-11. verification plan;
-12. implementation options.
+Use this default structure:
+
+```markdown
+# Documentation review
+
+Rating: <A-F>
+
+## Why
+- <material reason for the rating>
+- <material reason for the rating>
+
+## Correct procedure
+1. <step>
+2. <step>
+
+## Changes needed
+- `<file>`: <smallest coherent change and why>
+- `<file>`: <smallest coherent change and why>
+```
+
+Add an `## Unresolved` section only when a material ambiguity, conflict, or missing fact prevents a confident conclusion or procedure.
+
+Do not create standalone sections for documentation inventory, task modeling, reader-simulation metadata, evidence catalogs, architecture analysis, proposed reader paths, verification plans, or implementation options unless one is necessary to explain a material conclusion. Those are reasoning inputs, not mandatory report structure.
+
+Keep findings consolidated. Do not repeat the same defect in multiple sections using different terminology.
+
+For ratings below A, the `Why` section must make the deficiencies immediately understandable. A reader should not need to inspect the rest of the report to answer "is the documentation good?"
 
 Persist working reports under `./tmp/` using stable task-derived filenames and overwrite the same task report by default. Treat them as ephemeral evidence rather than canonical documentation.
+
+After presenting the report, offer the interactive real-execution walkthrough when a concrete procedure is available. Do not bury that offer inside a large implementation-options section.
 
 ## Completion criteria
 
 The review is complete when:
 
-- the requested task and material path decisions are explicit;
-- the relevant documentation and entrypoint relationships are mapped;
+- the task and material path decisions are understood;
+- the relevant documentation has been evaluated as an end-to-end reader path;
 - the required procedure is ordered by dependency;
 - at least one concrete reader path has been evaluated when applicable;
-- documented and required paths have been compared;
-- failures are assigned to the earliest responsible document;
-- the rating reflects scope, discoverability, ordering, ambiguity, defects, and verification;
-- proposed changes repair the complete path with minimal unrelated change;
-- and implementation remains separate unless explicitly authorized.
+- material failures are assigned to the earliest responsible document;
+- the rating clearly reflects the quality of the documented path;
+- the report states the correct procedure and smallest coherent changes needed;
+- unresolved uncertainty is explicit rather than hidden;
+- and the final output is concise enough that the overall judgment is obvious at a glance.
