@@ -24,6 +24,26 @@ Use this skill after one or more of the following are available:
 
 The proposal should reconcile the current documentation with the path a reader actually needs to follow.
 
+## Report selection and handoff
+
+Use the walkthrough report as the primary handoff artifact rather than relying on conversation memory alone.
+
+1. Use an explicit report path supplied by the user.
+2. Otherwise use a report path clearly established in the current conversation.
+3. Otherwise inspect `./tmp/documentation-walkthrough-*.md` in the target project's current working directory.
+4. If exactly one plausible report exists, use it.
+5. If multiple reports are plausible or the intended report is otherwise ambiguous, ask the user which report to use before inspecting documentation or producing a proposal. Do not guess, merge reports, or begin a broad investigation.
+6. Read the selected report, including its `User notes` section, before inspecting the documentation files it references.
+7. Verify the referenced documentation in its current state before proposing changes so stale or already-resolved findings are not applied blindly.
+
+Treat the evidence sources distinctly:
+
+- walkthrough findings are observed evidence;
+- `User notes` are explicit guidance, corrections, priorities, and constraints;
+- current documentation is the present state against which proposed changes must be checked.
+
+Do not erase a walkthrough finding merely because a user note rejects or reframes it. Record how the note affected the proposal, and identify changes driven by user notes separately from changes driven by observed defects.
+
 ## Core boundaries
 
 1. Begin in proposal-only mode.
@@ -48,7 +68,8 @@ Tie each proposed change to one or more of:
 - a missing or misplaced prerequisite;
 - a sourced procedure step;
 - a documented conflict;
-- an unresolved path-selection decision.
+- an unresolved path-selection decision;
+- an explicit user note.
 
 If a suggestion lacks supporting evidence, omit it or label it optional and explain why it is outside the minimum required correction.
 
@@ -145,7 +166,9 @@ Use this structure unless the user requests another format:
 ## Proposal basis
 
 - Requested outcome:
+- Walkthrough report:
 - Evidence reviewed:
+- User notes considered:
 - Verified procedure available: yes/no
 - Remaining uncertainty:
 
@@ -165,6 +188,7 @@ Use this structure unless the user requests another format:
 - Reason:
 - Reader outcome:
 - Evidence or issue IDs:
+- Evidence source: walkthrough | user note | current documentation | sourced procedure
 - Priority: required | optional
 
 #### Move
@@ -176,6 +200,7 @@ Use this structure unless the user requests another format:
 - Reason:
 - Reader outcome:
 - Evidence or issue IDs:
+- Evidence source:
 - Priority:
 
 #### Rewrite
@@ -187,6 +212,7 @@ Use this structure unless the user requests another format:
 - Reason:
 - Reader outcome:
 - Evidence or issue IDs:
+- Evidence source:
 - Priority:
 
 #### Remove
@@ -196,6 +222,7 @@ Use this structure unless the user requests another format:
 - Reason removal is appropriate:
 - Replacement or canonical source:
 - Evidence or issue IDs:
+- Evidence source:
 - Priority:
 
 ## Cross-file consistency changes
@@ -267,9 +294,12 @@ Make no file changes. Leave the proposal ready for review or later implementatio
 
 The proposal phase is complete when:
 
+- the intended walkthrough report was selected without ambiguity or confirmed by the user;
+- the selected report and its `User notes` were read before proposing changes;
+- current documentation was checked against the report findings;
 - every required change is organized by file;
 - each change is categorized as add, move, rewrite, or remove;
-- each change has a reason, reader outcome, evidence, and priority;
+- each change has a reason, reader outcome, evidence, evidence source, and priority;
 - the proposed reader path exposes material decisions before branch-specific instructions;
 - unrelated cleanup is excluded;
 - a verification plan is included;
