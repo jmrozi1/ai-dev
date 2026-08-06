@@ -23,7 +23,7 @@ Use this mode by default unless the user explicitly asks to execute, test, insta
 In read-only mode:
 
 - do not run commands;
-- do not edit files;
+- do not edit project files other than writing the generated walkthrough report;
 - do not change environment state;
 - follow the reader-visible documentation path progressively;
 - identify likely failures, ambiguities, missing prerequisites, and decision points;
@@ -62,6 +62,18 @@ In active mode:
 10. Do not retroactively rewrite the journey after discovering the correct solution.
 11. Do not rewrite or reorganize documentation. Produce evidence and recommendations only.
 12. Do not claim that a task works unless it was actually executed and verified.
+
+## Report file
+
+Persist the completed report as a Markdown file.
+
+- Use a path supplied by the user when provided.
+- Otherwise write to `./tmp/documentation-walkthrough-<task-slug>.md`, relative to the target project's current working directory.
+- Create `./tmp/` when it does not exist.
+- Derive a concise, filesystem-safe task slug from the requested walkthrough target.
+- Overwrite an existing report with the same path; do not create numbered or dated copies unless the user requests history.
+- Treat the report as ephemeral working evidence, not canonical project documentation.
+- Include the final report path in the response.
 
 ## Reader simulation rules
 
@@ -150,7 +162,7 @@ When recovery begins:
 
 ## Required output
 
-Use this structure unless the user requests another format:
+Write the following report to the configured report file and return a concise summary with its path. Use this structure unless the user requests another format:
 
 ```markdown
 ## Walkthrough target
@@ -238,4 +250,5 @@ The work is complete when:
 - documentation defects are tied to observed reader impact;
 - read-only and active behavior are clearly distinguished;
 - verified and unverified outcomes are separated;
+- the completed report is written to the configured path;
 - and the report reflects what a real reader could discover progressively, not what became obvious after reading everything.
