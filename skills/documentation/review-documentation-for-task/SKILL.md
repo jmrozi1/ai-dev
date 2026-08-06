@@ -23,6 +23,12 @@ Use these focused specializations as internal phases:
 
 The coordinator owns sequencing, shared context, unresolved questions, comparison, and final judgment. Do not delegate away the overall task model or merely concatenate specialization outputs.
 
+## Related execution skill
+
+After producing a concrete dependency-ordered procedure, offer to walk through it interactively using `../follow-documentation-for-task/SKILL.md`. That workflow performs the procedure one step at a time in the real environment and records only exceptions that expose documentation or project-instruction gaps.
+
+Do not begin the execution walkthrough unless the user chooses it.
+
 ## Core outcome
 
 Determine:
@@ -127,6 +133,12 @@ Assign responsibility to the earliest document that should have routed, scoped, 
 Load and apply `review-documentation-for-task-propose-changes` using the shared task model, architecture findings, reader simulation, correct procedure, comparison, and user notes.
 
 The proposal must repair the end-to-end reader path, not merely resolve isolated findings.
+
+### 9. Offer real execution walkthrough
+
+When a concrete ordered procedure is available, ask whether the user wants to go through it one step at a time using `follow-documentation-for-task`.
+
+If accepted, use the procedure as the execution checklist and let that skill create and maintain `./tmp/documentation-execution-<task-slug>.md`. Keep the execution walkthrough separate from the review report so real-world exception notes remain high-signal evidence for later documentation updates.
 
 ## Governing principles
 
