@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 assert_contains() {
 	local haystack="$1"
 	local needle="$2"
@@ -69,9 +82,11 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 	(
 		cd "$cwd"
-		"$AI_DEV_REAL" flow "$@"
+		"flow-$flow_command" "$@"
 	)
 }
 
@@ -181,7 +196,7 @@ else
 fi
 help_text="$(cat "$help_output")"
 assert_equals "$help_status" '0'
-assert_contains "$help_text" 'Usage: ai-dev flow promote "<commit-message>"'
+assert_contains "$help_text" 'Usage: flow-promote "<commit-message>"'
 
 repo_missing_arg="$TMP_DIR/repo-missing-arg"
 init_repo "$repo_missing_arg"
@@ -193,7 +208,7 @@ else
 fi
 missing_text="$(cat "$missing_output")"
 assert_equals "$missing_status" '1'
-assert_contains "$missing_text" 'Usage: ai-dev flow promote "<commit-message>"'
+assert_contains "$missing_text" 'Usage: flow-promote "<commit-message>"'
 
 empty_output="$TMP_DIR/empty-output"
 if run_flow_capture "$repo_missing_arg/subdir" "$empty_output" promote ''; then
@@ -203,7 +218,7 @@ else
 fi
 empty_text="$(cat "$empty_output")"
 assert_equals "$empty_status" '1'
-assert_contains "$empty_text" 'Usage: ai-dev flow promote "<commit-message>"'
+assert_contains "$empty_text" 'Usage: flow-promote "<commit-message>"'
 
 extra_output="$TMP_DIR/extra-output"
 if run_flow_capture "$repo_missing_arg/subdir" "$extra_output" promote 'msg' extra; then
@@ -213,7 +228,7 @@ else
 fi
 extra_text="$(cat "$extra_output")"
 assert_equals "$extra_status" '1'
-assert_contains "$extra_text" 'Usage: ai-dev flow promote "<commit-message>"'
+assert_contains "$extra_text" 'Usage: flow-promote "<commit-message>"'
 
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
@@ -528,7 +543,6 @@ repo_routing="$TMP_DIR/repo-routing"
 init_repo "$repo_routing"
 git -C "$repo_routing" checkout -q -b scratch
 routing_output_path="$TMP_DIR/promote-output.txt"
-track_config_file "$repo_routing" "$routing_output_path"
 state_set "$repo_routing/subdir" '{"activeIssueNumber":25,"mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
 create_commit_on_current_branch "$repo_routing" routed.txt 'routed' '1'
 routing_terminal_output="$TMP_DIR/routing-terminal-output"
@@ -539,12 +553,10 @@ else
 fi
 routing_terminal_text="$(cat "$routing_terminal_output")"
 assert_equals "$routing_status" '0'
-assert_equals "$routing_terminal_text" "Output written to $routing_output_path"
-routing_file_text="$(cat "$routing_output_path")"
-assert_contains "$routing_file_text" 'Promoted scratch to main'
-assert_contains "$routing_file_text" 'commit: '
-assert_contains "$routing_file_text" 'checkpoint: 0'
-assert_contains "$routing_file_text" 'activeIssueNumber: 25'
+assert_contains "$routing_terminal_text" 'Promoted scratch to main'
+assert_contains "$routing_terminal_text" 'commit: '
+assert_contains "$routing_terminal_text" 'checkpoint: 0'
+assert_contains "$routing_terminal_text" 'activeIssueNumber: 25'
 
 repo_switch_main_fail="$TMP_DIR/repo-switch-main-fail"
 init_repo "$repo_switch_main_fail"

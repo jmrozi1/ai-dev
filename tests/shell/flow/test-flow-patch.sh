@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 assert_contains() {
 	local haystack="$1"
 	local needle="$2"
@@ -62,9 +75,11 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 	(
 		cd "$cwd"
-		"$AI_DEV_REAL" flow "$@"
+		"flow-$flow_command" "$@"
 	)
 }
 
@@ -155,15 +170,14 @@ create_commit_on_current_branch() {
 # help
 repo_help="$TMP_DIR/repo-help"
 init_repo "$repo_help"
-help_text="$(run_flow "$repo_help/subdir" --help)"
-assert_contains "$help_text" 'Usage: ai-dev flow <command> [options]'
-assert_contains "$help_text" 'patch         Begin or adopt a local patch workflow on scratch.'
+help_text="$(run_flow "$repo_help/subdir" patch --help)"
+assert_contains "$help_text" 'Usage: flow-patch "<description>"'
 
 patch_help_short="$(run_flow "$repo_help/subdir" patch -h)"
 patch_help_long="$(run_flow "$repo_help/subdir" patch --help)"
 assert_equals "$patch_help_short" "$patch_help_long"
-assert_contains "$patch_help_short" 'Usage: ai-dev flow patch "<description>"'
-assert_contains "$patch_help_short" 'ai-dev flow patch --adopt "<description>"'
+assert_contains "$patch_help_short" 'Usage: flow-patch "<description>"'
+assert_contains "$patch_help_short" 'flow-patch --adopt "<description>"'
 assert_contains "$patch_help_short" 'without changing commits, index, or working tree'
 
 # clean patch start resets scratch and records patch state
@@ -229,7 +243,7 @@ else
 	adopt_missing_status=$?
 fi
 assert_equals "$adopt_missing_status" '1'
-assert_contains "$(cat "$TMP_DIR/adopt-missing-output")" 'Usage: ai-dev flow patch [--adopt] "<description>"'
+assert_contains "$(cat "$TMP_DIR/adopt-missing-output")" 'Usage: flow-patch [--adopt] "<description>"'
 
 if run_flow_capture "$repo_args/subdir" "$TMP_DIR/ordering-output" patch 'desc' --adopt; then
 	ordering_status=0
@@ -237,7 +251,7 @@ else
 	ordering_status=$?
 fi
 assert_equals "$ordering_status" '1'
-assert_contains "$(cat "$TMP_DIR/ordering-output")" 'Usage: ai-dev flow patch [--adopt] "<description>"'
+assert_contains "$(cat "$TMP_DIR/ordering-output")" 'Usage: flow-patch [--adopt] "<description>"'
 
 if run_flow_capture "$repo_args/subdir" "$TMP_DIR/extra-output" patch --adopt 'desc' extra; then
 	extra_status=0
@@ -245,7 +259,7 @@ else
 	extra_status=$?
 fi
 assert_equals "$extra_status" '1'
-assert_contains "$(cat "$TMP_DIR/extra-output")" 'Usage: ai-dev flow patch [--adopt] "<description>"'
+assert_contains "$(cat "$TMP_DIR/extra-output")" 'Usage: flow-patch [--adopt] "<description>"'
 
 # active workflow conflict
 repo_conflict_issue="$TMP_DIR/repo-conflict-issue"
@@ -355,24 +369,21 @@ assert_contains "$status_verbose" '  patch: Patch status'
 assert_not_contains "$status_verbose" 'issue URL'
 assert_not_contains "$status_verbose" 'github.com'
 
-# review identifies patch
-repo_review="$TMP_DIR/repo-review"
-init_repo "$repo_review"
-git -C "$repo_review" checkout -q -b scratch
-state_set "$repo_review/subdir" '{"patchDescription":"Patch review","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
-printf 'review\n' >> "$repo_review/tracked.txt"
-git -C "$repo_review" add tracked.txt
-if run_flow_capture "$repo_review/subdir" "$TMP_DIR/review-output" review; then
-	review_status=0
+# diff is available during patch workflows without mutating state
+repo_diff="$TMP_DIR/repo-diff"
+init_repo "$repo_diff"
+git -C "$repo_diff" checkout -q -b scratch
+state_set "$repo_diff/subdir" '{"patchDescription":"Patch diff","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'review\n' >> "$repo_diff/tracked.txt"
+git -C "$repo_diff" add tracked.txt
+if run_flow_capture "$repo_diff/subdir" "$TMP_DIR/diff-output" diff; then
+	diff_status=0
 else
-	review_status=$?
+	diff_status=$?
 fi
-review_text="$(cat "$TMP_DIR/review-output")"
-assert_equals "$review_status" '0'
-assert_contains "$review_text" 'Patch: Patch review'
-assert_contains "$review_text" 'Review summary:'
-assert_contains "$review_text" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
-assert_contains "$review_text" "$(cached_diff "$repo_review")"
+diff_text="$(cat "$TMP_DIR/diff-output")"
+assert_equals "$diff_status" '0'
+assert_contains "$diff_text" "$(cached_diff "$repo_diff")"
 
 # commit/promote/reset/complete support patch workflows
 repo_lifecycle="$TMP_DIR/repo-lifecycle"

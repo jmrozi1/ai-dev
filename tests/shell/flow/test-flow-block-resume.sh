@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 assert_contains() {
 	local haystack="$1"
 	local needle="$2"
@@ -79,9 +92,11 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 	(
 		cd "$cwd"
-		"$AI_DEV_REAL" flow "$@"
+		"flow-$flow_command" "$@"
 	)
 }
 
@@ -306,7 +321,7 @@ write_gh_state "$gh_state_file" '{
 }'
 if (
 	cd "$repo_success/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "$AI_DEV_REAL" flow block 'Need upstream validation'
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "flow-block" 'Need upstream validation'
 ) >"$TMP_DIR/block-success-output" 2>&1; then
 	block_success_status=0
 else
@@ -337,7 +352,7 @@ assert_contains "$status_verbose_success" 'reason: Need upstream validation'
 # successful resume
 if (
 	cd "$repo_success/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "$AI_DEV_REAL" flow resume 101
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "flow-resume" 101
 ) >"$TMP_DIR/resume-success-output" 2>&1; then
 	resume_success_status=0
 else
@@ -365,7 +380,7 @@ else
 	blank_reason_status=$?
 fi
 assert_equals "$blank_reason_status" '1'
-assert_contains "$(cat "$blank_reason_output")" 'Usage: ai-dev flow block "<reason>"'
+assert_contains "$(cat "$blank_reason_output")" 'Usage: flow-block "<reason>"'
 
 # patch workflow rejection
 repo_patch="$TMP_DIR/repo-patch"
@@ -495,7 +510,7 @@ write_gh_state "$gh_state_file" '{
 gh_fail_output="$TMP_DIR/gh-fail-output"
 if (
 	cd "$repo_gh_fail/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_FAIL_EDIT=1 "$AI_DEV_REAL" flow block 'Blocked by dependency'
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_FAIL_EDIT=1 "flow-block" 'Blocked by dependency'
 ) >"$gh_fail_output" 2>&1; then
 	gh_fail_status=0
 else
@@ -538,7 +553,7 @@ write_gh_state "$gh_state_file" '{
 resume_label_output="$TMP_DIR/resume-label-output"
 if (
 	cd "$repo_resume_label/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "$AI_DEV_REAL" flow resume 108
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "flow-resume" 108
 ) >"$resume_label_output" 2>&1; then
 	resume_label_status=0
 else
@@ -579,7 +594,7 @@ write_gh_state "$gh_state_file" '{
 }'
 if (
 	cd "$repo_resume_normalize/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "$AI_DEV_REAL" flow resume 109
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "flow-resume" 109
 ) >"$TMP_DIR/resume-normalize-output" 2>&1; then
 	resume_normalize_status=0
 else
@@ -617,7 +632,7 @@ blocked_before_resume_gh_fail="$(cat "$blocked_file_resume_gh_fail")"
 resume_gh_fail_output="$TMP_DIR/resume-gh-fail-output"
 if (
 	cd "$repo_resume_gh_fail/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_FAIL_EDIT=1 "$AI_DEV_REAL" flow resume 112
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_FAIL_EDIT=1 "flow-resume" 112
 ) >"$resume_gh_fail_output" 2>&1; then
 	resume_gh_fail_status=0
 else
@@ -662,7 +677,7 @@ write_gh_state "$gh_state_file" '{
 }'
 if (
 	cd "$repo_retry/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "$AI_DEV_REAL" flow block 'new reason'
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "flow-block" 'new reason'
 ) >"$TMP_DIR/retry-block-output" 2>&1; then
 	retry_block_status=0
 else
@@ -686,7 +701,7 @@ ln -sf "$(command -v python3)" "$no_gh_bin/python3"
 no_gh_output="$TMP_DIR/no-gh-output"
 if (
 	cd "$repo_no_gh/subdir"
-	PATH="$no_gh_bin" "$AI_DEV_REAL" flow block 'blocked by policy'
+	PATH="$no_gh_bin:$FLOW_BIN_DIR" "flow-block" 'blocked by policy'
 ) >"$no_gh_output" 2>&1; then
 	no_gh_status=0
 else

@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 assert_contains() {
 	local haystack="$1"
 	local needle="$2"
@@ -77,9 +90,11 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 	(
 		cd "$cwd"
-		"$AI_DEV_REAL" flow "$@"
+		"flow-$flow_command" "$@"
 	)
 }
 
@@ -159,7 +174,7 @@ else
 fi
 missing_arg_text="$(cat "$missing_arg_output")"
 assert_equals "$missing_arg_status" "1"
-assert_contains "$missing_arg_text" 'Usage: ai-dev flow start <issue-number>'
+assert_contains "$missing_arg_text" 'Usage: flow-start <issue-number>'
 
 # extra argument
 extra_arg_output="$TMP_DIR/extra-arg-output"
@@ -170,7 +185,7 @@ else
 fi
 extra_arg_text="$(cat "$extra_arg_output")"
 assert_equals "$extra_arg_status" "1"
-assert_contains "$extra_arg_text" 'Usage: ai-dev flow start <issue-number>'
+assert_contains "$extra_arg_text" 'Usage: flow-start <issue-number>'
 
 # explicitly empty extra argument
 empty_extra_output="$TMP_DIR/empty-extra-output"
@@ -181,7 +196,7 @@ else
 fi
 empty_extra_text="$(cat "$empty_extra_output")"
 assert_equals "$empty_extra_status" "1"
-assert_contains "$empty_extra_text" 'Usage: ai-dev flow start <issue-number>'
+assert_contains "$empty_extra_text" 'Usage: flow-start <issue-number>'
 
 # too many extra arguments
 many_extra_output="$TMP_DIR/many-extra-output"
@@ -192,7 +207,7 @@ else
 fi
 many_extra_text="$(cat "$many_extra_output")"
 assert_equals "$many_extra_status" "1"
-assert_contains "$many_extra_text" 'Usage: ai-dev flow start <issue-number>'
+assert_contains "$many_extra_text" 'Usage: flow-start <issue-number>'
 
 too_many_extra_output="$TMP_DIR/too-many-extra-output"
 if run_flow_capture "$repo_missing_arg/subdir" "$too_many_extra_output" start 1 extra more even-more; then
@@ -202,7 +217,7 @@ else
 fi
 too_many_extra_text="$(cat "$too_many_extra_output")"
 assert_equals "$too_many_extra_status" "1"
-assert_contains "$too_many_extra_text" 'Usage: ai-dev flow start <issue-number>'
+assert_contains "$too_many_extra_text" 'Usage: flow-start <issue-number>'
 
 # invalid issue numbers
 for invalid_issue in 0 -1 nope 1.5; do
@@ -325,7 +340,7 @@ fi
 blocked_issue_text="$(cat "$blocked_issue_output")"
 assert_equals "$blocked_issue_status" "1"
 assert_contains "$blocked_issue_text" 'Cannot start workflow: issue 9 is blocked.'
-assert_contains "$blocked_issue_text" 'Use ai-dev flow resume 9.'
+assert_contains "$blocked_issue_text" 'Use flow-resume 9.'
 assert_equals "$(state_get "$repo_blocked_issue/subdir")" "$state_before_blocked_start"
 assert_equals "$(current_branch "$repo_blocked_issue")" "$branch_before_blocked_start"
 assert_equals "$(branch_head "$repo_blocked_issue" main)" "$main_head_before_blocked_start"
@@ -468,7 +483,7 @@ chmod +x "$mock_bin_dir/gh"
 issue_metadata_output="$TMP_DIR/issue-metadata-output"
 if (
 	cd "$repo_issue_metadata/subdir"
-	PATH="$mock_bin_dir:$PATH" "$AI_DEV_REAL" flow start 25
+	PATH="$mock_bin_dir:$PATH" "flow-start" 25
 ) >"$issue_metadata_output" 2>&1; then
 	issue_metadata_status=0
 else
@@ -500,7 +515,7 @@ ln -sf "$(command -v python3)" "$no_gh_bin_dir/python3"
 issue_no_gh_output="$TMP_DIR/issue-no-gh-output"
 if (
 	cd "$repo_issue_no_gh/subdir"
-	PATH="$no_gh_bin_dir" "$AI_DEV_REAL" flow start 26
+	PATH="$no_gh_bin_dir:$FLOW_BIN_DIR" "flow-start" 26
 ) >"$issue_no_gh_output" 2>&1; then
 	issue_no_gh_status=0
 else
@@ -529,7 +544,7 @@ chmod +x "$gh_nonzero_bin_dir/gh"
 issue_gh_nonzero_output="$TMP_DIR/issue-gh-nonzero-output"
 if (
 	cd "$repo_issue_gh_nonzero/subdir"
-	PATH="$gh_nonzero_bin_dir:$PATH" "$AI_DEV_REAL" flow start 27
+	PATH="$gh_nonzero_bin_dir:$PATH" "flow-start" 27
 ) >"$issue_gh_nonzero_output" 2>&1; then
 	issue_gh_nonzero_status=0
 else
@@ -558,7 +573,7 @@ chmod +x "$gh_malformed_bin_dir/gh"
 issue_gh_malformed_output="$TMP_DIR/issue-gh-malformed-output"
 if (
 	cd "$repo_issue_gh_malformed/subdir"
-	PATH="$gh_malformed_bin_dir:$PATH" "$AI_DEV_REAL" flow start 28
+	PATH="$gh_malformed_bin_dir:$PATH" "flow-start" 28
 ) >"$issue_gh_malformed_output" 2>&1; then
 	issue_gh_malformed_status=0
 else
@@ -605,7 +620,7 @@ fi
 issue_gh_invalid_url_missing_output="$TMP_DIR/issue-gh-invalid-url-missing-output"
 if (
 	cd "$repo_issue_gh_invalid_url_missing_scratch/subdir"
-	PATH="$gh_invalid_url_bin_dir:$PATH" "$AI_DEV_REAL" flow start 29
+	PATH="$gh_invalid_url_bin_dir:$PATH" "flow-start" 29
 ) >"$issue_gh_invalid_url_missing_output" 2>&1; then
 	issue_gh_invalid_url_missing_status=0
 else
@@ -668,7 +683,7 @@ fi
 issue_gh_invalid_url_existing_output="$TMP_DIR/issue-gh-invalid-url-existing-output"
 if (
 	cd "$repo_issue_gh_invalid_url_existing_scratch/subdir"
-	PATH="$gh_invalid_url_bin_dir:$PATH" "$AI_DEV_REAL" flow start 30
+	PATH="$gh_invalid_url_bin_dir:$PATH" "flow-start" 30
 ) >"$issue_gh_invalid_url_existing_output" 2>&1; then
 	issue_gh_invalid_url_existing_status=0
 else
@@ -704,54 +719,6 @@ assert_equals "$(state_get "$repo_issue_gh_invalid_url_existing_scratch/subdir")
   "checkpoint": 0
 }'
 
-# config file remains visible to Git while workflow file is ignored
-repo_config_visibility="$TMP_DIR/repo-config-visibility"
-init_repo "$repo_config_visibility"
-(
-	cd "$repo_config_visibility/subdir"
-	"$AI_DEV_REAL" set out='reports/a.txt' >/dev/null
-)
-config_status_untracked="$(repo_status_porcelain "$repo_config_visibility")"
-assert_file_exists "$repo_config_visibility/.ai-dev/config.json"
-assert_not_contains "$config_status_untracked" '.ai-dev/workflow.json'
-git -C "$repo_config_visibility" add -f .ai-dev/config.json
-git -C "$repo_config_visibility" commit -q -m 'track config for visibility check'
-(
-	cd "$repo_config_visibility/subdir"
-	"$AI_DEV_REAL" set out='reports/b.txt' >/dev/null
-)
-config_status_modified="$(repo_status_porcelain "$repo_config_visibility")"
-assert_file_exists "$repo_config_visibility/.ai-dev/config.json"
-assert_not_contains "$config_status_modified" '.ai-dev/workflow.json'
 
-# output routing
-repo_routing="$TMP_DIR/repo-routing"
-init_repo "$repo_routing"
-mkdir -p "$repo_routing/reports"
-(
-	cd "$repo_routing/subdir"
-	"$AI_DEV_REAL" set out='reports/start-output.txt' >/dev/null
-)
-git -C "$repo_routing" add -f .ai-dev/config.json
-git -C "$repo_routing" commit -q -m 'seed output routing config'
-routing_output="$TMP_DIR/routing-output"
-if run_flow_capture "$repo_routing/subdir" "$routing_output" start 24; then
-	routing_status=0
-else
-	routing_status=$?
-fi
-routing_text="$(cat "$routing_output")"
-routed_file="$repo_routing/reports/start-output.txt"
-assert_equals "$routing_status" "0"
-assert_equals "$routing_text" "Output written to $routed_file"
-routed_text="$(cat "$routed_file")"
-assert_contains "$routed_text" 'Started issue 24'
-assert_contains "$routed_text" 'mainBranch: main'
-assert_contains "$routed_text" 'scratchBranch: scratch'
-assert_contains "$routed_text" 'checkpoint: 0'
-assert_file_exists "$repo_routing/.ai-dev/workflow.json"
-git -C "$repo_routing" check-ignore -q .ai-dev/workflow.json
-routing_status_after_start="$(repo_status_porcelain "$repo_routing")"
-assert_equals "$routing_status_after_start" '?? reports/start-output.txt'
 
 printf 'flow start tests passed\n'

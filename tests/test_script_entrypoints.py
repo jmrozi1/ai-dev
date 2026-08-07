@@ -114,6 +114,8 @@ class ScriptEntrypointTests(unittest.TestCase):
 
     def test_install_sh_help(self) -> None:
         script = self.repo_root / "scripts" / "install.sh"
+        home_root = self.tmp_path / "home-help"
+        home_root.mkdir(parents=True, exist_ok=True)
         completed = subprocess.run(
             ["bash", str(script), "--help"],
             check=False,
@@ -122,10 +124,108 @@ class ScriptEntrypointTests(unittest.TestCase):
             text=True,
             encoding="utf-8",
             cwd=str(self.repo_root),
+            env={**dict(os.environ), "HOME": str(home_root)},
         )
         self.assertEqual(completed.returncode, 0)
-        self.assertIn("Usage: scripts/install.sh", completed.stdout)
-        self.assertIn("python -m ai_dev_flow.bootstrap", completed.stdout)
+        self.assertIn("Usage: scripts/install.sh [bootstrap-options]", completed.stdout)
+        self.assertIn("--force", completed.stdout)
+        self.assertIn("-v", completed.stdout)
+        self.assertIn("--verbose", completed.stdout)
+        self.assertIn("--prefix", completed.stdout)
+        self.assertIn("--home", completed.stdout)
+        self.assertIn("--install-dir", completed.stdout)
+        self.assertFalse((home_root / ".local" / "bin").exists())
+
+    def test_install_sh_custom_prefix_overrides_default_flow_prefix(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        fake_bin = self.tmp_path / "fake-bin-prefix"
+        selected_log = self.tmp_path / "selected-prefix.log"
+        self._write_fake_python(fake_bin / "python3.11", version="3.11.9")
+
+        completed = subprocess.run(
+            ["bash", str(script), "--prefix", "ai-flow"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(self.tmp_path / "home-prefix"),
+            },
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+
+        selected = selected_log.read_text(encoding="utf-8")
+        self.assertIn(" --prefix ai-flow", selected)
+
+    def test_install_sh_verbose_does_not_forward_verbose_flags(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        fake_bin = self.tmp_path / "fake-bin-verbose"
+        selected_log = self.tmp_path / "selected-verbose.log"
+        self._write_fake_python(fake_bin / "python3.11", version="3.11.9")
+
+        completed = subprocess.run(
+            ["bash", str(script), "--prefix", "ai-flow", "-v"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(self.tmp_path / "home-verbose-forward"),
+            },
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+
+        selected = selected_log.read_text(encoding="utf-8")
+        self.assertIn(" --prefix ai-flow", selected)
+        self.assertIn(" --installer-output detailed", selected)
+        self.assertNotIn(" -v", selected)
+        self.assertNotIn(" --verbose", selected)
+
+    def test_install_sh_forwards_home_and_install_dir_options(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        fake_bin = self.tmp_path / "fake-bin-home"
+        selected_log = self.tmp_path / "selected-home.log"
+        self._write_fake_python(fake_bin / "python3.11", version="3.11.9")
+
+        forwarded_home = self.tmp_path / "forwarded home"
+        forwarded_install_dir = self.tmp_path / "forwarded bin"
+        completed = subprocess.run(
+            [
+                "bash",
+                str(script),
+                "--home",
+                str(forwarded_home),
+                "--install-dir",
+                str(forwarded_install_dir),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(self.tmp_path / "home-installer"),
+            },
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+
+        selected = selected_log.read_text(encoding="utf-8")
+        self.assertIn(f" --home {forwarded_home}", selected)
+        self.assertIn(f" --install-dir {forwarded_install_dir}", selected)
 
     def test_install_sh_runs_bootstrap_and_handles_space_paths(self) -> None:
         script = self.repo_root / "scripts" / "install.sh"
@@ -137,10 +237,6 @@ class ScriptEntrypointTests(unittest.TestCase):
             [
                 "bash",
                 str(script),
-                "--home",
-                str(home_root),
-                "--install-dir",
-                str(install_dir),
             ],
             check=False,
             stdout=subprocess.PIPE,
@@ -148,11 +244,277 @@ class ScriptEntrypointTests(unittest.TestCase):
             text=True,
             encoding="utf-8",
             cwd=str(self.repo_root),
-            env={**dict(os.environ), "AI_DEV_PYTHON": sys.executable},
+            env={
+                **dict(os.environ),
+                "AI_DEV_PYTHON": sys.executable,
+                "HOME": str(home_root),
+                "PATH": f"{install_dir}:{os.environ.get('PATH', '')}",
+            },
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
-        self.assertTrue((install_dir / "ai-dev").exists())
+        self.assertTrue((install_dir / "flow-status").exists())
+        self.assertEqual(completed.stdout.strip(), "AI Dev installation completed successfully.")
+        self.assertNotIn("Platform:", completed.stdout)
+        self.assertNotIn("Launcher:", completed.stdout)
+
+    def test_install_sh_verbose_short_prints_detailed_report(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        home_root = self.tmp_path / "home-verbose-short"
+        install_dir = home_root / ".local" / "bin"
+        home_root.mkdir(parents=True, exist_ok=True)
+
+        completed = subprocess.run(
+            ["bash", str(script), "-v"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "AI_DEV_PYTHON": sys.executable,
+                "HOME": str(home_root),
+                "PATH": f"{install_dir}:{os.environ.get('PATH', '')}",
+            },
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("Bootstrap complete.", completed.stdout)
+        self.assertIn("Platform:", completed.stdout)
         self.assertIn("Launcher:", completed.stdout)
+
+    def test_install_sh_verbose_long_is_equivalent_to_short(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        home_short = self.tmp_path / "home-verbose-short-equivalent"
+        home_long = self.tmp_path / "home-verbose-long-equivalent"
+        install_short = home_short / ".local" / "bin"
+        install_long = home_long / ".local" / "bin"
+        home_short.mkdir(parents=True, exist_ok=True)
+        home_long.mkdir(parents=True, exist_ok=True)
+
+        short = subprocess.run(
+            ["bash", str(script), "-v"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "AI_DEV_PYTHON": sys.executable,
+                "HOME": str(home_short),
+                "PATH": f"{install_short}:{os.environ.get('PATH', '')}",
+            },
+        )
+        long = subprocess.run(
+            ["bash", str(script), "--verbose"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "AI_DEV_PYTHON": sys.executable,
+                "HOME": str(home_long),
+                "PATH": f"{install_long}:{os.environ.get('PATH', '')}",
+            },
+        )
+
+        self.assertEqual(short.returncode, 0, msg=short.stderr)
+        self.assertEqual(long.returncode, 0, msg=long.stderr)
+        self.assertIn("Bootstrap complete.", short.stdout)
+        self.assertIn("Bootstrap complete.", long.stdout)
+        self.assertIn("Platform:", short.stdout)
+        self.assertIn("Platform:", long.stdout)
+
+    def test_install_sh_force_short_and_long_are_equivalent(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        fake_bin = self.tmp_path / "fake-bin-force"
+        selected_log = self.tmp_path / "selected-force.log"
+        self._write_fake_python(fake_bin / "python3.11", version="3.11.9")
+
+        home_short = self.tmp_path / "home-force-short"
+        home_long = self.tmp_path / "home-force-long"
+        home_short.mkdir(parents=True, exist_ok=True)
+        home_long.mkdir(parents=True, exist_ok=True)
+
+        completed_short = subprocess.run(
+            ["bash", str(script), "-f"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(home_short),
+            },
+        )
+        completed_long = subprocess.run(
+            ["bash", str(script), "--force"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(home_long),
+            },
+        )
+
+        self.assertEqual(completed_short.returncode, 0, msg=completed_short.stderr)
+        self.assertEqual(completed_long.returncode, 0, msg=completed_long.stderr)
+
+        selected = selected_log.read_text(encoding="utf-8")
+        self.assertIn(" --force", selected)
+
+    def test_install_sh_force_and_verbose_combines_correctly(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        home_root = self.tmp_path / "home-force-verbose"
+        install_dir = home_root / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / "flow-start").write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            ["bash", str(script), "-f", "-v"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "AI_DEV_PYTHON": sys.executable,
+                "HOME": str(home_root),
+                "PATH": f"{install_dir}:{os.environ.get('PATH', '')}",
+            },
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("Bootstrap complete.", completed.stdout)
+        self.assertIn("Launcher:", completed.stdout)
+        self.assertIn("Force-replacing conflicting launcher", completed.stderr)
+
+    def test_install_sh_noninteractive_conflict_refuses_and_preserves_original(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        home_root = self.tmp_path / "home-decline"
+        install_dir = home_root / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        conflict = install_dir / "flow-start"
+        original = "#!/usr/bin/env sh\necho custom\n"
+        conflict.write_text(original, encoding="utf-8")
+
+        completed = subprocess.run(
+            ["bash", str(script)],
+            check=False,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "AI_DEV_PYTHON": sys.executable,
+                "HOME": str(home_root),
+                "PATH": f"{install_dir}:{os.environ.get('PATH', '')}",
+            },
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("AI Dev installation failed:", completed.stderr)
+        self.assertIn("Cannot prompt to replace conflicting launcher", completed.stderr)
+        self.assertEqual(conflict.read_text(encoding="utf-8"), original)
+
+    def test_install_sh_force_replacement_succeeds_and_reports_warning_status(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        home_root = self.tmp_path / "home-force-warning"
+        install_dir = home_root / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        (install_dir / "flow-start").write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
+
+        completed = subprocess.run(
+            ["bash", str(script), "-f"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={
+                **dict(os.environ),
+                "AI_DEV_PYTHON": sys.executable,
+                "HOME": str(home_root),
+                "PATH": f"{install_dir}:{os.environ.get('PATH', '')}",
+            },
+        )
+
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+        self.assertIn("AI Dev installation completed with warnings.", completed.stdout)
+        self.assertIn("Warning: Force-replaced conflicting launcher", completed.stdout)
+
+    def test_install_sh_second_install_up_to_date_prints_single_success_line(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        home_root = self.tmp_path / "home-second-install"
+        install_dir = home_root / ".local" / "bin"
+        home_root.mkdir(parents=True, exist_ok=True)
+        env = {
+            **dict(os.environ),
+            "AI_DEV_PYTHON": sys.executable,
+            "HOME": str(home_root),
+            "PATH": f"{install_dir}:{os.environ.get('PATH', '')}",
+        }
+
+        first = subprocess.run(
+            ["bash", str(script)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env=env,
+        )
+        second = subprocess.run(
+            ["bash", str(script)],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env=env,
+        )
+
+        self.assertEqual(first.returncode, 0, msg=first.stderr)
+        self.assertEqual(second.returncode, 0, msg=second.stderr)
+        self.assertEqual(first.stdout.strip(), "AI Dev installation completed successfully.")
+        self.assertEqual(second.stdout.strip(), "AI Dev installation completed successfully.")
+
+    def test_install_sh_failure_output_is_concise_and_nonzero(self) -> None:
+        script = self.repo_root / "scripts" / "install.sh"
+        completed = subprocess.run(
+            ["bash", str(script), "--prefix", "bad/prefix"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+            env={**dict(os.environ), "AI_DEV_PYTHON": sys.executable, "HOME": str(self.tmp_path / "home-fail")},
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("AI Dev installation failed:", completed.stderr)
+        self.assertNotIn("Traceback", completed.stderr)
 
     def test_install_sh_skips_incompatible_python3_for_python311(self) -> None:
         fake_bin = self.tmp_path / "fake-bin"
@@ -168,8 +530,8 @@ class ScriptEntrypointTests(unittest.TestCase):
             env_updates={
                 "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
                 "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(home_root),
             },
-            arguments=["--home", str(home_root), "--install-dir", str(install_dir)],
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         selected = selected_log.read_text(encoding="utf-8").strip().splitlines()
@@ -192,8 +554,8 @@ class ScriptEntrypointTests(unittest.TestCase):
                 "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
                 "AI_DEV_PYTHON": str(explicit_python),
                 "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(home_root),
             },
-            arguments=["--home", str(home_root), "--install-dir", str(install_dir)],
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         selected = selected_log.read_text(encoding="utf-8").strip().splitlines()
@@ -219,8 +581,8 @@ class ScriptEntrypointTests(unittest.TestCase):
             env_updates={
                 "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
                 "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(home_root),
             },
-            arguments=["--home", str(home_root), "--install-dir", str(install_dir)],
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         selected = selected_log.read_text(encoding="utf-8").strip().splitlines()
@@ -246,8 +608,8 @@ class ScriptEntrypointTests(unittest.TestCase):
             env_updates={
                 "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
                 "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(home_root),
             },
-            arguments=["--home", str(home_root), "--install-dir", str(install_dir)],
         )
         self.assertEqual(completed.returncode, 0, msg=completed.stderr)
         selected = selected_log.read_text(encoding="utf-8").strip().splitlines()
@@ -270,8 +632,8 @@ class ScriptEntrypointTests(unittest.TestCase):
                 "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
                 "AI_DEV_PYTHON": str(incompatible),
                 "AI_DEV_TEST_SELECTED_LOG": str(selected_log),
+                "HOME": str(home_root),
             },
-            arguments=["--home", str(home_root), "--install-dir", str(install_dir)],
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("AI_DEV_PYTHON", completed.stderr)
@@ -297,8 +659,8 @@ class ScriptEntrypointTests(unittest.TestCase):
         completed = self._run_install_with_fake_path(
             env_updates={
                 "PATH": f"{fake_bin}:{os.environ.get('PATH', '')}",
+                "HOME": str(home_root),
             },
-            arguments=["--home", str(home_root), "--install-dir", str(install_dir)],
         )
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("No compatible Python interpreter found", completed.stderr)

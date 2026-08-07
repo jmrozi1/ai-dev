@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -47,7 +48,54 @@ class FlowNamespaceTests(unittest.TestCase):
 
         return repo_root
 
-    def _invoke(self, cwd: Path, *arguments: str) -> tuple[int, str, str]:
+    def _write_workflow_state(self, repo_root: Path) -> None:
+        ai_dev_dir = repo_root / ".ai-dev"
+        ai_dev_dir.mkdir(parents=True, exist_ok=True)
+        (ai_dev_dir / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "mainBranch": "main",
+                    "scratchBranch": "scratch",
+                    "checkpoint": 0,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _write_blocked_workflow(self, repo_root: Path, issue_number: int) -> None:
+        ai_dev_dir = repo_root / ".ai-dev"
+        ai_dev_dir.mkdir(parents=True, exist_ok=True)
+        (ai_dev_dir / "blocked-workflows.json").write_text(
+            json.dumps(
+                {
+                    "blockedWorkflows": [
+                        {
+                            "issueNumber": issue_number,
+                            "issueTitle": f"Issue {issue_number}",
+                            "issueUrl": f"https://github.com/jmrozi1/ai-dev/issues/{issue_number}",
+                            "reason": "waiting",
+                            "blockedAt": "2026-08-07T00:00:00Z",
+                        }
+                    ]
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _invoke_direct(self, cwd: Path, command: str, *arguments: str) -> tuple[int, str, str]:
+        return self._invoke_with_argv(
+            cwd,
+            f"flow-{command}",
+            cli._DIRECT_FLOW_ROUTE_TOKEN,
+            command,
+            *arguments,
+        )
+
+    def _invoke_with_argv(self, cwd: Path, argv0: str, *arguments: str) -> tuple[int, str, str]:
         previous_cwd = Path.cwd()
         previous_argv = list(sys.argv)
         had_command_name = "FLOW_COMMAND_NAME" in os.environ
@@ -56,8 +104,8 @@ class FlowNamespaceTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
 
-        os.environ["FLOW_COMMAND_NAME"] = "ai-dev"
-        sys.argv = ["ai-dev", *arguments]
+        os.environ["FLOW_COMMAND_NAME"] = argv0
+        sys.argv = [argv0, *arguments]
         os.chdir(cwd)
 
         try:
@@ -79,153 +127,92 @@ class FlowNamespaceTests(unittest.TestCase):
 
         return code, stdout.getvalue(), stderr.getvalue()
 
-    def test_top_level_help_emphasizes_flow_without_compatibility_routes(self) -> None:
+    def test_no_generic_dispatcher_contract_remains(self) -> None:
         outside = self.tmp_path / "outside"
         outside.mkdir(parents=True)
 
-        code, stdout, stderr = self._invoke(outside, "-h")
-        self.assertEqual(code, 0)
-        self.assertEqual(stderr, "")
-
-        self.assertIn("Usage: ai-dev <command> [options]", stdout)
-        self.assertIn("Commands:\n  flow", stdout)
-        self.assertIn("\n  apply", stdout)
-        self.assertIn("\n  update", stdout)
-        self.assertNotIn("Compatibility routes", stdout)
-
-        apply_index = stdout.index("  apply")
-        update_index = stdout.index("  update")
-        get_index = stdout.index("  get")
-        self.assertLess(apply_index, update_index)
-        self.assertLess(update_index, get_index)
-
-        commands_section = stdout.split("Commands:\n", 1)[1].split(
-            "\n\nRun `ai-dev <command> --help`", 1
-        )[0]
-        self.assertNotIn("\n  start", commands_section)
-        self.assertNotIn("\n  status", commands_section)
-
-    def test_flow_help_lists_lifecycle_commands_in_deterministic_order(self) -> None:
-        outside = self.tmp_path / "outside-flow"
-        outside.mkdir(parents=True)
-
-        code, stdout, stderr = self._invoke(outside, "flow", "--help")
-        self.assertEqual(code, 0)
-        self.assertEqual(stderr, "")
-
-        self.assertIn("Usage: ai-dev flow <command> [options]", stdout)
-        expected_order = [
-            "start",
-            "patch",
-            "task-prepare",
-            "status",
-            "review",
-            "commit",
-            "reset",
-            "promote",
-            "complete",
-            "block",
-            "resume",
-        ]
-        positions = [stdout.index(f"  {name}") for name in expected_order]
-        self.assertEqual(positions, sorted(positions))
-
-    def test_flow_with_no_subcommand_shows_flow_help(self) -> None:
-        outside = self.tmp_path / "outside-no-subcommand"
-        outside.mkdir(parents=True)
-
-        code, stdout, stderr = self._invoke(outside, "flow")
-        self.assertEqual(code, 0)
-        self.assertEqual(stderr, "")
-        self.assertIn("Usage: ai-dev flow <command> [options]", stdout)
-
-    def test_unknown_flow_subcommand_returns_non_zero_with_guidance(self) -> None:
-        outside = self.tmp_path / "outside-unknown"
-        outside.mkdir(parents=True)
-
-        code, stdout, stderr = self._invoke(outside, "flow", "unknown")
-        self.assertEqual(code, 1)
-        self.assertEqual(stdout, "")
-        self.assertIn("ai-dev flow: unknown command: unknown", stderr)
-        self.assertIn("Run ai-dev flow --help for usage.", stderr)
-
-    def test_flow_status_dispatches_successfully(self) -> None:
-        repo_root = self._init_repo("repo-status")
-
-        code, stdout, stderr = self._invoke(repo_root, "flow", "status")
-        self.assertEqual(code, 0)
-        self.assertEqual(stderr, "")
-        self.assertIn("No active workflow.", stdout)
-
-    def test_removed_top_level_lifecycle_routes_are_rejected(self) -> None:
-        outside = self.tmp_path / "outside-removed"
-        outside.mkdir(parents=True)
-
-        removed_commands = (
-            "start",
-            "patch",
-            "task-prepare",
-            "status",
-            "review",
-            "commit",
-            "reset",
-            "promote",
-            "complete",
-            "block",
-            "resume",
-        )
-
-        for command in removed_commands:
-            with self.subTest(command=command):
-                code, stdout, stderr = self._invoke(outside, command, "--help")
+        for argv in ((), ("--help",), ("status",), ("commit",)):
+            with self.subTest(argv=argv):
+                code, stdout, stderr = self._invoke_with_argv(outside, "flow", *argv)
                 self.assertEqual(code, 1)
                 self.assertEqual(stdout, "")
-                self.assertIn(f"ai-dev: unknown command: {command}", stderr)
+                self.assertNotIn("Usage: flow <command>", stderr)
 
-    def test_flow_lifecycle_commands_remain_recognized(self) -> None:
-        outside = self.tmp_path / "outside-flow-recognized"
+    def test_legacy_flow_namespace_is_rejected(self) -> None:
+        outside = self.tmp_path / "outside-legacy"
+        outside.mkdir(parents=True)
+
+        code, stdout, stderr = self._invoke_with_argv(outside, "ai-dev", "flow", "status")
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("ai-dev: unknown command: flow", stderr)
+
+    def test_command_specific_help_uses_direct_executable_name(self) -> None:
+        outside = self.tmp_path / "outside-help"
         outside.mkdir(parents=True)
 
         for command in cli.FLOW_LIFECYCLE_COMMANDS:
             with self.subTest(command=command):
-                code, stdout, stderr = self._invoke(outside, "flow", command, "--help")
+                code, stdout, stderr = self._invoke_direct(outside, command, "--help")
                 self.assertEqual(code, 0)
                 self.assertEqual(stderr, "")
-                self.assertIn(f"Usage: ai-dev flow {command}", stdout)
+                self.assertIn(f"Usage: flow-{command}", stdout)
+                self.assertNotIn(f"Usage: flow-{command} {command}", stdout)
 
-    def test_task_prepare_is_flow_only(self) -> None:
-        outside = self.tmp_path / "outside-task-prepare"
+    def test_internal_direct_route_accepts_all_fixed_flow_commands(self) -> None:
+        outside = self.tmp_path / "outside-direct-accept"
         outside.mkdir(parents=True)
 
-        top_code, top_stdout, top_stderr = self._invoke(outside, "task-prepare", "--help")
-        self.assertEqual(top_code, 1)
-        self.assertEqual(top_stdout, "")
-        self.assertIn("ai-dev: unknown command: task-prepare", top_stderr)
+        for command in cli.FIXED_FLOW_EXECUTABLE_COMMANDS:
+            with self.subTest(command=command):
+                code, stdout, stderr = self._invoke_with_argv(
+                    outside,
+                    f"flow-{command}",
+                    cli._DIRECT_FLOW_ROUTE_TOKEN,
+                    command,
+                    "--help",
+                )
 
-        flow_code, flow_stdout, flow_stderr = self._invoke(outside, "flow", "task-prepare", "--help")
-        self.assertEqual(flow_code, 0)
-        self.assertEqual(flow_stderr, "")
-        self.assertIn("Usage: ai-dev flow task-prepare", flow_stdout)
+                self.assertEqual(code, 0)
+                self.assertEqual(stderr, "")
+                self.assertIn(f"Usage: flow-{command}", stdout)
 
-    def test_registry_metadata_drives_help_lists(self) -> None:
-        outside = self.tmp_path / "outside-registry"
+    def test_internal_direct_route_rejects_non_fixed_flow_command(self) -> None:
+        outside = self.tmp_path / "outside-direct-reject"
         outside.mkdir(parents=True)
 
-        top_code, top_stdout, top_stderr = self._invoke(outside, "help")
-        flow_code, flow_stdout, flow_stderr = self._invoke(outside, "flow", "--help")
+        for command in ("review", "review-verify", "summarize", "summarize-verify"):
+            with self.subTest(command=command):
+                code, stdout, stderr = self._invoke_with_argv(
+                    outside,
+                    "flow-review",
+                    cli._DIRECT_FLOW_ROUTE_TOKEN,
+                    command,
+                    "--help",
+                )
 
-        self.assertEqual(top_code, 0)
-        self.assertEqual(top_stderr, "")
-        self.assertEqual(flow_code, 0)
-        self.assertEqual(flow_stderr, "")
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn(f"Invalid internal flow executable command: {command}", stderr)
 
-        for command in cli.TOP_LEVEL_CANONICAL_COMMANDS:
-            self.assertIn(f"  {command}", top_stdout)
+    def test_blocked_start_guidance_uses_custom_prefix_resume_executable(self) -> None:
+        repo_root = self._init_repo("repo-blocked-prefix-guidance")
+        self._run_git(repo_root, "checkout", "-q", "-b", "scratch")
+        self._write_workflow_state(repo_root)
+        self._write_blocked_workflow(repo_root, 9)
 
-        for command in cli.FLOW_LIFECYCLE_COMMANDS:
-            self.assertIn(f"  {command}", flow_stdout)
+        code, stdout, stderr = self._invoke_with_argv(
+            repo_root,
+            "ai-flow-start",
+            cli._DIRECT_FLOW_ROUTE_TOKEN,
+            "start",
+            "9",
+        )
 
-        self.assertEqual(cli.TOP_LEVEL_COMPATIBILITY_COMMANDS, ())
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("Cannot start workflow: issue 9 is blocked.", stderr)
+        self.assertIn("Use ai-flow-resume 9.", stderr)
 
 
 if __name__ == "__main__":

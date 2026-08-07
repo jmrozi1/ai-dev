@@ -1,4 +1,7 @@
-# Generated-Task Foundation (Issue #14)
+# Generated-Task Foundation (Issue #14, Historical)
+
+The generated-task, delivery, and report-presentation runtime documented below was retired in Issue #23 checkpoint 6.
+This file is retained as archival reference only.
 
 ## Scope
 

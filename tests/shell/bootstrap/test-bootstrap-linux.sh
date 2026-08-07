@@ -62,8 +62,9 @@ default_text="$(cat "$default_output")"
 assert_equals "$default_status" "0"
 assert_contains "$default_text" 'DEPRECATED: tools/bootstrap/bootstrap-linux.sh is deprecated.'
 assert_contains "$default_text" 'Use scripts/install.sh instead (or run ai-dev apply).'
-assert_contains "$default_text" 'Launcher:'
-assert_exists "$home_root/.local/bin/ai-dev"
+assert_contains "$default_text" 'AI Dev installation completed with warnings.'
+assert_contains "$default_text" 'Warning: Install directory is not currently on PATH.'
+assert_exists "$home_root/.local/bin/flow-start"
 
 # repeated invocation is safe/idempotent
 home_root="$TMP_DIR/home-repeat"
@@ -76,7 +77,8 @@ else
 fi
 repeat_text="$(cat "$repeat_output")"
 assert_equals "$repeat_status" "0"
-assert_contains "$repeat_text" 'Launcher:'
-assert_exists "$home_root/.local/bin/ai-dev"
+assert_contains "$repeat_text" 'AI Dev installation completed with warnings.'
+assert_contains "$repeat_text" 'Warning: Install directory is not currently on PATH.'
+assert_exists "$home_root/.local/bin/flow-start"
 
 printf 'bootstrap-linux tests passed\n'

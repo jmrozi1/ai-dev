@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 assert_contains() {
 	local haystack="$1"
 	local needle="$2"
@@ -90,9 +103,11 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 	(
 		cd "$cwd"
-		"$AI_DEV_REAL" flow "$@"
+		"flow-$flow_command" "$@"
 	)
 }
 
@@ -212,7 +227,7 @@ else
 	unknown_flag_status=$?
 fi
 assert_equals "$unknown_flag_status" '1'
-assert_contains "$(cat "$unknown_flag_output")" 'Usage: ai-dev flow status [-v|--verbose]'
+assert_contains "$(cat "$unknown_flag_output")" 'Usage: flow-status [-v|--verbose]'
 
 positional_output="$TMP_DIR/positional-output"
 if run_flow_capture "$repo_args/subdir" "$positional_output" status detail; then
@@ -221,7 +236,7 @@ else
 	positional_status=$?
 fi
 assert_equals "$positional_status" '1'
-assert_contains "$(cat "$positional_output")" 'Usage: ai-dev flow status [-v|--verbose]'
+assert_contains "$(cat "$positional_output")" 'Usage: flow-status [-v|--verbose]'
 
 multi_output="$TMP_DIR/multi-output"
 if run_flow_capture "$repo_args/subdir" "$multi_output" status -v --verbose; then
@@ -230,7 +245,7 @@ else
 	multi_status=$?
 fi
 assert_equals "$multi_status" '1'
-assert_contains "$(cat "$multi_output")" 'Usage: ai-dev flow status [-v|--verbose]'
+assert_contains "$(cat "$multi_output")" 'Usage: flow-status [-v|--verbose]'
 
 empty_arg_output="$TMP_DIR/empty-arg-output"
 if run_flow_capture "$repo_args/subdir" "$empty_arg_output" status ''; then
@@ -239,11 +254,10 @@ else
 	empty_arg_status=$?
 fi
 assert_equals "$empty_arg_status" '1'
-assert_contains "$(cat "$empty_arg_output")" 'Usage: ai-dev flow status [-v|--verbose]'
+assert_contains "$(cat "$empty_arg_output")" 'Usage: flow-status [-v|--verbose]'
 
-help_output="$(run_flow "$repo_args/subdir" --help)"
-assert_contains "$help_output" 'Usage: ai-dev flow <command> [options]'
-assert_contains "$help_output" 'status        Show the active issue and current repository state.'
+help_output="$(run_flow "$repo_args/subdir" status --help)"
+assert_contains "$help_output" 'Usage: flow-status [-v|--verbose]'
 
 # outside repository
 outside_repo="$TMP_DIR/outside-repo"
@@ -517,13 +531,9 @@ mkdir -p "$repo_subdir/subdir/nested/deeper"
 subdir_output="$(run_flow "$repo_subdir/subdir/nested/deeper" status)"
 assert_equals "$subdir_output" $'No active workflow.\nBranch: main'
 
-# output routing and malformed config strictness
+# malformed repository config is ignored by status
 repo_routing="$TMP_DIR/repo-routing"
 init_repo "$repo_routing"
-routed_output_path="$TMP_DIR/status-routed.txt"
-write_config_file "$repo_routing" "$routed_output_path"
-git -C "$repo_routing" add .ai-dev/config.json
-git -C "$repo_routing" commit -q -m 'track config'
 routing_terminal_output="$TMP_DIR/routing-terminal-output"
 if run_flow_capture "$repo_routing/subdir" "$routing_terminal_output" status; then
 	routing_status=0
@@ -532,14 +542,8 @@ else
 fi
 assert_equals "$routing_status" '0'
 routing_terminal_text="$(cat "$routing_terminal_output")"
-routing_file_text="$(cat "$routed_output_path")"
-routing_terminal_without_confirmation="$(printf '%s\n' "$routing_terminal_text" | sed '$d')"
-routing_terminal_confirmation="$(printf '%s\n' "$routing_terminal_text" | tail -n 1)"
 assert_contains "$routing_terminal_text" 'No active workflow.'
 assert_contains "$routing_terminal_text" 'Branch: main'
-assert_equals "$routing_terminal_without_confirmation" "$routing_file_text"
-assert_equals "$routing_terminal_confirmation" "Output written to $routed_output_path"
-assert_not_contains "$routing_file_text" 'Output written to'
 
 repo_malformed="$TMP_DIR/repo-malformed"
 init_repo "$repo_malformed"
@@ -551,8 +555,9 @@ if run_flow_capture "$repo_malformed/subdir" "$malformed_output" status; then
 else
 	malformed_status=$?
 fi
-assert_equals "$malformed_status" '1'
-assert_contains "$(cat "$malformed_output")" 'Invalid JSON in'
+assert_equals "$malformed_status" '0'
+assert_contains "$(cat "$malformed_output")" 'No active workflow.'
+assert_contains "$(cat "$malformed_output")" 'Branch: main'
 
 # read-only guarantees: workflow state, refs, HEAD, index, and worktree unchanged
 repo_read_only="$TMP_DIR/repo-read-only"

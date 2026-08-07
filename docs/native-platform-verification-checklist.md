@@ -1,22 +1,23 @@
-# Native Windows Verification Checklist (Issue #14 Blocker)
+# Native Windows Verification Checklist (Issue #14 Blocker, Historical)
 
-This checklist records what is complete on the current development platform and what still requires native Windows execution before closing issue #14.
+This checklist documents historical verification scope from Issue #14.
+The generated-task, delivery, and report-presentation runtime described here was retired in Issue #23 checkpoint 6.
 
 ## Linux Status (Implemented and Natively Verified)
 
 - Foundation behavior is implemented and verified on Linux through the current unittest and shell regression suites.
-- Delivery, task generation, editor-opening behavior, and report presentation flows are validated in Linux CI-compatible tests.
+- Delivery/task-generation/report-presentation items below are historical and no longer part of the active runtime surface.
 
 ## Windows Status (Mocked Coverage Complete, Native Verification Pending)
 
-Windows-related mocked coverage includes:
+Historical Windows mocked coverage included:
 
 - PowerShell clipboard command selection: `powershell` then `powershell.exe`
 - clipboard payload passed via stdin
 - no shell interpolation for clipboard command
 - editor command parsing and fallback-chain logic
 
-Native Windows verification still required:
+Historical native Windows verification items were:
 
 - verify PowerShell clipboard copy places exact invocation text onto the real clipboard
 - verify executable discovery in native environments (`powershell` and `powershell.exe`)

@@ -1,5 +1,7 @@
 # Summarize Task Preparation Slice 2 (Issue #15)
 
+Historical note: Runtime summarize commands were retired in Issue #23 checkpoint 5. This document is archived for historical reference only.
+
 ## Scope
 
 Slice 2 adds deterministic summarize execution preparation on top of Slice 1 planning.

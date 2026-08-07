@@ -127,10 +127,6 @@ def resolve_repo_root(cwd: Path | None = None) -> Path:
     return Path(completed.stdout.strip())
 
 
-def config_file_for_repo_root(repo_root: Path) -> Path:
-    return repo_root / ".ai-dev" / "config.json"
-
-
 def workflow_state_file_for_repo_root(repo_root: Path) -> Path:
     return repo_root / ".ai-dev" / "workflow.json"
 
@@ -145,8 +141,6 @@ def ensure_local_state_excluded(repo_root: Path) -> None:
 
 def sync_local_excludes(
     repo_root: Path,
-    *,
-    configured_output: str | None = None,
 ) -> None:
     exclude_path = _git_path_for_repo_root(repo_root, "info/exclude")
 
@@ -163,9 +157,6 @@ def sync_local_excludes(
     preserved_lines = _strip_managed_exclude_block(existing_lines)
 
     managed_entries = [".ai-dev/"]
-    output_exclusion = _managed_output_exclusion(repo_root, configured_output)
-    if output_exclusion is not None and output_exclusion not in managed_entries:
-        managed_entries.append(output_exclusion)
 
     next_text = _compose_exclude_text(
         preserved_lines=preserved_lines,
@@ -655,44 +646,3 @@ def _compose_exclude_text(
         return ""
 
     return "\n".join(lines) + "\n"
-
-
-def _managed_output_exclusion(
-    repo_root: Path,
-    configured_output: str | None,
-) -> str | None:
-    if configured_output is None:
-        return None
-
-    output_path = Path(configured_output)
-    if output_path.is_absolute():
-        resolved_output = output_path.resolve()
-    else:
-        resolved_output = (repo_root / output_path).resolve()
-
-    repo_root_resolved = repo_root.resolve()
-    try:
-        relative_output = resolved_output.relative_to(repo_root_resolved)
-    except ValueError:
-        return None
-
-    relative_text = relative_output.as_posix()
-    if not relative_text:
-        return None
-
-    return _escape_gitignore_pattern(relative_text)
-
-
-def _escape_gitignore_pattern(path: str) -> str:
-    replacements = {
-        "\\": "\\\\",
-        " ": "\\ ",
-        "#": "\\#",
-        "!": "\\!",
-        "*": "\\*",
-        "?": "\\?",
-        "[": "\\[",
-        "]": "\\]",
-    }
-
-    return "".join(replacements.get(character, character) for character in path)

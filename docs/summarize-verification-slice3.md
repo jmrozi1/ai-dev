@@ -1,5 +1,7 @@
 # Summarize Verification Slice 3 (Issue #15)
 
+Historical note: Runtime summarize commands were retired in Issue #23 checkpoint 5. This document is archived for historical reference only.
+
 ## Scope
 
 Slice 3 adds deterministic post-execution verification for summarize task preparation outputs.

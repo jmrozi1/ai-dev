@@ -89,6 +89,11 @@ class FlowResumeSafetyTests(unittest.TestCase):
         return repo_root
 
     def _invoke(self, cwd: Path, *arguments: str) -> tuple[int, str, str]:
+        if not arguments:
+            raise ValueError("command is required")
+        command = arguments[0]
+        command_arguments = list(arguments[1:])
+
         previous_cwd = Path.cwd()
         previous_argv = list(sys.argv)
         had_command_name = "FLOW_COMMAND_NAME" in os.environ
@@ -97,25 +102,13 @@ class FlowResumeSafetyTests(unittest.TestCase):
         stdout = io.StringIO()
         stderr = io.StringIO()
 
-        lifecycle_commands = {
-            "start",
-            "patch",
-            "task-prepare",
-            "status",
-            "review",
-            "commit",
-            "reset",
-            "promote",
-            "complete",
-            "block",
-            "resume",
-        }
-        invocation_arguments = list(arguments)
-        if invocation_arguments and invocation_arguments[0] in lifecycle_commands:
-            invocation_arguments = ["flow", *invocation_arguments]
-
-        os.environ["FLOW_COMMAND_NAME"] = "flow"
-        sys.argv = ["flow", *invocation_arguments]
+        os.environ["FLOW_COMMAND_NAME"] = f"flow-{command}"
+        sys.argv = [
+            f"flow-{command}",
+            cli._DIRECT_FLOW_ROUTE_TOKEN,
+            command,
+            *command_arguments,
+        ]
         os.chdir(cwd)
 
         try:

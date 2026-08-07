@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 fail() {
 	printf '%s\n' "$1" >&2
 	exit 1
@@ -72,10 +85,12 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 
 	(
 		cd "$cwd"
-		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "$AI_DEV_REAL" flow "$@"
+		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" "flow-$flow_command" "$@"
 	)
 }
 
@@ -236,12 +251,9 @@ assert_equals "$status_after_start" $'Issue 123\nBranch: scratch'
 printf 'checkpoint one\n' >> "$lifecycle_repo/tracked.txt"
 printf 'new file one\n' > "$lifecycle_repo/one.txt"
 
-review_one_output="$(run_flow "$lifecycle_repo/subdir" review)"
-assert_contains "$review_one_output" 'Issue: 123'
-assert_contains "$review_one_output" 'Review summary:'
-assert_contains "$review_one_output" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
-assert_contains "$review_one_output" 'diff --git a/one.txt b/one.txt'
-assert_contains "$review_one_output" 'diff --git a/tracked.txt b/tracked.txt'
+diff_one_output="$(run_flow "$lifecycle_repo/subdir" diff)"
+assert_contains "$diff_one_output" 'diff --git a/one.txt b/one.txt'
+assert_contains "$diff_one_output" 'diff --git a/tracked.txt b/tracked.txt'
 
 commit_one_output="$(run_flow "$lifecycle_repo/subdir" commit)"
 assert_contains "$commit_one_output" 'Created checkpoint 1'
@@ -257,14 +269,16 @@ assert_contains "$status_after_commit_one" '1 commit ahead of main'
 printf 'checkpoint two\n' >> "$lifecycle_repo/tracked.txt"
 printf 'new file two\n' > "$lifecycle_repo/two.txt"
 
-review_two_output="$(run_flow "$lifecycle_repo/subdir" review)"
-assert_contains "$review_two_output" 'Issue: 123'
-assert_contains "$review_two_output" 'Review summary:'
-assert_contains "$review_two_output" 'Diff legend: + added, - removed, unprefixed lines are unchanged context'
-assert_contains "$review_two_output" 'diff --git a/two.txt b/two.txt'
-assert_contains "$review_two_output" ' checkpoint one'
-assert_contains "$review_two_output" '+checkpoint two'
-assert_not_contains "$review_two_output" '+checkpoint one'
+diff_two_output="$(run_flow "$lifecycle_repo/subdir" diff)"
+assert_contains "$diff_two_output" 'diff --git a/two.txt b/two.txt'
+assert_contains "$diff_two_output" '+checkpoint two'
+
+diff_all_output="$(run_flow "$lifecycle_repo/subdir" diff --all)"
+assert_contains "$diff_all_output" 'diff --git a/one.txt b/one.txt'
+assert_contains "$diff_all_output" 'diff --git a/two.txt b/two.txt'
+assert_contains "$diff_all_output" ' checkpoint one'
+assert_contains "$diff_all_output" '+checkpoint two'
+assert_contains "$diff_all_output" '+checkpoint one'
 
 commit_two_output="$(run_flow "$lifecycle_repo/subdir" commit)"
 assert_contains "$commit_two_output" 'Created checkpoint 2'

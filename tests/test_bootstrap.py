@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import os
 from pathlib import Path
 import re
@@ -10,19 +13,20 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from ai_dev_flow.cli import FIXED_FLOW_EXECUTABLE_COMMANDS
 from ai_dev_flow.bootstrap import (
     BootstrapError,
     OWNERSHIP_MARKER,
+    _DIRECT_FLOW_ROUTE_TOKEN,
     _render_path_guidance,
-    _ensure_owned_launcher_text,
     _is_path_on_path,
     _paths_equal,
+    resolve_prefix_launcher_ownership_path,
     render_cmd_launcher,
     render_posix_launcher,
     render_powershell_launcher,
     run_bootstrap,
 )
-from ai_dev_flow.update_installation import load_installation_source_record
 
 
 class BootstrapCoreTests(unittest.TestCase):
@@ -34,6 +38,44 @@ class BootstrapCoreTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
+
+    def _write_prefix_ownership_record(
+        self,
+        *,
+        home: Path,
+        selected_prefix: str,
+        platform: str,
+        install_directory: Path | str,
+        owned_launchers: dict[str, str],
+    ) -> Path:
+        record_path = resolve_prefix_launcher_ownership_path(os_name="posix", home=home)
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "selected_prefix": selected_prefix,
+            "platform": platform,
+            "install_directory": str(install_directory),
+            "owned_launchers": dict(sorted(owned_launchers.items())),
+        }
+        record_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return record_path
+
+    def test_fixed_flow_executable_registry_matches_checkpoint_two_surface(self) -> None:
+        self.assertEqual(
+            FIXED_FLOW_EXECUTABLE_COMMANDS,
+            (
+                "start",
+                "patch",
+                "status",
+                "diff",
+                "commit",
+                "reset",
+                "promote",
+                "complete",
+                "block",
+                "resume",
+            ),
+        )
 
     def test_render_posix_launcher_forwards_args(self) -> None:
         text = render_posix_launcher(
@@ -70,18 +112,6 @@ class BootstrapCoreTests(unittest.TestCase):
         self.assertIn("-m ai_dev_flow.cli %*", text)
         self.assertIn("exit /b %AI_DEV_EXIT%", text)
 
-    def test_owned_launcher_detection(self) -> None:
-        _ensure_owned_launcher_text(f"#!/usr/bin/env sh\n# {OWNERSHIP_MARKER}\n", Path("/tmp/x"))
-        _ensure_owned_launcher_text(f"# {OWNERSHIP_MARKER}\nWrite-Output 'ok'\n", Path("/tmp/x.ps1"))
-        _ensure_owned_launcher_text(f"@echo off\n:: {OWNERSHIP_MARKER}\n", Path("/tmp/x.cmd"))
-        with self.assertRaises(BootstrapError):
-            _ensure_owned_launcher_text("#!/usr/bin/env sh\n# not-owned\n", Path("/tmp/y"))
-        with self.assertRaises(BootstrapError):
-            _ensure_owned_launcher_text(
-                f"#!/usr/bin/env sh\necho {OWNERSHIP_MARKER}\n",
-                Path("/tmp/z"),
-            )
-
     def test_path_detection_posix_and_windows(self) -> None:
         self.assertTrue(
             _is_path_on_path(Path("/tmp/bin"), path_value="/usr/bin:/tmp/bin:/bin", windows=False)
@@ -117,33 +147,27 @@ class BootstrapCoreTests(unittest.TestCase):
         home = self.tmp_path / "home"
         install_dir = home / ".local" / "bin"
         home.mkdir(parents=True)
-        self.config_path.parent.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(
-            "installation:\n"
-            "  aliases:\n"
-            "    commands: {}\n",
-            encoding="utf-8",
-        )
 
         first = run_bootstrap(
             platform="posix",
             repo_root=self.repo_root,
-            command_name="ai-dev",
+            prefix="flow",
             install_directory=install_dir,
             home=home,
             shell_program="/bin/bash",
             config_path=self.config_path,
             path_value="/usr/bin:/bin",
         )
-        self.assertFalse(first.config_created)
-        launcher_path = install_dir / "ai-dev"
-        self.assertTrue(launcher_path.exists())
-        self.assertTrue(launcher_path.stat().st_mode & 0o111)
+        self.assertEqual(first.command_name, "flow-*")
+        for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+            launcher_path = install_dir / f"flow-{command}"
+            self.assertTrue(launcher_path.exists())
+            self.assertTrue(launcher_path.stat().st_mode & 0o111)
 
         second = run_bootstrap(
             platform="posix",
             repo_root=self.repo_root,
-            command_name="ai-dev",
+            prefix="flow",
             install_directory=install_dir,
             home=home,
             shell_program="/bin/bash",
@@ -151,34 +175,318 @@ class BootstrapCoreTests(unittest.TestCase):
             path_value=f"{install_dir}:/usr/bin:/bin",
         )
         states = [item.state for item in second.launcher_statuses]
-        self.assertEqual(states, ["up-to-date"])
+        self.assertEqual(states, ["up-to-date"] * len(FIXED_FLOW_EXECUTABLE_COMMANDS))
         self.assertTrue(second.install_dir_on_path)
 
     def test_non_owned_collision_is_rejected(self) -> None:
         home = self.tmp_path / "home-collision"
         install_dir = home / ".local" / "bin"
         install_dir.mkdir(parents=True, exist_ok=True)
-        collision_path = install_dir / "ai-dev"
+        collision_path = install_dir / "flow-start"
         collision_path.write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
 
         with self.assertRaises(BootstrapError):
             run_bootstrap(
                 platform="posix",
                 repo_root=self.repo_root,
-                command_name="ai-dev",
+                prefix="flow",
                 install_directory=install_dir,
                 home=home,
                 shell_program="/bin/bash",
                 config_path=self.config_path,
+                input_stream=io.StringIO(""),
+                output_stream=io.StringIO(),
+                interactive=False,
             )
 
         self.assertEqual(collision_path.read_text(encoding="utf-8"), "#!/usr/bin/env sh\necho custom\n")
+
+    def test_interactive_y_replaces_non_owned_conflicting_launcher(self) -> None:
+        home = self.tmp_path / "home-collision-yes"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        collision_path = install_dir / "flow-start"
+        collision_path.write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            input_stream=io.StringIO("y\n"),
+            output_stream=io.StringIO(),
+            interactive=True,
+        )
+
+        self.assertIn(OWNERSHIP_MARKER, collision_path.read_text(encoding="utf-8"))
+        states = {item.path.name: item.state for item in result.launcher_statuses}
+        self.assertEqual(states["flow-start"], "updated")
+
+    def test_interactive_yes_replaces_non_owned_conflicting_launcher(self) -> None:
+        home = self.tmp_path / "home-collision-yes-long"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        collision_path = install_dir / "flow-start"
+        collision_path.write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            input_stream=io.StringIO("yes\n"),
+            output_stream=io.StringIO(),
+            interactive=True,
+        )
+
+        self.assertIn(OWNERSHIP_MARKER, collision_path.read_text(encoding="utf-8"))
+
+    def test_interactive_declines_preserve_conflicting_launcher_bytes(self) -> None:
+        responses = ("\n", "n\n", "No\n", "maybe\n")
+        for index, response in enumerate(responses):
+            with self.subTest(response=response.strip() or "empty"):
+                home = self.tmp_path / f"home-collision-decline-{index}"
+                install_dir = home / ".local" / "bin"
+                install_dir.mkdir(parents=True, exist_ok=True)
+                collision_path = install_dir / "flow-start"
+                original = "#!/usr/bin/env sh\necho custom\n"
+                collision_path.write_text(original, encoding="utf-8")
+                output_capture = io.StringIO()
+
+                with self.assertRaises(BootstrapError) as context:
+                    run_bootstrap(
+                        platform="posix",
+                        repo_root=self.repo_root,
+                        prefix="flow",
+                        install_directory=install_dir,
+                        home=home,
+                        shell_program="/bin/bash",
+                        config_path=self.config_path,
+                        input_stream=io.StringIO(response),
+                        output_stream=output_capture,
+                        interactive=True,
+                    )
+
+                self.assertIn("Preserved conflicting launcher", str(context.exception))
+                self.assertIn("Replace it? [y/N]", output_capture.getvalue())
+                self.assertEqual(collision_path.read_text(encoding="utf-8"), original)
+
+    def test_noninteractive_without_force_refuses_and_preserves_conflicting_launcher(self) -> None:
+        home = self.tmp_path / "home-collision-noninteractive"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        collision_path = install_dir / "flow-start"
+        original = "#!/usr/bin/env sh\necho custom\n"
+        collision_path.write_text(original, encoding="utf-8")
+
+        with self.assertRaises(BootstrapError) as context:
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=install_dir,
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+                input_stream=io.StringIO(""),
+                output_stream=io.StringIO(),
+                interactive=False,
+            )
+
+        self.assertIn("Cannot prompt to replace conflicting launcher", str(context.exception))
+        self.assertEqual(collision_path.read_text(encoding="utf-8"), original)
+
+    def test_force_replaces_conflicting_launcher_without_stdin_read(self) -> None:
+        class _ExplodingInput:
+            def readline(self) -> str:
+                raise AssertionError("stdin should not be read in force mode")
+
+            def isatty(self) -> bool:
+                return False
+
+        home = self.tmp_path / "home-collision-force"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        collision_path = install_dir / "flow-start"
+        collision_path.write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
+        stderr_capture = io.StringIO()
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            force=True,
+            input_stream=_ExplodingInput(),
+            output_stream=stderr_capture,
+            interactive=False,
+        )
+
+        self.assertIn(OWNERSHIP_MARKER, collision_path.read_text(encoding="utf-8"))
+        self.assertIn("Force-replacing conflicting launcher", stderr_capture.getvalue())
+
+    def test_force_replacement_updates_ownership_and_second_install_requires_no_force(self) -> None:
+        home = self.tmp_path / "home-collision-record"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        collision_path = install_dir / "flow-start"
+        collision_path.write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            force=True,
+            input_stream=io.StringIO(""),
+            output_stream=io.StringIO(),
+            interactive=False,
+        )
+
+        record_path = resolve_prefix_launcher_ownership_path(os_name="posix", home=home)
+        record_data = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertIn(str(collision_path), record_data["owned_launchers"])
+        self.assertEqual(
+            record_data["owned_launchers"][str(collision_path)],
+            hashlib.sha256(collision_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest(),
+        )
+
+        class _NoReadInput:
+            def readline(self) -> str:
+                raise AssertionError("prompt should not be reached")
+
+            def isatty(self) -> bool:
+                return True
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            input_stream=_NoReadInput(),
+            output_stream=io.StringIO(),
+            interactive=True,
+        )
+        self.assertTrue(all(item.state == "up-to-date" for item in second.launcher_statuses if item.path == collision_path))
+
+    def test_modified_owned_launcher_follows_prompt_force_contract(self) -> None:
+        home = self.tmp_path / "home-collision-divergent-owned"
+        install_dir = home / ".local" / "bin"
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        launcher_path = install_dir / "flow-start"
+        original = launcher_path.read_text(encoding="utf-8")
+        launcher_path.write_text(original + "# user change\n", encoding="utf-8")
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=install_dir,
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+                input_stream=io.StringIO(""),
+                output_stream=io.StringIO(),
+                interactive=False,
+            )
+        self.assertIn("# user change\n", launcher_path.read_text(encoding="utf-8"))
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            force=True,
+            input_stream=io.StringIO(""),
+            output_stream=io.StringIO(),
+            interactive=False,
+        )
+        self.assertEqual(launcher_path.read_text(encoding="utf-8"), original)
+
+    def test_force_replacement_does_not_overwrite_symlink_target(self) -> None:
+        home = self.tmp_path / "home-collision-symlink"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        target_path = home / "outside-target.sh"
+        target_path.write_text("#!/usr/bin/env sh\necho outside\n", encoding="utf-8")
+        launcher_path = install_dir / "flow-start"
+        launcher_path.symlink_to(target_path)
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            force=True,
+            input_stream=io.StringIO(""),
+            output_stream=io.StringIO(),
+            interactive=False,
+        )
+
+        self.assertEqual(target_path.read_text(encoding="utf-8"), "#!/usr/bin/env sh\necho outside\n")
+        self.assertFalse(launcher_path.is_symlink())
+        self.assertIn(OWNERSHIP_MARKER, launcher_path.read_text(encoding="utf-8"))
+
+    def test_unrelated_similarly_named_file_remains_untouched_when_forcing_conflict_replacement(self) -> None:
+        home = self.tmp_path / "home-collision-unrelated"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        collision_path = install_dir / "flow-start"
+        unrelated_path = install_dir / "flow-start-custom"
+        collision_path.write_text("#!/usr/bin/env sh\necho custom\n", encoding="utf-8")
+        unrelated_path.write_text("custom tool\n", encoding="utf-8")
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+            force=True,
+            input_stream=io.StringIO(""),
+            output_stream=io.StringIO(),
+            interactive=False,
+        )
+
+        self.assertEqual(unrelated_path.read_text(encoding="utf-8"), "custom tool\n")
 
     def test_non_owned_collision_with_marker_mention_is_rejected(self) -> None:
         home = self.tmp_path / "home-collision-marker"
         install_dir = home / ".local" / "bin"
         install_dir.mkdir(parents=True, exist_ok=True)
-        collision_path = install_dir / "ai-dev"
+        collision_path = install_dir / "flow-start"
         collision_path.write_text(
             "#!/usr/bin/env sh\n"
             "echo start\n"
@@ -190,11 +498,14 @@ class BootstrapCoreTests(unittest.TestCase):
             run_bootstrap(
                 platform="posix",
                 repo_root=self.repo_root,
-                command_name="ai-dev",
+                prefix="flow",
                 install_directory=install_dir,
                 home=home,
                 shell_program="/bin/bash",
                 config_path=self.config_path,
+                input_stream=io.StringIO(""),
+                output_stream=io.StringIO(),
+                interactive=False,
             )
 
         self.assertIn(OWNERSHIP_MARKER, collision_path.read_text(encoding="utf-8"))
@@ -216,19 +527,19 @@ class BootstrapCoreTests(unittest.TestCase):
                 config_path=self.config_path,
             )
 
-    def test_invalid_command_name_rejected_before_filesystem_work(self) -> None:
-        invalid_names = ["flow", "../x", "./ai-dev", "/tmp/x", "ai dev", " ai-dev", "ai-dev "]
-        for invalid_name in invalid_names:
-            with self.subTest(command_name=invalid_name):
+    def test_invalid_prefix_rejected_before_filesystem_work(self) -> None:
+        invalid_prefixes = ["", " flow", "flow ", "flow/status", "flow*", "flow?", "flow.", "flow_"]
+        for invalid_prefix in invalid_prefixes:
+            with self.subTest(prefix=invalid_prefix):
                 with self.assertRaises(BootstrapError) as ctx:
                     run_bootstrap(
                         platform="posix",
                         repo_root=self.tmp_path / "missing-repo",
-                        command_name=invalid_name,
+                        prefix=invalid_prefix,
                         config_path=self.config_path,
                     )
 
-                self.assertIn("Unsupported command name", str(ctx.exception))
+                self.assertIn("Invalid prefix", str(ctx.exception))
 
     def test_windows_install_renders_cmd_and_ps1_without_eval(self) -> None:
         home = self.tmp_path / "home-win"
@@ -236,7 +547,7 @@ class BootstrapCoreTests(unittest.TestCase):
         result = run_bootstrap(
             platform="windows",
             repo_root=self.repo_root,
-            command_name="ai-dev",
+            prefix="flow",
             install_directory=install_dir,
             home=home,
             user_profile=str(home),
@@ -245,8 +556,8 @@ class BootstrapCoreTests(unittest.TestCase):
         )
         self.assertFalse(result.install_dir_on_path)
 
-        ps1_path = install_dir / "ai-dev.ps1"
-        cmd_path = install_dir / "ai-dev.cmd"
+        ps1_path = install_dir / "flow-status.ps1"
+        cmd_path = install_dir / "flow-status.cmd"
         ps1_text = ps1_path.read_text(encoding="utf-8")
         cmd_text = cmd_path.read_text(encoding="utf-8")
         self.assertIn("@args", ps1_text)
@@ -259,7 +570,7 @@ class BootstrapCoreTests(unittest.TestCase):
         home = self.tmp_path / "home-rollback"
         install_dir = home / ".local" / "bin"
         install_dir.mkdir(parents=True, exist_ok=True)
-        launcher_path = install_dir / "ai-dev"
+        launcher_path = install_dir / "flow-start"
         original = "#!/usr/bin/env sh\n# AI_DEV_LAUNCHER_V1\necho old\n"
         launcher_path.write_text(original, encoding="utf-8")
         launcher_path.chmod(0o755)
@@ -269,11 +580,14 @@ class BootstrapCoreTests(unittest.TestCase):
                 run_bootstrap(
                     platform="posix",
                     repo_root=self.repo_root,
-                    command_name="ai-dev",
+                    prefix="flow",
                     install_directory=install_dir,
                     home=home,
                     shell_program="/bin/bash",
                     config_path=self.config_path,
+                    input_stream=io.StringIO("y\n"),
+                    output_stream=io.StringIO(),
+                    interactive=True,
                 )
 
         self.assertEqual(launcher_path.read_text(encoding="utf-8"), original)
@@ -284,16 +598,16 @@ class BootstrapCoreTests(unittest.TestCase):
         result = run_bootstrap(
             platform="posix",
             repo_root=self.repo_root,
-            command_name="ai-dev",
+            prefix="flow",
             install_directory=install_dir,
             home=home,
             shell_program="/bin/bash",
             config_path=self.config_path,
             path_value="/usr/bin:/bin",
         )
-        self.assertEqual(result.command_name, "ai-dev")
+        self.assertEqual(result.command_name, "flow-*")
 
-        launcher = install_dir / "ai-dev"
+        launcher = install_dir / "flow-status"
         self.assertTrue(launcher.exists())
 
         help_run = subprocess.run(
@@ -307,9 +621,9 @@ class BootstrapCoreTests(unittest.TestCase):
         )
         self.assertEqual(help_run.returncode, 0)
         self.assertIn("usage:", help_run.stdout.lower())
-        self.assertIn("config", help_run.stdout)
+        self.assertNotIn("config", help_run.stdout)
 
-        invalid_token = "not-a-real-ai-dev-command"
+        invalid_token = "not-a-real-flow-status-token"
         invalid_run = subprocess.run(
             [str(launcher), invalid_token],
             check=False,
@@ -320,7 +634,7 @@ class BootstrapCoreTests(unittest.TestCase):
             cwd=str(self.tmp_path),
         )
         self.assertNotEqual(invalid_run.returncode, 0)
-        self.assertIn(invalid_token, invalid_run.stderr)
+        self.assertIn("Usage: flow-status", invalid_run.stderr)
 
     def test_windows_path_guidance_single_quotes_literal_path(self) -> None:
         special_path = Path("C:/Users/O'Brien/Dir With $dollars/with`tick;semi(paren)")
@@ -441,74 +755,970 @@ class BootstrapCoreTests(unittest.TestCase):
         self.assertIsNotNone(match)
         self.assertEqual(int(match.group(1)), 0)
 
-    def test_bootstrap_records_installation_source_metadata(self) -> None:
-        home = self.tmp_path / "home-meta"
+    def test_prefix_install_creates_fixed_flow_launchers(self) -> None:
+        home = self.tmp_path / "home-prefix"
         install_dir = home / ".local" / "bin"
+
         result = run_bootstrap(
             platform="posix",
             repo_root=self.repo_root,
-            command_name="ai-dev",
+            prefix="flow",
             install_directory=install_dir,
             home=home,
             shell_program="/bin/bash",
             config_path=self.config_path,
-            update_branch="main",
-            update_remote="origin",
         )
 
-        record = load_installation_source_record(result.installation_source_path)
-        self.assertTrue(result.installation_source_path.exists())
-        self.assertEqual(record.source_repository, self.repo_root.resolve())
-        self.assertEqual(record.branch, "main")
-        self.assertEqual(record.remote, "origin")
+        self.assertEqual(result.command_name, "flow-*")
+        installed_names = {status.path.name for status in result.launcher_statuses}
+        expected_names = {f"flow-{command}" for command in FIXED_FLOW_EXECUTABLE_COMMANDS}
+        self.assertEqual(installed_names, expected_names)
 
-    def test_bootstrap_metadata_refresh_is_idempotent(self) -> None:
-        home = self.tmp_path / "home-meta-repeat"
+        for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+            launcher_text = (install_dir / f"flow-{command}").read_text(encoding="utf-8")
+            self.assertIn(_DIRECT_FLOW_ROUTE_TOKEN, launcher_text)
+            self.assertIn(f"'{command}'", launcher_text)
+
+    def test_recorded_owned_launchers_are_removed_on_prefix_change(self) -> None:
+        home = self.tmp_path / "home-prefix-stale"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        removed = {item.path.name for item in result.launcher_statuses if item.state == "removed"}
+        self.assertIn("flow-status", removed)
+
+    def test_invalid_prefix_rejected_before_repo_validation(self) -> None:
+        invalid_prefixes = ["", " flow", "flow ", "flow/status", "flow*", "flow?", "flow.", "flow_"]
+        for invalid_prefix in invalid_prefixes:
+            with self.subTest(prefix=invalid_prefix):
+                with self.assertRaises(BootstrapError) as ctx:
+                    run_bootstrap(
+                        platform="posix",
+                        repo_root=self.tmp_path / "missing-repo",
+                        prefix=invalid_prefix,
+                        config_path=self.config_path,
+                    )
+                self.assertIn("Invalid prefix", str(ctx.exception))
+
+    def test_prefix_transition_flow_to_ai_flow_removes_old_owned_launchers(self) -> None:
+        home = self.tmp_path / "home-prefix-transition-1"
         install_dir = home / ".local" / "bin"
 
         first = run_bootstrap(
             platform="posix",
             repo_root=self.repo_root,
-            command_name="ai-dev",
+            prefix="flow",
             install_directory=install_dir,
             home=home,
             shell_program="/bin/bash",
             config_path=self.config_path,
         )
-        first_text = first.installation_source_path.read_text(encoding="utf-8")
+        self.assertTrue(any(item.path.name == "flow-status" for item in first.launcher_statuses))
 
         second = run_bootstrap(
             platform="posix",
             repo_root=self.repo_root,
-            command_name="ai-dev",
+            prefix="ai-flow",
             install_directory=install_dir,
             home=home,
             shell_program="/bin/bash",
             config_path=self.config_path,
         )
-        second_text = second.installation_source_path.read_text(encoding="utf-8")
 
-        self.assertEqual(first.installation_source_path, second.installation_source_path)
-        self.assertEqual(first_text, second_text)
+        for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+            self.assertFalse((install_dir / f"flow-{command}").exists())
+            self.assertTrue((install_dir / f"ai-flow-{command}").exists())
 
-    def test_bootstrap_records_canonical_git_root_from_symlink(self) -> None:
-        home = self.tmp_path / "home-subdir"
+        removed = {item.path.name for item in second.launcher_statuses if item.state == "removed"}
+        self.assertIn("flow-status", removed)
+
+    def test_prefix_transition_ai_flow_to_flow_removes_old_owned_launchers(self) -> None:
+        home = self.tmp_path / "home-prefix-transition-2"
         install_dir = home / ".local" / "bin"
-        symlink_root = self.tmp_path / "repo-link"
-        symlink_root.symlink_to(self.repo_root, target_is_directory=True)
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+            self.assertFalse((install_dir / f"ai-flow-{command}").exists())
+            self.assertTrue((install_dir / f"flow-{command}").exists())
+
+        removed = {item.path.name for item in second.launcher_statuses if item.state == "removed"}
+        self.assertIn("ai-flow-status", removed)
+
+    def test_same_prefix_moved_to_different_install_directory_reconciles_old_owned_launchers(self) -> None:
+        home = self.tmp_path / "home-prefix-move-same"
+        old_install_dir = home / ".local" / "bin-old"
+        new_install_dir = home / ".local" / "bin-new"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=old_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=new_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        removed = {item.path.name for item in second.launcher_statuses if item.state == "removed"}
+        self.assertIn("flow-status", removed)
+        self.assertFalse((old_install_dir / "flow-status").exists())
+        self.assertTrue((new_install_dir / "flow-status").exists())
+
+    def test_prefix_and_install_directory_changed_together_reconciles_old_owned_launchers(self) -> None:
+        home = self.tmp_path / "home-prefix-move-both"
+        old_install_dir = home / ".local" / "bin-old"
+        new_install_dir = home / ".local" / "bin-new"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=old_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=new_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        removed = {item.path.name for item in second.launcher_statuses if item.state == "removed"}
+        self.assertIn("flow-status", removed)
+        self.assertFalse((old_install_dir / "flow-status").exists())
+        self.assertTrue((new_install_dir / "ai-flow-status").exists())
+
+    def test_modified_old_install_directory_launcher_is_preserved_and_reported_after_move(self) -> None:
+        home = self.tmp_path / "home-prefix-move-preserve"
+        old_install_dir = home / ".local" / "bin-old"
+        new_install_dir = home / ".local" / "bin-new"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=old_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        modified = old_install_dir / "flow-status"
+        modified.write_text(modified.read_text(encoding="utf-8") + "# user old-dir change\n", encoding="utf-8")
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=new_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        preserved = [item for item in second.launcher_statuses if item.path == modified]
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].state, "preserved-divergent")
+        self.assertTrue(modified.exists())
+        self.assertTrue((new_install_dir / "flow-status").exists())
+
+    def test_old_matching_launchers_removed_and_new_record_contains_only_new_set_after_move(self) -> None:
+        home = self.tmp_path / "home-prefix-move-record"
+        old_install_dir = home / ".local" / "bin-old"
+        new_install_dir = home / ".local" / "bin-new"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=old_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=new_install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        record_path = resolve_prefix_launcher_ownership_path(os_name="posix", home=home)
+        record_data = json.loads(record_path.read_text(encoding="utf-8"))
+        self.assertEqual(record_data["selected_prefix"], "flow")
+        self.assertEqual(record_data["install_directory"], str(new_install_dir))
+
+        recorded_paths = set(record_data["owned_launchers"].keys())
+        self.assertTrue(recorded_paths)
+        self.assertTrue(all(path.startswith(str(new_install_dir) + os.sep) for path in recorded_paths))
+        self.assertFalse(any(path.startswith(str(old_install_dir) + os.sep) for path in recorded_paths))
+
+    def test_modified_obsolete_launcher_is_preserved_and_reported(self) -> None:
+        home = self.tmp_path / "home-prefix-modified"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        modified = install_dir / "flow-status"
+        modified.write_text(modified.read_text(encoding="utf-8") + "# user change\n", encoding="utf-8")
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        self.assertTrue(modified.exists())
+        preserved = [item for item in second.launcher_statuses if item.path == modified]
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].state, "preserved-divergent")
+
+    def test_owned_obsolete_flow_review_launcher_is_removed(self) -> None:
+        home = self.tmp_path / "home-obsolete-review-removed"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        launcher_path = install_dir / "flow-review"
+        launcher_text = render_posix_launcher(
+            repo_root=self.repo_root,
+            python_executable=Path("/usr/bin/python3"),
+            command_name="flow-review",
+            flow_direct_command="review",
+        )
+        launcher_path.write_text(launcher_text, encoding="utf-8")
+        launcher_path.chmod(0o755)
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={str(launcher_path): hashlib.sha256(launcher_text.encode("utf-8")).hexdigest()},
+        )
 
         result = run_bootstrap(
             platform="posix",
-            repo_root=symlink_root,
-            command_name="ai-dev",
+            repo_root=self.repo_root,
+            prefix="flow",
             install_directory=install_dir,
             home=home,
             shell_program="/bin/bash",
             config_path=self.config_path,
         )
 
-        record = load_installation_source_record(result.installation_source_path)
-        self.assertEqual(record.source_repository, self.repo_root.resolve())
+        removed = [item for item in result.launcher_statuses if item.path == launcher_path]
+        self.assertEqual(len(removed), 1)
+        self.assertEqual(removed[0].state, "removed")
+        self.assertFalse(launcher_path.exists())
+
+    def test_modified_owned_obsolete_flow_review_launcher_is_preserved_and_reported(self) -> None:
+        home = self.tmp_path / "home-obsolete-review-preserved"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        launcher_path = install_dir / "flow-review"
+        launcher_text = render_posix_launcher(
+            repo_root=self.repo_root,
+            python_executable=Path("/usr/bin/python3"),
+            command_name="flow-review",
+            flow_direct_command="review",
+        )
+        launcher_path.write_text(launcher_text + "# user change\n", encoding="utf-8")
+        launcher_path.chmod(0o755)
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={str(launcher_path): hashlib.sha256(launcher_text.encode("utf-8")).hexdigest()},
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        preserved = [item for item in result.launcher_statuses if item.path == launcher_path]
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].state, "preserved-divergent")
+        self.assertTrue(launcher_path.exists())
+
+    def test_custom_prefix_obsolete_review_launchers_follow_same_cleanup_rules(self) -> None:
+        for divergent in (False, True):
+            with self.subTest(divergent=divergent):
+                home = self.tmp_path / f"home-obsolete-custom-{int(divergent)}"
+                install_dir = home / ".local" / "bin"
+                install_dir.mkdir(parents=True, exist_ok=True)
+
+                launcher_path = install_dir / "ai-flow-review"
+                launcher_text = render_posix_launcher(
+                    repo_root=self.repo_root,
+                    python_executable=Path("/usr/bin/python3"),
+                    command_name="ai-flow-review",
+                    flow_direct_command="review",
+                )
+                file_text = launcher_text + ("# user change\n" if divergent else "")
+                launcher_path.write_text(file_text, encoding="utf-8")
+                launcher_path.chmod(0o755)
+                self._write_prefix_ownership_record(
+                    home=home,
+                    selected_prefix="ai-flow",
+                    platform="posix",
+                    install_directory=install_dir,
+                    owned_launchers={str(launcher_path): hashlib.sha256(launcher_text.encode("utf-8")).hexdigest()},
+                )
+
+                result = run_bootstrap(
+                    platform="posix",
+                    repo_root=self.repo_root,
+                    prefix="ai-flow",
+                    install_directory=install_dir,
+                    home=home,
+                    shell_program="/bin/bash",
+                    config_path=self.config_path,
+                )
+
+                statuses = [item for item in result.launcher_statuses if item.path == launcher_path]
+                self.assertEqual(len(statuses), 1)
+                self.assertEqual(
+                    statuses[0].state,
+                    "preserved-divergent" if divergent else "removed",
+                )
+                self.assertEqual(launcher_path.exists(), divergent)
+
+    def test_unrelated_review_like_files_remain_untouched_during_obsolete_cleanup(self) -> None:
+        home = self.tmp_path / "home-obsolete-review-unrelated"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        obsolete_path = install_dir / "flow-review"
+        obsolete_text = render_posix_launcher(
+            repo_root=self.repo_root,
+            python_executable=Path("/usr/bin/python3"),
+            command_name="flow-review",
+            flow_direct_command="review",
+        )
+        obsolete_path.write_text(obsolete_text, encoding="utf-8")
+        obsolete_path.chmod(0o755)
+
+        unrelated_a = install_dir / "flow-review-custom"
+        unrelated_b = install_dir / "ai-flow-review-custom"
+        unrelated_a.write_text("user script a\n", encoding="utf-8")
+        unrelated_b.write_text("user script b\n", encoding="utf-8")
+
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={str(obsolete_path): hashlib.sha256(obsolete_text.encode("utf-8")).hexdigest()},
+        )
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        self.assertFalse(obsolete_path.exists())
+        self.assertEqual(unrelated_a.read_text(encoding="utf-8"), "user script a\n")
+        self.assertEqual(unrelated_b.read_text(encoding="utf-8"), "user script b\n")
+
+    def test_obsolete_launcher_with_invalid_utf8_bytes_is_preserved_and_reported(self) -> None:
+        home = self.tmp_path / "home-prefix-invalid-utf8"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        modified = install_dir / "flow-status"
+        modified.write_bytes(modified.read_bytes() + b"\n\xff\xfeinvalid\n")
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        self.assertTrue(modified.exists())
+        preserved = [item for item in second.launcher_statuses if item.path == modified]
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0].state, "preserved-divergent")
+
+    def test_unrelated_similarly_named_files_are_preserved(self) -> None:
+        home = self.tmp_path / "home-prefix-unrelated"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+        unrelated_a = install_dir / "flow-custom"
+        unrelated_b = install_dir / "ai-flow-custom"
+        unrelated_a.write_text("user script\n", encoding="utf-8")
+        unrelated_b.write_text("another user script\n", encoding="utf-8")
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        self.assertEqual(unrelated_a.read_text(encoding="utf-8"), "user script\n")
+        self.assertEqual(unrelated_b.read_text(encoding="utf-8"), "another user script\n")
+
+    def test_prefix_same_reinstall_is_idempotent(self) -> None:
+        home = self.tmp_path / "home-prefix-idempotent"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        second = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        states = [item.state for item in second.launcher_statuses]
+        self.assertTrue(states)
+        self.assertTrue(all(state == "up-to-date" for state in states))
+
+    def test_prefix_ownership_record_updates_after_successful_reconciliation(self) -> None:
+        home = self.tmp_path / "home-prefix-record"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        record_path = resolve_prefix_launcher_ownership_path(os_name="posix", home=home)
+        first_text = record_path.read_text(encoding="utf-8")
+        self.assertIn('"selected_prefix": "flow"', first_text)
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        second_text = record_path.read_text(encoding="utf-8")
+        self.assertIn('"selected_prefix": "ai-flow"', second_text)
+
+    def test_malformed_record_rejects_path_outside_install_directory(self) -> None:
+        home = self.tmp_path / "home-record-outside"
+        install_dir = home / ".local" / "bin"
+        outside_path = self.tmp_path / "outside" / "flow-status"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={str(outside_path): "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=install_dir,
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_malformed_record_rejects_non_normalized_path(self) -> None:
+        home = self.tmp_path / "home-record-nonnormal"
+        install_dir = home / ".local" / "bin"
+        non_normalized = f"{install_dir}/subdir/../flow-status"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={non_normalized: "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=install_dir,
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_malformed_record_rejects_different_prefix(self) -> None:
+        home = self.tmp_path / "home-record-prefix"
+        install_dir = home / ".local" / "bin"
+        mismatched = install_dir / "ai-flow-status"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={str(mismatched): "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=install_dir,
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_malformed_record_rejects_unknown_command(self) -> None:
+        home = self.tmp_path / "home-record-command"
+        install_dir = home / ".local" / "bin"
+        unknown = install_dir / "flow-unknown"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={str(unknown): "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=install_dir,
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_malformed_record_rejects_invalid_platform_extension(self) -> None:
+        home = self.tmp_path / "home-record-ext"
+        install_dir = home / ".local" / "bin"
+        bad_ext = install_dir / "flow-status.cmd"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="posix",
+            install_directory=install_dir,
+            owned_launchers={str(bad_ext): "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=install_dir,
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_windows_record_accepts_valid_cmd_launcher(self) -> None:
+        home = self.tmp_path / "home-record-windows-valid"
+        install_directory = r"C:\Users\Example\.local\bin"
+        launcher_path = r"C:\Users\Example\.local\bin\flow-status.cmd"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={launcher_path: "0" * 64},
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=home / ".local" / "bin",
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        self.assertTrue(any(item.path.name == "flow-status" for item in result.launcher_statuses))
+
+    def test_windows_record_accepts_valid_ps1_launcher(self) -> None:
+        home = self.tmp_path / "home-record-windows-valid-ps1"
+        install_directory = r"C:\Users\Example\.local\bin"
+        launcher_path = r"C:\Users\Example\.local\bin\flow-diff.ps1"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={launcher_path: "0" * 64},
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=home / ".local" / "bin",
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        self.assertTrue(any(item.path.name == "flow-status" for item in result.launcher_statuses))
+
+    def test_windows_record_accepts_case_insensitive_prefix_command_and_extension(self) -> None:
+        home = self.tmp_path / "home-record-windows-casing"
+        install_directory = r"C:\Users\Example\.local\bin"
+        launchers = {
+            r"C:\Users\Example\.local\bin\Flow-Status.CMD": "0" * 64,
+            r"C:\Users\Example\.local\bin\FLOW-DIFF.ps1": "1" * 64,
+        }
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers=launchers,
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=home / ".local" / "bin",
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+        self.assertTrue(any(item.path.name == "flow-status" for item in result.launcher_statuses))
+
+    def test_windows_record_rejects_path_outside_recorded_install_directory(self) -> None:
+        home = self.tmp_path / "home-record-windows-outside"
+        install_directory = r"C:\Users\Example\.local\bin"
+        outside_path = r"C:\Users\Example\Other\flow-status.cmd"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={outside_path: "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=home / ".local" / "bin",
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_windows_record_rejects_path_below_recorded_install_directory(self) -> None:
+        home = self.tmp_path / "home-record-windows-below"
+        install_directory = r"C:\Users\Example\.local\bin"
+        nested_path = r"C:\Users\Example\.local\bin\nested\flow-status.cmd"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={nested_path: "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=home / ".local" / "bin",
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_windows_record_rejects_non_normalized_windows_path(self) -> None:
+        home = self.tmp_path / "home-record-windows-nonnormal"
+        install_directory = r"C:\Users\Example\.local\bin"
+        non_normalized = r"C:\Users\Example\.local\bin\sub\..\flow-status.cmd"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={non_normalized: "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=home / ".local" / "bin",
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_windows_record_rejects_mismatched_prefix(self) -> None:
+        home = self.tmp_path / "home-record-windows-prefix"
+        install_directory = r"C:\Users\Example\.local\bin"
+        mismatched = r"C:\Users\Example\.local\bin\ai-flow-status.cmd"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={mismatched: "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=home / ".local" / "bin",
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_windows_record_rejects_unknown_command(self) -> None:
+        home = self.tmp_path / "home-record-windows-command"
+        install_directory = r"C:\Users\Example\.local\bin"
+        unknown = r"C:\Users\Example\.local\bin\flow-unknown.cmd"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={unknown: "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=home / ".local" / "bin",
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_windows_record_rejects_invalid_windows_launcher_extension(self) -> None:
+        home = self.tmp_path / "home-record-windows-extension"
+        install_directory = r"C:\Users\Example\.local\bin"
+        bad_extension = r"C:\Users\Example\.local\bin\flow-status.bat"
+        self._write_prefix_ownership_record(
+            home=home,
+            selected_prefix="flow",
+            platform="windows",
+            install_directory=install_directory,
+            owned_launchers={bad_extension: "0" * 64},
+        )
+
+        with self.assertRaises(BootstrapError):
+            run_bootstrap(
+                platform="posix",
+                repo_root=self.repo_root,
+                prefix="flow",
+                install_directory=home / ".local" / "bin",
+                home=home,
+                shell_program="/bin/bash",
+                config_path=self.config_path,
+            )
+
+    def test_prefixed_launchers_show_direct_help_and_forward_exit_codes(self) -> None:
+        home = self.tmp_path / "home-prefix-exec"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+            launcher = install_dir / f"flow-{command}"
+            with self.subTest(command=command):
+                help_run = subprocess.run(
+                    [str(launcher), "--help"],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    cwd=str(self.tmp_path),
+                )
+                self.assertEqual(help_run.returncode, 0)
+                self.assertIn(f"Usage: flow-{command}", help_run.stdout)
+                self.assertNotIn(f"Usage: flow-{command} {command}", help_run.stdout)
+
+        malformed_arguments: dict[str, list[str]] = {
+            "start": [],
+            "patch": [],
+            "status": ["--bogus"],
+            "diff": ["--bogus"],
+            "commit": ["extra"],
+            "reset": ["extra"],
+            "promote": [],
+            "complete": ["extra"],
+            "block": [],
+            "resume": [],
+        }
+
+        for command, arguments in malformed_arguments.items():
+            launcher = install_dir / f"flow-{command}"
+            with self.subTest(malformed_usage=command):
+                failure_run = subprocess.run(
+                    [str(launcher), *arguments],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    cwd=str(self.tmp_path),
+                )
+                self.assertNotEqual(failure_run.returncode, 0)
+                self.assertIn(f"Usage: flow-{command}", failure_run.stderr)
+                self.assertNotIn(f"Usage: flow-{command} {command}", failure_run.stderr)
+
+        status_launcher = install_dir / "flow-status"
+        status_run = subprocess.run(
+            [str(status_launcher), "--verbose"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.repo_root),
+        )
+        self.assertEqual(status_run.returncode, 0)
+        self.assertIn("Workflow:", status_run.stdout)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 fail() {
 	printf '%s\n' "$1" >&2
 	exit 1
@@ -73,9 +86,11 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 	(
 		cd "$cwd"
-		"$AI_DEV_REAL" flow "$@"
+		"flow-$flow_command" "$@"
 	)
 }
 
@@ -180,7 +195,7 @@ else
 fi
 	extra_text="$(cat "$extra_output")"
 assert_equals "$extra_status" '1'
-assert_contains "$extra_text" 'Usage: ai-dev flow commit'
+assert_contains "$extra_text" 'Usage: flow-commit'
 
 empty_extra_output="$TMP_DIR/empty-extra-output"
 if run_flow_capture "$repo_args/subdir" "$empty_extra_output" commit ''; then
@@ -190,7 +205,7 @@ else
 fi
 	empty_extra_text="$(cat "$empty_extra_output")"
 assert_equals "$empty_extra_status" '1'
-assert_contains "$empty_extra_text" 'Usage: ai-dev flow commit'
+assert_contains "$empty_extra_text" 'Usage: flow-commit'
 
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
@@ -469,7 +484,6 @@ repo_routing="$TMP_DIR/repo-routing"
 init_repo "$repo_routing"
 git -C "$repo_routing" checkout -q -b scratch
 routing_output_path="$TMP_DIR/commit-output.txt"
-track_config_file "$repo_routing" "$routing_output_path"
 state_set "$repo_routing/subdir" '{"activeIssueNumber":24,"mainBranch":"main","scratchBranch":"scratch","checkpoint":2}' >/dev/null
 printf 'routed\n' >> "$repo_routing/tracked.txt"
 git -C "$repo_routing" add tracked.txt
@@ -481,11 +495,9 @@ else
 fi
 	routing_terminal_text="$(cat "$routing_terminal_output")"
 assert_equals "$routing_status" '0'
-assert_equals "$routing_terminal_text" "Output written to $routing_output_path"
-routing_file_text="$(cat "$routing_output_path")"
-assert_contains "$routing_file_text" 'Created checkpoint 3'
-assert_contains "$routing_file_text" 'commit: '
-assert_contains "$routing_file_text" 'activeIssueNumber: 24'
+assert_contains "$routing_terminal_text" 'Created checkpoint 3'
+assert_contains "$routing_terminal_text" 'commit: '
+assert_contains "$routing_terminal_text" 'activeIssueNumber: 24'
 assert_repo_clean "$repo_routing"
 
 repo_commit_fail="$TMP_DIR/repo-commit-fail"

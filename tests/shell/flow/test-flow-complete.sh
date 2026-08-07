@@ -10,6 +10,19 @@ fi
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
+FLOW_COMMANDS=(start patch status diff commit reset promote complete block resume)
+FLOW_BIN_DIR="$TMP_DIR/flow-bin"
+mkdir -p "$FLOW_BIN_DIR"
+for flow_command in "${FLOW_COMMANDS[@]}"; do
+	launcher="$FLOW_BIN_DIR/flow-$flow_command"
+	{
+		printf '%s\n' '#!/usr/bin/env bash'
+		printf 'FLOW_COMMAND_NAME="flow-%s" PYTHONPATH="%s" exec python3 -m ai_dev_flow.cli __ai_dev_flow_exec__ "%s" "$@"\n' "$flow_command" "$ROOT" "$flow_command"
+	} >"$launcher"
+	chmod +x "$launcher"
+done
+export PATH="$FLOW_BIN_DIR:$PATH"
+
 assert_contains() {
 	local haystack="$1"
 	local needle="$2"
@@ -68,9 +81,11 @@ init_repo() {
 run_flow() {
 	local cwd="$1"
 	shift
+	local flow_command="$1"
+	shift
 	(
 		cd "$cwd"
-		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "$AI_DEV_REAL" flow "$@"
+		PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" "flow-$flow_command" "$@"
 	)
 }
 
@@ -299,7 +314,7 @@ else
 fi
 extra_text="$(cat "$extra_output")"
 assert_equals "$extra_status" '1'
-assert_contains "$extra_text" 'Usage: ai-dev flow complete'
+assert_contains "$extra_text" 'Usage: flow-complete'
 
 empty_extra_output="$TMP_DIR/empty-extra-output"
 if run_flow_capture "$repo_args/subdir" "$empty_extra_output" complete ''; then
@@ -309,7 +324,7 @@ else
 fi
 empty_extra_text="$(cat "$empty_extra_output")"
 assert_equals "$empty_extra_status" '1'
-assert_contains "$empty_extra_text" 'Usage: ai-dev flow complete'
+assert_contains "$empty_extra_text" 'Usage: flow-complete'
 
 outside_repo="$TMP_DIR/outside-repo"
 mkdir -p "$outside_repo"
@@ -525,7 +540,6 @@ assert_contains "$checkpoint_text" 'checkpoint must be 0'
 repo_success="$TMP_DIR/repo-success"
 init_repo "$repo_success"
 success_routed_output_path="$TMP_DIR/success-out.txt"
-track_config_file "$repo_success" "$success_routed_output_path"
 git -C "$repo_success" checkout -q -b scratch
 state_set "$repo_success/subdir" '{"activeIssueNumber":21,"activeIssueTitle":"Done title","activeIssueUrl":"https://github.com/jmrozi1/ai-dev/issues/21","mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
 write_gh_state "$gh_state_file" '{
@@ -549,15 +563,12 @@ else
 fi
 success_text="$(cat "$success_output")"
 assert_equals "$success_status" '0'
-assert_equals "$success_text" "Output written to $success_routed_output_path"
-assert_equals "$(cat "$success_routed_output_path")" $'Completed issue 21\nWorkflow: inactive\nmainBranch: main\nscratchBranch: scratch\ncheckpoint: 0'
+assert_equals "$success_text" $'Completed issue 21\nWorkflow: inactive\nmainBranch: main\nscratchBranch: scratch\ncheckpoint: 0'
 assert_equals "$(state_get "$repo_success")" $'{
   "mainBranch": "main",
   "scratchBranch": "scratch",
   "checkpoint": 0
 }'
-expected_success_config="$(printf '{\n  "out": "%s"\n}' "$success_routed_output_path")"
-assert_equals "$(cat "$repo_success/.ai-dev/config.json")" "$expected_success_config"
 assert_equals "$(current_branch "$repo_success")" "$success_branch_before"
 assert_equals "$(current_head "$repo_success")" "$success_head_before"
 assert_equals "$(branch_head "$repo_success" main)" "$success_main_before"
@@ -582,7 +593,7 @@ close_fail_state_before="$(state_get "$repo_close_fail")"
 close_fail_output="$TMP_DIR/close-fail-output"
 if (
 	cd "$repo_close_fail/subdir"
-	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" GH_MOCK_FAIL_CLOSE=1 "$AI_DEV_REAL" flow complete
+	PATH="$mock_bin_dir:$PATH" GH_MOCK_STATE="$gh_state_file" GH_MOCK_LOG="$gh_log_file" GH_MOCK_FAIL_CLOSE=1 "flow-complete"
 ) >"$close_fail_output" 2>&1; then
 	close_fail_status=0
 else
@@ -602,7 +613,7 @@ missing_gh_state_before="$(state_get "$repo_missing_gh")"
 missing_gh_output="$TMP_DIR/missing-gh-output"
 if (
 	cd "$repo_missing_gh/subdir"
-	PATH="$no_gh_bin" "$AI_DEV_REAL" flow complete
+	PATH="$no_gh_bin:$FLOW_BIN_DIR" "flow-complete"
 ) >"$missing_gh_output" 2>&1; then
 	missing_gh_status=0
 else
@@ -620,7 +631,7 @@ state_set "$repo_patch_complete/subdir" '{"patchDescription":"Local patch","main
 patch_complete_output="$TMP_DIR/patch-complete-output"
 if (
 	cd "$repo_patch_complete/subdir"
-	PATH="$no_gh_bin" "$AI_DEV_REAL" flow complete
+	PATH="$no_gh_bin:$FLOW_BIN_DIR" "flow-complete"
 ) >"$patch_complete_output" 2>&1; then
 	patch_complete_status=0
 else
@@ -688,7 +699,6 @@ assert_equals "$(read_gh_issue_state "$gh_state_file" '23')" 'closed'
 
 repo_routing="$TMP_DIR/repo-routing"
 init_repo "$repo_routing"
-track_config_file "$repo_routing" "$TMP_DIR/complete-output.txt"
 git -C "$repo_routing" checkout -q -b scratch
 state_set "$repo_routing/subdir" '{"activeIssueNumber":24,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
 write_gh_state "$gh_state_file" '{
@@ -706,11 +716,9 @@ else
 fi
 routing_terminal_text="$(cat "$routing_terminal_output")"
 assert_equals "$routing_status" '0'
-routing_file_text="$(cat "$TMP_DIR/complete-output.txt")"
-assert_equals "$routing_terminal_text" "Output written to $TMP_DIR/complete-output.txt"
-assert_contains "$routing_file_text" 'Completed issue 24'
-assert_contains "$routing_file_text" 'Workflow: inactive'
-assert_contains "$routing_file_text" 'checkpoint: 0'
+assert_contains "$routing_terminal_text" 'Completed issue 24'
+assert_contains "$routing_terminal_text" 'Workflow: inactive'
+assert_contains "$routing_terminal_text" 'checkpoint: 0'
 assert_equals "$(read_gh_issue_state "$gh_state_file" '24')" 'closed'
 
 if [[ "$(id -u)" != '0' ]]; then

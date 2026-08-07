@@ -4,7 +4,7 @@ function Show-Help {
     @'
 Usage: scripts/install.ps1 [bootstrap-options]
 
-Install or refresh the canonical ai-dev launcher.
+Install or refresh prefixed flow launchers.
 
 This wrapper calls:
   python -m ai_dev_flow.bootstrap --platform windows --repo-root <this-repo>
@@ -19,7 +19,7 @@ Common examples:
 
 Minimum Python version: 3.8
 
-After installation, use ai-dev as the normal interface.
+After installation, use prefixed launchers such as flow-status.
 '@ | Write-Output
 }
 
@@ -48,7 +48,7 @@ try {
         --platform windows `
         --repo-root $repositoryRoot `
         --python $pythonExecutable `
-        --command-name ai-dev `
+        --prefix flow `
         @args
     if ($null -eq $LASTEXITCODE) {
         exit 0

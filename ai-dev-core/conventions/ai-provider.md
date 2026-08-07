@@ -21,7 +21,7 @@ Use this mode when AI execution must remain manual or externally controlled.
 
 ## Operational Notes
 
-- Primary workflow entry points are `ai-dev summarize`, `ai-dev summarize-verify`, `ai-dev flow review`, `ai-dev review-verify`, `ai-dev config`, and `ai-dev config apply`.
+- Runtime summarize/review/task-prepare/showreport entry points were retired; use repository instructions/skills for summarization and review guidance. Current CLI entry points include `ai-dev flow ...`, `ai-dev config`, and `ai-dev apply`.
 - AI Dev keeps source files and deterministic validation artifacts as the authority.
 - No VS Code extension is required for supported workflow execution.
 
