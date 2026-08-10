@@ -183,19 +183,24 @@ Use `flow reset` only when disposable scratch work should be discarded. Confirm 
 
 Use `flow complete` only after the issue’s required work and validation are finished.
 
-## Output routing
+## Flow-diff modes
 
-The repository may configure operational command output through:
+Supported command surface:
 
 ```text
-flow get out
-flow set out=<path>
-flow unset out
+flow-diff
+flow-diff --refresh
+flow-diff --git
+flow-diff --all
 ```
 
-When output is routed to a file, successful operational output still prints to the terminal and is also written to the configured file. The terminal’s final line is `Output written to <resolved-path>`, and that confirmation line is not written into the file.
+`flow-diff` is read-only and writes raw diff content to stdout, while warnings and errors remain on stderr.
 
-Errors and important warnings still belong in the terminal. Configuration commands (`get`, `set`, and `unset`) remain terminal-only. Help is also terminal-only and does not write to `out`.
+`flow-diff --refresh` updates the ephemeral review baseline for incremental review sessions.
+
+`flow-diff --git` ignores review-baseline state and shows full current uncommitted changes.
+
+`flow-diff --all` ignores review-baseline state and shows full active-workflow scope since `main`.
 
 ## General rules
 

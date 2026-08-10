@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import binascii
+import base64
 import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 import sys
 from collections.abc import Sequence
@@ -34,11 +37,13 @@ from .repository import (
     resolve_short_commit_hash,
     resolve_tree_hash,
     restore_branch_to_revision,
+    clear_diff_baseline_for_repo_root,
     max_numbered_checkpoint_relative_to_main,
     squash_merge_branch_into_current,
     stage_all_changes,
     sync_local_excludes,
     workflow_state_file_for_repo_root,
+    diff_baseline_file_for_repo_root,
 )
 from .blocked_workflows import (
     BlockedWorkflowRecord,
@@ -58,9 +63,11 @@ from .workflow_state import (
     normalize_and_validate,
     save_state,
 )
+from .json_files import JsonFileError, load_json_object, write_json_object_atomic
 
 
 _DIRECT_FLOW_ROUTE_TOKEN = "__ai_dev_flow_exec__"
+_FLOW_DIFF_BASELINE_INVALID = "Review baseline is stale or invalid; run flow-diff --refresh."
 
 
 @dataclass(frozen=True)
@@ -215,15 +222,19 @@ Options:
   -v, --verbose  Show complete workflow and Git details.
   -h, --help     Show this help.
 """,
-        "diff": """\
-Usage: {command_name} diff [--all] [--stdout]
+    "diff": """\
+Usage: {command_name} [--git|--all]
+       {command_name} --refresh
 
 Show read-only diff output for the active workflow without modifying index,
 working tree, workflow state, or checkpoint state.
+Normal diff is review-baseline-relative when a valid baseline exists.
+Without a review baseline, normal diff shows the current full uncommitted diff.
 
 Options:
-    --all      Include committed workflow changes since main plus current changes.
-    --stdout   Explicitly select stdout delivery (the only implemented delivery mode).
+    --refresh  Set the review baseline.
+    --git      Show all current uncommitted changes, ignoring review baseline.
+    --all      Show whole active workflow since main, ignoring review baseline.
     -h, --help Show this help.
 """,
     "commit": """\
@@ -664,6 +675,7 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
 
     ensure_local_state_excluded(repo_root)
     save_state(state_path, issue_state)
+    _clear_diff_baseline_after_success(repo_root, operation="start")
 
     print(f"Started issue {issue_number}")
     print(f"mainBranch: {state.main_branch}")
@@ -751,6 +763,7 @@ def handle_patch(command_name: str, arguments: list[str]) -> int:
     )
     ensure_local_state_excluded(repo_root)
     save_state(state_path, patch_state)
+    _clear_diff_baseline_after_success(repo_root, operation="patch")
 
     _print_patch_success(
         adopted=adopt_mode,
@@ -923,7 +936,7 @@ def _status_usage(command_name: str) -> FlowError:
 
 
 def _diff_usage(command_name: str) -> FlowError:
-    return _usage_error(command_name, "diff", "[--all] [--stdout]")
+    return _usage_error(command_name, "diff", "[--git|--all] | --refresh")
 
 
 def _commit_usage(command_name: str) -> FlowError:
@@ -1025,6 +1038,20 @@ def _commit_subject(state: WorkflowState, checkpoint: int) -> str:
     return str(checkpoint)
 
 
+def _clear_diff_baseline_after_success(repo_root: Path, *, operation: str) -> None:
+    try:
+        clear_diff_baseline_for_repo_root(repo_root)
+    except RepositoryError as exc:
+        print(
+            f"Warning: review-baseline cleanup failed after successful {operation}: {exc}",
+            file=sys.stderr,
+        )
+        print(
+            "Run flow-diff --refresh before relying on baseline-relative diff.",
+            file=sys.stderr,
+        )
+
+
 def handle_commit(command_name: str, arguments: list[str]) -> int:
     if arguments:
         raise _commit_usage(command_name)
@@ -1069,6 +1096,7 @@ def handle_commit(command_name: str, arguments: list[str]) -> int:
             "Checkpoint commit created but workflow-state persistence failed. "
             f"Commit: {commit_hash}. {exc}"
         ) from exc
+    _clear_diff_baseline_after_success(repo_root, operation="commit")
 
     print(f"Created checkpoint {next_checkpoint}")
     print(f"commit: {commit_hash}")
@@ -1227,6 +1255,8 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
                 "Cannot promote workflow: scratch branch was not checked out after promotion."
             )
 
+        _clear_diff_baseline_after_success(repo_root, operation="promote")
+
         _print_promote_success(
             commit_hash=commit_hash,
             main_branch=state.main_branch,
@@ -1379,35 +1409,156 @@ def _diff_untracked_content(repo_root: Path, paths: list[str]) -> str:
     return "".join(diff_parts)
 
 
-def _parse_diff_options(command_name: str, arguments: list[str]) -> tuple[bool, bool]:
+def _parse_diff_options(command_name: str, arguments: list[str]) -> tuple[bool, bool, bool]:
+    use_git = False
     include_all = False
-    use_stdout = False
+    refresh = False
 
     for option in arguments:
+        if option == "--git":
+            if use_git:
+                raise FlowError("--git may be provided at most once.")
+            use_git = True
+            continue
         if option == "--all":
             if include_all:
                 raise FlowError("--all may be provided at most once.")
             include_all = True
             continue
-        if option == "--stdout":
-            if use_stdout:
-                raise FlowError("--stdout may be provided at most once.")
-            use_stdout = True
+        if option == "--refresh":
+            if refresh:
+                raise FlowError("--refresh may be provided at most once.")
+            refresh = True
             continue
         raise _diff_usage(command_name)
 
-    return include_all, use_stdout
+    if refresh and use_git:
+        raise FlowError("--refresh cannot be combined with --git.")
+    if refresh and include_all:
+        raise FlowError("--refresh cannot be combined with --all.")
+    if use_git and include_all:
+        raise FlowError("--git cannot be combined with --all.")
+
+    return use_git, include_all, refresh
 
 
-def handle_diff(command_name: str, arguments: list[str]) -> int:
-    include_all, _ = _parse_diff_options(command_name, arguments)
+@dataclass(frozen=True)
+class _FlowDiffStatusEntry:
+    index_status: str
+    worktree_status: str
+    path: str
+    source_path: str | None = None
 
-    repo_root, _, state = _resolve_repo_state_context()
-    if _active_workflow_type(state) is None:
-        raise FlowError("Cannot diff workflow: no active workflow is set.")
 
-    _ensure_main_and_scratch_branches_exist(repo_root, state)
+def _parse_flow_diff_status_tokens(tokens: list[str]) -> list[_FlowDiffStatusEntry]:
+    entries: list[_FlowDiffStatusEntry] = []
+    index = 0
+    while index < len(tokens):
+        record = tokens[index]
+        if len(record) < 4 or record[2] != " ":
+            raise FlowError("Cannot parse repository status for diff baseline refresh.")
 
+        x = record[0]
+        y = record[1]
+        destination_path = record[3:]
+        source_path: str | None = None
+
+        if x in {"R", "C"} or y in {"R", "C"}:
+            if index + 1 >= len(tokens):
+                raise FlowError("Cannot parse renamed/copied path in diff baseline refresh.")
+            source_path = tokens[index + 1]
+            index += 2
+        else:
+            index += 1
+
+        entries.append(
+            _FlowDiffStatusEntry(
+                index_status=x,
+                worktree_status=y,
+                path=destination_path,
+                source_path=source_path,
+            )
+        )
+
+    return entries
+
+
+def _flow_diff_status_entries(repo_root: Path) -> list[_FlowDiffStatusEntry]:
+    completed = subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo_root),
+            "status",
+            "--porcelain=1",
+            "--untracked-files=all",
+            "-z",
+            "--",
+            ".",
+            ":(exclude).ai-dev/**",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise FlowError(message)
+
+    tokens = _decode_nul_paths(completed.stdout)
+    return _parse_flow_diff_status_tokens(tokens)
+
+
+def _git_show_index_bytes(repo_root: Path, path_text: str) -> bytes:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "show", f":{path_text}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode != 0:
+        message = completed.stderr.decode("utf-8", errors="replace").strip()
+        raise FlowError(f"Cannot capture staged baseline content for {path_text}: {message}")
+    return completed.stdout
+
+
+def _git_show_tree_path_bytes(repo_root: Path, treeish: str, path_text: str) -> bytes | None:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), "show", f"{treeish}:{path_text}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if completed.returncode == 0:
+        return completed.stdout
+
+    message = completed.stderr.decode("utf-8", errors="replace").strip()
+    if (
+        "exists on disk, but not in" in message
+        or "does not exist in" in message
+        or "pathspec" in message
+    ):
+        return None
+    raise FlowError(f"Cannot capture baseline HEAD content for {path_text}: {message}")
+
+
+def _read_working_file_bytes(repo_root: Path, path_text: str) -> bytes | None:
+    absolute_path = (repo_root / path_text).resolve()
+    try:
+        absolute_path.relative_to(repo_root)
+    except ValueError as exc:
+        raise FlowError(f"Cannot capture baseline path outside repository: {path_text}") from exc
+
+    if not absolute_path.exists() or not absolute_path.is_file():
+        return None
+
+    try:
+        return absolute_path.read_bytes()
+    except OSError as exc:
+        raise FlowError(f"Cannot capture working baseline content for {path_text}: {exc}") from exc
+
+
+def _flow_diff_current_uncommitted_changes(repo_root: Path) -> str:
     staged_diff = _flow_diff_cached_changes(repo_root)
     unstaged_completed = subprocess.run(
         ["git", "-C", str(repo_root), "diff", "--binary", "--no-ext-diff"],
@@ -1426,6 +1577,392 @@ def handle_diff(command_name: str, arguments: list[str]) -> int:
     untracked_paths = _diff_untracked_paths(repo_root)
     untracked_diff = _diff_untracked_content(repo_root, untracked_paths)
 
+    return "".join(
+        part
+        for part in (
+            staged_diff,
+            unstaged_diff,
+            untracked_diff,
+        )
+        if part
+    )
+
+
+def _baseline_path_set(mapping: dict[str, object], key: str) -> set[str]:
+    raw_value = mapping.get(key, [])
+    if not isinstance(raw_value, list):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    return {str(item) for item in raw_value}
+
+
+def _baseline_working_snapshots(mapping: dict[str, object]) -> dict[str, bytes]:
+    raw_snapshots = mapping.get("snapshots")
+    if not isinstance(raw_snapshots, dict):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    raw_working = raw_snapshots.get("working", {})
+    if not isinstance(raw_working, dict):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    decoded: dict[str, bytes] = {}
+    for key, encoded in raw_working.items():
+        if not isinstance(encoded, str):
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+        try:
+            decoded[str(key)] = base64.b64decode(encoded, validate=True)
+        except (ValueError, binascii.Error) as exc:
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID) from exc
+
+    return decoded
+
+
+def _baseline_rename_source_paths(mapping: dict[str, object]) -> set[str]:
+    raw_status = mapping.get("status")
+    if not isinstance(raw_status, dict):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    raw_rename_copy = raw_status.get("renameCopy", [])
+    if not isinstance(raw_rename_copy, list):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    rename_sources: set[str] = set()
+    for item in raw_rename_copy:
+        if not isinstance(item, dict):
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+        source = item.get("sourcePath")
+        kind = item.get("kind")
+        index_status = item.get("indexStatus")
+        worktree_status = item.get("worktreeStatus")
+        if not isinstance(source, str):
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+        if not isinstance(kind, str):
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+        if not isinstance(index_status, str) or not isinstance(worktree_status, str):
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+        is_rename = kind == "rename" or "R" in {index_status, worktree_status}
+        if is_rename:
+            rename_sources.add(source)
+
+    return rename_sources
+
+
+def _validate_flow_diff_baseline_identity(
+    repo_root: Path,
+    state: WorkflowState,
+    baseline: dict[str, object],
+) -> str:
+    version = baseline.get("version")
+    if version != 1:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    repository = baseline.get("repository")
+    workflow = baseline.get("workflow")
+    if not isinstance(repository, dict) or not isinstance(workflow, dict):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    baseline_root = repository.get("root")
+    baseline_head = repository.get("head")
+    baseline_branch = repository.get("branch")
+    if not isinstance(baseline_root, str):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if not isinstance(baseline_head, str):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if not isinstance(baseline_branch, str):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    if Path(baseline_root).resolve() != repo_root.resolve():
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if baseline_branch != current_branch_name(repo_root):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if baseline_head != resolve_commit_hash(repo_root, "HEAD"):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    current_workflow_type = _active_workflow_type(state) or "none"
+    if workflow.get("type") != current_workflow_type:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if workflow.get("mainBranch") != state.main_branch:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if workflow.get("scratchBranch") != state.scratch_branch:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if workflow.get("checkpoint") != state.checkpoint:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if workflow.get("activeIssueNumber") != state.active_issue_number:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    if workflow.get("patchDescription") != state.patch_description:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    return baseline_head
+
+
+def _flow_diff_file_delta_patch(
+    path_text: str,
+    baseline_bytes: bytes | None,
+    current_bytes: bytes | None,
+) -> str:
+    with tempfile.TemporaryDirectory(prefix="flow-diff-baseline-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        before_file = temp_dir / "before"
+        after_file = temp_dir / "after"
+
+        before_arg = "/dev/null"
+        after_arg = "/dev/null"
+
+        if baseline_bytes is not None:
+            before_file.write_bytes(baseline_bytes)
+            before_arg = str(before_file)
+        if current_bytes is not None:
+            after_file.write_bytes(current_bytes)
+            after_arg = "after"
+        if baseline_bytes is not None:
+            before_arg = "before"
+
+        completed = subprocess.run(
+            [
+                "git",
+                "diff",
+                "--binary",
+                "--no-ext-diff",
+                "--no-index",
+                "--",
+                before_arg,
+                after_arg,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            cwd=str(temp_dir),
+        )
+
+    if completed.returncode not in {0, 1}:
+        message = completed.stderr.strip() or completed.stdout.strip()
+        raise FlowError(message)
+
+    rewritten_lines: list[str] = []
+    for line in completed.stdout.splitlines(keepends=True):
+        if line.startswith("diff --git "):
+            rewritten_lines.append(f"diff --git a/{path_text} b/{path_text}\n")
+            continue
+        if line.startswith("--- a/before") or line.startswith("--- a/after"):
+            rewritten_lines.append(f"--- a/{path_text}\n")
+            continue
+        if line.startswith("+++ b/after") or line.startswith("+++ b/before"):
+            rewritten_lines.append(f"+++ b/{path_text}\n")
+            continue
+        if line.startswith("Binary files "):
+            rewritten = line.replace("a/before", f"a/{path_text}")
+            rewritten = rewritten.replace("a/after", f"a/{path_text}")
+            rewritten = rewritten.replace("b/before", f"b/{path_text}")
+            rewritten = rewritten.replace("b/after", f"b/{path_text}")
+            rewritten_lines.append(rewritten)
+            continue
+        rewritten_lines.append(line)
+
+    return "".join(rewritten_lines)
+
+
+def _flow_diff_relative_to_baseline(repo_root: Path, state: WorkflowState) -> str | None:
+    baseline_path = diff_baseline_file_for_repo_root(repo_root)
+    if not baseline_path.exists():
+        return None
+
+    try:
+        baseline = load_json_object(baseline_path, missing_default={})
+    except JsonFileError as exc:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID) from exc
+    if not baseline:
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    baseline_head = _validate_flow_diff_baseline_identity(repo_root, state, baseline)
+
+    baseline_status = baseline.get("status")
+    if not isinstance(baseline_status, dict):
+        raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
+    baseline_staged = _baseline_path_set(baseline_status, "staged")
+    baseline_unstaged = _baseline_path_set(baseline_status, "unstaged")
+    baseline_untracked = _baseline_path_set(baseline_status, "untracked")
+    baseline_deleted = _baseline_path_set(baseline_status, "deleted")
+    baseline_rename_sources = _baseline_rename_source_paths(baseline)
+    baseline_working = _baseline_working_snapshots(baseline)
+
+    baseline_touched = (
+        baseline_staged
+        | baseline_unstaged
+        | baseline_untracked
+        | baseline_deleted
+        | baseline_rename_sources
+    )
+
+    current_entries = _flow_diff_status_entries(repo_root)
+    current_changed: set[str] = set()
+    for entry in current_entries:
+        x = entry.index_status
+        y = entry.worktree_status
+        if x == "?" and y == "?":
+            current_changed.add(entry.path)
+            continue
+
+        current_changed.add(entry.path)
+        if entry.source_path is not None and "R" in {x, y}:
+            current_changed.add(entry.source_path)
+
+    candidate_paths = {
+        path
+        for path in (baseline_touched | current_changed)
+        if path != ".ai-dev" and not path.startswith(".ai-dev/")
+    }
+
+    diff_parts: list[str] = []
+    for path_text in sorted(candidate_paths):
+        if path_text in baseline_rename_sources or path_text in baseline_deleted:
+            baseline_bytes: bytes | None = None
+        elif path_text in baseline_working:
+            baseline_bytes = baseline_working[path_text]
+        else:
+            baseline_bytes = _git_show_tree_path_bytes(repo_root, baseline_head, path_text)
+
+        current_bytes = _read_working_file_bytes(repo_root, path_text)
+        if baseline_bytes == current_bytes:
+            continue
+
+        diff_parts.append(_flow_diff_file_delta_patch(path_text, baseline_bytes, current_bytes))
+
+    return "".join(part for part in diff_parts if part)
+
+
+def _flow_diff_refresh_baseline(repo_root: Path, state: WorkflowState) -> None:
+    status_entries = _flow_diff_status_entries(repo_root)
+
+    staged_paths: set[str] = set()
+    unstaged_paths: set[str] = set()
+    untracked_paths: set[str] = set()
+    deleted_paths: set[str] = set()
+    staged_deleted_paths: set[str] = set()
+    unstaged_deleted_paths: set[str] = set()
+    rename_copy_entries: list[dict[str, object]] = []
+
+    for entry in status_entries:
+        x = entry.index_status
+        y = entry.worktree_status
+        path_text = entry.path
+
+        if x == "?" and y == "?":
+            untracked_paths.add(path_text)
+            continue
+
+        if x != " ":
+            staged_paths.add(path_text)
+        if y != " ":
+            unstaged_paths.add(path_text)
+        if x == "D":
+            staged_deleted_paths.add(path_text)
+            deleted_paths.add(path_text)
+        if y == "D":
+            unstaged_deleted_paths.add(path_text)
+            deleted_paths.add(path_text)
+
+        if entry.source_path is not None:
+            relation_status = x if x in {"R", "C"} else y if y in {"R", "C"} else ""
+            rename_copy_entries.append(
+                {
+                    "kind": "rename" if relation_status == "R" else "copy" if relation_status == "C" else "rename-or-copy",
+                    "sourcePath": entry.source_path,
+                    "destinationPath": path_text,
+                    "indexStatus": x,
+                    "worktreeStatus": y,
+                }
+            )
+
+    index_snapshots: dict[str, str] = {}
+    for path_text in sorted(staged_paths - staged_deleted_paths):
+        content = _git_show_index_bytes(repo_root, path_text)
+        index_snapshots[path_text] = base64.b64encode(content).decode("ascii")
+
+    working_snapshots: dict[str, str] = {}
+    working_paths = (staged_paths | unstaged_paths | untracked_paths) - deleted_paths
+    for path_text in sorted(working_paths):
+        absolute_path = (repo_root / path_text).resolve()
+        try:
+            absolute_path.relative_to(repo_root)
+        except ValueError as exc:
+            raise FlowError(f"Cannot capture baseline path outside repository: {path_text}") from exc
+
+        if not absolute_path.exists() or not absolute_path.is_file():
+            continue
+
+        try:
+            content = absolute_path.read_bytes()
+        except OSError as exc:
+            raise FlowError(f"Cannot capture working baseline content for {path_text}: {exc}") from exc
+
+        working_snapshots[path_text] = base64.b64encode(content).decode("ascii")
+
+    workflow_type = _active_workflow_type(state) or "none"
+    baseline_payload = {
+        "version": 1,
+        "capturedAt": _now_utc_iso_timestamp(),
+        "repository": {
+            "root": str(repo_root),
+            "head": resolve_commit_hash(repo_root, "HEAD"),
+            "branch": current_branch_name(repo_root),
+        },
+        "workflow": {
+            "type": workflow_type,
+            "mainBranch": state.main_branch,
+            "scratchBranch": state.scratch_branch,
+            "checkpoint": state.checkpoint,
+            "activeIssueNumber": state.active_issue_number,
+            "patchDescription": state.patch_description,
+        },
+        "status": {
+            "staged": sorted(staged_paths),
+            "unstaged": sorted(unstaged_paths),
+            "untracked": sorted(untracked_paths),
+            "deleted": sorted(deleted_paths),
+            "stagedDeleted": sorted(staged_deleted_paths),
+            "unstagedDeleted": sorted(unstaged_deleted_paths),
+            "renameCopy": sorted(
+                rename_copy_entries,
+                key=lambda item: (
+                    str(item["destinationPath"]),
+                    str(item["sourcePath"]),
+                    str(item["indexStatus"]),
+                    str(item["worktreeStatus"]),
+                ),
+            ),
+        },
+        "snapshots": {
+            "index": index_snapshots,
+            "working": working_snapshots,
+        },
+    }
+
+    baseline_path = diff_baseline_file_for_repo_root(repo_root)
+    try:
+        write_json_object_atomic(baseline_path, baseline_payload)
+    except JsonFileError as exc:
+        raise FlowError(str(exc)) from exc
+
+
+def handle_diff(command_name: str, arguments: list[str]) -> int:
+    use_git, include_all, refresh = _parse_diff_options(command_name, arguments)
+
+    repo_root, _, state = _resolve_repo_state_context()
+    if _active_workflow_type(state) is None:
+        raise FlowError("Cannot diff workflow: no active workflow is set.")
+
+    _ensure_main_and_scratch_branches_exist(repo_root, state)
+
+    if refresh:
+        _flow_diff_refresh_baseline(repo_root, state)
+        print("Review baseline refreshed.")
+        return 0
+
+    current_uncommitted = _flow_diff_current_uncommitted_changes(repo_root)
+
     committed_diff = ""
     if include_all:
         committed_diff = _flow_diff_workflow_changes(
@@ -1434,13 +1971,17 @@ def handle_diff(command_name: str, arguments: list[str]) -> int:
             scratch_branch=state.scratch_branch,
         )
 
+    scoped_uncommitted = current_uncommitted
+    if not include_all and not use_git:
+        baseline_relative = _flow_diff_relative_to_baseline(repo_root, state)
+        if baseline_relative is not None:
+            scoped_uncommitted = baseline_relative
+
     combined = "".join(
         part
         for part in (
             committed_diff,
-            staged_diff,
-            unstaged_diff,
-            untracked_diff,
+            scoped_uncommitted,
         )
         if part
     )
@@ -1506,6 +2047,7 @@ def handle_reset(command_name: str, arguments: list[str]) -> int:
             "Scratch was reset but workflow state could not be saved. "
             f"{exc}"
         ) from exc
+    _clear_diff_baseline_after_success(repo_root, operation="reset")
 
     print(f"Reset {state.scratch_branch} to {state.main_branch}")
     print("checkpoint: 0")
@@ -1594,6 +2136,7 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
         checkpoint=0,
     )
     save_state(state_path, inactive_state)
+    _clear_diff_baseline_after_success(repo_root, operation="complete")
 
     if state.patch_description is not None:
         print(f"Completed patch: {state.patch_description}")
@@ -1678,6 +2221,7 @@ def handle_block(command_name: str, arguments: list[str]) -> int:
         checkpoint=0,
     )
     save_state(state_path, inactive_state)
+    _clear_diff_baseline_after_success(repo_root, operation="block")
 
     print(f"Blocked issue {state.active_issue_number}")
     print(f"reason: {reason}")
@@ -1812,6 +2356,8 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
                 blocked_restore_failure_message=blocked_restore_failure_message,
             )
         ) from exc
+
+    _clear_diff_baseline_after_success(repo_root, operation="resume")
 
     print(f"Resumed issue {issue_number}")
     print(f"mainBranch: {state.main_branch}")

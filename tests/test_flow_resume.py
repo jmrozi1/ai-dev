@@ -88,6 +88,22 @@ class FlowResumeSafetyTests(unittest.TestCase):
 
         return repo_root
 
+    def _diff_baseline_path(self, repo_root: Path) -> Path:
+        return repo_root / ".ai-dev" / "diff-baseline" / "baseline.json"
+
+    def _write_diff_baseline_marker(self, repo_root: Path) -> Path:
+        baseline_path = self._diff_baseline_path(repo_root)
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        baseline_path.write_text('{"version":1,"repository":{"root":"x"},"workflow":{},"status":{},"snapshots":{"working":{}}}\n', encoding="utf-8")
+        return baseline_path
+
+    def _ignore_flow_artifacts(self, repo_root: Path) -> None:
+        exclude_path = repo_root / ".git" / "info" / "exclude"
+        exclude_path.parent.mkdir(parents=True, exist_ok=True)
+        existing = exclude_path.read_text(encoding="utf-8") if exclude_path.exists() else ""
+        if ".ai-dev/\n" not in existing:
+            exclude_path.write_text(existing + ".ai-dev/\n", encoding="utf-8")
+
     def _invoke(self, cwd: Path, *arguments: str) -> tuple[int, str, str]:
         if not arguments:
             raise ValueError("command is required")
@@ -161,6 +177,8 @@ class FlowResumeSafetyTests(unittest.TestCase):
 
     def test_resume_success_activates_locally_and_sets_active_label(self) -> None:
         repo_root = self._init_repo("repo-resume-success")
+        self._ignore_flow_artifacts(repo_root)
+        baseline_path = self._write_diff_baseline_marker(repo_root)
         labels_state = ["blocked"]
 
         with (
@@ -192,6 +210,7 @@ class FlowResumeSafetyTests(unittest.TestCase):
         self.assertNotIn(12, blocked_numbers)
 
         self.assertEqual(labels_state, ["active"])
+        self.assertFalse(baseline_path.exists())
 
     def test_resume_restore_blocked_record_when_state_save_fails(self) -> None:
         repo_root = self._init_repo("repo-resume-save-fail")
@@ -218,6 +237,8 @@ class FlowResumeSafetyTests(unittest.TestCase):
 
     def test_resume_does_not_activate_when_blocked_registry_update_fails(self) -> None:
         repo_root = self._init_repo("repo-resume-remove-fail")
+        self._ignore_flow_artifacts(repo_root)
+        baseline_path = self._write_diff_baseline_marker(repo_root)
         labels_state = ["blocked"]
 
         with (
@@ -244,6 +265,7 @@ class FlowResumeSafetyTests(unittest.TestCase):
         blocked_numbers = [item.get("issueNumber") for item in blocked_data.get("blockedWorkflows", [])]
         self.assertIn(12, blocked_numbers)
         self.assertEqual(labels_state, ["blocked"])
+        self.assertTrue(baseline_path.exists())
 
     def test_resume_reports_blocked_restore_failure_and_rolls_back_label(self) -> None:
         repo_root = self._init_repo("repo-resume-save-fail-restore-fail")

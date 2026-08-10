@@ -9,6 +9,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 from ai_dev_flow import cli
 
@@ -107,6 +108,9 @@ class FlowCommitTests(unittest.TestCase):
 
         return code, stdout.getvalue(), stderr.getvalue()
 
+    def _diff_baseline_path(self, repo_root: Path) -> Path:
+        return repo_root / ".ai-dev" / "diff-baseline" / "baseline.json"
+
     def test_commit_includes_untracked_and_staged_changes(self) -> None:
         repo_root = self._init_repo("repo-commit-staging")
 
@@ -152,6 +156,53 @@ class FlowCommitTests(unittest.TestCase):
         self.assertIn("no staged changes", err)
         self.assertTrue(review_root.exists())
         self.assertTrue(marker.exists())
+
+    def test_successful_commit_clears_review_baseline(self) -> None:
+        repo_root = self._init_repo("repo-commit-clears-baseline")
+        baseline_path = self._diff_baseline_path(repo_root)
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        baseline_path.write_text('{"version":1,"repository":{"root":"x"},"workflow":{},"status":{},"snapshots":{"working":{}}}\n', encoding="utf-8")
+
+        (repo_root / "staged.txt").write_text("staged\n", encoding="utf-8")
+        self._run_git(repo_root, "add", "staged.txt")
+
+        code, out, err = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0)
+        self.assertEqual(err, "")
+        self.assertIn("Created checkpoint 1\n", out)
+        self.assertFalse(baseline_path.exists())
+
+    def test_failed_commit_preserves_review_baseline(self) -> None:
+        repo_root = self._init_repo("repo-commit-preserves-baseline-on-failure")
+        baseline_path = self._diff_baseline_path(repo_root)
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        baseline_path.write_text('{"version":1,"repository":{"root":"x"},"workflow":{},"status":{},"snapshots":{"working":{}}}\n', encoding="utf-8")
+
+        code, out, err = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+        self.assertIn("no staged changes", err)
+        self.assertTrue(baseline_path.exists())
+
+    def test_successful_commit_reports_warning_when_baseline_cleanup_fails(self) -> None:
+        repo_root = self._init_repo("repo-commit-cleanup-warning")
+
+        (repo_root / "staged.txt").write_text("staged\n", encoding="utf-8")
+        self._run_git(repo_root, "add", "staged.txt")
+
+        with patch(
+            "ai_dev_flow.cli.clear_diff_baseline_for_repo_root",
+            side_effect=cli.RepositoryError("cleanup denied"),
+        ):
+            code, out, err = self._invoke(repo_root, "commit")
+
+        self.assertEqual(code, 0)
+        self.assertIn("Created checkpoint 1\n", out)
+        self.assertIn("Warning: review-baseline cleanup failed", err)
+        self.assertIn("flow-diff --refresh", err)
+
+        state_data = json.loads((repo_root / ".ai-dev" / "workflow.json").read_text(encoding="utf-8"))
+        self.assertEqual(state_data.get("checkpoint"), 1)
 
 
 if __name__ == "__main__":

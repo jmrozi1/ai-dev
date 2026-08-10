@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import shutil
 from pathlib import Path
 from collections.abc import Sequence
 import subprocess
@@ -133,6 +134,26 @@ def workflow_state_file_for_repo_root(repo_root: Path) -> Path:
 
 def blocked_workflows_file_for_repo_root(repo_root: Path) -> Path:
     return repo_root / ".ai-dev" / "blocked-workflows.json"
+
+
+def diff_baseline_file_for_repo_root(repo_root: Path) -> Path:
+    return repo_root / ".ai-dev" / "diff-baseline" / "baseline.json"
+
+
+def clear_diff_baseline_for_repo_root(repo_root: Path) -> None:
+    baseline_dir = repo_root / ".ai-dev" / "diff-baseline"
+    if not baseline_dir.exists():
+        return
+
+    try:
+        if baseline_dir.is_dir():
+            shutil.rmtree(baseline_dir)
+        else:
+            baseline_dir.unlink()
+    except OSError as exc:
+        raise RepositoryError(
+            f"Cannot clear review baseline at {baseline_dir}: {exc}"
+        ) from exc
 
 
 def ensure_local_state_excluded(repo_root: Path) -> None:

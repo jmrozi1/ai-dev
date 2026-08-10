@@ -125,7 +125,42 @@ Review reasoning now belongs in external repository instructions or skills.
 Legacy `.ai-dev/review/` artifacts may be removed manually when desired.
 Legacy `flow-review` launchers are removed only when ownership is safely verified.
 `flow-diff` is read-only: raw diff content goes to stdout, while notices and errors go to stderr.
-`flow-diff --all` includes committed workflow changes plus current staged, unstaged, and untracked changes.
+Supported `flow-diff` modes are exactly:
+
+- `flow-diff`
+- `flow-diff --refresh`
+- `flow-diff --git`
+- `flow-diff --all`
+
+Mode semantics:
+
+- `flow-diff`: show changes since the current review baseline when a valid baseline exists; otherwise show the full current uncommitted delta.
+- `flow-diff --refresh`: replace the review baseline with the current effective repository state.
+- `flow-diff --git`: ignore review-baseline state and show the full current uncommitted delta.
+- `flow-diff --all`: ignore review-baseline state and show the full active-workflow delta since `main` (committed workflow changes plus current uncommitted work).
+
+Review baseline and flow checkpoint are different concepts:
+
+- Review baseline: ephemeral review-session marker updated with `flow-diff --refresh`.
+- Flow checkpoint: durable approved implementation milestone created with `flow-commit`.
+
+Typical AI-assisted loop:
+
+```text
+flow-diff --refresh
+# Copilot / implementation pass
+flow-diff
+# review/fix
+flow-diff --refresh
+# next implementation pass
+```
+
+Recovery and scope views:
+
+- Use `flow-diff --git` for full current uncommitted state, independent of baseline validity.
+- Use `flow-diff --all` for complete active-workflow scope since `main`.
+
+Successful authoritative lifecycle transitions clear stale review-baseline state where needed: `start`, `patch`, `commit`, `promote`, `reset`, `complete`, `block`, and `resume`.
 
 ## Checkpoint-2 Prefixed Flow Executables
 
@@ -160,9 +195,10 @@ flow-diff --help
 
 Flow-diff is read-only. Raw diff content is written to stdout, while notices and errors are written to stderr. It supports:
 
-- `flow-diff` (workflow-focused diff scope)
-- `flow-diff --all` (broader comparison scope)
-- `flow-diff --stdout` (explicit stdout delivery; default output remains stdout)
+- `flow-diff`
+- `flow-diff --refresh`
+- `flow-diff --git`
+- `flow-diff --all`
 
 Checkpoint-9 removes runtime command coexistence; the supported runtime surface is fixed `<prefix>-<command>` executables.
 
