@@ -105,13 +105,16 @@ flow-promote ...
 flow-complete ...
 flow-block ...
 flow-resume ...
+flow-ticket-create ...
+flow-ticket-show ...
+flow-ticket-query ...
 ```
 
 Issue #23 checkpoint 8 retired top-level `get`, `set`, and `unset` commands.
 Issue #23 checkpoint 9 retired the legacy `ai-dev` dispatcher runtime surface and `config` / `apply` / `update` runtime commands.
 Repository-scoped output routing via `.ai-dev/config.json` is retired.
-Retained Flow lifecycle commands emit directly to stdout/stderr and do not route output through repository config.
-If `.ai-dev/config.json` already exists, it is preserved but ignored by retained runtime commands.
+Retained Flow lifecycle commands emit directly to stdout/stderr and do not route output through repository output config.
+`.ai-dev/config.json` is still used for ticket provider configuration.
 Previously configured output files (for example `out.txt`) are ordinary files and are not automatically deleted.
 `flow-diff` replaces the retired runtime review command.
 Runtime `summarize` and `summarize-verify` commands were retired in Issue #23 checkpoint 5.
@@ -168,7 +171,7 @@ Successful authoritative lifecycle transitions clear stale review-baseline state
 
 - Default install: `./scripts/install.sh` (equivalent to `./scripts/install.sh --prefix flow`).
 - Custom prefix: `./scripts/install.sh --prefix ai-flow`.
-- Fixed executable set: `start`, `patch`, `status`, `diff`, `commit`, `reset`, `promote`, `complete`, `block`, `resume`.
+- Fixed executable set: `start`, `patch`, `status`, `diff`, `commit`, `reset`, `promote`, `complete`, `block`, `resume`, `ticket-create`, `ticket-show`, `ticket-query`.
 
 Examples with default prefix:
 
@@ -183,6 +186,9 @@ flow-promote
 flow-complete
 flow-block
 flow-resume
+flow-ticket-create
+flow-ticket-show
+flow-ticket-query
 ```
 
 Launcher discovery works with shell completion patterns such as `flow-<Tab>`.
@@ -201,6 +207,43 @@ Flow-diff is read-only. Raw diff content is written to stdout, while notices and
 - `flow-diff --all`
 
 Checkpoint-9 removes runtime command coexistence; the supported runtime surface is fixed `<prefix>-<command>` executables.
+
+For local ticket configuration (`tickets.provider: local`), checkpoint-2 storage is one normalized ticket file per ID under the configured directory (for example `.ai-dev/tickets/1.json`, `.ai-dev/tickets/2.json`).
+
+## Ticket Provider Configuration (Issue #10)
+
+Ticket-touching commands require a valid `tickets` block in `.ai-dev/config.json`:
+
+- `flow-ticket-create`
+- `flow-ticket-show`
+- `flow-ticket-query`
+- `flow-start` (ticket lookup and workflow binding)
+
+Supported provider modes:
+
+- `local`: requires `tickets.path` (repository-relative, normalized path).
+- `github`: requires `tickets.repository` in `owner/repo` format.
+- `github-current`: resolves repository from the current project's Git `origin` remote.
+
+Local mode storage:
+
+- One ticket file per ID under `tickets.path`.
+- Example: `.ai-dev/tickets/1.json`.
+
+Provider-neutral ticket command surface:
+
+- `flow-ticket-create`
+- `flow-ticket-show`
+- `flow-ticket-query`
+
+Lifecycle commands touching tickets:
+
+- `flow-start` marks ticket active.
+- `flow-block` transitions active workflow ticket to blocked.
+- `flow-resume` transitions blocked workflow ticket back to active.
+- `flow-complete` closes/completes the bound workflow ticket before clearing active workflow state.
+
+Active workflow ticket identity is bound at `flow-start` and persisted in workflow state. Later configuration or remote changes do not retarget that in-flight workflow's ticket operations.
 
 Ownership and cleanup safety for prefixed launchers:
 

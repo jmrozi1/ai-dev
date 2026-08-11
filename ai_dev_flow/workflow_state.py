@@ -5,6 +5,11 @@ from pathlib import Path
 from typing import Any
 
 from .json_files import JsonFileError, load_json_object, write_json_object_atomic
+from .tickets import (
+    TicketModelError,
+    TicketReference,
+    normalize_ticket_reference_data,
+)
 
 
 DEFAULT_MAIN_BRANCH = "main"
@@ -16,6 +21,7 @@ ALLOWED_KEYS = frozenset(
         "activeIssueNumber",
         "activeIssueTitle",
         "activeIssueUrl",
+        "ticket",
         "patchDescription",
         "mainBranch",
         "scratchBranch",
@@ -36,6 +42,7 @@ class WorkflowState:
     active_issue_number: int | None = None
     active_issue_title: str | None = None
     active_issue_url: str | None = None
+    ticket_reference: TicketReference | None = None
     patch_description: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +60,9 @@ class WorkflowState:
 
         if self.active_issue_url is not None:
             payload["activeIssueUrl"] = self.active_issue_url
+
+        if self.ticket_reference is not None:
+            payload["ticket"] = self.ticket_reference.to_dict()
 
         if self.patch_description is not None:
             payload["patchDescription"] = self.patch_description
@@ -117,12 +127,19 @@ def normalize_and_validate(
     has_issue_number = "activeIssueNumber" in state_data
     has_issue_title = "activeIssueTitle" in state_data
     has_issue_url = "activeIssueUrl" in state_data
+    has_ticket_reference = "ticket" in state_data
     has_patch_description = "patchDescription" in state_data
 
     if has_issue_number and has_patch_description:
         raise WorkflowStateError(
             f"Invalid workflow state in {context}: "
             "activeIssueNumber and patchDescription cannot both be set."
+        )
+
+    if has_ticket_reference and has_patch_description:
+        raise WorkflowStateError(
+            f"Invalid workflow state in {context}: "
+            "ticket and patchDescription cannot both be set."
         )
 
     active_issue_number: int | None = None
@@ -195,6 +212,32 @@ def normalize_and_validate(
             "activeIssueUrl requires activeIssueNumber."
         )
 
+    ticket_reference: TicketReference | None = None
+    if has_ticket_reference:
+        reference_data = state_data["ticket"]
+        if not isinstance(reference_data, dict):
+            raise WorkflowStateError(
+                f"Invalid workflow state in {context}: "
+                "ticket must be an object."
+            )
+
+        try:
+            ticket_reference = normalize_ticket_reference_data(
+                reference_data,
+                context=f"workflow ticket in {context}",
+            )
+        except TicketModelError as exc:
+            raise WorkflowStateError(
+                f"Invalid workflow state in {context}: {exc}"
+            ) from exc
+
+    if ticket_reference is not None and active_issue_number is not None:
+        if ticket_reference.ticket_id != str(active_issue_number):
+            raise WorkflowStateError(
+                f"Invalid workflow state in {context}: "
+                "ticket.ticketId must match activeIssueNumber when both are set."
+            )
+
     patch_description: str | None = None
     if has_patch_description:
         patch_description_value = state_data["patchDescription"]
@@ -221,6 +264,7 @@ def normalize_and_validate(
         active_issue_number=active_issue_number,
         active_issue_title=active_issue_title,
         active_issue_url=active_issue_url,
+        ticket_reference=ticket_reference,
         patch_description=patch_description,
     )
 

@@ -1088,6 +1088,36 @@ class FlowDiffTests(unittest.TestCase):
 
     def test_start_clears_existing_review_baseline(self) -> None:
         repo_root = self._init_repo("repo-diff-start-clears-baseline")
+        config_path = repo_root / ".ai-dev" / "config.json"
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(
+            json.dumps(
+                {
+                    "tickets": {
+                        "provider": "local",
+                        "path": ".ai-dev/tickets",
+                    }
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        ticket_path = repo_root / ".ai-dev" / "tickets" / "24.json"
+        ticket_path.parent.mkdir(parents=True, exist_ok=True)
+        ticket_path.write_text(
+            json.dumps(
+                {
+                    "reference": {"provider": "local", "ticketId": "24", "path": ".ai-dev/tickets"},
+                    "title": "Ticket 24",
+                    "lifecycleState": "open",
+                    "workflowState": "inactive",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         self._write_workflow_state(
             repo_root,
             {

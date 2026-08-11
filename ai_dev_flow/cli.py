@@ -63,7 +63,15 @@ from .workflow_state import (
     normalize_and_validate,
     save_state,
 )
+from .ticket_config import TicketConfigError, load_ticket_configuration_for_repo_root
+from .ticket_providers import (
+    TicketProvider,
+    TicketProviderError,
+    instantiate_ticket_provider,
+    resolve_ticket_provider_for_reference,
+)
 from .json_files import JsonFileError, load_json_object, write_json_object_atomic
+from .tickets import TicketReference
 
 
 _DIRECT_FLOW_ROUTE_TOKEN = "__ai_dev_flow_exec__"
@@ -80,6 +88,7 @@ class CommandSpec:
     compatibility_top_level: bool = False
     help_visible: bool = True
     alias_eligible: bool = True
+    lifecycle_command: bool = True
     fixed_prefixed_executable: bool = False
 
 
@@ -174,6 +183,33 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         handler_key="resume",
         fixed_prefixed_executable=True,
     ),
+    CommandSpec(
+        name="ticket-create",
+        description="Create a new ticket using the configured ticket provider.",
+        canonical_namespace="flow",
+        order=120,
+        handler_key="ticket-create",
+        lifecycle_command=False,
+        fixed_prefixed_executable=True,
+    ),
+    CommandSpec(
+        name="ticket-show",
+        description="Show one ticket by ID from the configured ticket provider.",
+        canonical_namespace="flow",
+        order=130,
+        handler_key="ticket-show",
+        lifecycle_command=False,
+        fixed_prefixed_executable=True,
+    ),
+    CommandSpec(
+        name="ticket-query",
+        description="Query tickets from the configured ticket provider.",
+        canonical_namespace="flow",
+        order=140,
+        handler_key="ticket-query",
+        lifecycle_command=False,
+        fixed_prefixed_executable=True,
+    ),
 )
 
 COMMAND_SPEC_BY_NAME: dict[str, CommandSpec] = {
@@ -183,13 +219,13 @@ COMMAND_SPEC_BY_NAME: dict[str, CommandSpec] = {
 FLOW_LIFECYCLE_COMMANDS: tuple[str, ...] = tuple(
     spec.name
     for spec in sorted(COMMAND_SPECS, key=lambda item: item.order)
-    if spec.canonical_namespace == "flow" and spec.help_visible
+    if spec.canonical_namespace == "flow" and spec.help_visible and spec.lifecycle_command
 )
 
 FIXED_FLOW_EXECUTABLE_COMMANDS: tuple[str, ...] = tuple(
     spec.name
     for spec in sorted(COMMAND_SPECS, key=lambda item: item.order)
-    if spec.canonical_namespace == "flow" and spec.fixed_prefixed_executable
+    if spec.fixed_prefixed_executable
 )
 
 COMMAND_HELP: dict[str, str] = {
@@ -287,6 +323,37 @@ Reactivate a blocked issue workflow as the local active issue.
 
 Options:
   -h, --help  Show this help.
+""",
+        "ticket-create": """\
+    Usage: {command_name} "<title>" [--body "<text>"] [--acceptance "<criterion>"]... [--label "<label>"]...
+
+Create a ticket using the configured ticket provider.
+
+Options:
+    --body <text>           Set ticket body text.
+    --acceptance <text>     Add one acceptance criterion. Repeat to add more.
+    --label <name>          Add one label. Repeat to add more.
+    -h, --help              Show this help.
+""",
+        "ticket-show": """\
+    Usage: {command_name} <ticket-id>
+
+Show one ticket by identifier using the configured ticket provider.
+
+Options:
+    -h, --help  Show this help.
+""",
+        "ticket-query": """\
+    Usage: {command_name} [--lifecycle <open|closed>] [--workflow <inactive|active|blocked>] [--label "<label>"]... [--query "<text>"]
+
+Query tickets using the configured ticket provider.
+
+Options:
+    --lifecycle <state>     Filter by lifecycle state.
+    --workflow <state>      Filter by workflow state.
+    --label <name>          Require one label. Repeat to require more labels.
+    --query <text>          Match text in ticket title, body, or acceptance criteria.
+    -h, --help              Show this help.
 """,
 }
 
@@ -403,7 +470,7 @@ def _with_invocation_usage_context(
 def print_unknown_command(command_name: str, command: str) -> None:
     print(f"{command_name}: unknown command: {command}", file=sys.stderr)
     print(
-        "Run one of the direct lifecycle executables (for example flow-status --help) for usage.",
+        "Run one of the direct executables (for example flow-status --help) for usage.",
         file=sys.stderr,
     )
 
@@ -464,29 +531,6 @@ def _parse_issue_number(command_name: str, arguments: list[str]) -> int:
         raise FlowError("issue-number must be a positive integer.")
 
     return issue_number
-
-
-def _resolve_issue_metadata(issue_number: int) -> tuple[str, str]:
-    completed = subprocess.run(
-        ["gh", "issue", "view", str(issue_number), "--json", "title,url"],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=False,
-    )
-    if completed.returncode != 0 or not completed.stdout.strip():
-        return "", ""
-
-    try:
-        payload = json.loads(completed.stdout)
-    except json.JSONDecodeError:
-        return "", ""
-
-    title = payload.get("title")
-    url = payload.get("url")
-    return (title.strip() if isinstance(title, str) else "", url.strip() if isinstance(url, str) else "")
 
 
 def _resolve_issue_details_with_labels(issue_number: int) -> tuple[str, str, list[str]]:
@@ -627,27 +671,6 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
             f"Use {resume_command} {issue_number}."
         )
 
-    issue_title = ""
-    issue_url = ""
-    try:
-        issue_title, issue_url = _resolve_issue_metadata(issue_number)
-    except FileNotFoundError:
-        issue_title, issue_url = "", ""
-
-    # Validate prospective state before any git mutation.
-    issue_state = WorkflowState(
-        main_branch=state.main_branch,
-        scratch_branch=state.scratch_branch,
-        checkpoint=0,
-        active_issue_number=issue_number,
-        active_issue_title=issue_title or None,
-        active_issue_url=issue_url or None,
-    )
-    issue_state = normalize_and_validate(
-        issue_state.to_dict(),
-        context="start command",
-    )
-
     _ensure_main_and_scratch_branches_differ(state)
 
     if not branch_exists(repo_root, state.main_branch):
@@ -660,6 +683,32 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
 
     ensure_no_active_git_operations(repo_root)
 
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+    try:
+        ticket = provider.get(str(issue_number))
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    if ticket.lifecycle_state != "open":
+        raise FlowError(
+            f"Cannot start workflow: ticket {issue_number} is {ticket.lifecycle_state}."
+        )
+
+    # Validate prospective state before any git mutation.
+    issue_state = WorkflowState(
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        checkpoint=0,
+        active_issue_number=issue_number,
+        active_issue_title=ticket.title,
+        active_issue_url=ticket.reference.url,
+        ticket_reference=ticket.reference,
+    )
+    issue_state = normalize_and_validate(
+        issue_state.to_dict(),
+        context="start command",
+    )
+
     checkout_branch(repo_root, state.main_branch)
     create_or_reset_branch_from_source(
         repo_root,
@@ -671,6 +720,27 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
         repo_root,
         left_branch=state.main_branch,
         right_branch=state.scratch_branch,
+    )
+
+    try:
+        active_ticket = provider.mark_active(ticket.reference)
+    except TicketProviderError as exc:
+        raise FlowError(
+            f"Cannot start workflow: failed to mark ticket {issue_number} active. {exc}"
+        ) from exc
+
+    issue_state = WorkflowState(
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        checkpoint=0,
+        active_issue_number=issue_number,
+        active_issue_title=active_ticket.title,
+        active_issue_url=active_ticket.reference.url,
+        ticket_reference=active_ticket.reference,
+    )
+    issue_state = normalize_and_validate(
+        issue_state.to_dict(),
+        context="start command",
     )
 
     ensure_local_state_excluded(repo_root)
@@ -961,6 +1031,61 @@ def _block_usage(command_name: str) -> FlowError:
 
 def _resume_usage(command_name: str) -> FlowError:
     return _usage_error(command_name, "resume", "<ticket-number>")
+
+
+def _ticket_create_usage(command_name: str) -> FlowError:
+    return FlowError(
+        f'Usage: {command_name} "<title>" [--body "<text>"] '
+        '[--acceptance "<criterion>"]... [--label "<label>"]...'
+    )
+
+
+def _ticket_show_usage(command_name: str) -> FlowError:
+    return FlowError(f"Usage: {command_name} <ticket-id>")
+
+
+def _ticket_query_usage(command_name: str) -> FlowError:
+    return FlowError(
+        "Usage: "
+        f"{command_name} "
+        '[--lifecycle <open|closed>] [--workflow <inactive|active|blocked>] '
+        '[--label "<label>"]... [--query "<text>"]'
+    )
+
+
+def _normalize_ticket_lifecycle_state(
+    *,
+    raw_value: str,
+) -> str:
+    value = raw_value.strip()
+    if value in {"open", "closed"}:
+        return value
+    raise FlowError(
+        f"Invalid lifecycle state: {raw_value}. Expected one of: open, closed."
+    )
+
+
+def _normalize_ticket_workflow_state(
+    *,
+    raw_value: str,
+) -> str:
+    value = raw_value.strip()
+    if value in {"inactive", "active", "blocked"}:
+        return value
+    raise FlowError(
+        f"Invalid workflow state: {raw_value}. Expected one of: inactive, active, blocked."
+    )
+
+
+def _resolve_ticket_provider_for_repo_root(repo_root: Path) -> TicketProvider:
+    try:
+        configuration = load_ticket_configuration_for_repo_root(repo_root)
+    except TicketConfigError as exc:
+        raise FlowError(str(exc)) from exc
+    try:
+        return instantiate_ticket_provider(repo_root=repo_root, config=configuration)
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
 
 
 def _restore_promote_state(
@@ -2110,32 +2235,64 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
         )
 
     if state.active_issue_number is not None:
-        try:
-            completed = subprocess.run(
-                ["gh", "issue", "close", str(state.active_issue_number)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-            )
-        except FileNotFoundError as exc:
-            raise FlowError("GitHub CLI (gh) is required for this command.") from exc
+        if state.ticket_reference is None:
+            # Compatibility path for legacy workflows created before ticket
+            # references were persisted.
+            try:
+                completed = subprocess.run(
+                    ["gh", "issue", "close", str(state.active_issue_number)],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    check=False,
+                )
+            except FileNotFoundError as exc:
+                raise FlowError("GitHub CLI (gh) is required for this command.") from exc
 
-        if completed.returncode != 0:
-            message = completed.stderr.strip() or completed.stdout.strip()
-            raise FlowError(
-                "Cannot complete workflow: failed to close GitHub issue "
-                f"{state.active_issue_number}: {message}"
-            )
+            if completed.returncode != 0:
+                message = completed.stderr.strip() or completed.stdout.strip()
+                raise FlowError(
+                    "Cannot complete workflow: failed to close GitHub issue "
+                    f"{state.active_issue_number}: {message}"
+                )
+        else:
+            try:
+                provider = resolve_ticket_provider_for_reference(
+                    repo_root=repo_root,
+                    reference=state.ticket_reference,
+                )
+            except TicketProviderError as exc:
+                raise FlowError(str(exc)) from exc
+
+            try:
+                provider.complete(state.ticket_reference)
+            except TicketProviderError as exc:
+                raise FlowError(
+                    "Cannot complete workflow: failed to complete bound ticket "
+                    f"{state.active_issue_number}. {exc}"
+                ) from exc
 
     inactive_state = WorkflowState(
         main_branch=state.main_branch,
         scratch_branch=state.scratch_branch,
         checkpoint=0,
     )
-    save_state(state_path, inactive_state)
+    try:
+        save_state(state_path, inactive_state)
+    except WorkflowStateError as exc:
+        if state.active_issue_number is None:
+            raise FlowError(
+                "Cannot complete workflow: patch completed but workflow state could not be cleared. "
+                f"{exc}"
+            ) from exc
+
+        raise FlowError(
+            "Cannot complete workflow: ticket completion succeeded but workflow state could not be cleared. "
+            "The active workflow state was kept so you can retry flow-complete after fixing local state persistence. "
+            f"{exc}"
+        ) from exc
     _clear_diff_baseline_after_success(repo_root, operation="complete")
 
     if state.patch_description is not None:
@@ -2186,41 +2343,141 @@ def handle_block(command_name: str, arguments: list[str]) -> int:
             f"Cannot block workflow: checkpoint must be 0 (current: {state.checkpoint})."
         )
 
-    try:
-        issue_title, issue_url, issue_labels = _resolve_issue_details_with_labels(state.active_issue_number)
-    except FileNotFoundError as exc:
-        raise FlowError("GitHub CLI (gh) is required for this command.") from exc
-
     blocked_file = blocked_workflows_file_for_repo_root(repo_root)
     blocked_before = load_blocked_workflows(blocked_file)
+    if state.ticket_reference is None:
+        # Compatibility path for legacy workflows created before ticket references
+        # were persisted in workflow state.
+        try:
+            issue_title, issue_url, issue_labels = _resolve_issue_details_with_labels(state.active_issue_number)
+        except FileNotFoundError as exc:
+            raise FlowError("GitHub CLI (gh) is required for this command.") from exc
 
-    record = BlockedWorkflowRecord(
-        issue_number=state.active_issue_number,
-        issue_title=issue_title,
-        issue_url=issue_url,
-        reason=reason,
-        blocked_at=_now_utc_iso_timestamp(),
-    )
-    upsert_blocked_workflow(blocked_file, record)
-
-    try:
-        _reconcile_github_workflow_label(state.active_issue_number, "blocked", issue_labels)
-    except FlowError as exc:
-        save_blocked_workflows(blocked_file, blocked_before)
-        print(
-            f"{command_name}: GitHub label reconciliation failed for #{state.active_issue_number}.",
-            file=sys.stderr,
+        record = BlockedWorkflowRecord(
+            issue_number=state.active_issue_number,
+            issue_title=issue_title,
+            issue_url=issue_url,
+            reason=reason,
+            blocked_at=_now_utc_iso_timestamp(),
+            ticket_reference=None,
         )
-        raise FlowError(
-            f"Cannot block workflow: failed to synchronize GitHub labels for issue {state.active_issue_number}."
-        ) from exc
+        upsert_blocked_workflow(blocked_file, record)
+
+        try:
+            _reconcile_github_workflow_label(state.active_issue_number, "blocked", issue_labels)
+        except FlowError as exc:
+            save_blocked_workflows(blocked_file, blocked_before)
+            print(
+                f"{command_name}: GitHub label reconciliation failed for #{state.active_issue_number}.",
+                file=sys.stderr,
+            )
+            raise FlowError(
+                f"Cannot block workflow: failed to synchronize GitHub labels for issue {state.active_issue_number}."
+            ) from exc
+    else:
+        try:
+            provider = resolve_ticket_provider_for_reference(
+                repo_root=repo_root,
+                reference=state.ticket_reference,
+            )
+        except TicketProviderError as exc:
+            raise FlowError(str(exc)) from exc
+
+        try:
+            blocked_ticket = provider.block(state.ticket_reference, reason)
+        except TicketProviderError as exc:
+            raise FlowError(
+                f"Cannot block workflow: failed to transition ticket {state.active_issue_number} to blocked. {exc}"
+            ) from exc
+
+        def _rollback_provider_to_active() -> str | None:
+            try:
+                provider.resume(state.ticket_reference)
+            except TicketProviderError as exc:
+                return str(exc)
+            return None
+
+        issue_url = blocked_ticket.reference.url or state.active_issue_url
+
+        record = BlockedWorkflowRecord(
+            issue_number=state.active_issue_number,
+            issue_title=blocked_ticket.title,
+            issue_url=issue_url,
+            reason=reason,
+            blocked_at=_now_utc_iso_timestamp(),
+            ticket_reference=blocked_ticket.reference,
+        )
+        try:
+            upsert_blocked_workflow(blocked_file, record)
+        except BlockedWorkflowsError as exc:
+            rollback_failure = _rollback_provider_to_active()
+            if rollback_failure is None:
+                raise FlowError(
+                    "Cannot block workflow: failed to update blocked workflow registry."
+                ) from exc
+            raise FlowError(
+                "Cannot block workflow: failed to update blocked workflow registry. "
+                "Additional failures: provider rollback failed after registry failure: "
+                f"{rollback_failure}"
+            ) from exc
 
     inactive_state = WorkflowState(
         main_branch=state.main_branch,
         scratch_branch=state.scratch_branch,
         checkpoint=0,
     )
-    save_state(state_path, inactive_state)
+    try:
+        save_state(state_path, inactive_state)
+    except WorkflowStateError as exc:
+        if state.ticket_reference is None:
+            raise FlowError(
+                "Cannot block workflow: failed to transition local workflow to inactive state."
+            ) from exc
+
+        try:
+            provider = resolve_ticket_provider_for_reference(
+                repo_root=repo_root,
+                reference=state.ticket_reference,
+            )
+        except TicketProviderError as exc:
+            raise FlowError(str(exc)) from exc
+        def _rollback_provider_to_active() -> str | None:
+            try:
+                provider.resume(state.ticket_reference)
+            except TicketProviderError as provider_exc:
+                return str(provider_exc)
+            return None
+
+        blocked_restore_failure: str | None = None
+        try:
+            save_blocked_workflows(blocked_file, blocked_before)
+        except BlockedWorkflowsError as blocked_exc:
+            blocked_restore_failure = str(blocked_exc)
+
+        rollback_failure = _rollback_provider_to_active()
+        details: list[str] = []
+        if blocked_restore_failure is not None:
+            details.append(
+                "failed to restore blocked workflow metadata after state-save failure: "
+                f"{blocked_restore_failure}"
+            )
+        if rollback_failure is not None:
+            details.append(
+                "provider rollback failed after state-save failure: "
+                f"{rollback_failure}"
+            )
+
+        if not details:
+            raise FlowError(
+                "Cannot block workflow: failed to transition local workflow to inactive state."
+            ) from exc
+
+        raise FlowError(
+            "Cannot block workflow: failed to transition local workflow to inactive state. "
+            "Additional failures: "
+            + " | ".join(details)
+        ) from exc
+
     _clear_diff_baseline_after_success(repo_root, operation="block")
 
     print(f"Blocked issue {state.active_issue_number}")
@@ -2276,86 +2533,166 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
             f"Cannot resume workflow: no blocked record exists for issue {issue_number}."
         )
 
-    try:
-        _, _, issue_labels = _resolve_issue_details_with_labels(issue_number)
-    except FileNotFoundError as exc:
-        raise FlowError("GitHub CLI (gh) is required for this command.") from exc
-
-    issue_labels_before_active = list(issue_labels)
-
-    def _resume_label_rollback_error() -> str | None:
-        rollback_labels = list(issue_labels_before_active)
-        if "active" not in rollback_labels:
-            rollback_labels.append("active")
+    if blocked_record.ticket_reference is None:
+        # Compatibility path for blocked records created before ticket
+        # references were persisted.
         try:
-            _reconcile_github_workflow_label(issue_number, "blocked", rollback_labels)
-        except FlowError as exc:
-            return str(exc)
-        except OSError as exc:
-            message = str(exc).strip() or exc.__class__.__name__
-            return (
-                "GitHub invocation error during rollback "
-                f"({exc.__class__.__name__}): {message}"
-            )
-        return None
+            _, _, issue_labels = _resolve_issue_details_with_labels(issue_number)
+        except FileNotFoundError as exc:
+            raise FlowError("GitHub CLI (gh) is required for this command.") from exc
 
-    def _resume_transition_failure_message(
-        *,
-        primary_message: str,
-        blocked_restore_failure_message: str | None = None,
-    ) -> str:
-        detail_messages: list[str] = []
-        if blocked_restore_failure_message is not None:
-            detail_messages.append(blocked_restore_failure_message)
+        issue_labels_before_active = list(issue_labels)
 
-        label_rollback_failure = _resume_label_rollback_error()
-        if label_rollback_failure is not None:
-            detail_messages.append(
-                "GitHub label rollback failed after local resume failure: "
-                f"{label_rollback_failure}"
-            )
+        def _resume_label_rollback_error() -> str | None:
+            rollback_labels = list(issue_labels_before_active)
+            if "active" not in rollback_labels:
+                rollback_labels.append("active")
+            try:
+                _reconcile_github_workflow_label(issue_number, "blocked", rollback_labels)
+            except FlowError as exc:
+                return str(exc)
+            except OSError as exc:
+                message = str(exc).strip() or exc.__class__.__name__
+                return (
+                    "GitHub invocation error during rollback "
+                    f"({exc.__class__.__name__}): {message}"
+                )
+            return None
 
-        if not detail_messages:
-            return primary_message
+        def _resume_transition_failure_message(
+            *,
+            primary_message: str,
+            blocked_restore_failure_message: str | None = None,
+        ) -> str:
+            detail_messages: list[str] = []
+            if blocked_restore_failure_message is not None:
+                detail_messages.append(blocked_restore_failure_message)
 
-        return primary_message + " Additional failures: " + " | ".join(detail_messages)
+            label_rollback_failure = _resume_label_rollback_error()
+            if label_rollback_failure is not None:
+                detail_messages.append(
+                    "GitHub label rollback failed after local resume failure: "
+                    f"{label_rollback_failure}"
+                )
 
-    _reconcile_github_workflow_label(issue_number, "active", issue_labels)
+            if not detail_messages:
+                return primary_message
 
-    resumed_state = WorkflowState(
-        main_branch=state.main_branch,
-        scratch_branch=state.scratch_branch,
-        checkpoint=0,
-        active_issue_number=issue_number,
-        active_issue_title=blocked_record.issue_title,
-        active_issue_url=blocked_record.issue_url,
-    )
+            return primary_message + " Additional failures: " + " | ".join(detail_messages)
 
-    try:
-        remove_blocked_workflow(blocked_file, issue_number)
-    except BlockedWorkflowsError as exc:
-        raise FlowError(
-            _resume_transition_failure_message(
-                primary_message="Cannot resume workflow: failed to update blocked workflow registry.",
-            )
-        ) from exc
+        _reconcile_github_workflow_label(issue_number, "active", issue_labels)
 
-    try:
-        save_state(state_path, resumed_state)
-    except WorkflowStateError as exc:
-        blocked_restore_failure_message: str | None = None
+        resumed_state = WorkflowState(
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+            checkpoint=0,
+            active_issue_number=issue_number,
+            active_issue_title=blocked_record.issue_title,
+            active_issue_url=blocked_record.issue_url,
+        )
+
         try:
-            save_blocked_workflows(blocked_file, blocked_before)
-        except BlockedWorkflowsError:
-            blocked_restore_failure_message = (
-                f"failed to restore blocked workflow metadata for #{issue_number}"
+            remove_blocked_workflow(blocked_file, issue_number)
+        except BlockedWorkflowsError as exc:
+            raise FlowError(
+                _resume_transition_failure_message(
+                    primary_message="Cannot resume workflow: failed to update blocked workflow registry.",
+                )
+            ) from exc
+
+        try:
+            save_state(state_path, resumed_state)
+        except WorkflowStateError as exc:
+            blocked_restore_failure_message: str | None = None
+            try:
+                save_blocked_workflows(blocked_file, blocked_before)
+            except BlockedWorkflowsError:
+                blocked_restore_failure_message = (
+                    f"failed to restore blocked workflow metadata for #{issue_number}"
+                )
+            raise FlowError(
+                _resume_transition_failure_message(
+                    primary_message=f"Cannot resume workflow: failed to activate issue {issue_number}.",
+                    blocked_restore_failure_message=blocked_restore_failure_message,
+                )
+            ) from exc
+    else:
+        try:
+            provider = resolve_ticket_provider_for_reference(
+                repo_root=repo_root,
+                reference=blocked_record.ticket_reference,
             )
-        raise FlowError(
-            _resume_transition_failure_message(
-                primary_message=f"Cannot resume workflow: failed to activate issue {issue_number}.",
-                blocked_restore_failure_message=blocked_restore_failure_message,
-            )
-        ) from exc
+        except TicketProviderError as exc:
+            raise FlowError(str(exc)) from exc
+
+        try:
+            resumed_ticket = provider.resume(blocked_record.ticket_reference)
+        except TicketProviderError as exc:
+            raise FlowError(
+                f"Cannot resume workflow: failed to transition ticket {issue_number} to active. {exc}"
+            ) from exc
+
+        def _resume_provider_rollback_error() -> str | None:
+            try:
+                provider.block(blocked_record.ticket_reference, blocked_record.reason)
+            except TicketProviderError as exc:
+                return str(exc)
+            return None
+
+        resumed_state = WorkflowState(
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+            checkpoint=0,
+            active_issue_number=issue_number,
+            active_issue_title=resumed_ticket.title,
+            active_issue_url=resumed_ticket.reference.url,
+            ticket_reference=resumed_ticket.reference,
+        )
+
+        try:
+            remove_blocked_workflow(blocked_file, issue_number)
+        except BlockedWorkflowsError as exc:
+            rollback_failure = _resume_provider_rollback_error()
+            if rollback_failure is None:
+                raise FlowError(
+                    "Cannot resume workflow: failed to update blocked workflow registry."
+                ) from exc
+            raise FlowError(
+                "Cannot resume workflow: failed to update blocked workflow registry. "
+                "Additional failures: provider rollback failed after registry failure: "
+                f"{rollback_failure}"
+            ) from exc
+
+        try:
+            save_state(state_path, resumed_state)
+        except WorkflowStateError as exc:
+            blocked_restore_failure_message: str | None = None
+            try:
+                save_blocked_workflows(blocked_file, blocked_before)
+            except BlockedWorkflowsError:
+                blocked_restore_failure_message = (
+                    f"failed to restore blocked workflow metadata for #{issue_number}"
+                )
+
+            rollback_failure = _resume_provider_rollback_error()
+            detail_messages: list[str] = []
+            if blocked_restore_failure_message is not None:
+                detail_messages.append(blocked_restore_failure_message)
+            if rollback_failure is not None:
+                detail_messages.append(
+                    "provider rollback failed after local resume failure: "
+                    f"{rollback_failure}"
+                )
+
+            if not detail_messages:
+                raise FlowError(
+                    f"Cannot resume workflow: failed to activate issue {issue_number}."
+                ) from exc
+
+            raise FlowError(
+                f"Cannot resume workflow: failed to activate issue {issue_number}. "
+                "Additional failures: " + " | ".join(detail_messages)
+            ) from exc
 
     _clear_diff_baseline_after_success(repo_root, operation="resume")
 
@@ -2508,6 +2845,130 @@ def handle_status(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
+def handle_ticket_create(command_name: str, arguments: list[str]) -> int:
+    if not arguments:
+        raise _ticket_create_usage(command_name)
+
+    title = arguments[0]
+    body: str | None = None
+    acceptance_criteria: list[str] = []
+    labels: list[str] = []
+
+    index = 1
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--body":
+            if index + 1 >= len(arguments):
+                raise _ticket_create_usage(command_name)
+            body = arguments[index + 1]
+            index += 2
+            continue
+        if token == "--acceptance":
+            if index + 1 >= len(arguments):
+                raise _ticket_create_usage(command_name)
+            acceptance_criteria.append(arguments[index + 1])
+            index += 2
+            continue
+        if token == "--label":
+            if index + 1 >= len(arguments):
+                raise _ticket_create_usage(command_name)
+            labels.append(arguments[index + 1])
+            index += 2
+            continue
+
+        raise _ticket_create_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+
+    try:
+        reference = provider.create(
+            title=title,
+            body=body,
+            acceptance_criteria=tuple(acceptance_criteria),
+            labels=tuple(labels),
+        )
+        ticket = provider.get(reference.ticket_id)
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    print(json.dumps(ticket.to_dict(), indent=2))
+    return 0
+
+
+def handle_ticket_show(command_name: str, arguments: list[str]) -> int:
+    if len(arguments) != 1:
+        raise _ticket_show_usage(command_name)
+
+    ticket_id = arguments[0].strip()
+    if not ticket_id:
+        raise _ticket_show_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+
+    try:
+        ticket = provider.get(ticket_id)
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    print(json.dumps(ticket.to_dict(), indent=2))
+    return 0
+
+
+def handle_ticket_query(command_name: str, arguments: list[str]) -> int:
+    lifecycle_state: str | None = None
+    workflow_state: str | None = None
+    labels: list[str] = []
+    query_text: str | None = None
+
+    index = 0
+    while index < len(arguments):
+        token = arguments[index]
+        if token == "--lifecycle":
+            if index + 1 >= len(arguments):
+                raise _ticket_query_usage(command_name)
+            lifecycle_state = _normalize_ticket_lifecycle_state(raw_value=arguments[index + 1])
+            index += 2
+            continue
+        if token == "--workflow":
+            if index + 1 >= len(arguments):
+                raise _ticket_query_usage(command_name)
+            workflow_state = _normalize_ticket_workflow_state(raw_value=arguments[index + 1])
+            index += 2
+            continue
+        if token == "--label":
+            if index + 1 >= len(arguments):
+                raise _ticket_query_usage(command_name)
+            labels.append(arguments[index + 1])
+            index += 2
+            continue
+        if token == "--query":
+            if index + 1 >= len(arguments):
+                raise _ticket_query_usage(command_name)
+            query_text = arguments[index + 1]
+            index += 2
+            continue
+
+        raise _ticket_query_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+
+    try:
+        tickets = provider.query(
+            lifecycle_state=lifecycle_state,
+            workflow_state=workflow_state,
+            labels=tuple(labels),
+            query_text=query_text,
+        )
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    print(json.dumps({"tickets": [ticket.to_dict() for ticket in tickets]}, indent=2))
+    return 0
+
+
 def require_test_mode(command_name: str, command: str) -> None:
     if os.environ.get("FLOW_TEST_MODE", "0") != "1":
         print_unknown_command(command_name, command)
@@ -2597,6 +3058,9 @@ def _resolve_command_handler(handler_key: str):
         "complete": handle_complete,
         "block": handle_block,
         "resume": handle_resume,
+        "ticket-create": handle_ticket_create,
+        "ticket-show": handle_ticket_show,
+        "ticket-query": handle_ticket_query,
     }
     return handlers.get(handler_key)
 

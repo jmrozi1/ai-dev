@@ -64,6 +64,29 @@ init_repo() {
 	local repo_root="$1"
 
 	mkdir -p "$repo_root/subdir"
+	mkdir -p "$repo_root/.ai-dev/tickets"
+	cat >"$repo_root/.ai-dev/config.json" <<'EOF'
+{
+	"tickets": {
+		"provider": "local",
+		"path": ".ai-dev/tickets"
+	}
+}
+EOF
+	for ticket_id in $(seq 1 200); do
+		cat >"$repo_root/.ai-dev/tickets/${ticket_id}.json" <<EOF
+{
+	"reference": {
+		"provider": "local",
+		"ticketId": "${ticket_id}",
+		"path": ".ai-dev/tickets"
+	},
+	"title": "Ticket ${ticket_id}",
+	"lifecycleState": "open",
+	"workflowState": "inactive"
+}
+EOF
+	done
 
 	(
 		cd "$repo_root"
@@ -72,7 +95,7 @@ init_repo() {
 		git config user.name 'Flow Lifecycle Tests'
 		git config user.email 'flow-lifecycle-tests@example.com'
 
-		printf '.ai-dev/workflow.json\n' > .gitignore
+		printf '.ai-dev/workflow.json\n.ai-dev/blocked-workflows.json\n.ai-dev/config.json\n.ai-dev/tickets/\n' > .gitignore
 		printf 'base\n' > tracked.txt
 		printf 'keep\n' > subdir/.keep
 
@@ -246,7 +269,7 @@ assert_equals "$(branch_head "$lifecycle_repo" main)" "$(branch_head "$lifecycle
 assert_repo_clean "$lifecycle_repo"
 
 status_after_start="$(run_flow "$lifecycle_repo/subdir" status)"
-assert_equals "$status_after_start" $'Issue 123\nBranch: scratch'
+assert_equals "$status_after_start" $'Issue 123 — Ticket 123\nBranch: scratch'
 
 printf 'checkpoint one\n' >> "$lifecycle_repo/tracked.txt"
 printf 'new file one\n' > "$lifecycle_repo/one.txt"
@@ -304,7 +327,7 @@ assert_equals "$(current_branch "$lifecycle_repo")" 'scratch'
 assert_repo_clean "$lifecycle_repo"
 
 status_after_promote="$(run_flow "$lifecycle_repo/subdir" status)"
-assert_equals "$status_after_promote" $'Issue 123\nBranch: scratch'
+assert_equals "$status_after_promote" $'Issue 123 — Ticket 123\nBranch: scratch'
 
 complete_output="$(run_flow "$lifecycle_repo/subdir" complete)"
 assert_contains "$complete_output" 'Completed issue 123'
@@ -360,6 +383,6 @@ if [[ -e "$reset_repo/untracked-dir" ]]; then
 fi
 
 reset_status="$(run_flow "$reset_repo/subdir" status)"
-assert_equals "$reset_status" $'Issue 124\nBranch: scratch'
+assert_equals "$reset_status" $'Issue 124 — Ticket 124\nBranch: scratch'
 
 printf 'flow lifecycle tests passed\n'

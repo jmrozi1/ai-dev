@@ -13,7 +13,7 @@ class FlowRuntimeMigrationInventoryTests(unittest.TestCase):
 
         expected_names = {
             "ai-dev",
-            *cli.FLOW_LIFECYCLE_COMMANDS,
+            *cli.FIXED_FLOW_EXECUTABLE_COMMANDS,
         }
 
         missing = sorted(name for name in expected_names if f"| {name} |" not in text)

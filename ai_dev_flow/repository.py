@@ -136,6 +136,10 @@ def blocked_workflows_file_for_repo_root(repo_root: Path) -> Path:
     return repo_root / ".ai-dev" / "blocked-workflows.json"
 
 
+def config_file_for_repo_root(repo_root: Path) -> Path:
+    return repo_root / ".ai-dev" / "config.json"
+
+
 def diff_baseline_file_for_repo_root(repo_root: Path) -> Path:
     return repo_root / ".ai-dev" / "diff-baseline" / "baseline.json"
 

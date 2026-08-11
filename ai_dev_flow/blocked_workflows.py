@@ -7,6 +7,7 @@ from typing import Any
 from urllib.parse import urlparse
 
 from .json_files import JsonFileError, load_json_object, write_json_object_atomic
+from .tickets import TicketModelError, TicketReference, normalize_ticket_reference_data
 
 
 class BlockedWorkflowsError(Exception):
@@ -17,17 +18,23 @@ class BlockedWorkflowsError(Exception):
 class BlockedWorkflowRecord:
     issue_number: int
     issue_title: str
-    issue_url: str
+    issue_url: str | None
     reason: str
     blocked_at: str
+    ticket_reference: TicketReference | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "issueNumber": self.issue_number,
             "issueTitle": self.issue_title,
-            "issueUrl": self.issue_url,
             "reason": self.reason,
             "blockedAt": self.blocked_at,
+            **({"issueUrl": self.issue_url} if self.issue_url is not None else {}),
+            **(
+                {"ticket": self.ticket_reference.to_dict()}
+                if self.ticket_reference is not None
+                else {}
+            ),
         }
 
 
@@ -36,7 +43,7 @@ def _is_int(value: object) -> bool:
 
 
 def _normalize_record(record_data: dict[str, Any], *, context: str) -> BlockedWorkflowRecord:
-    required = ["issueNumber", "issueTitle", "issueUrl", "reason", "blockedAt"]
+    required = ["issueNumber", "issueTitle", "reason", "blockedAt"]
     missing = [name for name in required if name not in record_data]
     if missing:
         raise BlockedWorkflowsError(
@@ -55,22 +62,47 @@ def _normalize_record(record_data: dict[str, Any], *, context: str) -> BlockedWo
             f"Invalid blocked workflow record in {context}: issueTitle cannot be empty."
         )
 
-    issue_url = record_data["issueUrl"]
-    if not isinstance(issue_url, str) or not issue_url.strip():
-        raise BlockedWorkflowsError(
-            f"Invalid blocked workflow record in {context}: issueUrl cannot be empty."
-        )
-    parsed = urlparse(issue_url.strip())
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
-        raise BlockedWorkflowsError(
-            f"Invalid blocked workflow record in {context}: issueUrl must be a valid HTTP(S) URL."
-        )
+    issue_url: str | None = None
+    if "issueUrl" in record_data:
+        raw_issue_url = record_data["issueUrl"]
+        if raw_issue_url is not None:
+            if not isinstance(raw_issue_url, str) or not raw_issue_url.strip():
+                raise BlockedWorkflowsError(
+                    f"Invalid blocked workflow record in {context}: issueUrl cannot be empty."
+                )
+            parsed = urlparse(raw_issue_url.strip())
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                raise BlockedWorkflowsError(
+                    f"Invalid blocked workflow record in {context}: issueUrl must be a valid HTTP(S) URL."
+                )
+            issue_url = raw_issue_url.strip()
 
     reason = record_data["reason"]
     if not isinstance(reason, str) or not reason.strip():
         raise BlockedWorkflowsError(
             f"Invalid blocked workflow record in {context}: reason cannot be empty."
         )
+
+    ticket_reference: TicketReference | None = None
+    if "ticket" in record_data:
+        ticket_data = record_data["ticket"]
+        if ticket_data is not None:
+            if not isinstance(ticket_data, dict):
+                raise BlockedWorkflowsError(
+                    f"Invalid blocked workflow record in {context}: ticket must be an object when provided."
+                )
+            try:
+                ticket_reference = normalize_ticket_reference_data(
+                    ticket_data,
+                    context=f"blocked workflow ticket in {context}",
+                )
+            except TicketModelError as exc:
+                raise BlockedWorkflowsError(str(exc)) from exc
+
+            if ticket_reference.ticket_id != str(issue_number):
+                raise BlockedWorkflowsError(
+                    f"Invalid blocked workflow record in {context}: ticket.ticketId must match issueNumber."
+                )
 
     blocked_at = record_data["blockedAt"]
     if not isinstance(blocked_at, str) or not blocked_at.strip():
@@ -89,9 +121,10 @@ def _normalize_record(record_data: dict[str, Any], *, context: str) -> BlockedWo
     return BlockedWorkflowRecord(
         issue_number=issue_number,
         issue_title=issue_title.strip(),
-        issue_url=issue_url.strip(),
+        issue_url=issue_url,
         reason=reason.strip(),
         blocked_at=blocked_at.strip(),
+        ticket_reference=ticket_reference,
     )
 
 

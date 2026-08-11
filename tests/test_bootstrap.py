@@ -60,7 +60,7 @@ class BootstrapCoreTests(unittest.TestCase):
         record_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return record_path
 
-    def test_fixed_flow_executable_registry_matches_checkpoint_two_surface(self) -> None:
+    def test_fixed_flow_executable_registry_matches_checkpoint_two_plus_ticket_surface(self) -> None:
         self.assertEqual(
             FIXED_FLOW_EXECUTABLE_COMMANDS,
             (
@@ -74,6 +74,9 @@ class BootstrapCoreTests(unittest.TestCase):
                 "complete",
                 "block",
                 "resume",
+                "ticket-create",
+                "ticket-show",
+                "ticket-query",
             ),
         )
 
@@ -850,6 +853,24 @@ class BootstrapCoreTests(unittest.TestCase):
 
         removed = {item.path.name for item in second.launcher_statuses if item.state == "removed"}
         self.assertIn("flow-status", removed)
+
+    def test_custom_prefix_installs_ticket_command_launchers(self) -> None:
+        home = self.tmp_path / "home-prefix-ticket-launchers"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        self.assertTrue((install_dir / "ai-flow-ticket-create").exists())
+        self.assertTrue((install_dir / "ai-flow-ticket-show").exists())
+        self.assertTrue((install_dir / "ai-flow-ticket-query").exists())
 
     def test_prefix_transition_ai_flow_to_flow_removes_old_owned_launchers(self) -> None:
         home = self.tmp_path / "home-prefix-transition-2"
@@ -1689,6 +1710,9 @@ class BootstrapCoreTests(unittest.TestCase):
             "complete": ["extra"],
             "block": [],
             "resume": [],
+            "ticket-create": [],
+            "ticket-show": [],
+            "ticket-query": ["--bogus"],
         }
 
         for command, arguments in malformed_arguments.items():
@@ -1719,6 +1743,66 @@ class BootstrapCoreTests(unittest.TestCase):
         )
         self.assertEqual(status_run.returncode, 0)
         self.assertIn("Workflow:", status_run.stdout)
+
+    def test_ticket_launchers_help_do_not_repeat_command_name(self) -> None:
+        home = self.tmp_path / "home-prefix-ticket-help"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        for command in ("ticket-create", "ticket-show", "ticket-query"):
+            launcher = install_dir / f"flow-{command}"
+            with self.subTest(command=command):
+                help_run = subprocess.run(
+                    [str(launcher), "--help"],
+                    check=False,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    cwd=str(self.tmp_path),
+                )
+                self.assertEqual(help_run.returncode, 0)
+                self.assertEqual(help_run.stderr, "")
+                self.assertIn(f"Usage: flow-{command}", help_run.stdout)
+                self.assertNotIn(f"Usage: flow-{command} {command}", help_run.stdout)
+
+    def test_custom_prefix_ticket_create_help_uses_name_once(self) -> None:
+        home = self.tmp_path / "home-prefix-ticket-help-custom"
+        install_dir = home / ".local" / "bin"
+
+        run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="ai-flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        launcher = install_dir / "ai-flow-ticket-create"
+        help_run = subprocess.run(
+            [str(launcher), "--help"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=str(self.tmp_path),
+        )
+        self.assertEqual(help_run.returncode, 0)
+        self.assertEqual(help_run.stderr, "")
+        self.assertIn("Usage: ai-flow-ticket-create", help_run.stdout)
+        self.assertNotIn("Usage: ai-flow-ticket-create ticket-create", help_run.stdout)
 
 
 if __name__ == "__main__":

@@ -58,12 +58,35 @@ assert_equals() {
 init_repo() {
 	local repo_root="$1"
 	mkdir -p "$repo_root/subdir"
+	mkdir -p "$repo_root/.ai-dev/tickets"
+	cat >"$repo_root/.ai-dev/config.json" <<'EOF'
+{
+  "tickets": {
+    "provider": "local",
+    "path": ".ai-dev/tickets"
+  }
+}
+EOF
+	for ticket_id in $(seq 1 200); do
+		cat >"$repo_root/.ai-dev/tickets/${ticket_id}.json" <<EOF
+{
+  "reference": {
+    "provider": "local",
+		"ticketId": "${ticket_id}",
+		"path": ".ai-dev/tickets"
+  },
+  "title": "Ticket ${ticket_id}",
+  "lifecycleState": "open",
+  "workflowState": "inactive"
+}
+EOF
+	done
 	(
 		cd "$repo_root"
 		git init -q
 		git config user.name 'Flow Patch Tests'
 		git config user.email 'flow-patch-tests@example.com'
-		printf '.ai-dev/workflow.json\n' > .gitignore
+		printf '.ai-dev/workflow.json\n.ai-dev/blocked-workflows.json\n.ai-dev/config.json\n.ai-dev/tickets/\n' > .gitignore
 		printf 'base\n' > tracked.txt
 		printf 'keep\n' > subdir/.keep
 		git add .gitignore tracked.txt subdir/.keep
