@@ -18,11 +18,19 @@ from .json_files import JsonFileError, load_json_object, write_json_object_atomi
 
 
 OWNERSHIP_MARKER = "AI_DEV_LAUNCHER_V1"
+LEGACY_MANAGED_LAUNCHER_MARKER = "AI_DEV_MANAGED_LAUNCHER_V1"
 CANONICAL_COMMAND_NAME = "ai-dev"
 _PREFIX_PATTERN = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]*[a-zA-Z0-9])?$")
 _DIRECT_FLOW_ROUTE_TOKEN = "__ai_dev_flow_exec__"
 PREFIX_LAUNCHER_OWNERSHIP_VERSION = 1
+_SYMLINK_OWNERSHIP_PREFIX = "symlink:"
 OBSOLETE_FIXED_FLOW_EXECUTABLE_COMMANDS = frozenset({"review"})
+LEGACY_RETIRED_FLOW_LAUNCHER_NAMES = (
+    "flow",
+    "flow-help",
+    "flow-review",
+    "flow-task-prepare",
+)
 
 
 class BootstrapError(Exception):
@@ -273,6 +281,77 @@ def resolve_prefix_launcher_ownership_path(
     return base_dir / "prefixed-launcher-ownership.json"
 
 
+def resolve_legacy_installation_manifest_path(
+    *,
+    os_name: str | None = None,
+    home: Path | None = None,
+    appdata: str | None = None,
+    xdg_config_home: str | None = None,
+) -> Path:
+    return resolve_prefix_launcher_ownership_path(
+        os_name=os_name,
+        home=home,
+        appdata=appdata,
+        xdg_config_home=xdg_config_home,
+    ).with_name("installation-manifest.json")
+
+
+def _load_legacy_managed_launchers(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    try:
+        raw = load_json_object(path, missing_default={})
+    except JsonFileError:
+        return {}
+
+    if not isinstance(raw, dict):
+        return {}
+
+    managed_launchers = raw.get("managed_launchers")
+    if not isinstance(managed_launchers, dict):
+        return {}
+
+    digests: dict[str, str] = {}
+    for path_text, digest in managed_launchers.items():
+        if not isinstance(path_text, str) or not path_text:
+            continue
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            continue
+        digests[path_text] = digest
+
+    return digests
+
+
+def _matches_legacy_retired_flow_launcher_shape(
+    *,
+    launcher_name: str,
+    text: str,
+) -> bool:
+    expected_exec_line_by_name = {
+        "flow": "exec 'ai-dev' 'flow' \"$@\"",
+        "flow-help": "exec 'ai-dev' 'flow' '--help' \"$@\"",
+        "flow-review": "exec 'ai-dev' 'flow' 'review' \"$@\"",
+        "flow-task-prepare": "exec 'ai-dev' 'flow' 'task-prepare' \"$@\"",
+    }
+
+    expected_exec_line = expected_exec_line_by_name.get(launcher_name)
+    if expected_exec_line is None:
+        return False
+
+    lines = _canonical_newlines(text).splitlines()
+    if len(lines) < 4:
+        return False
+
+    if lines[0] != "#!/usr/bin/env sh":
+        return False
+    if lines[1] != f"# {LEGACY_MANAGED_LAUNCHER_MARKER}":
+        return False
+    if "set -eu" not in lines:
+        return False
+    return expected_exec_line in lines
+
+
 def _load_prefix_launcher_ownership(path: Path) -> _PrefixLauncherOwnershipRecord | None:
     if not path.exists():
         return None
@@ -332,9 +411,16 @@ def _load_prefix_launcher_ownership(path: Path) -> _PrefixLauncherOwnershipRecor
             raise BootstrapError(
                 f"Invalid prefix launcher ownership record in {path}: launcher path keys must be non-empty strings."
             )
-        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        if not isinstance(digest, str):
             raise BootstrapError(
-                f"Invalid prefix launcher ownership record in {path}: digest must be lowercase SHA-256."
+                f"Invalid prefix launcher ownership record in {path}: digest must be a string."
+            )
+        if not (
+            re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+            or digest.startswith(_SYMLINK_OWNERSHIP_PREFIX)
+        ):
+            raise BootstrapError(
+                f"Invalid prefix launcher ownership record in {path}: digest must be lowercase SHA-256 or symlink marker."
             )
         launcher_path = _validate_recorded_launcher_path(
             record_path=path,
@@ -776,6 +862,177 @@ def _build_prefixed_flow_launcher_map(
     return launcher_map
 
 
+def _build_posix_prefixed_flow_symlink_map(
+    *,
+    repo_root: Path,
+    install_directory: Path,
+    prefix: str,
+) -> dict[Path, Path]:
+    symlink_map: dict[Path, Path] = {}
+    scripts_root = repo_root / "skills" / "flow" / "scripts"
+    for flow_command in _fixed_flow_launcher_commands():
+        launcher_name = f"{prefix}-{flow_command}"
+        launcher_path = install_directory / launcher_name
+        target_path = (scripts_root / f"flow-{flow_command}").resolve()
+        if not target_path.exists() or not target_path.is_file():
+            raise BootstrapError(
+                f"Canonical flow skill command target not found: {target_path}"
+            )
+        symlink_map[launcher_path] = target_path
+    return symlink_map
+
+
+def _path_exists_or_symlink(path: Path) -> bool:
+    return path.exists() or path.is_symlink()
+
+
+def _normalized_absolute_path_text_for_platform(path: Path, *, platform: str) -> str:
+    absolute = path.expanduser().resolve(strict=False)
+    return _normalize_path_text_for_platform(str(absolute), platform=platform)
+
+
+def _normalized_literal_symlink_target_text(path: Path, *, platform: str) -> str | None:
+    if not path.is_symlink():
+        return None
+    try:
+        target_text = os.readlink(path)
+    except OSError:
+        return None
+    target_path = Path(target_text)
+    if not target_path.is_absolute():
+        target_path = path.parent / target_path
+    return _normalize_path_text_for_platform(str(target_path), platform=platform)
+
+
+def _normalized_symlink_target_text(path: Path, *, platform: str) -> str | None:
+    literal_target = _normalized_literal_symlink_target_text(path, platform=platform)
+    if literal_target is None:
+        return None
+    return _normalized_absolute_path_text_for_platform(Path(literal_target), platform=platform)
+
+
+def _symlink_ownership_value(target_path: Path, *, platform: str) -> str:
+    normalized_target = _normalized_absolute_path_text_for_platform(
+        target_path,
+        platform=platform,
+    )
+    return f"{_SYMLINK_OWNERSHIP_PREFIX}{normalized_target}"
+
+
+def _owned_entry_matches_existing_path(
+    *,
+    path: Path,
+    ownership_value: str,
+    platform: str,
+) -> bool:
+    if ownership_value.startswith(_SYMLINK_OWNERSHIP_PREFIX):
+        expected_target = ownership_value[len(_SYMLINK_OWNERSHIP_PREFIX) :]
+        actual_target = _normalized_symlink_target_text(path, platform=platform)
+        return actual_target == expected_target
+
+    if not path.is_file():
+        return False
+    try:
+        return _sha256_file(path) == ownership_value
+    except OSError:
+        return False
+
+
+def _install_posix_symlink_launchers(
+    *,
+    symlink_map: dict[Path, Path],
+    prior_record: _PrefixLauncherOwnershipRecord | None,
+    force: bool,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    interactive: bool | None,
+    emit_force_notice: bool,
+) -> tuple[LauncherInstallStatus, ...]:
+    statuses: list[LauncherInstallStatus] = []
+    prior_owned = prior_record.owned_launchers if prior_record is not None else {}
+
+    for path, target in symlink_map.items():
+        if not _path_exists_or_symlink(path):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                path.symlink_to(target)
+            except OSError as exc:
+                raise BootstrapError(f"Cannot create symlink launcher {path}: {exc}") from exc
+            statuses.append(LauncherInstallStatus(path=path, state="installed"))
+            continue
+
+        actual_target = _normalized_symlink_target_text(path, platform="posix")
+        expected_target = _normalized_absolute_path_text_for_platform(target, platform="posix")
+        if actual_target == expected_target:
+            statuses.append(LauncherInstallStatus(path=path, state="up-to-date"))
+            continue
+
+        ownership_value = prior_owned.get(str(path))
+        owned_and_provable = (
+            ownership_value is not None
+            and _owned_entry_matches_existing_path(
+                path=path,
+                ownership_value=ownership_value,
+                platform="posix",
+            )
+        )
+
+        if not owned_and_provable:
+            if not path.is_file() and not path.is_symlink():
+                raise BootstrapError(
+                    "Cannot install launcher because destination exists and is neither a regular file nor a symlink: "
+                    f"{path}"
+                )
+            _confirm_replace_conflicting_launcher(
+                path=path,
+                force=force,
+                input_stream=input_stream,
+                output_stream=output_stream,
+                interactive=interactive,
+                emit_force_notice=emit_force_notice,
+            )
+
+        previous_is_symlink = path.is_symlink()
+        previous_link_target: str | None = None
+        previous_bytes: bytes | None = None
+        previous_mode: int | None = None
+        try:
+            previous_mode = path.lstat().st_mode
+            if previous_is_symlink:
+                previous_link_target = os.readlink(path)
+            elif path.is_file():
+                previous_bytes = path.read_bytes()
+        except OSError as exc:
+            raise BootstrapError(f"Cannot snapshot existing launcher {path}: {exc}") from exc
+
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise BootstrapError(f"Cannot replace launcher {path}: {exc}") from exc
+        try:
+            path.symlink_to(target)
+        except OSError as exc:
+            rollback_error: Exception | None = None
+            try:
+                if previous_is_symlink and previous_link_target is not None:
+                    path.symlink_to(previous_link_target)
+                elif previous_bytes is not None:
+                    path.write_bytes(previous_bytes)
+                    if previous_mode is not None:
+                        path.chmod(previous_mode)
+            except Exception as rollback_exc:  # pragma: no cover - best-effort rollback
+                rollback_error = rollback_exc
+
+            if rollback_error is not None:
+                raise BootstrapError(
+                    f"Cannot create symlink launcher {path}: {exc}; rollback failed: {rollback_error}"
+                ) from exc
+            raise BootstrapError(f"Cannot create symlink launcher {path}: {exc}") from exc
+        statuses.append(LauncherInstallStatus(path=path, state="updated"))
+
+    return tuple(statuses)
+
+
 def _reconcile_recorded_owned_launchers(
     *,
     prior_record: _PrefixLauncherOwnershipRecord | None,
@@ -813,8 +1070,24 @@ def _reconcile_recorded_owned_launchers(
     for obsolete_path_text in obsolete_paths:
         obsolete_path = Path(obsolete_path_text)
         expected_digest = prior_record.owned_launchers[obsolete_path_text]
-        if not obsolete_path.exists():
+        if not _path_exists_or_symlink(obsolete_path):
             statuses.append(LauncherInstallStatus(path=obsolete_path, state="already-absent"))
+            continue
+
+        if expected_digest.startswith(_SYMLINK_OWNERSHIP_PREFIX):
+            expected_target = expected_digest[len(_SYMLINK_OWNERSHIP_PREFIX) :]
+            actual_target = _normalized_symlink_target_text(
+                obsolete_path,
+                platform=normalized_platform,
+            )
+            if actual_target != expected_target:
+                statuses.append(LauncherInstallStatus(path=obsolete_path, state="preserved-divergent"))
+                continue
+            try:
+                obsolete_path.unlink()
+            except OSError as exc:
+                raise BootstrapError(f"Cannot remove obsolete owned launcher {obsolete_path}: {exc}") from exc
+            statuses.append(LauncherInstallStatus(path=obsolete_path, state="removed"))
             continue
 
         if not obsolete_path.is_file():
@@ -836,6 +1109,72 @@ def _reconcile_recorded_owned_launchers(
         except OSError as exc:
             raise BootstrapError(f"Cannot remove obsolete owned launcher {obsolete_path}: {exc}") from exc
         statuses.append(LauncherInstallStatus(path=obsolete_path, state="removed"))
+
+    return tuple(statuses)
+
+
+def _reconcile_legacy_retired_flow_launchers(
+    *,
+    legacy_managed_launchers: dict[str, str],
+    normalized_platform: str,
+    install_dir: Path,
+) -> tuple[LauncherInstallStatus, ...]:
+    if normalized_platform != "posix":
+        return ()
+
+    normalized_legacy_digests = {
+        _normalize_path_text_for_platform(path_text, platform=normalized_platform): digest
+        for path_text, digest in legacy_managed_launchers.items()
+    }
+
+    statuses: list[LauncherInstallStatus] = []
+    for launcher_name in LEGACY_RETIRED_FLOW_LAUNCHER_NAMES:
+        launcher_path = install_dir / launcher_name
+        normalized_path = _normalize_path_text_for_platform(
+            str(launcher_path),
+            platform=normalized_platform,
+        )
+
+        expected_digest = normalized_legacy_digests.get(normalized_path)
+        if expected_digest is None:
+            continue
+
+        if not launcher_path.exists():
+            statuses.append(LauncherInstallStatus(path=launcher_path, state="already-absent"))
+            continue
+
+        if not launcher_path.is_file():
+            statuses.append(LauncherInstallStatus(path=launcher_path, state="preserved-divergent"))
+            continue
+
+        try:
+            actual_digest = _sha256_file(launcher_path)
+        except OSError:
+            statuses.append(LauncherInstallStatus(path=launcher_path, state="preserved-divergent"))
+            continue
+
+        if actual_digest != expected_digest:
+            statuses.append(LauncherInstallStatus(path=launcher_path, state="preserved-divergent"))
+            continue
+
+        try:
+            current_text = launcher_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            statuses.append(LauncherInstallStatus(path=launcher_path, state="preserved-divergent"))
+            continue
+
+        if not _matches_legacy_retired_flow_launcher_shape(
+            launcher_name=launcher_name,
+            text=current_text,
+        ):
+            statuses.append(LauncherInstallStatus(path=launcher_path, state="preserved-divergent"))
+            continue
+
+        try:
+            launcher_path.unlink()
+        except OSError as exc:
+            raise BootstrapError(f"Cannot remove obsolete owned launcher {launcher_path}: {exc}") from exc
+        statuses.append(LauncherInstallStatus(path=launcher_path, state="removed"))
 
     return tuple(statuses)
 
@@ -1030,15 +1369,25 @@ def run_bootstrap(
     if output_stream is None:
         output_stream = sys.stderr
 
-    collision_validation = _validate_launcher_collisions_with_replacement(
-        launcher_map=launcher_map,
-        force=force,
-        input_stream=input_stream,
-        output_stream=output_stream,
-        interactive=interactive,
-        emit_force_notice=emit_force_replacement_notices,
-    )
-    snapshots = collision_validation.snapshots
+    collision_validation = None
+    snapshots: dict[Path, _SnapshotEntry] = {}
+    posix_symlink_map: dict[Path, Path] = {}
+    if normalized_platform == "posix":
+        posix_symlink_map = _build_posix_prefixed_flow_symlink_map(
+            repo_root=canonical_repo_root,
+            install_directory=install_dir,
+            prefix=cleaned_prefix,
+        )
+    else:
+        collision_validation = _validate_launcher_collisions_with_replacement(
+            launcher_map=launcher_map,
+            force=force,
+            input_stream=input_stream,
+            output_stream=output_stream,
+            interactive=interactive,
+            emit_force_notice=emit_force_replacement_notices,
+        )
+        snapshots = collision_validation.snapshots
 
     try:
         install_dir.mkdir(parents=True, exist_ok=True)
@@ -1046,30 +1395,61 @@ def run_bootstrap(
         raise BootstrapError(f"Cannot create install directory {install_dir}: {exc}") from exc
 
     prior_prefix_ownership = _load_prefix_launcher_ownership(prefix_ownership_path)
-
-    install_statuses = _install_launchers(
-        launcher_map=launcher_map,
-        snapshots=snapshots,
-        platform=normalized_platform,
+    legacy_manifest_path = resolve_legacy_installation_manifest_path(
+        os_name=os_name,
+        home=home_path,
     )
+    legacy_managed_launchers = _load_legacy_managed_launchers(legacy_manifest_path)
+
+    if normalized_platform == "posix":
+        install_statuses = _install_posix_symlink_launchers(
+            symlink_map=posix_symlink_map,
+            prior_record=prior_prefix_ownership,
+            force=force,
+            input_stream=input_stream,
+            output_stream=output_stream,
+            interactive=interactive,
+            emit_force_notice=emit_force_replacement_notices,
+        )
+        desired_paths = set(posix_symlink_map.keys())
+    else:
+        install_statuses = _install_launchers(
+            launcher_map=launcher_map,
+            snapshots=snapshots,
+            platform=normalized_platform,
+        )
+        desired_paths = set(launcher_map.keys())
+
     cleanup_statuses = _reconcile_recorded_owned_launchers(
         prior_record=prior_prefix_ownership,
-        desired_paths=set(launcher_map.keys()),
+        desired_paths=desired_paths,
+        normalized_platform=normalized_platform,
+        install_dir=install_dir,
+    )
+    legacy_cleanup_statuses = _reconcile_legacy_retired_flow_launchers(
+        legacy_managed_launchers=legacy_managed_launchers,
         normalized_platform=normalized_platform,
         install_dir=install_dir,
     )
 
-    statuses = (*install_statuses, *cleanup_statuses)
+    statuses = (*install_statuses, *cleanup_statuses, *legacy_cleanup_statuses)
 
     ownership_record = _PrefixLauncherOwnershipRecord(
         version=PREFIX_LAUNCHER_OWNERSHIP_VERSION,
         selected_prefix=cleaned_prefix,
         platform=normalized_platform,
         install_directory=str(install_dir),
-        owned_launchers={
-            str(path): _sha256_text(text)
-            for path, text in launcher_map.items()
-        },
+        owned_launchers=(
+            {
+                str(path): _symlink_ownership_value(target, platform=normalized_platform)
+                for path, target in posix_symlink_map.items()
+            }
+            if normalized_platform == "posix"
+            else {
+                str(path): _sha256_text(text)
+                for path, text in launcher_map.items()
+            }
+        ),
     )
     _save_prefix_launcher_ownership(prefix_ownership_path, ownership_record)
 
@@ -1080,10 +1460,12 @@ def run_bootstrap(
         windows=windows,
     )
 
-    warnings: list[str] = [
-        f"Force-replaced conflicting launcher at {path}."
-        for path in collision_validation.force_replaced_paths
-    ]
+    warnings: list[str] = []
+    if collision_validation is not None:
+        warnings.extend(
+            f"Force-replaced conflicting launcher at {path}."
+            for path in collision_validation.force_replaced_paths
+        )
     if not on_path:
         warnings.append("Install directory is not currently on PATH.")
 

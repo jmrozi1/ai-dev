@@ -134,6 +134,9 @@ class ScriptEntrypointTests(unittest.TestCase):
         self.assertIn("--prefix", completed.stdout)
         self.assertIn("--home", completed.stdout)
         self.assertIn("--install-dir", completed.stdout)
+        self.assertIn("flow-ticket-create", completed.stdout)
+        self.assertIn("flow-ticket-show", completed.stdout)
+        self.assertIn("flow-ticket-query", completed.stdout)
         self.assertFalse((home_root / ".local" / "bin").exists())
 
     def test_install_sh_custom_prefix_overrides_default_flow_prefix(self) -> None:

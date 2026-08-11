@@ -16,11 +16,13 @@ from unittest.mock import patch
 from ai_dev_flow.cli import FIXED_FLOW_EXECUTABLE_COMMANDS
 from ai_dev_flow.bootstrap import (
     BootstrapError,
+    LEGACY_RETIRED_FLOW_LAUNCHER_NAMES,
     OWNERSHIP_MARKER,
     _DIRECT_FLOW_ROUTE_TOKEN,
     _render_path_guidance,
     _is_path_on_path,
     _paths_equal,
+    resolve_legacy_installation_manifest_path,
     resolve_prefix_launcher_ownership_path,
     render_cmd_launcher,
     render_posix_launcher,
@@ -59,6 +61,36 @@ class BootstrapCoreTests(unittest.TestCase):
         }
         record_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         return record_path
+
+    def _write_legacy_installation_manifest(
+        self,
+        *,
+        home: Path,
+        managed_launchers: dict[str, str],
+    ) -> Path:
+        manifest_path = resolve_legacy_installation_manifest_path(os_name="posix", home=home)
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "version": 1,
+            "managed_launchers": dict(sorted(managed_launchers.items())),
+        }
+        manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return manifest_path
+
+    def _legacy_retired_launcher_text(self, launcher_name: str) -> str:
+        exec_line_by_name = {
+            "flow": "exec 'ai-dev' 'flow' \"$@\"",
+            "flow-help": "exec 'ai-dev' 'flow' '--help' \"$@\"",
+            "flow-review": "exec 'ai-dev' 'flow' 'review' \"$@\"",
+            "flow-task-prepare": "exec 'ai-dev' 'flow' 'task-prepare' \"$@\"",
+        }
+        exec_line = exec_line_by_name[launcher_name]
+        return (
+            "#!/usr/bin/env sh\n"
+            "# AI_DEV_MANAGED_LAUNCHER_V1\n"
+            "set -eu\n"
+            f"{exec_line}\n"
+        )
 
     def test_fixed_flow_executable_registry_matches_checkpoint_two_plus_ticket_surface(self) -> None:
         self.assertEqual(
@@ -363,7 +395,7 @@ class BootstrapCoreTests(unittest.TestCase):
         self.assertIn(str(collision_path), record_data["owned_launchers"])
         self.assertEqual(
             record_data["owned_launchers"][str(collision_path)],
-            hashlib.sha256(collision_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest(),
+            f"symlink:{(self.repo_root / 'skills' / 'flow' / 'scripts' / 'flow-start').resolve()}",
         )
 
         class _NoReadInput:
@@ -400,8 +432,8 @@ class BootstrapCoreTests(unittest.TestCase):
             config_path=self.config_path,
         )
         launcher_path = install_dir / "flow-start"
-        original = launcher_path.read_text(encoding="utf-8")
-        launcher_path.write_text(original + "# user change\n", encoding="utf-8")
+        launcher_path.unlink()
+        launcher_path.write_text("#!/usr/bin/env sh\necho user change\n", encoding="utf-8")
 
         with self.assertRaises(BootstrapError):
             run_bootstrap(
@@ -416,7 +448,9 @@ class BootstrapCoreTests(unittest.TestCase):
                 output_stream=io.StringIO(),
                 interactive=False,
             )
-        self.assertIn("# user change\n", launcher_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(launcher_path.is_file())
+        self.assertIn("user change", launcher_path.read_text(encoding="utf-8"))
 
         run_bootstrap(
             platform="posix",
@@ -431,7 +465,7 @@ class BootstrapCoreTests(unittest.TestCase):
             output_stream=io.StringIO(),
             interactive=False,
         )
-        self.assertEqual(launcher_path.read_text(encoding="utf-8"), original)
+        self.assertTrue(launcher_path.is_symlink())
 
     def test_force_replacement_does_not_overwrite_symlink_target(self) -> None:
         home = self.tmp_path / "home-collision-symlink"
@@ -457,8 +491,11 @@ class BootstrapCoreTests(unittest.TestCase):
         )
 
         self.assertEqual(target_path.read_text(encoding="utf-8"), "#!/usr/bin/env sh\necho outside\n")
-        self.assertFalse(launcher_path.is_symlink())
-        self.assertIn(OWNERSHIP_MARKER, launcher_path.read_text(encoding="utf-8"))
+        self.assertTrue(launcher_path.is_symlink())
+        self.assertEqual(
+            launcher_path.resolve(),
+            (self.repo_root / "skills" / "flow" / "scripts" / "flow-start").resolve(),
+        )
 
     def test_unrelated_similarly_named_file_remains_untouched_when_forcing_conflict_replacement(self) -> None:
         home = self.tmp_path / "home-collision-unrelated"
@@ -578,7 +615,7 @@ class BootstrapCoreTests(unittest.TestCase):
         launcher_path.write_text(original, encoding="utf-8")
         launcher_path.chmod(0o755)
 
-        with patch("ai_dev_flow.bootstrap._set_executable_if_needed", side_effect=RuntimeError("chmod fail")):
+        with patch("pathlib.Path.symlink_to", side_effect=OSError("symlink fail")):
             with self.assertRaises(BootstrapError):
                 run_bootstrap(
                     platform="posix",
@@ -778,9 +815,15 @@ class BootstrapCoreTests(unittest.TestCase):
         self.assertEqual(installed_names, expected_names)
 
         for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
-            launcher_text = (install_dir / f"flow-{command}").read_text(encoding="utf-8")
+            launcher_path = install_dir / f"flow-{command}"
+            self.assertTrue(launcher_path.is_symlink())
+            self.assertEqual(
+                launcher_path.resolve(),
+                (self.repo_root / "skills" / "flow" / "scripts" / f"flow-{command}").resolve(),
+            )
+            launcher_text = launcher_path.read_text(encoding="utf-8")
             self.assertIn(_DIRECT_FLOW_ROUTE_TOKEN, launcher_text)
-            self.assertIn(f"'{command}'", launcher_text)
+            self.assertIn(f'"{command}"', launcher_text)
 
     def test_recorded_owned_launchers_are_removed_on_prefix_change(self) -> None:
         home = self.tmp_path / "home-prefix-stale"
@@ -808,6 +851,154 @@ class BootstrapCoreTests(unittest.TestCase):
 
         removed = {item.path.name for item in result.launcher_statuses if item.state == "removed"}
         self.assertIn("flow-status", removed)
+
+    def test_legacy_retired_launchers_are_removed_only_when_digest_and_shape_match(self) -> None:
+        home = self.tmp_path / "home-legacy-retired-cleanup"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        managed_launchers: dict[str, str] = {}
+        for launcher_name in LEGACY_RETIRED_FLOW_LAUNCHER_NAMES:
+            path = install_dir / launcher_name
+            content = self._legacy_retired_launcher_text(launcher_name)
+            path.write_text(content, encoding="utf-8")
+            managed_launchers[str(path)] = hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+        self._write_legacy_installation_manifest(
+            home=home,
+            managed_launchers=managed_launchers,
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        removed = {
+            item.path.name: item.state
+            for item in result.launcher_statuses
+            if item.path.name in LEGACY_RETIRED_FLOW_LAUNCHER_NAMES
+        }
+        self.assertEqual(
+            removed,
+            {name: "removed" for name in LEGACY_RETIRED_FLOW_LAUNCHER_NAMES},
+        )
+        for launcher_name in LEGACY_RETIRED_FLOW_LAUNCHER_NAMES:
+            self.assertFalse((install_dir / launcher_name).exists())
+
+    def test_legacy_retired_launcher_is_preserved_when_digest_mismatch(self) -> None:
+        home = self.tmp_path / "home-legacy-retired-digest-mismatch"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        launcher_name = "flow-review"
+        launcher_path = install_dir / launcher_name
+        launcher_content = self._legacy_retired_launcher_text(launcher_name)
+        launcher_path.write_text(launcher_content, encoding="utf-8")
+
+        self._write_legacy_installation_manifest(
+            home=home,
+            managed_launchers={
+                str(launcher_path): hashlib.sha256(b"wrong-digest-source").hexdigest(),
+            },
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        status = [
+            item.state
+            for item in result.launcher_statuses
+            if item.path == launcher_path
+        ]
+        self.assertEqual(status, ["preserved-divergent"])
+        self.assertTrue(launcher_path.exists())
+
+    def test_legacy_retired_launcher_is_preserved_when_shape_mismatch(self) -> None:
+        home = self.tmp_path / "home-legacy-retired-shape-mismatch"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        launcher_name = "flow-task-prepare"
+        launcher_path = install_dir / launcher_name
+        launcher_content = (
+            "#!/usr/bin/env sh\n"
+            "# AI_DEV_MANAGED_LAUNCHER_V1\n"
+            "set -eu\n"
+            "exec 'ai-dev' 'flow' 'status' \"$@\"\n"
+        )
+        launcher_path.write_text(launcher_content, encoding="utf-8")
+
+        self._write_legacy_installation_manifest(
+            home=home,
+            managed_launchers={
+                str(launcher_path): hashlib.sha256(launcher_content.encode("utf-8")).hexdigest(),
+            },
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        status = [
+            item.state
+            for item in result.launcher_statuses
+            if item.path == launcher_path
+        ]
+        self.assertEqual(status, ["preserved-divergent"])
+        self.assertTrue(launcher_path.exists())
+
+    def test_legacy_cleanup_is_narrow_to_retired_flow_launcher_names(self) -> None:
+        home = self.tmp_path / "home-legacy-retired-narrow-scope"
+        install_dir = home / ".local" / "bin"
+        install_dir.mkdir(parents=True, exist_ok=True)
+
+        launcher_path = install_dir / "flow-legacy-custom"
+        launcher_content = (
+            "#!/usr/bin/env sh\n"
+            "# AI_DEV_MANAGED_LAUNCHER_V1\n"
+            "set -eu\n"
+            "exec 'ai-dev' 'flow' 'status' \"$@\"\n"
+        )
+        launcher_path.write_text(launcher_content, encoding="utf-8")
+
+        self._write_legacy_installation_manifest(
+            home=home,
+            managed_launchers={
+                str(launcher_path): hashlib.sha256(launcher_content.encode("utf-8")).hexdigest(),
+            },
+        )
+
+        result = run_bootstrap(
+            platform="posix",
+            repo_root=self.repo_root,
+            prefix="flow",
+            install_directory=install_dir,
+            home=home,
+            shell_program="/bin/bash",
+            config_path=self.config_path,
+        )
+
+        self.assertTrue(launcher_path.exists())
+        self.assertFalse(any(item.path == launcher_path for item in result.launcher_statuses))
 
     def test_invalid_prefix_rejected_before_repo_validation(self) -> None:
         invalid_prefixes = ["", " flow", "flow ", "flow/status", "flow*", "flow?", "flow.", "flow_"]
@@ -979,7 +1170,8 @@ class BootstrapCoreTests(unittest.TestCase):
         )
 
         modified = old_install_dir / "flow-status"
-        modified.write_text(modified.read_text(encoding="utf-8") + "# user old-dir change\n", encoding="utf-8")
+        modified.unlink()
+        modified.write_text("#!/usr/bin/env sh\necho old-dir divergent\n", encoding="utf-8")
 
         second = run_bootstrap(
             platform="posix",
@@ -1047,7 +1239,8 @@ class BootstrapCoreTests(unittest.TestCase):
         )
 
         modified = install_dir / "flow-status"
-        modified.write_text(modified.read_text(encoding="utf-8") + "# user change\n", encoding="utf-8")
+        modified.unlink()
+        modified.write_text("#!/usr/bin/env sh\necho divergent\n", encoding="utf-8")
 
         second = run_bootstrap(
             platform="posix",
@@ -1238,7 +1431,8 @@ class BootstrapCoreTests(unittest.TestCase):
         )
 
         modified = install_dir / "flow-status"
-        modified.write_bytes(modified.read_bytes() + b"\n\xff\xfeinvalid\n")
+        modified.unlink()
+        modified.write_bytes(b"#!/usr/bin/env sh\n\xff\xfeinvalid\n")
 
         second = run_bootstrap(
             platform="posix",

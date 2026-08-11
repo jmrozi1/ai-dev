@@ -16,6 +16,7 @@ By default it adds:
 So the installed launchers are:
 	flow-start flow-patch flow-status flow-diff flow-commit
 	flow-reset flow-promote flow-complete flow-block flow-resume
+	flow-ticket-create flow-ticket-show flow-ticket-query
 
 Additional installer shorthand:
 	-f  Equivalent to --force.
