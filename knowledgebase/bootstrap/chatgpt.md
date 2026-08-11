@@ -27,6 +27,16 @@ Use the issue as the source of scope. Use the repository and current diff as the
 
 When testing reveals that the design has changed, update the issue rather than claiming that outdated acceptance criteria were satisfied.
 
+## Skill catalog
+
+When working with AI Dev and a task may match a reusable skill, inspect `skills/index.md`.
+
+If one listed skill clearly applies, load only that skill's canonical `SKILL.md` before doing the work.
+
+Treat `skills/index.md` as derivative guidance only. Canonical `SKILL.md` instructions override the catalog.
+
+Do not use the catalog as a general router and do not preload every skill.
+
 ## Choosing ChatGPT or Copilot
 
 Use ChatGPT directly for:

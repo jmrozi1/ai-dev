@@ -45,16 +45,33 @@ class SkillInstallationTests(unittest.TestCase):
 
     def test_discovery_finds_only_real_top_level_skill_packages(self) -> None:
         self._write_skill("flow", content="# Flow\n")
+        self._write_skill("frontend-design-review", content="# Front-end\n")
         nested = self.repo_root / "skills" / "documentation" / "example"
         nested.mkdir(parents=True, exist_ok=True)
         (nested / "SKILL.md").write_text("# Nested\n", encoding="utf-8")
         (self.repo_root / "skills" / "README.md").write_text("# Index\n", encoding="utf-8")
+        (self.repo_root / "skills" / "index.md").write_text("# Catalog\n", encoding="utf-8")
 
         packages = discover_skill_packages(self.repo_root)
 
-        self.assertEqual(len(packages), 1)
-        self.assertEqual(packages[0].name, "flow")
+        self.assertEqual(len(packages), 2)
+        self.assertEqual(
+            [package.name for package in packages],
+            ["flow", "frontend-design-review"],
+        )
         self.assertEqual(packages[0].source_directory, self.repo_root / "skills" / "flow")
+        self.assertEqual(
+            packages[1].source_directory,
+            self.repo_root / "skills" / "frontend-design-review",
+        )
+
+    def test_repository_discovery_matches_real_top_level_skill_packages(self) -> None:
+        packages = discover_skill_packages(Path(__file__).resolve().parents[1])
+
+        self.assertEqual(
+            [package.name for package in packages],
+            ["flow", "frontend-design-review"],
+        )
 
     def test_default_destination_root_is_agents_skills(self) -> None:
         home = self.tmp_path / "home"
