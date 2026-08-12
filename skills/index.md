@@ -14,6 +14,18 @@ Use when writing or refining a skill specifically for the constrained work-agent
 
 Canonical skill: `skills/work-agent-skills/write-low-reasoning-skills/SKILL.md`
 
+### documentation
+
+Use whenever discussing, writing, reviewing, or revising project documentation for the constrained work-agent environment, especially Markdown under `docs/`. Do not use this for the repository's root `README.md`; use `project-readme` instead.
+
+Canonical skill: `skills/work-agent-skills/documentation/SKILL.md`
+
+### project-readme
+
+Use whenever discussing, writing, reviewing, or revising the repository's root `README.md` for the constrained work-agent environment. Treat that README as the project's front door and routing page rather than as ordinary detailed documentation.
+
+Canonical skill: `skills/work-agent-skills/project-readme/SKILL.md`
+
 ## Reviews
 
 ### frontend-design-review
