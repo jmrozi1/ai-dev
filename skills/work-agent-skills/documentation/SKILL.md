@@ -33,13 +33,17 @@ Do not silently rely on undocumented commands, paths, configuration, environment
 
 When reviewing a procedure, do not approve it merely because the expected steps are present. Determine whether those steps form a usable path to the stated outcome.
 
+## Markup Validity
+
+Use markup that is valid and meaningful in the target documentation renderer.
+
+Remove unsupported or meaningless markup rather than leaving it as decorative text or treating it as a working documentation feature.
+
 ## Navigation
 
-Make long or structurally complex pages navigable when navigation would materially help the reader.
+Provide usable navigation for long or structurally complex pages when readers would otherwise need to scan to find the relevant section.
 
-Navigation aids must actually work in the documentation renderer being used. A placeholder such as `[TOC]` does not count as a table of contents unless the target renderer is known to turn it into one.
-
-Do not add a table of contents to short pages merely to satisfy a rule.
+Do not add a table of contents or other navigation aid to short pages merely to satisfy a rule.
 
 ## Review Standard
 
@@ -49,6 +53,7 @@ When reviewing documentation:
 - judge whether the reader can find the correct path;
 - judge whether procedural instructions can actually be followed as documented;
 - identify contradictory, duplicate, dead, or misleading guidance;
+- identify unsupported or meaningless markup;
 - prefer a few concrete usability defects over a checklist of superficial compliance;
 - do not sign off solely because expected documentation elements exist.
 
