@@ -6,13 +6,13 @@ When a listed skill applies, load and follow its canonical `SKILL.md` before doi
 
 This file is derivative of canonical skill metadata. `SKILL.md` files are the source of truth.
 
-## Low Reasoning Tolerance
+## Work Agent Skills
 
 ### write-low-reasoning-skills
 
-Use when writing or refining skills specifically for models that cannot reliably infer intent or exercise strong judgment from concise instructions, especially after a weaker target model has demonstrated superficial compliance, missed intent, or unreliable judgment. Do not load this merely for ordinary skill writing.
+Use when writing or refining a skill specifically for the constrained work-agent environment. These skills may deliberately use more explicit constraints to achieve reliable minimum behavior from the approved work agents. Do not load this for ordinary/shared skill writing.
 
-Canonical skill: `skills/low-reasoning-tolerance/write-low-reasoning-skills/SKILL.md`
+Canonical skill: `skills/work-agent-skills/write-low-reasoning-skills/SKILL.md`
 
 ## Reviews
 
