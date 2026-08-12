@@ -6,6 +6,14 @@ When a listed skill applies, load and follow its canonical `SKILL.md` before doi
 
 This file is derivative of canonical skill metadata. `SKILL.md` files are the source of truth.
 
+## Low Reasoning Tolerance
+
+### write-low-reasoning-skills
+
+Use when writing or refining skills specifically for models that cannot reliably infer intent or exercise strong judgment from concise instructions, especially after a weaker target model has demonstrated superficial compliance, missed intent, or unreliable judgment. Do not load this merely for ordinary skill writing.
+
+Canonical skill: `skills/low-reasoning-tolerance/write-low-reasoning-skills/SKILL.md`
+
 ## Reviews
 
 ### frontend-design-review
