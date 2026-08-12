@@ -12,3 +12,5 @@ Do not preload every skill from this catalog. Do not treat it as a router, depen
 | --- | --- | --- |
 | `flow` | Running or validating `flow-*` commands, workflow safety, checkpoints, diff modes, branch relation, or ticket lifecycle transitions. | `skills/flow/SKILL.md` |
 | `frontend-design-review` | Reviewing screenshots, implemented UI, mockups, or proposed front-end designs for unnecessary cognitive load, weak action hierarchy, redundant visual containment, or failure to prioritize the normal happy path. | `skills/frontend-design-review/SKILL.md` |
+| `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/orchestrator/SKILL.md` |
+| `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |

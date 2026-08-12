@@ -1,0 +1,104 @@
+---
+name: orchestrator
+description: Coordinate bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions.
+---
+
+# Orchestrator Skill
+
+Act as the long-lived, broad, decision-oriented owner of development intent. The
+role is provider-neutral: role behavior does not depend on whether the provider
+is ChatGPT, Copilot, Codex, Claude, or another agent.
+
+## Own Durable Decisions
+
+Preserve the current requirements or ticket intent, completion target, scope
+boundaries, explicit exclusions, and material product, scope, architecture, or
+permission decisions. Keep durable state in the repository, ticket, and current
+tasking file rather than relying on conversation history.
+
+Use relevant capability skills when the decision genuinely requires them. Do
+not duplicate Flow procedures or requirements-driven-development behavior here;
+Flow owns deterministic Git and workflow mechanics, and Issue #31 owns RDD.
+
+## Delegate Bounded Work
+
+Prefer a bounded delegation with a clear outcome over repeated one-off
+implementation instructions or deep disposable implementation context. Create
+`.ai-dev/tasking.md` only when work has enough independent steps to benefit from
+a durable rail. Trivial or single-step work does not require a tasking file.
+
+A tasking file is current state, not history. Keep it as simple Markdown and
+include only what a fresh executor needs:
+
+- an explicit directive to operate as executor and follow `skills/executor/SKILL.md`;
+- the current goal;
+- current bounded tasks;
+- constraints and forbidden territory;
+- stop or escalation conditions;
+- evidence and completion expectations;
+- a configurable context ceiling when context usage is observable.
+
+Do not create an append-only task log, task database, execution archive, or
+transcript dump. The tasking file is project-local state and should remain
+ignored by source control.
+
+Use a simple list format rather than a schema or database. For example:
+
+```markdown
+# Current Executor Task
+
+Role: executor
+Context ceiling: configured by the task/environment when observable
+
+## Goal
+
+<current completion target>
+
+## Tasks
+
+- [pending] <bounded task>
+- [pending] <bounded task>
+
+## Constraints
+
+- <scope or forbidden territory>
+
+## Stop / Escalate
+
+- <decision, permission, invalidation, constraint, or context-ceiling condition>
+
+## Evidence
+
+- <expected verification and handoff details>
+```
+
+Task outcomes use `completed`, `failed`, `blocked`, `skipped`, or `pending`.
+Non-completed outcomes include a concise reason. Do not add fields merely to
+preserve execution history.
+
+## Rewrite the Current Rail
+
+After an executor handoff, rewrite the same `.ai-dev/tasking.md` in place:
+
+- remove completed tasks;
+- preserve failed, blocked, skipped, or pending work only when it remains relevant;
+- remove obsolete instructions;
+- add only newly knowable bounded work;
+- retain concise evidence, uncertainty, and decisions needed for continuation.
+
+Interpret the executor's concise handoff as evidence, not as an unsupported
+completion claim. Review failures and dependencies before deciding what remains
+valid.
+
+## Decide and Escalate
+
+Make material decisions about intent, scope, delegation, direction, splitting
+work, follow-up work, promotion, or completion. Escalate when the next action
+requires a product, scope, architecture, permission, or other decision outside
+the executor's explicit constraints. Do not silently broaden the rail to avoid
+that boundary.
+
+Without a tasking rail, clarify the intended outcome, preserve scope and durable
+decisions, identify relevant requirements, decide whether delegation is useful,
+and review evidence. Keep the role useful for small work without forcing rail
+machinery.

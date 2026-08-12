@@ -13,6 +13,7 @@ out.txt
 .ai-dev/workflow.json
 .ai-dev/config.json
 .ai-dev/blocked-workflows.json
+.ai-dev/tasking.md
 .ai-dev/review/
 .ai-dev/reviews/
 .ai-dev/tasks/review-*-task.md
