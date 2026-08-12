@@ -70,7 +70,13 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(
             [package.name for package in packages],
-            ["executor", "flow", "frontend-design-review", "orchestrator"],
+            [
+                "executor",
+                "flow",
+                "frontend-design-review",
+                "orchestrator",
+                "requirements-driven-development",
+            ],
         )
 
     def test_default_destination_root_is_agents_skills(self) -> None:
