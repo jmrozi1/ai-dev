@@ -17,3 +17,7 @@ Do not preload every skill from this catalog. Do not treat it as a router, depen
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/orchestrator/SKILL.md` |
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
 | `review-process` | Atomic process-review judgment for checkpoint or promotion contexts; assess approach quality, intervention balance, wasted effort, and skill opportunities. | `skills/review-process/SKILL.md` |
+| `work-agent-orchestration` | Directing, debugging, or refining constrained work agents and their reference instructions, permissions, and work-agent-specific skills. | `skills/work-agent-skills/work-agent-orchestration/SKILL.md` |
+| `documentation` | Writing, reviewing, or revising project documentation for the constrained work-agent environment, excluding the root README. | `skills/work-agent-skills/documentation/SKILL.md` |
+| `project-readme` | Writing, reviewing, or revising the root README as the constrained work-agent environment's front door and routing page. | `skills/work-agent-skills/project-readme/SKILL.md` |
+| `write-low-reasoning-skills` | Writing or refining skills specifically for the constrained work-agent environment. | `skills/work-agent-skills/write-low-reasoning-skills/SKILL.md` |

@@ -43,9 +43,12 @@ class SkillInstallationTests(unittest.TestCase):
         record = json.loads(ownership_path.read_text(encoding="utf-8"))
         return record["owned_skills"]
 
-    def test_discovery_finds_only_real_top_level_skill_packages(self) -> None:
+    def test_discovery_finds_general_and_work_agent_skill_packages(self) -> None:
         self._write_skill("flow", content="# Flow\n")
         self._write_skill("frontend-design-review", content="# Front-end\n")
+        work_agent_skill = self.repo_root / "skills" / "work-agent-skills" / "documentation"
+        work_agent_skill.mkdir(parents=True, exist_ok=True)
+        (work_agent_skill / "SKILL.md").write_text("# Work-agent documentation\n", encoding="utf-8")
         nested = self.repo_root / "skills" / "documentation" / "example"
         nested.mkdir(parents=True, exist_ok=True)
         (nested / "SKILL.md").write_text("# Nested\n", encoding="utf-8")
@@ -54,14 +57,14 @@ class SkillInstallationTests(unittest.TestCase):
 
         packages = discover_skill_packages(self.repo_root)
 
-        self.assertEqual(len(packages), 2)
+        self.assertEqual(len(packages), 3)
         self.assertEqual(
             [package.name for package in packages],
-            ["flow", "frontend-design-review"],
+            ["documentation", "flow", "frontend-design-review"],
         )
-        self.assertEqual(packages[0].source_directory, self.repo_root / "skills" / "flow")
+        self.assertEqual(packages[0].source_directory, work_agent_skill)
         self.assertEqual(
-            packages[1].source_directory,
+            packages[2].source_directory,
             self.repo_root / "skills" / "frontend-design-review",
         )
 
@@ -72,12 +75,16 @@ class SkillInstallationTests(unittest.TestCase):
             [package.name for package in packages],
             [
                 "auto-review",
+                "documentation",
                 "executor",
                 "flow",
                 "frontend-design-review",
                 "orchestrator",
+                "project-readme",
                 "requirements-driven-development",
                 "review-process",
+                "work-agent-orchestration",
+                "write-low-reasoning-skills",
             ],
         )
 

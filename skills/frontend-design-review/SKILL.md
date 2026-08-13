@@ -123,6 +123,66 @@ Avoid persistent explanations of behavior the user will understand after the fir
 
 Onboarding may be useful. Permanent onboarding usually becomes clutter.
 
+### 6. Keep Repeated Collections Compact
+
+Repeated content should use as little vertical space per item as the information allows. Prefer a single row per item when practical.
+
+Judge collection layouts at realistic scale, not only with a few sample items. A design that looks comfortable with three items but becomes cumbersome with thirty is not appropriate when thirty is a realistic working set.
+
+For repeated items, preserve scanability before preserving immediate access to every secondary operation.
+
+It is acceptable to place secondary actions such as rename, delete, settings, or reordering behind compact icons, gear menus, overflow menus, or similar affordances when doing so keeps the collection easy to scan.
+
+Do not apply this tradeoff blindly to the collection's primary action. The action users repeatedly perform on each item should remain obvious and efficient.
+
+### 7. Prefer Recoverability Over Confirmation
+
+Do not use confirmation prompts as the default protection against accidental actions.
+
+When practical, design the operation so that it can be reversed instead:
+
+- retain enough state to restore the prior value
+- provide undo
+- allow deleted or changed content to be restored
+- make inexpensive objects easy to recreate when restoration is unnecessary
+
+Confirmation forces every intentional action to pay for the possibility of an accidental one. Recoverability keeps the normal path immediate while still providing a way out of mistakes.
+
+When reviewing an interrupting confirmation flow, first ask whether the underlying action can be made safely reversible rather than assuming the interruption is necessary.
+
+### 8. Spend Interaction Cost Where the Current Context Can Afford It
+
+Optimize persistent UI for the actions that matter in the user's current context, not for global action frequency across the entire application.
+
+Persistent controls have a recurring cognitive and visual cost. An extra click on an infrequent action may be cheaper than keeping that action visible all the time.
+
+When deciding whether an action should remain visible, compare:
+
+- how often the action is used in the current context
+- how much persistent attention and screen space the control consumes
+- how costly the extra interaction would be when the action is needed
+- whether the action becomes common or central in a different mode or screen
+
+It is often correct to move an infrequent action behind a single obvious secondary affordance such as a kebab or gear menu when that keeps the normal state substantially cleaner.
+
+Re-evaluate the tradeoff when context changes. An operation that belongs behind a menu during execution may deserve a persistent control during configuration. For example, reordering may be exceptional during an active workout but common enough in a routine editor to justify persistent drag handles.
+
+Do not optimize for minimum click count in isolation. Prefer the interaction structure that minimizes total cognitive cost across normal use.
+
+### 9. Replace Obsolete Controls Instead of Accumulating New Ones
+
+When a state transition makes an existing control no longer actionable, prefer reusing that space for the next relevant action instead of adding another persistent control.
+
+For example, after a set is completed, the control used to complete it can become an Undo control. The old action is no longer useful, the new action is contextually relevant, and UI density does not increase.
+
+Ask when state changes:
+
+- Which visible actions are no longer valid?
+- Can their controls be replaced by the most likely follow-up action?
+- Can the new state become simpler rather than accumulating additional buttons?
+
+Prefer state-dependent replacement when the new meaning remains understandable from context. Do not overload one control with unrelated meanings merely to save space.
+
 ## Review Method
 
 For each screen:
@@ -130,10 +190,14 @@ For each screen:
 1. Identify the screen's dominant user task.
 2. Identify the normal happy-path state.
 3. Determine what should receive the most visual attention.
-4. Review visible controls for frequency, importance, and necessity.
-5. Review containers and borders for redundant hierarchy.
-6. Review persistent text for unnecessary attention cost.
-7. Report only findings that materially affect clarity or workflow.
+4. Review visible controls for frequency, importance, necessity, and persistent attention cost in the current context.
+5. Check whether infrequent actions can tolerate an additional interaction in exchange for a cleaner normal state.
+6. Review repeated collections at realistic scale and check whether secondary actions are consuming unnecessary space.
+7. Review state transitions for obsolete controls that could be replaced instead of supplemented.
+8. Review containers and borders for redundant hierarchy.
+9. Review persistent text for unnecessary attention cost.
+10. Review interrupting confirmation flows for opportunities to replace confirmation with recoverability.
+11. Report only findings that materially affect clarity or workflow.
 
 Do not invent issues merely to produce a longer review.
 

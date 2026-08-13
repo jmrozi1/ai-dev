@@ -5,6 +5,8 @@ This repository uses a minimal, proven skill package layout.
 Canonical layout:
 
 - `skills/<skill-name>/SKILL.md`
+- `skills/work-agent-skills/<skill-name>/SKILL.md` only for work-agent-specific
+	skills that have earned separate constraints.
 
 Optional subdirectories are allowed only when real skill content requires them:
 
@@ -17,6 +19,8 @@ Rules:
 
 - Do not create speculative category hierarchy directories now.
 - Introduce categories later only if repeated real skills demonstrate a clear need.
+- `work-agent-skills/` is the one current exception; do not use it for general
+	skills or as a precedent for generic categories.
 - If a compatibility catalog is needed for non-native hosts, keep it as a small maintained derivative file under `skills/index.md`.
 - Canonical `skills/<skill-name>/SKILL.md` files remain authoritative over any derivative catalog.
 - Do not add generated routing files, category hierarchies, or custom skill-loading frameworks.

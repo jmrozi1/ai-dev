@@ -48,7 +48,11 @@ def discover_skill_packages(repo_root: Path) -> tuple[SkillPackage, ...]:
         return ()
 
     packages: list[SkillPackage] = []
-    for skill_file in sorted(source_root.glob("*/SKILL.md")):
+    skill_files = [
+        *source_root.glob("*/SKILL.md"),
+        *source_root.glob("work-agent-skills/*/SKILL.md"),
+    ]
+    for skill_file in skill_files:
         if not skill_file.is_file():
             continue
         skill_directory = skill_file.parent
@@ -59,7 +63,7 @@ def discover_skill_packages(repo_root: Path) -> tuple[SkillPackage, ...]:
             )
         )
 
-    return tuple(packages)
+    return tuple(sorted(packages, key=lambda package: package.name))
 
 
 def resolve_copilot_skills_root(
