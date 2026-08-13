@@ -76,6 +76,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "frontend-design-review",
                 "orchestrator",
                 "requirements-driven-development",
+                "review",
             ],
         )
 

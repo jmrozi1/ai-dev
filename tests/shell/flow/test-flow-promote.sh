@@ -72,8 +72,16 @@ init_repo() {
 		git config user.name 'Flow Tests'
 		git config user.email 'flow-tests@example.com'
 		printf '.ai-dev/workflow.json\n' > .gitignore
+		mkdir -p .ai-dev
+		cat > .ai-dev/config.json <<'EOF'
+{
+  "review": {
+    "promotionGate": false
+  }
+}
+EOF
 		printf 'base\n' > tracked.txt
-		git add .gitignore tracked.txt
+		git add .gitignore .ai-dev/config.json tracked.txt
 		git commit -q -m 'initial commit'
 		git branch -M main
 	)

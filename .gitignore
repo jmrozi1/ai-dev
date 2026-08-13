@@ -14,6 +14,7 @@ out.txt
 .ai-dev/config.json
 .ai-dev/blocked-workflows.json
 .ai-dev/tasking.md
+.ai-dev/promotion-review.json
 .ai-dev/review/
 .ai-dev/reviews/
 .ai-dev/tasks/review-*-task.md

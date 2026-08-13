@@ -19,6 +19,10 @@ The tasking file is current state, not history. Do not create a task database,
 append-only execution diary, or transcript dump. Do not silently broaden scope,
 change requirements, or cross explicit forbidden territory.
 
+The rail may carry a compact current-state process-notes section. Read it as
+context for how the work has been going, and report process observations worth
+carrying forward in the handoff so the orchestrator can rewrite it.
+
 For trivial or single-step work, execute the provided bounded assignment without
 forcing creation of a formal tasking file.
 
@@ -66,6 +70,8 @@ useful current state:
 - unresolved uncertainty or material deviation;
 - decisions or permissions needed;
 - independent remaining work;
+- process observations worth carrying on the rail, such as avoidable human
+  interventions, repeated approaches, or rediscovery friction;
 - context-ceiling state when observable.
 
 Do not dump the executor transcript or claim work was completed without

@@ -71,11 +71,13 @@ from .ticket_providers import (
     resolve_ticket_provider_for_reference,
 )
 from .json_files import JsonFileError, load_json_object, write_json_object_atomic
+from .repository import config_file_for_repo_root
 from .tickets import TicketReference
 
 
 _DIRECT_FLOW_ROUTE_TOKEN = "__ai_dev_flow_exec__"
 _FLOW_DIFF_BASELINE_INVALID = "Review baseline is stale or invalid; run flow-diff --refresh."
+_PROMOTION_REVIEW_RECORD_PATH = ".ai-dev/promotion-review.json"
 
 
 @dataclass(frozen=True)
@@ -489,6 +491,97 @@ def _resolve_repo_state_context() -> tuple[Path, Path, WorkflowState]:
     return repo_root, state_path, state
 
 
+def _promotion_review_record_path(repo_root: Path) -> Path:
+    return repo_root / ".ai-dev" / "promotion-review.json"
+
+
+def _clear_promotion_review_record(repo_root: Path) -> None:
+    record_path = _promotion_review_record_path(repo_root)
+    try:
+        record_path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise FlowError(f"Cannot clear promotion review state at {record_path}: {exc}") from exc
+
+
+def _promotion_gate_enabled(repo_root: Path) -> bool:
+    config_path = config_file_for_repo_root(repo_root)
+    if not config_path.exists():
+        return True
+
+    try:
+        payload = load_json_object(config_path, missing_default={})
+    except JsonFileError:
+        return True
+
+    review_block = payload.get("review")
+    if not isinstance(review_block, dict):
+        return True
+
+    value = review_block.get("promotionGate")
+    if value is False:
+        return False
+    return True
+
+
+def _promotion_review_record_matches_state(
+    record: dict[str, object],
+    state: WorkflowState,
+    current_scratch_commit: str,
+) -> bool:
+    if record.get("version") != 1:
+        return False
+    if record.get("result") != "pass":
+        return False
+    if record.get("scratchCommit") != current_scratch_commit:
+        return False
+    if record.get("mainBranch") != state.main_branch:
+        return False
+    if record.get("scratchBranch") != state.scratch_branch:
+        return False
+
+    if state.active_issue_number is not None:
+        if record.get("activeIssueNumber") != state.active_issue_number:
+            return False
+    elif state.patch_description is not None:
+        if record.get("patchDescription") != state.patch_description:
+            return False
+
+    return True
+
+
+def _require_valid_promotion_review_gate(repo_root: Path, state: WorkflowState) -> None:
+    if not _promotion_gate_enabled(repo_root):
+        return
+
+    record_path = _promotion_review_record_path(repo_root)
+    if not record_path.exists():
+        raise FlowError(
+            "Cannot promote workflow: promotion review gate requires a pass record at "
+            f"{_PROMOTION_REVIEW_RECORD_PATH}."
+        )
+
+    try:
+        payload = load_json_object(record_path, missing_default={})
+    except JsonFileError as exc:
+        raise FlowError(
+            f"Cannot promote workflow: invalid promotion review gate record at {_PROMOTION_REVIEW_RECORD_PATH}: {exc}"
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise FlowError(
+            f"Cannot promote workflow: invalid promotion review gate record at {_PROMOTION_REVIEW_RECORD_PATH}."
+        )
+
+    current_scratch_commit = resolve_commit_hash(repo_root, state.scratch_branch)
+    if not _promotion_review_record_matches_state(payload, state, current_scratch_commit):
+        raise FlowError(
+            "Cannot promote workflow: promotion review gate requires a current pass record "
+            "for this workflow and scratch commit."
+        )
+
+
 def _ensure_main_and_scratch_branches_differ(state: WorkflowState) -> None:
     if state.main_branch == state.scratch_branch:
         raise FlowError(
@@ -729,6 +822,8 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
             f"Cannot start workflow: failed to mark ticket {issue_number} active. {exc}"
         ) from exc
 
+    _clear_promotion_review_record(repo_root)
+
     issue_state = WorkflowState(
         main_branch=state.main_branch,
         scratch_branch=state.scratch_branch,
@@ -831,6 +926,7 @@ def handle_patch(command_name: str, arguments: list[str]) -> int:
         checkpoint=checkpoint,
         patch_description=description,
     )
+    _clear_promotion_review_record(repo_root)
     ensure_local_state_excluded(repo_root)
     save_state(state_path, patch_state)
     _clear_diff_baseline_after_success(repo_root, operation="patch")
@@ -1321,6 +1417,8 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
             "Cannot promote workflow: unable to determine branch relationship."
         )
 
+    _require_valid_promotion_review_gate(repo_root, state)
+
     if not branch_is_ancestor(
         repo_root,
         ancestor_revision=state.main_branch,
@@ -1374,6 +1472,7 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
         updated_state = replace(state, checkpoint=0)
         save_state(state_path, updated_state)
         workflow_state_updated = True
+        _clear_promotion_review_record(repo_root)
 
         if current_branch_name(repo_root) != state.scratch_branch:
             raise FlowError(
@@ -2163,6 +2262,8 @@ def handle_reset(command_name: str, arguments: list[str]) -> int:
         )
     except RepositoryError as exc:
         raise FlowError(f"Git reset failed: {exc}") from exc
+
+    _clear_promotion_review_record(repo_root)
 
     updated_state = replace(state, checkpoint=0)
     try:

@@ -36,6 +36,7 @@ include only what a fresh executor needs:
 - constraints and forbidden territory;
 - stop or escalation conditions;
 - evidence and completion expectations;
+- compact current-state process notes when they carry real signal;
 - a configurable context ceiling when context usage is observable.
 
 Do not create an append-only task log, task database, execution archive, or
@@ -70,11 +71,29 @@ Context ceiling: configured by the task/environment when observable
 ## Evidence
 
 - <expected verification and handoff details>
+
+## Process Notes
+
+- <current process observation worth carrying forward>
 ```
 
 Task outcomes use `completed`, `failed`, `blocked`, `skipped`, or `pending`.
 Non-completed outcomes include a concise reason. Do not add fields merely to
 preserve execution history.
+
+## Carry Process Notes
+
+Process notes exist so the next checkpoint review can see how the work is going
+without replaying the conversation. Carry only what still matters, such as
+avoidable human interventions, failed or repeated approaches worth remembering,
+notable context or rediscovery friction, process changes already decided for the
+next checkpoint, candidate skill additions or refinements, and explicit
+no-action conclusions where they prevent re-litigating a settled question.
+
+Keep the section short and current. Rewrite it, never append to it. Omit any
+line that has no value rather than filling a template mechanically, and omit the
+whole section when there is nothing worth carrying. Do not turn it into a
+transcript, retrospective, or process-history database.
 
 ## Rewrite the Current Rail
 
@@ -85,6 +104,10 @@ After an executor handoff, rewrite the same `.ai-dev/tasking.md` in place:
 - remove obsolete instructions;
 - add only newly knowable bounded work;
 - retain concise evidence, uncertainty, and decisions needed for continuation.
+
+Rewriting means replacing the file's contents in place as current state. Edit or
+overwrite the existing file; do not delete it first to work around a tool that
+refuses to overwrite.
 
 Interpret the executor's concise handoff as evidence, not as an unsupported
 completion claim. Review failures and dependencies before deciding what remains

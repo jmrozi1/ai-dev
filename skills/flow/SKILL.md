@@ -143,8 +143,11 @@ Before implementation or consequential commands:
 2. Confirm branch context and relation (`main` vs `scratch`).
 3. Confirm working-tree expectations (clean when command requires it).
 4. Confirm no blocked-workflow or active-workflow conflicts.
+5. Require the current review pass record to match the active workflow identity and current scratch HEAD before `flow-promote` proceeds, unless a repository explicitly opts out via `.ai-dev/config.json` with `review.promotionGate: false`.
 
 Fail-closed behavior is expected: if safety preconditions are not met, stop and resolve state first.
+
+Promotion review is required by default for normal AI Dev operation; the explicit opt-out path is a deliberate escape hatch only when a repository genuinely needs it.
 
 ## Verification Of Results
 

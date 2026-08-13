@@ -1,0 +1,230 @@
+#!/usr/bin/env bash
+# Deterministic evidence gathering for the review skill; judgment stays in SKILL.md.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: review-evidence [--mode checkpoint|promotion]
+
+Print the compact evidence surface for a review of the repository containing the
+current working directory.
+
+Options:
+  --mode <mode>  checkpoint (default) reviews the most recent checkpoint plus
+                 uncommitted work; promotion reviews the cumulative workflow.
+EOF
+}
+
+mode="checkpoint"
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --mode)
+      if [[ $# -lt 2 ]]; then
+        echo "review-evidence: --mode requires a value" >&2
+        exit 2
+      fi
+      mode="$2"
+      shift 2
+      ;;
+    --mode=*)
+      mode="${1#--mode=}"
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "review-evidence: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+case "$mode" in
+  checkpoint|promotion) ;;
+  *)
+    echo "review-evidence: unknown mode: $mode (expected checkpoint or promotion)" >&2
+    exit 2
+    ;;
+esac
+
+# The package is installed by symlink, so scope comes from the caller's repository.
+if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  echo "review-evidence: not inside a Git repository" >&2
+  exit 2
+fi
+cd "$repo_root"
+
+workflow_file=".ai-dev/workflow.json"
+main_branch="main"
+scratch_branch="scratch"
+workflow_summary="no Flow workflow state at $workflow_file"
+
+read_workflow_state() {
+  python3 - "$workflow_file" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, ValueError) as exc:
+    sys.stderr.write(f"{exc}\n")
+    raise SystemExit(1)
+
+if not isinstance(data, dict):
+    sys.stderr.write("expected a JSON object\n")
+    raise SystemExit(1)
+
+main_branch = data.get("mainBranch", "main")
+scratch_branch = data.get("scratchBranch", "scratch")
+checkpoint = data.get("checkpoint", 0)
+if not isinstance(main_branch, str) or not main_branch:
+    sys.stderr.write("mainBranch must be a non-empty string\n")
+    raise SystemExit(1)
+if not isinstance(scratch_branch, str) or not scratch_branch:
+    sys.stderr.write("scratchBranch must be a non-empty string\n")
+    raise SystemExit(1)
+
+issue_number = data.get("activeIssueNumber")
+patch_description = data.get("patchDescription")
+if issue_number is not None:
+    identity = f"issue {issue_number}"
+elif isinstance(patch_description, str) and patch_description:
+    identity = f"patch {patch_description}"
+else:
+    identity = "inactive"
+
+print(main_branch)
+print(scratch_branch)
+print(f"{identity}, checkpoint {checkpoint}")
+PY
+}
+
+if [[ -f "$workflow_file" ]]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "review-evidence: python3 is required to read $workflow_file" >&2
+    exit 2
+  fi
+  if ! workflow_fields="$(read_workflow_state)"; then
+    echo "review-evidence: malformed Flow workflow state in $workflow_file" >&2
+    exit 2
+  fi
+  main_branch="$(sed -n 1p <<<"$workflow_fields")"
+  scratch_branch="$(sed -n 2p <<<"$workflow_fields")"
+  workflow_summary="$(sed -n 3p <<<"$workflow_fields")"
+fi
+
+branch_exists() {
+  git rev-parse --verify --quiet "$1" >/dev/null
+}
+
+range=""
+scope_label=""
+if [[ "$mode" == "promotion" ]]; then
+  if branch_exists "$main_branch" && branch_exists "$scratch_branch"; then
+    range="$main_branch..$scratch_branch"
+    scope_label="cumulative $range"
+  else
+    scope_label="cumulative scope unavailable (missing $main_branch or $scratch_branch)"
+  fi
+else
+  if branch_exists "$main_branch" && [[ "$(git rev-list --count "$main_branch..HEAD" 2>/dev/null || echo 0)" != "0" ]]; then
+    range="HEAD~1..HEAD"
+    scope_label="latest checkpoint $range"
+  else
+    scope_label="no checkpoint ahead of $main_branch; uncommitted work only"
+  fi
+fi
+
+uncommitted="$(git status --porcelain)"
+
+changed_paths=""
+if [[ -n "$range" ]]; then
+  changed_paths="$(git diff --name-only "$range")"
+fi
+if [[ -n "$uncommitted" ]]; then
+  changed_paths="$changed_paths"$'\n'"$(printf '%s\n' "$uncommitted" | awk '{print $NF}')"
+fi
+
+printf '# Review Evidence\n\n'
+printf 'mode: %s\n' "$mode"
+printf 'repository: %s\n' "$repo_root"
+printf 'scope: %s\n\n' "$scope_label"
+
+printf '## Workflow\n\n'
+printf 'workflow: %s\n' "$workflow_summary"
+printf 'main branch: %s\n' "$main_branch"
+printf 'scratch branch: %s\n' "$scratch_branch"
+printf 'current branch: %s\n' "$(git branch --show-current)"
+if branch_exists "$main_branch"; then
+  printf 'commits ahead of %s: %s\n\n' "$main_branch" "$(git rev-list --count "$main_branch..HEAD")"
+else
+  printf 'branch %s does not exist\n\n' "$main_branch"
+fi
+
+printf '## Changed Files\n\n'
+if [[ -n "$range" ]]; then
+  git diff --name-status "$range"
+  printf '\n'
+  git diff --stat "$range"
+  printf '\n'
+else
+  printf 'none in scope\n\n'
+fi
+
+printf '## Uncommitted\n\n'
+if [[ -n "$uncommitted" ]]; then
+  printf '%s\n\n' "$uncommitted"
+else
+  printf 'clean\n\n'
+fi
+
+printf '## Tasking Process Notes\n\n'
+tasking_file=".ai-dev/tasking.md"
+process_notes=""
+if [[ -f "$tasking_file" ]]; then
+  process_notes="$(sed -n '/^## Process Notes$/,/^## /{/^## Process Notes$/d;/^## /d;p;}' "$tasking_file")"
+fi
+if [[ -n "${process_notes// /}" ]]; then
+  printf '%s\n\n' "$process_notes"
+elif [[ -f "$tasking_file" ]]; then
+  printf 'tasking rail present at %s with no process notes\n\n' "$tasking_file"
+else
+  printf 'no tasking rail at %s\n\n' "$tasking_file"
+fi
+
+printf '## Skills To Review\n\n'
+skills_to_review=""
+while IFS= read -r changed_path; do
+  [[ -n "$changed_path" ]] || continue
+  package="$(sed -n 's|^skills/\([^/]*\)/.*|\1|p' <<<"$changed_path")"
+  if [[ -n "$package" ]]; then
+    skills_to_review+="$package: package changed ($changed_path)"$'\n'
+  fi
+done <<<"$changed_paths"
+
+for skill_file in skills/*/SKILL.md; do
+  [[ -f "$skill_file" ]] || continue
+  skill_name="$(basename "$(dirname "$skill_file")")"
+  triggers="$(sed -n '/^## Review Triggers$/,/^## /{/^## /d;s/^- //p;}' "$skill_file")"
+  [[ -n "$triggers" ]] || continue
+  while IFS= read -r trigger; do
+    [[ -n "$trigger" ]] || continue
+    while IFS= read -r changed_path; do
+      [[ -n "$changed_path" ]] || continue
+      # Unquoted pattern so declared globs match.
+      if [[ "$changed_path" == $trigger ]]; then
+        skills_to_review+="$skill_name: review trigger $trigger matched ($changed_path)"$'\n'
+      fi
+    done <<<"$changed_paths"
+  done <<<"$triggers"
+done
+
+if [[ -n "${skills_to_review//[[:space:]]/}" ]]; then
+  printf '%s' "$skills_to_review" | sort -u | sed 's/^/- /'
+else
+  printf 'none\n'
+fi

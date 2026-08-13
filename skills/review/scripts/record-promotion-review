@@ -1,0 +1,172 @@
+#!/usr/bin/env bash
+# Record a promotion-review pass; this is the review package's current-state evidence.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: record-promotion-review [--issue <number> | --patch <description>] [--commit <sha>]
+
+Record a current-state promotion review pass for the active workflow.
+The record is used only as a pass gate for the current scratch commit and never as
+an append-only review log.
+
+Options:
+  --issue <number>   Record pass for an active issue workflow.
+  --patch <desc>     Record pass for a patch workflow.
+  --commit <sha>     Optional scratch commit SHA; defaults to HEAD.
+  -h, --help         Show this help.
+EOF
+}
+
+issue_number=""
+patch_description=""
+commit_sha=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --issue)
+      if [[ $# -lt 2 ]]; then
+        echo "record-promotion-review: --issue requires a value" >&2
+        exit 2
+      fi
+      issue_number="$2"
+      shift 2
+      ;;
+    --patch)
+      if [[ $# -lt 2 ]]; then
+        echo "record-promotion-review: --patch requires a value" >&2
+        exit 2
+      fi
+      patch_description="$2"
+      shift 2
+      ;;
+    --commit)
+      if [[ $# -lt 2 ]]; then
+        echo "record-promotion-review: --commit requires a value" >&2
+        exit 2
+      fi
+      commit_sha="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "record-promotion-review: unknown argument: $1" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [[ -n "$issue_number" && -n "$patch_description" ]]; then
+  echo "record-promotion-review: specify either --issue or --patch, not both" >&2
+  exit 2
+fi
+
+if [[ -z "$issue_number" && -z "$patch_description" ]]; then
+  if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+    echo "record-promotion-review: not inside a Git repository" >&2
+    exit 2
+  fi
+  cd "$repo_root"
+  if [[ ! -f .ai-dev/workflow.json ]]; then
+    echo "record-promotion-review: no active workflow state at .ai-dev/workflow.json" >&2
+    exit 2
+  fi
+  python3 - "$repo_root" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+repo_root = Path(sys.argv[1])
+path = repo_root / ".ai-dev" / "workflow.json"
+try:
+    data = json.loads(path.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"record-promotion-review: invalid workflow state: {exc}")
+if not isinstance(data, dict):
+    raise SystemExit("record-promotion-review: workflow state must be a JSON object")
+issue_number = data.get("activeIssueNumber")
+patch_description = data.get("patchDescription")
+if issue_number is None and patch_description is None:
+    raise SystemExit("record-promotion-review: no active issue or patch workflow is set")
+if issue_number is not None and patch_description is not None:
+    raise SystemExit("record-promotion-review: workflow state cannot contain both issue and patch identity")
+if issue_number is not None:
+    print(f"--issue {issue_number}")
+else:
+    print(f"--patch {patch_description}")
+PY
+  exit 0
+fi
+
+if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  echo "record-promotion-review: not inside a Git repository" >&2
+  exit 2
+fi
+cd "$repo_root"
+
+workflow_file=".ai-dev/workflow.json"
+if [[ ! -f "$workflow_file" ]]; then
+  echo "record-promotion-review: no active workflow state at $workflow_file" >&2
+  exit 2
+fi
+
+if [[ -z "$commit_sha" ]]; then
+  commit_sha="$(git rev-parse HEAD)"
+fi
+
+python3 - "$workflow_file" "$commit_sha" "$issue_number" "$patch_description" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+workflow_file = Path(sys.argv[1])
+commit_sha = sys.argv[2]
+issue_number = sys.argv[3]
+patch_description = sys.argv[4]
+
+try:
+    data = json.loads(workflow_file.read_text(encoding="utf-8"))
+except (FileNotFoundError, json.JSONDecodeError) as exc:
+    raise SystemExit(f"record-promotion-review: invalid workflow state: {exc}")
+if not isinstance(data, dict):
+    raise SystemExit("record-promotion-review: workflow state must be a JSON object")
+
+main_branch = data.get("mainBranch", "main")
+scratch_branch = data.get("scratchBranch", "scratch")
+if not isinstance(main_branch, str) or not main_branch.strip():
+    raise SystemExit("record-promotion-review: workflow state missing valid mainBranch")
+if not isinstance(scratch_branch, str) or not scratch_branch.strip():
+    raise SystemExit("record-promotion-review: workflow state missing valid scratchBranch")
+
+record = {
+    "version": 1,
+    "scratchCommit": commit_sha,
+    "result": "pass",
+    "mainBranch": main_branch,
+    "scratchBranch": scratch_branch,
+}
+
+if issue_number:
+    try:
+        record["activeIssueNumber"] = int(issue_number)
+    except ValueError as exc:
+        raise SystemExit(f"record-promotion-review: invalid issue number: {issue_number}") from exc
+elif patch_description:
+    record["patchDescription"] = patch_description
+else:
+    issue_number_value = data.get("activeIssueNumber")
+    patch_value = data.get("patchDescription")
+    if issue_number_value is not None:
+        record["activeIssueNumber"] = issue_number_value
+    elif patch_value is not None:
+        record["patchDescription"] = patch_value
+    else:
+        raise SystemExit("record-promotion-review: no active issue or patch workflow is set")
+
+path = workflow_file.parent / "promotion-review.json"
+path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+print(f"recorded promotion review pass for {path}")
+PY

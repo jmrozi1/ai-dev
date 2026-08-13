@@ -15,3 +15,4 @@ Do not preload every skill from this catalog. Do not treat it as a router, depen
 | `requirements-driven-development` | Defining, refining, implementing, validating, or reviewing behavior that needs explicit requirements and objective evidence. | `skills/requirements-driven-development/SKILL.md` |
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/orchestrator/SKILL.md` |
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
+| `review` | Reviewing an in-progress issue at a checkpoint to decide whether the next checkpoint should be worked differently, or deciding whether cumulative workflow changes justify promotion. | `skills/review/SKILL.md` |
