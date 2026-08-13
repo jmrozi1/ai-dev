@@ -2,7 +2,7 @@
 
 Investigation and proposal are autonomous. Execution is not.
 
-If `~/.agent/ACTIVE_TASK.md` exists, read it before responding to every user message and treat it as the active task contract.
+If `~/.agents/ACTIVE_TASK.md` exists, read it before responding to every user message and treat it as the active task contract.
 
 Before making any change to project files or executing any command that can modify project, repository, filesystem, or environment state:
 
