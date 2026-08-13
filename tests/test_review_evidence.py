@@ -11,7 +11,7 @@ import unittest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-HELPER_RELATIVE_PATH = Path("skills") / "review" / "scripts" / "review-evidence"
+HELPER_RELATIVE_PATH = Path("skills") / "auto-review" / "scripts" / "review-evidence"
 
 
 def _git(repo: Path, *arguments: str) -> str:
@@ -91,8 +91,8 @@ class ReviewEvidenceHelperTests(unittest.TestCase):
     def _install_skill_by_symlink(self) -> Path:
         installed_root = self.tmp_path / "agents" / "skills"
         installed_root.mkdir(parents=True)
-        link = installed_root / "review"
-        link.symlink_to(REPO_ROOT / "skills" / "review", target_is_directory=True)
+        link = installed_root / "auto-review"
+        link.symlink_to(REPO_ROOT / "skills" / "auto-review", target_is_directory=True)
         return link / "scripts" / "review-evidence"
 
     def _run_helper(self, *arguments: str, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:

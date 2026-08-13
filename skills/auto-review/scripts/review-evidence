@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Deterministic evidence gathering for the review skill; judgment stays in SKILL.md.
+# Deterministic evidence gathering for review lifecycle; judgment stays in SKILL.md.
 set -euo pipefail
 
 usage() {

@@ -10,9 +10,10 @@ Do not preload every skill from this catalog. Do not treat it as a router, depen
 
 | Skill | Use when | Canonical path |
 | --- | --- | --- |
+| `auto-review` | Lifecycle review orchestration; checkpoint/promotion stage selection; candidate review composition and applicability; promotion-pass recording and gate interaction. | `skills/auto-review/SKILL.md` |
 | `flow` | Running or validating `flow-*` commands, workflow safety, checkpoints, diff modes, branch relation, or ticket lifecycle transitions. | `skills/flow/SKILL.md` |
 | `frontend-design-review` | Reviewing screenshots, implemented UI, mockups, or proposed front-end designs for unnecessary cognitive load, weak action hierarchy, redundant visual containment, or failure to prioritize the normal happy path. | `skills/frontend-design-review/SKILL.md` |
 | `requirements-driven-development` | Defining, refining, implementing, validating, or reviewing behavior that needs explicit requirements and objective evidence. | `skills/requirements-driven-development/SKILL.md` |
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/orchestrator/SKILL.md` |
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
-| `review` | Reviewing an in-progress issue at a checkpoint to decide whether the next checkpoint should be worked differently, or deciding whether cumulative workflow changes justify promotion. | `skills/review/SKILL.md` |
+| `review-process` | Atomic process-review judgment for checkpoint or promotion contexts; assess approach quality, intervention balance, wasted effort, and skill opportunities. | `skills/review-process/SKILL.md` |

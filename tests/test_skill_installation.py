@@ -71,12 +71,13 @@ class SkillInstallationTests(unittest.TestCase):
         self.assertEqual(
             [package.name for package in packages],
             [
+                "auto-review",
                 "executor",
                 "flow",
                 "frontend-design-review",
                 "orchestrator",
                 "requirements-driven-development",
-                "review",
+                "review-process",
             ],
         )
 

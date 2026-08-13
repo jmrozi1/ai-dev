@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Record a promotion-review pass; this is the review package's current-state evidence.
+# Record a promotion-review pass; this is the auto-review package's current-state evidence.
 set -euo pipefail
 
 usage() {
