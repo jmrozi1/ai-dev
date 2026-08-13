@@ -6,6 +6,14 @@ When a listed skill applies, load and follow its canonical `SKILL.md` before doi
 
 This file is derivative of canonical skill metadata. `SKILL.md` files are the source of truth.
 
+## Orchestration
+
+### work-agent-orchestration
+
+Use whenever helping the user direct, debug, or refine constrained work AIs, including deciding what instructions to relay, diagnosing work-agent failures, or tuning the CLAUDE.md instructions, permissions, and work-agent-specific skills used in that environment. Optimize for low manual relay cost and preserve the boundary between work-agent-specific constraints and globally useful guidance.
+
+Canonical skill: `skills/orchestration/work-agent-orchestration/SKILL.md`
+
 ## Work Agent Skills
 
 ### write-low-reasoning-skills
