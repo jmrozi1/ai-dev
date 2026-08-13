@@ -21,4 +21,6 @@ After approval:
 - If new information requires a material change to the approved plan, stop, explain the required change, propose the revised plan, and wait for approval before continuing.
 - Never delete or discard existing work merely because replacement content has been created or copied elsewhere.
 
+Run logically distinct operations as separate commands. In particular, do not combine read-only inspection with state-changing actions in the same command or command chain. Inspect first, evaluate the result, then perform any required mutation separately.
+
 Commands and operations that are read-only may be used autonomously during investigation.
