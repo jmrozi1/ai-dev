@@ -4,7 +4,8 @@
     "allow": [
       "Bash(ls *)",
       "Bash(ssh *)",
-      "Bash(echo *)"
+      "Bash(echo *)",
+      "Bash(find *)"
     ]
   }
 }
