@@ -34,6 +34,18 @@ should be worked differently. Look for these failure modes:
 - **Skill opportunity:** a new skill would materially reduce recurring friction,
   or observed behavior no longer matches an existing skill.
 
+As a cheap part of each checkpoint review, record only what is observable and
+useful about materially used skills, missing or irrelevant activation,
+interventions, repeated approaches, rediscovery, permission friction, scope
+drift, and similar process friction. Skill use alone is not evidence of a
+deficiency; do not deep-review every loaded skill.
+
+If that evidence suggests a substantive skill-definition problem rather than
+executor noncompliance, ambiguous tasking, provider permission, or an isolated
+failure, recommend or escalate a focused `skill-authoring` review. Otherwise
+return no skill action. Do not duplicate the `skill-authoring` judgment model
+here.
+
 Do not turn checkpoint review into an implementation or code review. Inspect
 changed code only far enough to judge process, and stop there.
 

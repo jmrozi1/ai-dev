@@ -47,6 +47,7 @@ reasoning rules remain in the applicable canonical `SKILL.md` files.
 | `auto-review` | Deciding review applicability and composition, synthesizing findings, judging materiality, and authorizing promotion-review recording. | `skills/chatgpt/auto-review/SKILL.md` |
 | `flow` | Interpreting Flow lifecycle state, deciding valid transitions, and escalating blocked or unsafe workflow state. | `skills/chatgpt/flow/SKILL.md` |
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/chatgpt/orchestrator/SKILL.md` |
+| `skill-authoring` | Creating or refining an AI Dev skill, or performing focused skill-quality review when execution evidence suggests a skill-definition problem. | `skills/chatgpt/skill-authoring/SKILL.md` |
 
 ## Copilot
 

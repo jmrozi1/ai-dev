@@ -77,6 +77,13 @@ useful current state:
 Do not dump the executor transcript or claim work was completed without
 supporting evidence.
 
+When useful and observable, keep the concise handoff evidence specific by
+reporting materially used skills, notable skill or process friction, repeated
+user corrections or interventions, rediscovered knowledge, unexpected
+permission friction, and obvious cases where a relevant skill did not activate.
+Report observations only. Do not decide or state that a skill is defective;
+ChatGPT owns that judgment. Do not add empty template fields or a history log.
+
 ## Fresh Resume
 
 A fresh executor must be able to continue from this skill, the current
