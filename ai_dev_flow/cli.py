@@ -25,6 +25,7 @@ from .repository import (
     create_or_reset_branch_from_source,
     create_commit,
     compare_main_and_scratch,
+    compare_main_to_tracked_upstream,
     current_branch_name,
     ensure_branches_point_to_same_commit,
     ensure_local_state_excluded,
@@ -39,9 +40,13 @@ from .repository import (
     restore_branch_to_revision,
     clear_diff_baseline_for_repo_root,
     max_numbered_checkpoint_relative_to_main,
+    fetch_tracked_upstream,
+    push_main_to_tracked_upstream,
+    resolve_tracked_upstream,
     squash_merge_branch_into_current,
     stage_all_changes,
     sync_local_excludes,
+    TrackedUpstream,
     workflow_state_file_for_repo_root,
     diff_baseline_file_for_repo_root,
 )
@@ -72,6 +77,14 @@ from .ticket_providers import (
 )
 from .json_files import JsonFileError, load_json_object, write_json_object_atomic
 from .repository import config_file_for_repo_root
+from .promotion_sync import (
+    PromotionSyncError,
+    PromotionSyncRecord,
+    load_promotion_sync_record,
+    promotion_sync_record_matches_state,
+    clear_promotion_sync_record,
+    save_promotion_sync_record,
+)
 from .tickets import TicketReference
 
 
@@ -582,6 +595,173 @@ def _require_valid_promotion_review_gate(repo_root: Path, state: WorkflowState) 
         )
 
 
+def _require_tracked_upstream_preflight(repo_root: Path, state: WorkflowState):
+    try:
+        upstream = resolve_tracked_upstream(repo_root, branch_name=state.main_branch)
+    except RepositoryError as exc:
+        raise FlowError(
+            f"Cannot promote workflow: cannot resolve tracked upstream for {state.main_branch}. {exc}"
+        ) from exc
+    if upstream is None:
+        return None
+
+    try:
+        fetch_tracked_upstream(repo_root, upstream=upstream)
+    except RepositoryError as exc:
+        raise FlowError(
+            "Cannot promote workflow: cannot fetch tracked upstream "
+            f"{upstream.remote_name} before promotion. {exc}"
+        ) from exc
+
+    try:
+        upstream_comparison = compare_main_to_tracked_upstream(
+            repo_root,
+            main_branch=state.main_branch,
+            upstream=upstream,
+        )
+    except RepositoryError as exc:
+        raise FlowError(
+            "Cannot promote workflow: cannot resolve tracked upstream "
+            f"{upstream.remote_name} after fetch. {exc}"
+        ) from exc
+
+    if upstream_comparison.relationship == "upstream-ahead":
+        raise FlowError(
+            "Cannot promote workflow: tracked upstream "
+            f"{upstream_comparison.upstream_ref} is ahead of local {state.main_branch}. "
+            "Reconcile local main before promotion."
+        )
+    if upstream_comparison.relationship == "diverged":
+        raise FlowError(
+            "Cannot promote workflow: tracked upstream "
+            f"{upstream_comparison.upstream_ref} has diverged from local {state.main_branch}. "
+            "Reconcile local main before promotion."
+        )
+    return upstream
+
+
+def _pending_sync_retry_context(repo_root: Path, state: WorkflowState):
+    try:
+        record = load_promotion_sync_record(repo_root)
+    except PromotionSyncError:
+        return None
+    if record is None or record.status != "pending":
+        return None
+
+    try:
+        main_commit = resolve_commit_hash(repo_root, state.main_branch)
+        scratch_commit = resolve_commit_hash(repo_root, state.scratch_branch)
+        upstream = resolve_tracked_upstream(repo_root, branch_name=state.main_branch)
+    except RepositoryError:
+        return None
+    if upstream is None or main_commit != scratch_commit:
+        return None
+    if not promotion_sync_record_matches_state(
+        record,
+        state,
+        promoted_main_commit=main_commit,
+    ):
+        return None
+    if record.remote_name != upstream.remote_name or record.upstream_ref != upstream.merge_ref:
+        return None
+    return record, upstream
+
+
+def _require_synchronized_completion_state(repo_root: Path, state: WorkflowState) -> None:
+    try:
+        upstream = resolve_tracked_upstream(repo_root, branch_name=state.main_branch)
+    except RepositoryError as exc:
+        raise FlowError(
+            f"Cannot complete workflow: cannot resolve tracked upstream for {state.main_branch}. {exc}"
+        ) from exc
+    if upstream is None:
+        return
+
+    try:
+        record = load_promotion_sync_record(repo_root)
+        main_commit = resolve_commit_hash(repo_root, state.main_branch)
+        scratch_commit = resolve_commit_hash(repo_root, state.scratch_branch)
+    except (PromotionSyncError, RepositoryError):
+        record = None
+        main_commit = ""
+        scratch_commit = ""
+
+    if (
+        record is None
+        or record.status != "synchronized"
+        or main_commit != scratch_commit
+        or not promotion_sync_record_matches_state(
+            record,
+            state,
+            promoted_main_commit=main_commit,
+        )
+        or record.remote_name != upstream.remote_name
+        or record.upstream_ref != upstream.merge_ref
+    ):
+        raise FlowError(
+            "Cannot complete workflow: promotion to the tracked upstream has not been "
+            "synchronized. Run flow-promote to retry remote synchronization."
+        )
+
+
+def _save_synchronized_promotion_record(repo_root: Path, record: PromotionSyncRecord) -> None:
+    synchronized = replace(record, status="synchronized")
+    try:
+        save_promotion_sync_record(repo_root, synchronized)
+    except PromotionSyncError as exc:
+        raise FlowError(
+            "Remote synchronization succeeded but its local state could not be recorded. "
+            "Rerun flow-promote to verify synchronization. "
+            f"{exc}"
+        ) from exc
+
+
+def _retry_pending_remote_synchronization(
+    repo_root: Path,
+    *,
+    state: WorkflowState,
+    record: PromotionSyncRecord,
+    upstream: TrackedUpstream,
+) -> int:
+    try:
+        fetch_tracked_upstream(repo_root, upstream=upstream)
+        comparison = compare_main_to_tracked_upstream(
+            repo_root,
+            main_branch=state.main_branch,
+            upstream=upstream,
+        )
+    except RepositoryError as exc:
+        raise FlowError(
+            "Cannot retry remote synchronization: unable to fetch or resolve the tracked upstream. "
+            f"{exc}"
+        ) from exc
+
+    if comparison.relationship == "diverged":
+        raise FlowError(
+            "Cannot retry remote synchronization: tracked upstream "
+            f"{comparison.upstream_ref} has diverged from promoted {state.main_branch}. "
+            "Reconcile local main before retrying."
+        )
+
+    if comparison.relationship == "upstream-behind":
+        try:
+            push_main_to_tracked_upstream(
+                repo_root,
+                main_branch=state.main_branch,
+                upstream=upstream,
+            )
+        except RepositoryError as exc:
+            print("Local promotion remains complete, but remote synchronization is pending.", file=sys.stderr)
+            print("Rerun flow-promote to retry remote synchronization.", file=sys.stderr)
+            print(f"Remote push failed: {exc}", file=sys.stderr)
+            return 1
+
+    _save_synchronized_promotion_record(repo_root, record)
+    print("Remote synchronization completed.")
+    print(f"commit: {record.promoted_main_commit}")
+    return 0
+
+
 def _ensure_main_and_scratch_branches_differ(state: WorkflowState) -> None:
     if state.main_branch == state.scratch_branch:
         raise FlowError(
@@ -840,6 +1020,10 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
 
     ensure_local_state_excluded(repo_root)
     save_state(state_path, issue_state)
+    try:
+        clear_promotion_sync_record(repo_root)
+    except PromotionSyncError as exc:
+        raise FlowError(f"Started workflow but could not clear stale promotion synchronization state. {exc}") from exc
     _clear_diff_baseline_after_success(repo_root, operation="start")
 
     print(f"Started issue {issue_number}")
@@ -929,6 +1113,11 @@ def handle_patch(command_name: str, arguments: list[str]) -> int:
     _clear_promotion_review_record(repo_root)
     ensure_local_state_excluded(repo_root)
     save_state(state_path, patch_state)
+    if not adopt_mode:
+        try:
+            clear_promotion_sync_record(repo_root)
+        except PromotionSyncError as exc:
+            raise FlowError(f"Started patch but could not clear stale promotion synchronization state. {exc}") from exc
     _clear_diff_baseline_after_success(repo_root, operation="patch")
 
     _print_patch_success(
@@ -1378,12 +1567,17 @@ def _print_promote_partial_success(
 
 
 def handle_promote(command_name: str, arguments: list[str]) -> int:
-    if len(arguments) != 1:
+    if len(arguments) > 1:
         raise _promote_usage(command_name)
 
-    commit_message = arguments[0].strip()
-    if not commit_message:
+    commit_message = arguments[0].strip() if arguments else ""
+    if arguments and not commit_message:
         raise _promote_usage(command_name)
+    if not arguments:
+        try:
+            resolve_repo_root()
+        except RepositoryError as exc:
+            raise _promote_usage(command_name) from exc
 
     repo_root, state_path, state = _resolve_repo_state_context()
 
@@ -1407,6 +1601,18 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
     if git_status_short_filtered(repo_root, excluded_paths=excluded_paths):
         raise FlowError("Cannot promote workflow: repository must be clean.")
 
+    retry_context = _pending_sync_retry_context(repo_root, state)
+    if retry_context is not None:
+        record, upstream = retry_context
+        return _retry_pending_remote_synchronization(
+            repo_root,
+            state=state,
+            record=record,
+            upstream=upstream,
+        )
+    if not commit_message:
+        raise _promote_usage(command_name)
+
     comparison = compare_main_and_scratch(
         repo_root,
         main_branch=state.main_branch,
@@ -1416,8 +1622,6 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
         raise FlowError(
             "Cannot promote workflow: unable to determine branch relationship."
         )
-
-    _require_valid_promotion_review_gate(repo_root, state)
 
     if not branch_is_ancestor(
         repo_root,
@@ -1431,6 +1635,9 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
     relationship_error = _promote_branch_relationship_error(comparison)
     if relationship_error:
         raise FlowError(relationship_error)
+
+    upstream = _require_tracked_upstream_preflight(repo_root, state)
+    _require_valid_promotion_review_gate(repo_root, state)
 
     original_branch = current_branch
     original_main_commit = resolve_commit_hash(repo_root, state.main_branch)
@@ -1472,6 +1679,27 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
         updated_state = replace(state, checkpoint=0)
         save_state(state_path, updated_state)
         workflow_state_updated = True
+
+        sync_record: PromotionSyncRecord | None = None
+        if upstream is not None:
+            sync_record = PromotionSyncRecord(
+                status="pending",
+                main_branch=state.main_branch,
+                scratch_branch=state.scratch_branch,
+                promoted_main_commit=commit_hash,
+                remote_name=upstream.remote_name,
+                upstream_ref=upstream.merge_ref,
+                active_issue_number=state.active_issue_number,
+                patch_description=state.patch_description,
+            )
+            try:
+                save_promotion_sync_record(repo_root, sync_record)
+            except PromotionSyncError as exc:
+                raise FlowError(
+                    "Local promotion succeeded but remote synchronization state could not be recorded. "
+                    f"{exc}"
+                ) from exc
+
         _clear_promotion_review_record(repo_root)
 
         if current_branch_name(repo_root) != state.scratch_branch:
@@ -1480,6 +1708,20 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
             )
 
         _clear_diff_baseline_after_success(repo_root, operation="promote")
+
+        if sync_record is not None:
+            try:
+                push_main_to_tracked_upstream(
+                    repo_root,
+                    main_branch=state.main_branch,
+                    upstream=upstream,
+                )
+            except RepositoryError as exc:
+                print("Local promotion succeeded, but remote synchronization failed.", file=sys.stderr)
+                print("Rerun flow-promote to retry remote synchronization.", file=sys.stderr)
+                print(f"Remote push failed: {exc}", file=sys.stderr)
+                return 1
+            _save_synchronized_promotion_record(repo_root, sync_record)
 
         _print_promote_success(
             commit_hash=commit_hash,
@@ -2273,6 +2515,10 @@ def handle_reset(command_name: str, arguments: list[str]) -> int:
             "Scratch was reset but workflow state could not be saved. "
             f"{exc}"
         ) from exc
+    try:
+        clear_promotion_sync_record(repo_root)
+    except PromotionSyncError as exc:
+        raise FlowError(f"Scratch was reset but stale promotion synchronization state could not be cleared. {exc}") from exc
     _clear_diff_baseline_after_success(repo_root, operation="reset")
 
     print(f"Reset {state.scratch_branch} to {state.main_branch}")
@@ -2335,6 +2581,8 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
             f"Cannot complete workflow: checkpoint must be 0 (current: {state.checkpoint})."
         )
 
+    _require_synchronized_completion_state(repo_root, state)
+
     if state.active_issue_number is not None:
         if state.ticket_reference is None:
             # Compatibility path for legacy workflows created before ticket
@@ -2392,6 +2640,13 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
         raise FlowError(
             "Cannot complete workflow: ticket completion succeeded but workflow state could not be cleared. "
             "The active workflow state was kept so you can retry flow-complete after fixing local state persistence. "
+            f"{exc}"
+        ) from exc
+    try:
+        clear_promotion_sync_record(repo_root)
+    except PromotionSyncError as exc:
+        raise FlowError(
+            "Cannot complete workflow: workflow completion succeeded but promotion synchronization state could not be cleared. "
             f"{exc}"
         ) from exc
     _clear_diff_baseline_after_success(repo_root, operation="complete")

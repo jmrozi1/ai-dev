@@ -34,6 +34,34 @@ class BranchComparison:
         return self.main_head == self.scratch_head
 
 
+@dataclass(frozen=True)
+class TrackedUpstream:
+    local_branch: str
+    remote_name: str
+    merge_ref: str
+
+
+@dataclass(frozen=True)
+class MainUpstreamComparison:
+    main_branch: str
+    upstream: TrackedUpstream
+    main_head: str
+    upstream_head: str
+    upstream_ref: str
+    local_ahead_of_upstream: int
+    local_behind_upstream: int
+
+    @property
+    def relationship(self) -> str:
+        if self.local_ahead_of_upstream == 0 and self.local_behind_upstream == 0:
+            return "equal"
+        if self.local_ahead_of_upstream > 0 and self.local_behind_upstream == 0:
+            return "upstream-behind"
+        if self.local_ahead_of_upstream == 0 and self.local_behind_upstream > 0:
+            return "upstream-ahead"
+        return "diverged"
+
+
 def _run_git(
     repo_root: Path,
     arguments: list[str],
@@ -207,6 +235,123 @@ def branch_exists(repo_root: Path, branch_name: str) -> bool:
 def ensure_branch_exists(repo_root: Path, branch_name: str) -> None:
     if not branch_exists(repo_root, branch_name):
         raise RepositoryError(f"Required branch does not exist: {branch_name}")
+
+
+def resolve_tracked_upstream(
+    repo_root: Path,
+    *,
+    branch_name: str,
+) -> TrackedUpstream | None:
+    remote = _run_git(
+        repo_root,
+        ["config", "--get", f"branch.{branch_name}.remote"],
+        check=False,
+    )
+    if remote.returncode == 1:
+        return None
+    if remote.returncode != 0:
+        raise RepositoryError(remote.stderr.strip() or "Cannot resolve branch upstream remote.")
+
+    remote_name = remote.stdout.strip()
+    if not remote_name or remote_name == ".":
+        return None
+
+    merge = _run_git(
+        repo_root,
+        ["config", "--get", f"branch.{branch_name}.merge"],
+        check=False,
+    )
+    if merge.returncode != 0:
+        raise RepositoryError(
+            f"Tracked branch {branch_name} is missing its upstream merge ref."
+        )
+
+    merge_ref = merge.stdout.strip()
+    if not merge_ref.startswith("refs/heads/") or merge_ref == "refs/heads/":
+        raise RepositoryError(
+            f"Tracked branch {branch_name} has invalid upstream merge ref: {merge_ref!r}."
+        )
+
+    return TrackedUpstream(
+        local_branch=branch_name,
+        remote_name=remote_name,
+        merge_ref=merge_ref,
+    )
+
+
+def fetch_tracked_upstream(repo_root: Path, *, upstream: TrackedUpstream) -> None:
+    _run_git(repo_root, ["fetch", "--no-tags", upstream.remote_name], check=True)
+
+
+def compare_main_to_tracked_upstream(
+    repo_root: Path,
+    *,
+    main_branch: str,
+    upstream: TrackedUpstream,
+) -> MainUpstreamComparison:
+    if main_branch != upstream.local_branch:
+        raise RepositoryError(
+            "Tracked upstream branch does not match the requested main branch."
+        )
+
+    main_head = _resolve_branch_head(repo_root, main_branch)
+    if main_head is None:
+        raise RepositoryError(f"Required branch does not exist: {main_branch}")
+
+    upstream_ref_result = _run_git(
+        repo_root,
+        ["rev-parse", "--symbolic-full-name", f"{main_branch}@{{upstream}}"],
+        check=True,
+    )
+    upstream_ref = upstream_ref_result.stdout.strip()
+    if not upstream_ref:
+        raise RepositoryError(f"Cannot resolve tracked upstream for {main_branch}.")
+
+    upstream_head_result = _run_git(
+        repo_root,
+        ["rev-parse", "--verify", upstream_ref],
+        check=True,
+    )
+    upstream_head = upstream_head_result.stdout.strip()
+    if not upstream_head:
+        raise RepositoryError(f"Cannot resolve tracked upstream commit for {main_branch}.")
+
+    counts_result = _run_git(
+        repo_root,
+        ["rev-list", "--left-right", "--count", f"{upstream_ref}...{main_branch}"],
+        check=True,
+    )
+    counts = counts_result.stdout.strip().split()
+    if len(counts) != 2:
+        raise RepositoryError("Cannot determine local main and upstream relationship.")
+
+    return MainUpstreamComparison(
+        main_branch=main_branch,
+        upstream=upstream,
+        main_head=main_head,
+        upstream_head=upstream_head,
+        upstream_ref=upstream_ref,
+        local_ahead_of_upstream=int(counts[1]),
+        local_behind_upstream=int(counts[0]),
+    )
+
+
+def push_main_to_tracked_upstream(
+    repo_root: Path,
+    *,
+    main_branch: str,
+    upstream: TrackedUpstream,
+) -> None:
+    if main_branch != upstream.local_branch:
+        raise RepositoryError(
+            "Tracked upstream branch does not match the requested main branch."
+        )
+
+    _run_git(
+        repo_root,
+        ["push", "--porcelain", upstream.remote_name, f"{main_branch}:{upstream.merge_ref}"],
+        check=True,
+    )
 
 
 def active_git_operations(repo_root: Path) -> list[str]:

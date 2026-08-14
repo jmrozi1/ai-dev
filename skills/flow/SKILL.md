@@ -77,8 +77,10 @@ Issue lifecycle (high level):
 1. `flow-start <issue-number>` binds workflow to a ticket and resets `scratch` from `main`.
 2. Implement changes.
 3. `flow-commit` creates numbered checkpoints on `scratch`.
-4. `flow-promote "<message>"` squashes workflow changes onto `main` and realigns `scratch`.
-5. `flow-complete` closes/completes the bound ticket and clears active workflow state.
+4. `flow-promote "<message>"` squashes workflow changes onto `main`, realigns
+	`scratch`, and synchronizes a tracked shared mainline when configured.
+5. `flow-complete` closes/completes the bound ticket only after required tracked
+	upstream synchronization has completed, then clears active workflow state.
 
 Patch lifecycle (high level):
 
@@ -148,6 +150,43 @@ Before implementation or consequential commands:
 Fail-closed behavior is expected: if safety preconditions are not met, stop and resolve state first.
 
 Promotion review is required by default for normal AI Dev operation; the explicit opt-out path is a deliberate escape hatch only when a repository genuinely needs it.
+
+## Tracked-Upstream Promotion
+
+When the workflow `main` branch has a configured Git upstream, Flow uses that
+tracked remote and branch; it does not assume the remote is named `origin`.
+
+Before local promotion, Flow fetches the configured remote without tags, then
+compares the fresh tracked upstream with local `main`:
+
+- equal: promotion may proceed;
+- upstream behind local `main`: promotion may proceed and can fast-forward the
+	shared mainline;
+- upstream ahead or diverged: Flow refuses before mutating local `main`;
+- fetch or upstream-resolution failure: Flow refuses before mutating local
+	`main`.
+
+Flow does not automatically merge, rebase, reconcile conflicts, force-push, or
+use force-with-lease.
+
+After successful local promotion, Flow records pending synchronization before
+making an ordinary non-force push to the exact tracked upstream. If that push
+succeeds, synchronization is marked complete. If it fails, local promotion is
+preserved, the workflow stays active, and `flow-promote` reports that remote
+synchronization is pending.
+
+Run `flow-promote` again to retry a valid pending synchronization. The retry
+does not create another squash-promotion commit or require a new promotion
+review. It fetches first and either pushes the already-promoted `main`, detects
+that the remote already contains the promoted SHA and marks synchronization
+complete without pushing, or refuses if the histories diverged.
+
+Repositories whose `main` has no tracked upstream retain local-only promotion
+and completion semantics. For a tracked upstream, `flow-complete` requires a
+matching synchronized promotion state for the current workflow and promoted SHA;
+pending, missing, stale, or mismatched state blocks completion. Completion does
+not fetch: an earlier successful push is the durable proof that the promoted SHA
+reached the shared mainline.
 
 ## Verification Of Results
 
