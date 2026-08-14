@@ -18,10 +18,10 @@ while [[ -L "$script_path" ]]; do
 done
 
 script_dir="$(cd "$(dirname "$script_path")" && pwd)"
-repo_root="$(cd "$script_dir/../../.." && pwd)"
+repo_root="$(cd "$script_dir/../../../.." && pwd)"
 source "$repo_root/tools/bootstrap/python_select.sh"
 
-python_executable="$(ai_dev_select_python "flow-patch")" || exit 1
+python_executable="$(ai_dev_select_python "flow-reset")" || exit 1
 flow_command_name="$(basename "$0")"
 export FLOW_COMMAND_NAME="$flow_command_name"
 
@@ -32,4 +32,4 @@ else
 fi
 export PYTHONPATH
 
-exec "$python_executable" -m ai_dev_flow.cli "__ai_dev_flow_exec__" "patch" "$@"
+exec "$python_executable" -m ai_dev_flow.cli "__ai_dev_flow_exec__" "reset" "$@"

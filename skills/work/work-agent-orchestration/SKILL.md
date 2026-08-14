@@ -62,7 +62,7 @@ Do not promote a work-agent workaround into shared guidance merely because it im
 
 Prefer outcome-oriented instructions until the work agent demonstrates that they are insufficient. Add mechanical constraints only to address observed failures, non-negotiable requirements, or safety/correctness invariants.
 
-When a work-agent-specific skill needs refinement, use `skills/work-agent-skills/write-low-reasoning-skills/SKILL.md`.
+When a work-agent-specific skill needs refinement, use `skills/work/write-low-reasoning-skills/SKILL.md`.
 
 ## Track Persistent Changes
 

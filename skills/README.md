@@ -1,28 +1,45 @@
 # Skills Package
 
-This repository uses a minimal, proven skill package layout.
+AI Dev skills are organized by operating audience only when audience-specific
+instructions materially change behavior, permissions, recovery, or evidence.
 
-Canonical layout:
+Canonical locations:
 
-- `skills/<skill-name>/SKILL.md`
-- `skills/work-agent-skills/<skill-name>/SKILL.md` only for work-agent-specific
-	skills that have earned separate constraints.
+- `skills/<skill-name>/SKILL.md` for genuinely shared operational skills;
+- `skills/chatgpt/<skill-name>/SKILL.md` for ChatGPT-oriented skills;
+- `skills/copilot/<skill-name>/SKILL.md` for Copilot-oriented skills;
+- `skills/work/<skill-name>/SKILL.md` for constrained work-agent skills.
 
-Optional subdirectories are allowed only when real skill content requires them:
+Not every capability exists for every audience. Duplicate capability
+implementations are allowed conceptually when audiences need materially
+different operational guidance, but this checkpoint introduces no duplicates.
+Audience specialization is justified by behavioral differences, not merely by
+different wording or examples.
 
-- `scripts/`
-- `src/`
-- `tests/`
-- `references/`
+The current shared skills are `frontend-design-review`,
+`requirements-driven-development`, and `review-process`. The current
+audience-specific skills are:
 
-Rules:
+- ChatGPT: `auto-review`, `flow`, `orchestrator`;
+- Copilot: `auto-review`, `executor`, `flow`;
+- Work: `work-agent-orchestration`, `documentation`, `project-readme`, and
+  `write-low-reasoning-skills`.
 
-- Do not create speculative category hierarchy directories now.
-- Introduce categories later only if repeated real skills demonstrate a clear need.
-- `work-agent-skills/` is the one current exception; do not use it for general
-	skills or as a precedent for generic categories.
-- If a compatibility catalog is needed for non-native hosts, keep it as a small maintained derivative file under `skills/index.md`.
-- Canonical `skills/<skill-name>/SKILL.md` files remain authoritative over any derivative catalog.
-- Do not add generated routing files, category hierarchies, or custom skill-loading frameworks.
-- Keep each skill self-contained under its own directory.
-- Add optional subdirectories only when they contain real, maintained content.
+Flow remains one deterministic runtime in `ai_dev_flow` with one launcher set,
+owned by the Copilot Flow package for repository execution. ChatGPT receives
+lifecycle interpretation guidance, and Work receives no Flow package.
+
+Skill discovery is explicit rather than recursive. The installer recognizes
+root shared packages and direct packages under `chatgpt/`, `copilot/`, and
+`work/`. Each installation selects one audience and includes the root shared
+packages in that audience's flat installed destination. Duplicate capability
+names are valid across source audiences but cannot collide within one selected
+installation.
+
+`skills/index.md` is a thin derivative catalog for providers without native
+skill discovery. Canonical `SKILL.md` files remain authoritative. Do not add a
+router, inheritance system, synchronization framework, or speculative category
+tree.
+
+Optional subdirectories such as `scripts/`, `src/`, `tests/`, and `references/`
+are allowed only when real skill content requires them.

@@ -5,14 +5,15 @@ show_help() {
 	cat <<'EOF'
 Usage: scripts/install-skills.sh [skill-installer-options]
 
-Install repository Copilot skills discovered from:
-	skills/*/SKILL.md
+Install repository skills discovered from:
+	skills/*/SKILL.md and the selected audience directory
 
 Default destination is:
 	~/.agents/skills
 
 Options:
 	-h, --help  Show this help and exit.
+	--audience <name>  Select chatgpt, copilot, or work (default: copilot).
 
 Any additional options are forwarded to:
 	python -m ai_dev_flow.skill_installation

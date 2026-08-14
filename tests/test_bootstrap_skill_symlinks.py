@@ -23,7 +23,7 @@ class BootstrapSkillSymlinkTests(unittest.TestCase):
         self.repo_root = self.tmp_path / "repo-fixture"
         shutil.copytree(source_repo_root / "ai_dev_flow", self.repo_root / "ai_dev_flow")
         shutil.copytree(source_repo_root / "tools" / "bootstrap", self.repo_root / "tools" / "bootstrap")
-        shutil.copytree(source_repo_root / "skills" / "flow" / "scripts", self.repo_root / "skills" / "flow" / "scripts")
+        shutil.copytree(source_repo_root / "skills" / "copilot" / "flow" / "scripts", self.repo_root / "skills" / "copilot" / "flow" / "scripts")
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()

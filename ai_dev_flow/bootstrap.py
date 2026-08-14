@@ -869,7 +869,7 @@ def _build_posix_prefixed_flow_symlink_map(
     prefix: str,
 ) -> dict[Path, Path]:
     symlink_map: dict[Path, Path] = {}
-    scripts_root = repo_root / "skills" / "flow" / "scripts"
+    scripts_root = repo_root / "skills" / "copilot" / "flow" / "scripts"
     for flow_command in _fixed_flow_launcher_commands():
         launcher_name = f"{prefix}-{flow_command}"
         launcher_path = install_directory / launcher_name

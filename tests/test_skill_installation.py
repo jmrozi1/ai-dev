@@ -43,29 +43,186 @@ class SkillInstallationTests(unittest.TestCase):
         record = json.loads(ownership_path.read_text(encoding="utf-8"))
         return record["owned_skills"]
 
-    def test_discovery_finds_general_and_work_agent_skill_packages(self) -> None:
-        self._write_skill("flow", content="# Flow\n")
+    def test_discovery_finds_shared_and_audience_skill_packages(self) -> None:
         self._write_skill("frontend-design-review", content="# Front-end\n")
-        work_agent_skill = self.repo_root / "skills" / "work-agent-skills" / "documentation"
-        work_agent_skill.mkdir(parents=True, exist_ok=True)
-        (work_agent_skill / "SKILL.md").write_text("# Work-agent documentation\n", encoding="utf-8")
+        chatgpt_skill = self.repo_root / "skills" / "chatgpt" / "orchestrator"
+        chatgpt_skill.mkdir(parents=True, exist_ok=True)
+        (chatgpt_skill / "SKILL.md").write_text("# ChatGPT orchestration\n", encoding="utf-8")
+        copilot_skill = self.repo_root / "skills" / "copilot" / "executor"
+        copilot_skill.mkdir(parents=True, exist_ok=True)
+        (copilot_skill / "SKILL.md").write_text("# Copilot execution\n", encoding="utf-8")
+        chatgpt_flow = self.repo_root / "skills" / "chatgpt" / "flow"
+        chatgpt_flow.mkdir(parents=True, exist_ok=True)
+        (chatgpt_flow / "SKILL.md").write_text("# ChatGPT Flow\n", encoding="utf-8")
+        copilot_flow = self.repo_root / "skills" / "copilot" / "flow"
+        copilot_flow.mkdir(parents=True, exist_ok=True)
+        (copilot_flow / "SKILL.md").write_text("# Copilot Flow\n", encoding="utf-8")
+        work_skill = self.repo_root / "skills" / "work" / "documentation"
+        work_skill.mkdir(parents=True, exist_ok=True)
+        (work_skill / "SKILL.md").write_text("# Work documentation\n", encoding="utf-8")
         nested = self.repo_root / "skills" / "documentation" / "example"
         nested.mkdir(parents=True, exist_ok=True)
         (nested / "SKILL.md").write_text("# Nested\n", encoding="utf-8")
+        deeper = self.repo_root / "skills" / "work" / "documentation" / "example"
+        deeper.mkdir(parents=True, exist_ok=True)
+        (deeper / "SKILL.md").write_text("# Deeper\n", encoding="utf-8")
         (self.repo_root / "skills" / "README.md").write_text("# Index\n", encoding="utf-8")
         (self.repo_root / "skills" / "index.md").write_text("# Catalog\n", encoding="utf-8")
 
         packages = discover_skill_packages(self.repo_root)
 
-        self.assertEqual(len(packages), 3)
+        self.assertEqual(len(packages), 6)
         self.assertEqual(
             [package.name for package in packages],
-            ["documentation", "flow", "frontend-design-review"],
+            ["documentation", "executor", "flow", "flow", "frontend-design-review", "orchestrator"],
         )
-        self.assertEqual(packages[0].source_directory, work_agent_skill)
+        self.assertEqual(packages[0].source_directory, work_skill)
+        self.assertEqual(
+            packages[1].source_directory,
+            copilot_skill,
+        )
+        self.assertEqual(
+            packages[3].source_directory,
+            copilot_flow,
+        )
         self.assertEqual(
             packages[2].source_directory,
-            self.repo_root / "skills" / "frontend-design-review",
+            chatgpt_flow,
+        )
+        self.assertEqual(
+            packages[5].source_directory,
+            chatgpt_skill,
+        )
+
+    def test_discovery_does_not_scan_obsolete_or_arbitrary_paths(self) -> None:
+        obsolete = self.repo_root / "skills" / "work-agent-skills" / "legacy"
+        obsolete.mkdir(parents=True, exist_ok=True)
+        (obsolete / "SKILL.md").write_text("# Legacy\n", encoding="utf-8")
+        arbitrary = self.repo_root / "skills" / "other" / "nested"
+        arbitrary.mkdir(parents=True, exist_ok=True)
+        (arbitrary / "SKILL.md").write_text("# Arbitrary\n", encoding="utf-8")
+
+        self.assertEqual(discover_skill_packages(self.repo_root), ())
+
+    def test_each_audience_install_set_has_unique_names(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+
+        for audience in ("chatgpt", "copilot", "work"):
+            with self.subTest(audience=audience):
+                names = [
+                    package.name
+                    for package in discover_skill_packages(source_repo, audience=audience)
+                ]
+                self.assertEqual(len(names), len(set(names)))
+
+    def test_duplicate_capability_names_are_valid_across_audiences(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        names = [package.name for package in discover_skill_packages(source_repo)]
+
+        self.assertEqual(names.count("auto-review"), 2)
+        self.assertEqual(names.count("flow"), 2)
+        self.assertEqual(len(names), 13)
+
+    def test_real_repository_packages_install_to_flat_destination(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        destination = self.tmp_path / "dest"
+        home = self.tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+
+        result = install_skill_packages(
+            repo_root=source_repo,
+            destination_root=destination,
+            home=home,
+        )
+
+        copilot_packages = discover_skill_packages(source_repo, audience="copilot")
+        self.assertEqual(result.discovered_count, len(copilot_packages))
+        self.assertEqual(result.installed_count, len(copilot_packages))
+        self.assertEqual(result.updated_count, 0)
+        self.assertEqual(result.unchanged_count, 0)
+        for package in copilot_packages:
+            self.assertTrue((destination / package.name).is_symlink())
+
+    def test_each_audience_install_includes_shared_and_selected_skills(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        shared_names = {
+            "frontend-design-review",
+            "requirements-driven-development",
+            "review-process",
+        }
+
+        expected_audience_skills = {
+            "chatgpt": {"auto-review", "flow", "orchestrator"},
+            "copilot": {"auto-review", "executor", "flow"},
+            "work": {
+                "documentation",
+                "project-readme",
+                "work-agent-orchestration",
+                "write-low-reasoning-skills",
+            },
+        }
+        for audience, audience_skills in expected_audience_skills.items():
+            with self.subTest(audience=audience):
+                destination = self.tmp_path / f"dest-{audience}"
+                home = self.tmp_path / f"home-{audience}"
+                home.mkdir(parents=True, exist_ok=True)
+                result = install_skill_packages(
+                    repo_root=source_repo,
+                    destination_root=destination,
+                    home=home,
+                    audience=audience,
+                )
+
+                self.assertEqual(
+                    {status.name for status in result.statuses if status.state == "installed"},
+                    shared_names | audience_skills,
+                )
+
+    def test_all_audience_flat_install_is_unsupported(self) -> None:
+        with self.assertRaisesRegex(SkillInstallationError, "Unsupported skill audience"):
+            install_skill_packages(
+                repo_root=Path(__file__).resolve().parents[1],
+                destination_root=self.tmp_path / "dest-all",
+                home=self.tmp_path / "home-all",
+                audience="all",
+            )
+
+    def test_real_repository_has_no_obsolete_work_agent_paths(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+
+        self.assertFalse((source_repo / "skills" / "work-agent-skills").exists())
+        self.assertFalse((source_repo / "skills" / "flow").exists())
+        self.assertEqual(
+            [package.name for package in discover_skill_packages(source_repo)],
+            [
+                "auto-review",
+                "auto-review",
+                "documentation",
+                "executor",
+                "flow",
+                "flow",
+                "frontend-design-review",
+                "orchestrator",
+                "project-readme",
+                "requirements-driven-development",
+                "review-process",
+                "work-agent-orchestration",
+                "write-low-reasoning-skills",
+            ],
+        )
+
+    def test_shared_skill_source_remains_at_root(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+
+        self.assertTrue(
+            (source_repo / "skills" / "requirements-driven-development" / "SKILL.md").exists()
+        )
+        self.assertTrue(
+            (source_repo / "skills" / "frontend-design-review" / "SKILL.md").exists()
+        )
+        self.assertEqual(
+            discover_skill_packages(self.repo_root),
+            (),
         )
 
     def test_repository_discovery_matches_real_top_level_skill_packages(self) -> None:
@@ -75,8 +232,10 @@ class SkillInstallationTests(unittest.TestCase):
             [package.name for package in packages],
             [
                 "auto-review",
+                "auto-review",
                 "documentation",
                 "executor",
+                "flow",
                 "flow",
                 "frontend-design-review",
                 "orchestrator",

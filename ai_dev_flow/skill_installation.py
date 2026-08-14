@@ -18,6 +18,7 @@ class SkillInstallationError(Exception):
 class SkillPackage:
     name: str
     source_directory: Path
+    audience: str | None = None
 
 
 @dataclass(frozen=True)
@@ -42,24 +43,42 @@ SKILL_INSTALLATION_OWNERSHIP_VERSION = 1
 _SYMLINK_OWNERSHIP_PREFIX = "symlink:"
 
 
-def discover_skill_packages(repo_root: Path) -> tuple[SkillPackage, ...]:
+SUPPORTED_AUDIENCES = ("chatgpt", "copilot", "work")
+
+
+def discover_skill_packages(
+    repo_root: Path,
+    *,
+    audience: str | None = None,
+) -> tuple[SkillPackage, ...]:
     source_root = repo_root / "skills"
     if not source_root.exists():
         return ()
+    if audience is not None and audience not in SUPPORTED_AUDIENCES:
+        raise SkillInstallationError(
+            f"Unsupported skill audience {audience!r}; expected one of: "
+            f"{', '.join(SUPPORTED_AUDIENCES)}."
+        )
 
     packages: list[SkillPackage] = []
-    skill_files = [
-        *source_root.glob("*/SKILL.md"),
-        *source_root.glob("work-agent-skills/*/SKILL.md"),
-    ]
+    skill_files = [*source_root.glob("*/SKILL.md")]
+    if audience is None:
+        audiences = SUPPORTED_AUDIENCES
+    else:
+        audiences = (audience,)
+    for package_audience in audiences:
+        skill_files.extend(source_root.glob(f"{package_audience}/*/SKILL.md"))
     for skill_file in skill_files:
         if not skill_file.is_file():
             continue
         skill_directory = skill_file.parent
+        relative_parts = skill_directory.relative_to(source_root).parts
+        package_audience = relative_parts[0] if len(relative_parts) == 2 else None
         packages.append(
             SkillPackage(
                 name=skill_directory.name,
                 source_directory=skill_directory,
+                audience=package_audience,
             )
         )
 
@@ -311,8 +330,18 @@ def install_skill_packages(
     repo_root: Path,
     destination_root: Path,
     home: Path | None = None,
+    audience: str = "copilot",
 ) -> SkillInstallResult:
-    packages = discover_skill_packages(repo_root)
+    packages = discover_skill_packages(repo_root, audience=audience)
+    package_names = [package.name for package in packages]
+    if len(package_names) != len(set(package_names)):
+        duplicates = sorted(
+            name for name in set(package_names) if package_names.count(name) > 1
+        )
+        raise SkillInstallationError(
+            "Selected skill audience contains duplicate package names: "
+            f"{', '.join(duplicates)}."
+        )
     source_root = repo_root / "skills"
     if not source_root.exists():
         raise SkillInstallationError(f"skills directory not found: {source_root}")
@@ -424,13 +453,19 @@ def install_skill_packages(
 def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m ai_dev_flow.skill_installation",
-        description="Install repository Copilot skill packages discovered from skills/*/SKILL.md.",
+        description="Install shared and selected-audience skill packages.",
     )
     parser.add_argument("--repo-root", required=True, help="Repository root path.")
     parser.add_argument(
         "--destination-root",
         default="",
         help="Optional explicit destination directory. Defaults to ~/.agents/skills.",
+    )
+    parser.add_argument(
+        "--audience",
+        choices=SUPPORTED_AUDIENCES,
+        default="copilot",
+        help="Audience to install, including shared root skills (default: copilot).",
     )
     parser.add_argument("--home", default="", help="Optional home override for destination resolution.")
     return parser.parse_args(argv)
@@ -468,6 +503,7 @@ def main(argv: list[str] | None = None) -> int:
             repo_root=repo_root,
             destination_root=destination_root,
             home=home,
+            audience=args.audience,
         )
     except SkillInstallationError as exc:
         print(f"skill-installation: {exc}", file=sys.stderr)

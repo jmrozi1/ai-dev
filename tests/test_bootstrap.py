@@ -395,7 +395,7 @@ class BootstrapCoreTests(unittest.TestCase):
         self.assertIn(str(collision_path), record_data["owned_launchers"])
         self.assertEqual(
             record_data["owned_launchers"][str(collision_path)],
-            f"symlink:{(self.repo_root / 'skills' / 'flow' / 'scripts' / 'flow-start').resolve()}",
+            f"symlink:{(self.repo_root / 'skills' / 'copilot' / 'flow' / 'scripts' / 'flow-start').resolve()}",
         )
 
         class _NoReadInput:
@@ -494,7 +494,7 @@ class BootstrapCoreTests(unittest.TestCase):
         self.assertTrue(launcher_path.is_symlink())
         self.assertEqual(
             launcher_path.resolve(),
-            (self.repo_root / "skills" / "flow" / "scripts" / "flow-start").resolve(),
+            (self.repo_root / "skills" / "copilot" / "flow" / "scripts" / "flow-start").resolve(),
         )
 
     def test_unrelated_similarly_named_file_remains_untouched_when_forcing_conflict_replacement(self) -> None:
@@ -819,7 +819,7 @@ class BootstrapCoreTests(unittest.TestCase):
             self.assertTrue(launcher_path.is_symlink())
             self.assertEqual(
                 launcher_path.resolve(),
-                (self.repo_root / "skills" / "flow" / "scripts" / f"flow-{command}").resolve(),
+                (self.repo_root / "skills" / "copilot" / "flow" / "scripts" / f"flow-{command}").resolve(),
             )
             launcher_text = launcher_path.read_text(encoding="utf-8")
             self.assertIn(_DIRECT_FLOW_ROUTE_TOKEN, launcher_text)
