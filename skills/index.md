@@ -1,10 +1,26 @@
 # AI Dev Skill Catalog
 
-This catalog is derivative only.
+This catalog is a lightweight discovery surface and derivative catalog.
 
-Canonical instructions always live in each skill's `SKILL.md`. Use this file only when a provider cannot natively inspect `~/.agents/skills` and needs a cheap way to decide whether one canonical AI Dev skill should be loaded.
+Canonical instructions always live in each skill's `SKILL.md`. Use this file
+when a provider cannot natively inspect `~/.agents/skills` and needs a cheap way
+to decide whether one canonical AI Dev skill should be loaded.
 
 Do not preload every skill from this catalog. Do not treat it as a router, dependency graph, or authoritative metadata source.
+
+## ChatGPT skill observability
+
+When ChatGPT uses this catalog to choose an AI Dev skill, the user-facing
+response must make the selection result observable.
+
+- If a skill is selected, follow that skill's ChatGPT interaction instructions.
+- If no AI Dev skill applies, begin the response with:
+
+	`Skill: none`
+
+This convention is ChatGPT-facing only. It does not change Copilot or Work
+behavior. The catalog owns only this observable fallback; review and design
+reasoning rules remain in the applicable canonical `SKILL.md` files.
 
 ## Shared skills
 

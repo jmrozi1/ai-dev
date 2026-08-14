@@ -45,3 +45,13 @@ reviewing an execution failure.
 The shared runtime remains the source of truth for state transitions and
 command results. This skill supplies lifecycle judgment, not a second command
 implementation.
+
+## ChatGPT Interaction
+
+When ChatGPT intentionally activates this skill, begin the user-facing response
+with:
+
+`Skill: flow`
+
+This is an announcement only. Do not add a reasoning recommendation or a
+proceed gate for routine lifecycle interpretation.

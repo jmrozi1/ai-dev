@@ -55,3 +55,27 @@ the canonical recorder is:
 
 ChatGPT authorizes that transition; it should not turn review policy into an
 unbounded repository command-running loop.
+
+## ChatGPT Interaction
+
+When ChatGPT begins substantive review work with this skill, begin the
+user-facing response with `Skill: auto-review`. If it intentionally composes
+another review skill, announce the chain instead, for example:
+
+`Skills: auto-review → review-process`
+
+Then recommend an advisory reasoning level, briefly summarize what the review
+will evaluate, and ask:
+
+`Proceed?`
+
+Stop before substantial review analysis until the user confirms. The
+recommendation does not change or assume the actual ChatGPT reasoning setting.
+
+This gate occurs once when the substantive review invocation begins. After the
+user proceeds, continue announcing the active skill or chain in follow-up
+responses by beginning them with the active skill or chain, without repeating
+the reasoning cue, scope summary, or proceed gate.
+Gate again only when a new substantive invocation begins, the active chain
+changes materially, or the scope changes enough to make a new reasoning
+decision meaningful.

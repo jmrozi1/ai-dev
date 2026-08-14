@@ -80,3 +80,23 @@ for doing so.
 When handing work off, state the requirements addressed, the evidence obtained,
 any unresolved uncertainty, and decisions needed. Keep the handoff focused on
 current work and next decisions rather than a transcript of execution.
+
+## ChatGPT Interaction
+
+When ChatGPT uses this shared skill for routine requirements interpretation,
+announce `Skill: requirements-driven-development` and continue without a
+confirmation gate. When ChatGPT begins substantive requirements design or
+refinement that could materially change intent, announce the skill, recommend
+an advisory reasoning level, briefly summarize the outcome, evidence, and
+violating behavior it will refine, ask `Proceed?`, and stop before substantial
+refinement until confirmation.
+
+This instruction is scoped to ChatGPT use. It does not change Copilot or Work
+requirements execution.
+
+For substantive design or refinement, the gate is activation-time and occurs
+once per continuous requirements activity. After the user proceeds, begin
+follow-up responses with the active skill without repeating the reasoning cue,
+requirements summary, or proceed gate. Gate again only for a new invocation, a
+materially changed skill chain, or a scope change that makes a new reasoning
+decision meaningful. Routine interpretation remains announcement-only.

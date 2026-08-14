@@ -248,3 +248,24 @@ For each finding, state:
 Prefer a few strong findings over a comprehensive inventory of minor stylistic preferences.
 
 Preserve existing behavior unless changing it is necessary to resolve the design problem.
+
+## ChatGPT Interaction
+
+When ChatGPT begins a substantive design review, begin with:
+
+`Skill: frontend-design-review`
+
+Recommend an advisory reasoning level, briefly summarize that the review will
+evaluate hierarchy, interaction cost, recoverability, density, happy-path
+prominence, and material design issues, then ask `Proceed?` and stop before
+substantial analysis until confirmation.
+
+The recommendation is advisory and does not change or assume the actual
+ChatGPT reasoning setting. This instruction is scoped to ChatGPT use and does
+not alter Copilot or Work behavior.
+
+The gate is activation-time and occurs once per continuous design review. After
+the user proceeds, begin follow-up responses with the active skill without
+repeating the reasoning cue, design summary, or proceed gate. Gate again only
+for a new invocation, a materially changed skill chain, or a scope change that
+makes a new reasoning decision meaningful.

@@ -125,3 +125,13 @@ Without a tasking rail, clarify the intended outcome, preserve scope and durable
 decisions, identify relevant requirements, decide whether delegation is useful,
 and review evidence. Keep the role useful for small work without forcing rail
 machinery.
+
+## ChatGPT Interaction
+
+When ChatGPT intentionally activates this skill, begin the user-facing response
+with:
+
+`Skill: orchestrator`
+
+This is an announcement only. Do not add a reasoning recommendation or a
+proceed gate for routine orchestration.
