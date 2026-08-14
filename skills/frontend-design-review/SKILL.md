@@ -17,6 +17,24 @@ Every visible control, label, border, container, instruction, and decorative ele
 
 Optimize first for the repeated happy path: what the user normally came to this screen to do when nothing is wrong.
 
+## Execution Discipline
+
+Do not review by impression first and then selectively apply these principles to whatever stood out.
+
+Execute the full Review Method in order before forming recommendations. Inspect every review category even when the final response will mention only a few findings.
+
+For each review step, determine whether it produces:
+
+- no issue
+- a minor or non-material issue
+- a material finding
+
+Only report material findings, but do not skip a category merely because an obvious issue was found earlier.
+
+A short review is acceptable only after the full review method has been executed. Few findings should mean the screen passed the other checks, not that those checks were skipped.
+
+When producing implementation guidance, derive the implementation plan from the accepted findings rather than improvising a redesign. Keep the plan scoped to the smallest changes that resolve those findings.
+
 ## Review Principles
 
 ### 1. Minimize Visible Actions
@@ -135,6 +153,20 @@ It is acceptable to place secondary actions such as rename, delete, settings, or
 
 Do not apply this tradeoff blindly to the collection's primary action. The action users repeatedly perform on each item should remain obvious and efficient.
 
+Review repeated spacing cumulatively, not only one item at a time. Padding, borders or dividers, margins, and inter-row gaps may each look harmless on one row while becoming excessive when multiplied across a realistic collection.
+
+For row-oriented collections, account for the combined vertical cost of:
+
+- cell padding
+- borders or dividers
+- margins
+- inter-row gaps
+- repeated labels or metadata
+
+Do not automatically use both containment and spacing to separate every row. If a border, divider, background treatment, alignment, or other structure already establishes the row boundary, additional vertical separation should justify its cumulative cost.
+
+Ask: would this row treatment still be efficient with thirty items?
+
 ### 7. Prefer Recoverability Over Confirmation
 
 Do not use confirmation prompts as the default protection against accidental actions.
@@ -185,7 +217,7 @@ Prefer state-dependent replacement when the new meaning remains understandable f
 
 ## Review Method
 
-For each screen:
+For each screen, execute every step in order before forming recommendations:
 
 1. Identify the screen's dominant user task.
 2. Identify the normal happy-path state.
@@ -193,11 +225,13 @@ For each screen:
 4. Review visible controls for frequency, importance, necessity, and persistent attention cost in the current context.
 5. Check whether infrequent actions can tolerate an additional interaction in exchange for a cleaner normal state.
 6. Review repeated collections at realistic scale and check whether secondary actions are consuming unnecessary space.
-7. Review state transitions for obsolete controls that could be replaced instead of supplemented.
-8. Review containers and borders for redundant hierarchy.
-9. Review persistent text for unnecessary attention cost.
-10. Review interrupting confirmation flows for opportunities to replace confirmation with recoverability.
-11. Report only findings that materially affect clarity or workflow.
+7. Review cumulative row density: padding, borders or dividers, margins, inter-row gaps, and repeated labels or metadata.
+8. Review state transitions for obsolete controls that could be replaced instead of supplemented.
+9. Review containers and borders for redundant hierarchy.
+10. Review persistent text for unnecessary attention cost.
+11. Review interrupting confirmation flows for opportunities to replace confirmation with recoverability.
+12. Classify findings as material, minor, or no issue.
+13. Report only findings that materially affect clarity or workflow.
 
 Do not invent issues merely to produce a longer review.
 
