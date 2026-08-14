@@ -60,7 +60,8 @@ unbounded repository command-running loop.
 
 When ChatGPT begins substantive review work with this skill, begin the
 user-facing response with `Skill: auto-review`. If it intentionally composes
-another review skill, announce the chain instead, for example:
+other review skills, announce every materially active skill in responsibility
+order, for example:
 
 `Skills: auto-review → review-process`
 

@@ -251,9 +251,13 @@ Preserve existing behavior unless changing it is necessary to resolve the design
 
 ## ChatGPT Interaction
 
-When ChatGPT begins a substantive design review, begin with:
+When ChatGPT begins a substantive design review, begin with the active skill or
+responsibility-ordered composed chain. For standalone use, announce:
 
 `Skill: frontend-design-review`
+
+When other materially active skills own distinct responsibilities, list every
+one in the chain rather than announcing this skill alone.
 
 Recommend an advisory reasoning level, briefly summarize that the review will
 evaluate hierarchy, interaction cost, recoverability, density, happy-path

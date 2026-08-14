@@ -95,6 +95,7 @@ Return one of:
 
 When ChatGPT intentionally activates this shared skill for substantive process
 review, begin with `Skill: review-process` or, when composed by auto-review,
+announce every materially active skill in responsibility order, such as
 `Skills: auto-review → review-process`. Recommend an advisory reasoning level,
 briefly summarize that the review will evaluate approach, decomposition,
 intervention balance, evidence strategy, and skill opportunities, then ask

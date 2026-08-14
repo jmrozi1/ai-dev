@@ -3,17 +3,27 @@
 This catalog is a lightweight discovery surface and derivative catalog.
 
 Canonical instructions always live in each skill's `SKILL.md`. Use this file
-when a provider cannot natively inspect `~/.agents/skills` and needs a cheap way
-to decide whether one canonical AI Dev skill should be loaded.
+when a provider cannot natively inspect `~/.agents/skills` and needs a lightweight
+way to evaluate the full current task against the catalog.
 
 Do not preload every skill from this catalog. Do not treat it as a router, dependency graph, or authoritative metadata source.
+
+Evaluate the full current development task and determine which skill or skills
+materially apply. Do not stop after finding the first match. Compose multiple
+skills when they own distinct responsibilities required by the task, but do not
+load skills merely because they are adjacent or potentially useful. Composition
+does not imply a dependency graph, router, prefix convention, or automatic
+recursive loading.
 
 ## ChatGPT skill observability
 
 When ChatGPT uses this catalog to choose an AI Dev skill, the user-facing
 response must make the selection result observable.
 
-- If a skill is selected, follow that skill's ChatGPT interaction instructions.
+- If one skill is selected, follow that skill's ChatGPT interaction instructions.
+- If multiple skills are selected, list every materially active skill in a
+	responsibility-ordered chain and follow each skill's ChatGPT interaction
+	instructions.
 - If no AI Dev skill applies, begin the response with:
 
 	`Skill: none`

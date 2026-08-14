@@ -16,9 +16,16 @@ boundaries, explicit exclusions, and material product, scope, architecture, or
 permission decisions. Keep durable state in the repository, ticket, and current
 tasking file rather than relying on conversation history.
 
-Use relevant capability skills when the decision genuinely requires them. Do
-not duplicate Flow procedures or requirements-driven-development behavior here;
-Flow owns deterministic Git and workflow mechanics, and Issue #31 owns RDD.
+Use every relevant capability skill when the task genuinely requires its
+distinct responsibility. Orchestration does not suppress capability-skill
+activation or end discovery after finding `orchestrator`. Do not duplicate Flow
+procedures or requirements-driven-development behavior here; Flow owns
+deterministic Git and workflow mechanics, and RDD owns requirements methodology.
+
+When requirements are being established or refined while orchestrating, load
+RDD as an additional capability because it owns that distinct responsibility.
+This is task-driven composition, not a hard-coded orchestrator-to-RDD
+dependency.
 
 ## Delegate Bounded Work
 

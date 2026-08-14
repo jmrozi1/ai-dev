@@ -84,10 +84,12 @@ current work and next decisions rather than a transcript of execution.
 ## ChatGPT Interaction
 
 When ChatGPT uses this shared skill for routine requirements interpretation,
-announce `Skill: requirements-driven-development` and continue without a
+announce `Skill: requirements-driven-development`, or include it in a
+responsibility-ordered composed chain, and continue without a
 confirmation gate. When ChatGPT begins substantive requirements design or
-refinement that could materially change intent, announce the skill, recommend
-an advisory reasoning level, briefly summarize the outcome, evidence, and
+refinement that could materially change intent, announce the skill or
+responsibility-ordered composed chain, recommend an advisory reasoning level,
+briefly summarize the outcome, evidence, and
 violating behavior it will refine, ask `Proceed?`, and stop before substantial
 refinement until confirmation.
 
