@@ -98,6 +98,8 @@ Do not force every intentional action to pay for the possibility of an accidenta
 
 Do not optimize for minimum click count in isolation. An operation that belongs behind a menu during execution may deserve a visible control during configuration.
 
+Separate setup from tuning. Distinguish decisions needed to establish a usable result from decisions that merely tune or override sensible defaults. Give setup decisions immediate prominence; when tuning is infrequently needed, weigh its discoverability against the recurring cognitive cost of presenting it alongside core setup.
+
 Choose the interaction structure that minimizes total cognitive cost for the current mode and workflow.
 
 ### 9. State-Dependent Controls
