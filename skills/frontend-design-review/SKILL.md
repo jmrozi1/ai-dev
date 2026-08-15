@@ -84,6 +84,8 @@ Do not automatically use both containment and spacing to separate every row. If 
 
 Preserve immediate access to the collection's primary row action. Secondary operations may use compact icons, menus, or other lower-cost affordances when appropriate.
 
+Preserve browsing while the realistic collection remains usefully scannable. Search and filtering can supplement visible rows as scale grows; do not replace visible choices with search/select solely to save space when doing so hides a small or moderate collection. Prefer search-only selection when scale or known-item retrieval clearly outweighs the value of browsing.
+
 ### 7. Recoverability
 
 **Balance:** interruption of intentional actions vs the cost and reversibility of mistakes.
@@ -109,6 +111,14 @@ Choose the interaction structure that minimizes total cognitive cost for the cur
 When a state transition makes an existing control obsolete, prefer replacing or repurposing that space for the next relevant action instead of adding another persistent control.
 
 Do not overload one control with unrelated meanings merely to save space.
+
+### 10. Interaction Consistency
+
+**Balance:** familiarity and transfer of learned behavior vs context-specific optimization.
+
+When similar objects or workflows already exist elsewhere in the product, start from the established interaction model. Reusing a familiar pattern lowers learning and cognitive cost.
+
+Diverge only when scale, task frequency, or materially different behavior gives a concrete reason. Consistency is the default, not an absolute.
 
 ## Review Process
 
@@ -150,6 +160,7 @@ Start with a concise metric report:
 | Recoverability | ... | ... |
 | Contextual Interaction Cost | ... | ... |
 | State-Dependent Controls | ... | ... |
+| Interaction Consistency | ... | ... |
 
 Then provide `Recommended changes` containing only material changes after overlapping findings have been combined.
 
@@ -165,7 +176,7 @@ When ChatGPT begins a substantive design review, begin with the active skill or 
 
 When other materially active skills own distinct responsibilities, list every one in the chain rather than announcing this skill alone.
 
-Recommend an advisory reasoning level, briefly summarize that the review will evaluate hierarchy, interaction cost, recoverability, density, happy-path prominence, and material design issues, then ask `Proceed?` and stop before substantial analysis until confirmation.
+Recommend an advisory reasoning level, briefly summarize that the review will evaluate hierarchy, interaction cost, recoverability, density, consistency, happy-path prominence, and material design issues, then ask `Proceed?` and stop before substantial analysis until confirmation.
 
 The recommendation is advisory and does not change or assume the actual ChatGPT reasoning setting. This instruction is scoped to ChatGPT use and does not alter Copilot or Work behavior.
 
