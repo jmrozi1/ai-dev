@@ -1,6 +1,6 @@
 ---
 name: flow
-description: Execute and validate AI Dev Flow lifecycle commands against the shared runtime.
+description: Report active-ticket and project status; execute natural-language lifecycle intents (start ticket, start patch, checkpoint this, close this out); manage exact repository-facing Flow lifecycle operations.
 ---
 
 # Copilot Flow
