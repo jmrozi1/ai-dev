@@ -48,9 +48,11 @@ When an orchestrator reviews work performed by a separate executor, do not treat
 
 Before accepting the work, declaring it complete, or issuing the next dependent task, independently inspect the actual output and the evidence required by the assignment.
 
-For repository changes, inspect the relevant diff and changed files. For claimed validation such as tests or command results, inspect the actual reported output or independently rerun the appropriate read-only validation when practical.
+When the orchestrator and executor have access to the same filesystem or repository, inspect the authoritative shared state directly rather than asking the executor to reproduce file contents, diffs, or other evidence that the orchestrator can access itself. Use the executor's report to identify the expected changes and validation performed, not as the source of truth.
 
-If the orchestrator does not yet have enough evidence to make the judgment, gather the missing evidence or instruct the executor to return it before accepting the work.
+For repository changes, inspect the repository state, relevant diff, and changed files directly. For changes outside a repository, inspect the resulting files or other affected state directly. For claimed validation such as tests or command results, inspect available output or independently rerun the appropriate read-only validation when practical.
+
+Request evidence from the executor only when it is not available to the orchestrator directly. Do not accept the work, declare it complete, or issue a dependent task until the available authoritative evidence supports the executor's claim.
 
 ## Choose the Correct Control Layer
 
