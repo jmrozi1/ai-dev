@@ -42,6 +42,16 @@ For each interaction:
 
 Do not speculate about every possible failure in advance.
 
+## Independently Validate Executor Work
+
+When an orchestrator reviews work performed by a separate executor, do not treat the executor's summary, claimed success, or description of changes as sufficient validation.
+
+Before accepting the work, declaring it complete, or issuing the next dependent task, independently inspect the actual output and the evidence required by the assignment.
+
+For repository changes, inspect the relevant diff and changed files. For claimed validation such as tests or command results, inspect the actual reported output or independently rerun the appropriate read-only validation when practical.
+
+If the orchestrator does not yet have enough evidence to make the judgment, gather the missing evidence or instruct the executor to return it before accepting the work.
+
 ## Choose the Correct Control Layer
 
 When a work-agent failure reveals a process problem, classify the fix before changing anything.
