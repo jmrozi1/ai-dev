@@ -17,10 +17,11 @@ Audience specialization is justified by behavioral differences, not merely by
 different wording or examples.
 
 The current shared skills are `frontend-design-review`,
-`requirements-driven-development`, and `review-process`. The current
-audience-specific skills are:
+`requirements-driven-development`, `review-process`, and `search-select`. The
+current audience-specific skills are:
 
-- ChatGPT: `auto-review`, `flow`, `orchestrator`;
+- ChatGPT: `auto-review`, `flow`, `frontend-design`, `orchestrator`,
+  `skill-authoring`, and `ticket-creation`;
 - Copilot: `auto-review`, `executor`, `flow`;
 - Work: `work-agent-orchestration`, `documentation`, `project-readme`, and
   `write-low-reasoning-skills`.
