@@ -34,6 +34,28 @@ Use an empirical refinement loop:
 
 Do not optimize for excellent output if acceptable reliable output is sufficient for the work environment.
 
+## Claude Skill Filesystem Contract
+
+When creating a Claude skill for the work environment, create a directory for the skill and place its primary instructions in `SKILL.md`.
+
+For a user-level skill, use:
+
+```text
+~/.claude/skills/<skill-name>/SKILL.md
+```
+
+Do not create `~/.claude/skills/<skill-name>.md`.
+
+A skill may contain additional reference files or scripts inside its skill directory when they are necessary. `SKILL.md` is the skill entrypoint.
+
+Before reporting that a newly created skill is complete, verify that:
+
+- the skill directory exists;
+- `SKILL.md` exists inside it;
+- `SKILL.md` contains `name` and `description` frontmatter.
+
+When modifying an existing skill, locate its `SKILL.md` first and preserve its existing skill directory unless relocation is explicitly part of the task.
+
 ## Preserve Judgment Until It Fails
 
 Prefer outcome-oriented instructions while the work agent can follow them.
