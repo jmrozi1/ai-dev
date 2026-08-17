@@ -13,7 +13,6 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from ai_dev_flow import cli
-from ai_dev_flow.bootstrap import run_bootstrap
 
 
 class FlowDiffTests(unittest.TestCase):
@@ -355,21 +354,9 @@ class FlowDiffTests(unittest.TestCase):
         self.assertEqual(stdout, "")
         self.assertEqual(stderr, "No diff content for current scope.\n")
 
-    def test_installed_flow_diff_help_uses_executable_name(self) -> None:
+    def test_skill_local_flow_diff_help_uses_executable_name(self) -> None:
         repo_root = self._init_repo("repo-diff-launcher-help")
-        home = self.tmp_path / "home-launcher-help"
-        install_dir = home / ".local" / "bin"
-
-        run_bootstrap(
-            platform="posix",
-            repo_root=Path(__file__).resolve().parents[1],
-            prefix="flow",
-            install_directory=install_dir,
-            home=home,
-            shell_program="/bin/bash",
-        )
-
-        launcher = install_dir / "flow-diff"
+        launcher = Path(__file__).resolve().parents[1] / "skills" / "copilot" / "flow" / "scripts" / "flow-diff"
         completed = subprocess.run(
             [str(launcher), "--help"],
             check=False,
@@ -383,52 +370,13 @@ class FlowDiffTests(unittest.TestCase):
         self.assertIn("Usage: flow-diff [--git|--all]", completed.stdout)
         self.assertNotIn("Usage: flow-diff diff", completed.stdout)
 
-    def test_installed_custom_prefix_flow_diff_help_uses_executable_name(self) -> None:
-        repo_root = self._init_repo("repo-diff-launcher-help-custom-prefix")
-        home = self.tmp_path / "home-launcher-help-custom-prefix"
-        install_dir = home / ".local" / "bin"
-
-        run_bootstrap(
-            platform="posix",
-            repo_root=Path(__file__).resolve().parents[1],
-            prefix="ai-flow",
-            install_directory=install_dir,
-            home=home,
-            shell_program="/bin/bash",
-        )
-
-        launcher = install_dir / "ai-flow-diff"
-        completed = subprocess.run(
-            [str(launcher), "--help"],
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            cwd=str(repo_root),
-        )
-        self.assertEqual(completed.returncode, 0)
-        self.assertIn("Usage: ai-flow-diff [--git|--all]", completed.stdout)
-        self.assertNotIn("Usage: ai-flow-diff diff", completed.stdout)
-
-    def test_installed_flow_diff_outputs_raw_diff_on_stdout(self) -> None:
+    def test_skill_local_flow_diff_outputs_raw_diff_on_stdout(self) -> None:
         repo_root = self._init_repo("repo-diff-launcher-stdout")
-        home = self.tmp_path / "home-launcher-stdout"
-        install_dir = home / ".local" / "bin"
-
-        run_bootstrap(
-            platform="posix",
-            repo_root=Path(__file__).resolve().parents[1],
-            prefix="flow",
-            install_directory=install_dir,
-            home=home,
-            shell_program="/bin/bash",
-        )
 
         (repo_root / "tracked.txt").write_text("base\nstaged\n", encoding="utf-8")
         self._run_git(repo_root, "add", "tracked.txt")
 
-        launcher = install_dir / "flow-diff"
+        launcher = Path(__file__).resolve().parents[1] / "skills" / "copilot" / "flow" / "scripts" / "flow-diff"
         completed = subprocess.run(
             [str(launcher), "--all"],
             check=False,
@@ -442,21 +390,9 @@ class FlowDiffTests(unittest.TestCase):
         self.assertIn("diff --git a/tracked.txt b/tracked.txt", completed.stdout)
         self.assertEqual(completed.stderr, "")
 
-    def test_installed_flow_diff_empty_scope_notice_on_stderr(self) -> None:
+    def test_skill_local_flow_diff_empty_scope_notice_on_stderr(self) -> None:
         repo_root = self._init_repo("repo-diff-launcher-empty")
-        home = self.tmp_path / "home-launcher-empty"
-        install_dir = home / ".local" / "bin"
-
-        run_bootstrap(
-            platform="posix",
-            repo_root=Path(__file__).resolve().parents[1],
-            prefix="flow",
-            install_directory=install_dir,
-            home=home,
-            shell_program="/bin/bash",
-        )
-
-        launcher = install_dir / "flow-diff"
+        launcher = Path(__file__).resolve().parents[1] / "skills" / "copilot" / "flow" / "scripts" / "flow-diff"
         completed = subprocess.run(
             [str(launcher)],
             check=False,

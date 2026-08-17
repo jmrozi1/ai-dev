@@ -33,14 +33,21 @@ runtime owned by AI Dev; routine command mechanics belong to Copilot.
   the governing workflow explicitly permits it; Flow normally refuses those
   paths.
 - Do not replace the deterministic Flow runtime with bespoke Git procedure.
+- Do not treat the numeric Flow `checkpoint` as the authoritative named ticket
+  roadmap index. Named ticket checkpoints remain the canonical implementation
+  roadmap, while numeric Flow checkpoints are execution state.
+- Completing a named checkpoint is the normal boundary for creating a Flow
+  checkpoint commit and running checkpoint review; a review fix or retry may
+  create extra Flow checkpoint commits without advancing the named roadmap.
 
 ## Command and Report Use
 
-ChatGPT may request read-only status or diff evidence when needed, but should
-prefer compact reports that expose workflow identity, checkpoint, branch
-relation, working-tree state, blocked/pending state, and the required decision.
-It should avoid carrying Copilot-level launcher and shell procedure unless
-reviewing an execution failure.
+Understand `/status` semantics for orchestration, but delegate the interaction
+to Copilot Flow. Copilot's installed package renders the active ticket's named
+roadmap progress and may return Flow diagnostics only when they require a
+decision, recovery, or escalation. Flow's numeric `checkpoint` is never the
+`/status` roadmap index. Avoid carrying Copilot-level launcher and shell
+procedure unless reviewing such an execution failure.
 
 The shared runtime remains the source of truth for state transitions and
 command results. This skill supplies lifecycle judgment, not a second command

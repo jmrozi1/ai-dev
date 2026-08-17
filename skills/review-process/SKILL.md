@@ -103,21 +103,22 @@ Return one of:
 - explicit acknowledgment that no process change is warranted;
 - process issues that should be escalated or deferred.
 
+Completing a named ticket checkpoint is the normal boundary for creating a Flow
+checkpoint commit and running checkpoint review. Review fixes or retries may
+create additional Flow checkpoint commits without advancing the named roadmap.
+
 ## ChatGPT Interaction
 
 When ChatGPT intentionally activates this shared skill for substantive process
 review, begin with `Skill: review-process` or, when composed by auto-review,
 announce every materially active skill in responsibility order, such as
-`Skills: auto-review → review-process`. Recommend an advisory reasoning level,
-briefly summarize that the review will evaluate approach, decomposition,
-intervention balance, evidence strategy, and skill opportunities, then ask
-`Proceed?` and stop before substantial analysis until confirmation.
+`Skills: auto-review → review-process`. Briefly summarize that the review will
+evaluate approach, decomposition, intervention balance, evidence strategy, and
+skill opportunities before continuing.
 
 This instruction is scoped to ChatGPT use. It does not change Copilot or Work
 review execution.
 
-The gate is activation-time and occurs once per continuous process review. After
-the user proceeds, begin follow-up responses with the active skill or chain
-without repeating the reasoning cue, review summary, or proceed gate. Gate again
-only for a new invocation, a materially changed chain, or a scope change that
-makes a new reasoning decision meaningful.
+Begin each response with the active skill or chain and continue without extra
+activation gating. Re-announce the skill or chain only when the invocation or
+composition changes materially.

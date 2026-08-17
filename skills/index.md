@@ -48,6 +48,7 @@ reasoning rules remain in the applicable canonical `SKILL.md` files.
 | `flow` | Interpreting Flow lifecycle state, deciding valid transitions, and escalating blocked or unsafe workflow state. | `skills/chatgpt/flow/SKILL.md` |
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/chatgpt/orchestrator/SKILL.md` |
 | `skill-authoring` | Creating or refining an AI Dev skill, or performing focused skill-quality review when execution evidence suggests a skill-definition problem. | `skills/chatgpt/skill-authoring/SKILL.md` |
+| `ticket-creation` | Creating task records using the canonical ticket schema and repository ticket-provider contract. | `skills/chatgpt/ticket-creation/SKILL.md` |
 
 ## Copilot
 

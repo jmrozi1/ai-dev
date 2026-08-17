@@ -85,20 +85,15 @@ current work and next decisions rather than a transcript of execution.
 
 When ChatGPT uses this shared skill for routine requirements interpretation,
 announce `Skill: requirements-driven-development`, or include it in a
-responsibility-ordered composed chain, and continue without a
-confirmation gate. When ChatGPT begins substantive requirements design or
-refinement that could materially change intent, announce the skill or
-responsibility-ordered composed chain, recommend an advisory reasoning level,
-briefly summarize the outcome, evidence, and
-violating behavior it will refine, ask `Proceed?`, and stop before substantial
-refinement until confirmation.
+responsibility-ordered composed chain, and continue without extra gating. When
+ChatGPT begins substantive requirements design or refinement that could
+materially change intent, announce the skill or responsibility-ordered composed
+chain and briefly summarize the outcome, evidence, and violating behavior it
+will refine before continuing.
 
 This instruction is scoped to ChatGPT use. It does not change Copilot or Work
 requirements execution.
 
-For substantive design or refinement, the gate is activation-time and occurs
-once per continuous requirements activity. After the user proceeds, begin
-follow-up responses with the active skill without repeating the reasoning cue,
-requirements summary, or proceed gate. Gate again only for a new invocation, a
-materially changed skill chain, or a scope change that makes a new reasoning
-decision meaningful. Routine interpretation remains announcement-only.
+Routine interpretation remains announcement-only. For a new invocation or a
+materially changed skill chain, re-announce the active skill at the start of the
+response.

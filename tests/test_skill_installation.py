@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
 import tempfile
 import unittest
 
@@ -115,13 +117,94 @@ class SkillInstallationTests(unittest.TestCase):
                 ]
                 self.assertEqual(len(names), len(set(names)))
 
+    def test_ticket_creation_skill_is_discoverable_for_chatgpt(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        names = [package.name for package in discover_skill_packages(source_repo)]
+
+        self.assertIn("ticket-creation", names)
+        self.assertEqual(
+            [package.name for package in discover_skill_packages(source_repo, audience="chatgpt")].count("ticket-creation"),
+            1,
+        )
+        self.assertNotIn(
+            "ticket-creation",
+            [package.name for package in discover_skill_packages(source_repo, audience="copilot")],
+        )
+        self.assertNotIn(
+            "ticket-creation",
+            [package.name for package in discover_skill_packages(source_repo, audience="work")],
+        )
+
+    def test_copilot_flow_skill_has_single_windows_local_invocation_mechanism(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        scripts_dir = source_repo / "skills" / "copilot" / "flow" / "scripts"
+        helper_text = (scripts_dir / "invoke-flow.ps1").read_text(encoding="utf-8")
+
+        self.assertIn("__ai_dev_flow_exec__", helper_text)
+        self.assertIn("ai_dev_flow.cli", helper_text)
+
+        for command in (
+            "start",
+            "patch",
+            "status",
+            "diff",
+            "commit",
+            "reset",
+            "promote",
+            "complete",
+            "block",
+            "resume",
+        ):
+            ps1_text = (scripts_dir / f"flow-{command}.ps1").read_text(encoding="utf-8")
+            self.assertIn("invoke-flow.ps1", ps1_text)
+            self.assertIn(f'"{command}"', ps1_text)
+            self.assertFalse((scripts_dir / f"flow-{command}.cmd").exists())
+
+        for command in ("ticket-create", "ticket-show", "ticket-query"):
+            self.assertFalse((scripts_dir / f"flow-{command}").exists())
+            self.assertFalse((scripts_dir / f"flow-{command}.ps1").exists())
+
+    def test_installed_copilot_flow_scripts_execute_without_path_launchers(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        destination = self.tmp_path / "installed-skills"
+        home = self.tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+        install_skill_packages(
+            repo_root=source_repo,
+            destination_root=destination,
+            home=home,
+            audience="copilot",
+        )
+        repo = self.tmp_path / "workflow-repo"
+        repo.mkdir()
+        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Skill Test"], cwd=repo, check=True)
+        subprocess.run(["git", "config", "user.email", "skill-test@example.com"], cwd=repo, check=True)
+        (repo / "tracked.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "add", "tracked.txt"], cwd=repo, check=True)
+        subprocess.run(["git", "commit", "-q", "-m", "initial"], cwd=repo, check=True)
+        subprocess.run(["git", "branch", "-M", "main"], cwd=repo, check=True)
+
+        path_without_flow_launchers = os.pathsep.join(("/usr/bin", "/bin"))
+        self.assertIsNone(shutil.which("flow-patch", path=path_without_flow_launchers))
+        environment = {**os.environ, "PATH": path_without_flow_launchers}
+        scripts_dir = destination / "flow" / "scripts"
+
+        subprocess.run([str(scripts_dir / "flow-patch"), "Installed skill lifecycle"], cwd=repo, env=environment, check=True)
+        (repo / "tracked.txt").write_text("changed\n", encoding="utf-8")
+        subprocess.run([str(scripts_dir / "flow-commit")], cwd=repo, env=environment, check=True)
+        subprocess.run([str(scripts_dir / "flow-reset")], cwd=repo, env=environment, check=True)
+
+        self.assertEqual((repo / "tracked.txt").read_text(encoding="utf-8"), "base\n")
+        self.assertTrue((repo / ".ai-dev" / "workflow.json").exists())
+
     def test_duplicate_capability_names_are_valid_across_audiences(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
         names = [package.name for package in discover_skill_packages(source_repo)]
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 14)
+        self.assertEqual(len(names), 15)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -152,7 +235,7 @@ class SkillInstallationTests(unittest.TestCase):
         }
 
         expected_audience_skills = {
-            "chatgpt": {"auto-review", "flow", "orchestrator", "skill-authoring"},
+            "chatgpt": {"auto-review", "flow", "orchestrator", "skill-authoring", "ticket-creation"},
             "copilot": {"auto-review", "executor", "flow"},
             "work": {
                 "documentation",
@@ -207,6 +290,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "requirements-driven-development",
                 "review-process",
                 "skill-authoring",
+                "ticket-creation",
                 "work-agent-orchestration",
                 "write-low-reasoning-skills",
             ],
@@ -244,6 +328,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "requirements-driven-development",
                 "review-process",
                 "skill-authoring",
+                "ticket-creation",
                 "work-agent-orchestration",
                 "write-low-reasoning-skills",
             ],

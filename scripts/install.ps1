@@ -4,22 +4,22 @@ function Show-Help {
     @'
 Usage: scripts/install.ps1 [bootstrap-options]
 
-Install or refresh prefixed flow launchers.
+Safely remove AI Dev-managed legacy Flow launchers.
 
 This wrapper calls:
-  python -m ai_dev_flow.bootstrap --platform windows --repo-root <this-repo>
+    python -m ai_dev_flow.bootstrap --platform windows
 
 Options:
   -h, --help  Show this help and exit.
 
-Any additional options are forwarded to ai_dev_flow.bootstrap.
+`--home <path>` cleans the ownership record under a different home.
 Common examples:
   .\scripts\install.ps1
-  .\scripts\install.ps1 --home $HOME --install-dir "$HOME\.local\bin"
+    .\scripts\install.ps1 --home $HOME
 
 Minimum Python version: 3.8
 
-After installation, use prefixed launchers such as flow-status.
+Normal Flow execution uses the installed Copilot skill package, not PATH commands.
 '@ | Write-Output
 }
 
@@ -46,9 +46,6 @@ else {
 try {
     & $pythonExecutable -m ai_dev_flow.bootstrap `
         --platform windows `
-        --repo-root $repositoryRoot `
-        --python $pythonExecutable `
-        --prefix flow `
         @args
     if ($null -eq $LASTEXITCODE) {
         exit 0

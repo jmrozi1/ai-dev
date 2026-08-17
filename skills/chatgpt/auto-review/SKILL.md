@@ -65,18 +65,9 @@ order, for example:
 
 `Skills: auto-review → review-process`
 
-Then recommend an advisory reasoning level, briefly summarize what the review
-will evaluate, and ask:
+Briefly summarize what the review will evaluate before continuing.
 
-`Proceed?`
-
-Stop before substantial review analysis until the user confirms. The
-recommendation does not change or assume the actual ChatGPT reasoning setting.
-
-This gate occurs once when the substantive review invocation begins. After the
-user proceeds, continue announcing the active skill or chain in follow-up
-responses by beginning them with the active skill or chain, without repeating
-the reasoning cue, scope summary, or proceed gate.
-Gate again only when a new substantive invocation begins, the active chain
-changes materially, or the scope changes enough to make a new reasoning
-decision meaningful.
+This instruction is scoped to ChatGPT use. Continue announcing the active skill
+or chain in follow-up responses by beginning them with the active skill or
+chain, without repeating the summary unless the active chain changes
+materially.

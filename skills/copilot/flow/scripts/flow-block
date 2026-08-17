@@ -17,7 +17,7 @@ while [[ -L "$script_path" ]]; do
   fi
 done
 
-script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+script_dir="$(cd "$(dirname "$script_path")" && pwd -P)"
 repo_root="$(cd "$script_dir/../../../.." && pwd)"
 source "$repo_root/tools/bootstrap/python_select.sh"
 

@@ -97,6 +97,11 @@ notable context or rediscovery friction, process changes already decided for the
 next checkpoint, candidate skill additions or refinements, and explicit
 no-action conclusions where they prevent re-litigating a settled question.
 
+The ticket checkpoint list is the canonical current implementation roadmap. Keep
+that roadmap in the ticket itself, update it before intentionally changing the
+route, and keep the numeric Flow checkpoint as deterministic execution state
+rather than the authoritative named index.
+
 Keep the section short and current. Rewrite it, never append to it. Omit any
 line that has no value rather than filling a template mechanically, and omit the
 whole section when there is nothing worth carrying. Do not turn it into a

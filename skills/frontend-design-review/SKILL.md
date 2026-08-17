@@ -176,8 +176,11 @@ When ChatGPT begins a substantive design review, begin with the active skill or 
 
 When other materially active skills own distinct responsibilities, list every one in the chain rather than announcing this skill alone.
 
-Recommend an advisory reasoning level, briefly summarize that the review will evaluate hierarchy, interaction cost, recoverability, density, consistency, happy-path prominence, and material design issues, then ask `Proceed?` and stop before substantial analysis until confirmation.
+Briefly summarize that the review will evaluate hierarchy, interaction cost,
+recoverability, density, happy-path prominence, and material design issues
+before continuing.
 
-The recommendation is advisory and does not change or assume the actual ChatGPT reasoning setting. This instruction is scoped to ChatGPT use and does not alter Copilot or Work behavior.
-
-The gate is activation-time and occurs once per continuous design review. After the user proceeds, begin follow-up responses with the active skill without repeating the reasoning cue, design summary, or proceed gate. Gate again only for a new invocation, a materially changed skill chain, or a scope change that makes a new reasoning decision meaningful.
+This instruction is scoped to ChatGPT use and does not alter Copilot or Work
+behavior. Begin each response with the active skill or chain and continue
+without extra activation gating. Re-announce the skill or chain only when the
+invocation or composition changes materially.

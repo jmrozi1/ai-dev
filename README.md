@@ -19,51 +19,17 @@ On Windows PowerShell:
 .\scripts\install.ps1
 ```
 
-The installer installs the fixed `flow-*` launchers. Use `--verbose` (or `-v`)
-for a detailed bootstrap report and `--force` when noninteractive replacement
-of conflicting managed launchers is required.
+The installer safely removes only legacy `flow-*` launchers that its ownership
+record can prove AI Dev managed. It does not install PATH commands. Use
+`--home <path>` to clean another existing AI Dev installation safely.
 
 ## Workflow
 
-Flow owns issue and patch lifecycle state, checkpoint progression, ticket
-operations, and read-only diff inspection. The supported top-level executables
-are:
-
-```text
-flow-start
-flow-patch
-flow-status
-flow-diff
-flow-commit
-flow-reset
-flow-promote
-flow-complete
-flow-block
-flow-resume
-flow-ticket-create
-flow-ticket-show
-flow-ticket-query
-```
-
-A typical issue workflow is:
-
-```text
-flow-start <issue-number>
-# implement and test a bounded slice
-flow-diff --git
-flow-commit
-flow-promote "Describe the completed change"
-flow-complete
-```
-
-Use `flow-patch "<description>"` for a small local change, or
-`flow-patch --adopt "<description>"` when suitable work already exists on
-`scratch`. Use `flow-status -v` to inspect active workflow state. `flow-diff`
-and its `--refresh`, `--git`, and `--all` modes are read-only; use
-`flow-diff --help` for their exact scope.
-
-Ticket commands use the configured provider in `.ai-dev/config.json`. The
-configuration is for ticket access, not repository output routing.
+Flow owns deterministic issue and patch lifecycle state, checkpoint commits,
+and repository safety. Normal operation is through the installed Copilot Flow
+skill package: it maps lifecycle intent to local helpers and renders `/status`
+from the active ticket roadmap. Legacy `flow-*` and `flow-ticket-*` PATH
+commands are retired; ticket creation and refinement belong to ChatGPT.
 
 ## Skills
 

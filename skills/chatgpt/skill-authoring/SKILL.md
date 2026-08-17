@@ -15,18 +15,13 @@ re-scoping, relocating, or deliberately preserving a skill.
 
 This is substantive review/design work. When the invocation begins, announce
 `Skill: skill-authoring`, or announce the full responsibility-ordered composed
-chain when other skills are materially active. Recommend an advisory reasoning
-level, summarize that the review will evaluate activation, guidance sufficiency,
-audience placement, composition, helper boundaries, permissions, dogfooding,
-and whether no action is correct, then ask `Proceed?`.
+chain when other skills are materially active. Briefly summarize that the review
+will evaluate activation, guidance sufficiency, audience placement,
+composition, helper boundaries, permissions, dogfooding, and whether no action
+is correct before continuing.
 
-Stop before substantial skill-quality analysis until the user confirms. The gate
-occurs once per continuous invocation. After proceeding, begin follow-up
-responses with the active skill or chain without repeating the reasoning cue,
-lens summary, or `Proceed?`. Gate again only for a new invocation, a materially
-changed chain, or a scope change that makes a new reasoning decision meaningful.
-The recommendation is advisory and does not change or assume the actual ChatGPT
-reasoning setting.
+Begin follow-up responses with the active skill or chain without repeating the
+summary unless the invocation or chain changes materially.
 
 ## Evidence Before Judgment
 
