@@ -56,6 +56,41 @@ Before reporting that a newly created skill is complete, verify that:
 
 When modifying an existing skill, locate its `SKILL.md` first and preserve its existing skill directory unless relocation is explicitly part of the task.
 
+## Constrain Execution Surfaces
+
+Treat work-agent skills as read-only by default. Reading files, documentation, logs, and other available evidence for explanation or guidance does not require an execution surface.
+
+When a skill requires mutation or command execution, define the smallest explicit execution surface needed for that capability. Prefer a design where the agent:
+
+1. reads authoritative documentation and relevant files;
+2. explains the task, configuration, requirements, and failures to the user;
+3. edits only specifically identified configuration files;
+4. runs only specifically identified skill-local scripts; and
+5. leaves deterministic mechanics, command construction, environment checks, validation, and underlying tool execution to those scripts.
+
+Do not instruct the work agent to reproduce a deterministic procedure through a sequence of shell commands when that procedure can be encoded in a script. Do not grant general shell discretion for environment exploration, diagnosis, or remediation merely because the underlying task uses shell commands.
+
+If required environment information can be gathered deterministically, gather it inside an approved script and report it through the script's output rather than asking the agent to improvise exploratory commands.
+
+Prefer:
+
+- edit a named configuration file;
+- run a named skill-local script;
+- interpret the result;
+
+instead of:
+
+- inspect the environment with arbitrary commands;
+- construct a tool invocation from prose instructions;
+- run additional diagnostic commands;
+- manually remediate discovered state.
+
+If an approved script encounters unsupported state, the agent should stop, explain the observed failure from available evidence, and help the user decide whether the script should be extended. It should not improvise an alternate operational procedure.
+
+When creating or refining a work-agent skill would introduce a new command, executable script, or writable file beyond the skill's existing execution surface, identify that expansion explicitly to the user before adding it. Ask whether that execution authority is actually desired when the same outcome could reasonably be achieved through guidance, configuration, or an existing script.
+
+Do not require renewed confirmation merely to preserve an already-approved execution surface while refining unrelated skill behavior.
+
 ## Preserve Judgment Until It Fails
 
 Prefer outcome-oriented instructions while the work agent can follow them.
