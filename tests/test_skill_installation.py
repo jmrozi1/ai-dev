@@ -135,6 +135,27 @@ class SkillInstallationTests(unittest.TestCase):
             [package.name for package in discover_skill_packages(source_repo, audience="work")],
         )
 
+    def test_frontend_design_and_search_select_have_expected_audience_placement(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        chatgpt_names = [
+            package.name
+            for package in discover_skill_packages(source_repo, audience="chatgpt")
+        ]
+        copilot_names = [
+            package.name
+            for package in discover_skill_packages(source_repo, audience="copilot")
+        ]
+        work_names = [
+            package.name
+            for package in discover_skill_packages(source_repo, audience="work")
+        ]
+
+        self.assertIn("frontend-design", chatgpt_names)
+        self.assertNotIn("frontend-design", copilot_names)
+        self.assertNotIn("frontend-design", work_names)
+        for names in (chatgpt_names, copilot_names, work_names):
+            self.assertIn("search-select", names)
+
     def test_copilot_flow_skill_has_single_windows_local_invocation_mechanism(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
         scripts_dir = source_repo / "skills" / "copilot" / "flow" / "scripts"
@@ -204,7 +225,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 15)
+        self.assertEqual(len(names), 17)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -232,10 +253,18 @@ class SkillInstallationTests(unittest.TestCase):
             "frontend-design-review",
             "requirements-driven-development",
             "review-process",
+            "search-select",
         }
 
         expected_audience_skills = {
-            "chatgpt": {"auto-review", "flow", "orchestrator", "skill-authoring", "ticket-creation"},
+            "chatgpt": {
+                "auto-review",
+                "flow",
+                "frontend-design",
+                "orchestrator",
+                "skill-authoring",
+                "ticket-creation",
+            },
             "copilot": {"auto-review", "executor", "flow"},
             "work": {
                 "documentation",
@@ -284,11 +313,13 @@ class SkillInstallationTests(unittest.TestCase):
                 "executor",
                 "flow",
                 "flow",
+                "frontend-design",
                 "frontend-design-review",
                 "orchestrator",
                 "project-readme",
                 "requirements-driven-development",
                 "review-process",
+                "search-select",
                 "skill-authoring",
                 "ticket-creation",
                 "work-agent-orchestration",
@@ -304,6 +335,9 @@ class SkillInstallationTests(unittest.TestCase):
         )
         self.assertTrue(
             (source_repo / "skills" / "frontend-design-review" / "SKILL.md").exists()
+        )
+        self.assertTrue(
+            (source_repo / "skills" / "search-select" / "SKILL.md").exists()
         )
         self.assertEqual(
             discover_skill_packages(self.repo_root),
@@ -322,11 +356,13 @@ class SkillInstallationTests(unittest.TestCase):
                 "executor",
                 "flow",
                 "flow",
+                "frontend-design",
                 "frontend-design-review",
                 "orchestrator",
                 "project-readme",
                 "requirements-driven-development",
                 "review-process",
+                "search-select",
                 "skill-authoring",
                 "ticket-creation",
                 "work-agent-orchestration",
