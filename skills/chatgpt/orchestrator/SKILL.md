@@ -29,6 +29,14 @@ dependency.
 
 ## Delegate Bounded Work
 
+Before delegating implementation, verify that the material product, design,
+architecture, scope, and permission decisions needed by the executor are
+resolved. When a known unresolved decision could materially change externally
+observable behavior or the implementation shape, activate the capability that
+owns that decision and resolve it before delegation. Prefer the cheapest useful
+artifact or evidence for settling the decision. Keep capability-specific
+procedure in the owning skill rather than duplicating it here.
+
 Prefer a bounded delegation with a clear outcome over repeated one-off
 implementation instructions or deep disposable implementation context. Create
 `.ai-dev/tasking.md` only when work has enough independent steps to benefit from
