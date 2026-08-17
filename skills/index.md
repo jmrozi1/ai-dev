@@ -39,6 +39,7 @@ reasoning rules remain in the applicable canonical `SKILL.md` files.
 | `frontend-design-review` | Reviewing screenshots, implemented UI, mockups, or proposed front-end designs for unnecessary cognitive load, weak action hierarchy, redundant visual containment, or failure to prioritize the normal happy path. | `skills/frontend-design-review/SKILL.md` |
 | `requirements-driven-development` | Defining, refining, implementing, validating, or reviewing behavior that needs explicit requirements and objective evidence. | `skills/requirements-driven-development/SKILL.md` |
 | `review-process` | Atomic process-review judgment for checkpoint or promotion contexts; assess approach quality, intervention balance, wasted effort, and skill opportunities. | `skills/review-process/SKILL.md` |
+| `search-select` | Designing, implementing, or reviewing a browse-first searchable single-select control with ordinary-selection or select-to-add behavior. | `skills/search-select/SKILL.md` |
 
 ## ChatGPT
 
@@ -46,6 +47,7 @@ reasoning rules remain in the applicable canonical `SKILL.md` files.
 | --- | --- | --- |
 | `auto-review` | Deciding review applicability and composition, synthesizing findings, judging materiality, and authorizing promotion-review recording. | `skills/chatgpt/auto-review/SKILL.md` |
 | `flow` | Interpreting Flow lifecycle state, deciding valid transitions, and escalating blocked or unsafe workflow state. | `skills/chatgpt/flow/SKILL.md` |
+| `frontend-design` | Designing or materially restructuring front-end screens or interaction flows before implementation; use cheap ASCII/text prototypes when structural decisions remain unresolved. | `skills/chatgpt/frontend-design/SKILL.md` |
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/chatgpt/orchestrator/SKILL.md` |
 | `skill-authoring` | Creating or refining an AI Dev skill, or performing focused skill-quality review when execution evidence suggests a skill-definition problem. | `skills/chatgpt/skill-authoring/SKILL.md` |
 | `ticket-creation` | Creating task records using the canonical ticket schema and repository ticket-provider contract. | `skills/chatgpt/ticket-creation/SKILL.md` |
