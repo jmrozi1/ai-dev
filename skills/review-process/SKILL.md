@@ -81,6 +81,17 @@ includes:
 - current tasking state;
 - the concise executor or orchestrator handoff;
 - compact current-state process notes.
+- the compact AI usage report when an issue usage summary is available. Treat
+  usage as a process signal, not a verdict: high usage alone does not prove
+  inefficiency, and low usage alone does not prove good execution.
+- unavailable or unattributable usage is not zero. Usage variance matters only
+  when actual and expected values use compatible provider-native units and
+  scope. Process conclusions about complexity, rediscovery, decomposition,
+  intervention, or skills require supporting process evidence.
+
+An explicit `no process change is warranted` remains valid when the available
+usage and process evidence do not support a change. Do not duplicate the
+management renderer's formatting rules here.
 
 Do not build a generated review report, and do not load the repository broadly to
 feel thorough.

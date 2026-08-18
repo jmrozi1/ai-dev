@@ -56,10 +56,27 @@ if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
 fi
 cd "$repo_root"
 
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+  script_dir="$(cd "$(dirname "$script_path")" && pwd -P)"
+  script_path="$(readlink "$script_path")"
+  if [[ "$script_path" != /* ]]; then
+    script_path="$script_dir/$script_path"
+  fi
+done
+script_dir="$(cd "$(dirname "$script_path")" && pwd -P)"
+package_root="$(cd "$script_dir/../../../.." && pwd)"
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="$package_root:$PYTHONPATH"
+else
+  export PYTHONPATH="$package_root"
+fi
+
 workflow_file=".ai-dev/workflow.json"
 main_branch="main"
 scratch_branch="scratch"
 workflow_summary="no Flow workflow state at $workflow_file"
+active_issue_number=""
 
 read_workflow_state() {
   python3 - "$workflow_file" <<'PY'
@@ -100,6 +117,7 @@ else:
 print(main_branch)
 print(scratch_branch)
 print(f"{identity}, checkpoint {checkpoint}")
+print(issue_number if issue_number is not None else "")
 PY
 }
 
@@ -115,6 +133,7 @@ if [[ -f "$workflow_file" ]]; then
   main_branch="$(sed -n 1p <<<"$workflow_fields")"
   scratch_branch="$(sed -n 2p <<<"$workflow_fields")"
   workflow_summary="$(sed -n 3p <<<"$workflow_fields")"
+  active_issue_number="$(sed -n 4p <<<"$workflow_fields")"
 fi
 
 branch_exists() {
@@ -194,6 +213,22 @@ elif [[ -f "$tasking_file" ]]; then
   printf 'tasking rail present at %s with no process notes\n\n' "$tasking_file"
 else
   printf 'no tasking rail at %s\n\n' "$tasking_file"
+fi
+
+if [[ -n "$active_issue_number" && -f ".ai-dev/usage/issue-${active_issue_number}.json" ]]; then
+  printf '## AI Usage\n\n'
+  python3 - ".ai-dev/usage/issue-${active_issue_number}.json" <<'PY'
+import json
+import sys
+
+from ai_dev_flow.usage_report import render_usage_report
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    summary = json.load(handle)
+
+print(render_usage_report(summary))
+print()
+PY
 fi
 
 printf '## Skills To Review\n\n'

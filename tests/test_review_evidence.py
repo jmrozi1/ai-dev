@@ -88,6 +88,14 @@ class ReviewEvidenceHelperTests(unittest.TestCase):
         state_path = self.other_repo / ".ai-dev" / "workflow.json"
         state_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
+    def _write_usage_summary(self, issue_id: str, payload: dict[str, object]) -> None:
+        usage_directory = self.other_repo / ".ai-dev" / "usage"
+        usage_directory.mkdir(parents=True, exist_ok=True)
+        (usage_directory / f"issue-{issue_id}.json").write_text(
+            json.dumps(payload, indent=2),
+            encoding="utf-8",
+        )
+
     def _install_skill_by_symlink(self) -> Path:
         installed_root = self.tmp_path / "agents" / "skills"
         installed_root.mkdir(parents=True)
@@ -214,6 +222,50 @@ class ReviewEvidenceHelperTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("no tasking rail at .ai-dev/tasking.md", result.stdout)
+
+    def test_active_issue_usage_summary_is_included_compactly(self) -> None:
+        self._write_workflow_state(
+            {
+                "mainBranch": "main",
+                "scratchBranch": "scratch",
+                "checkpoint": 1,
+                "activeIssueNumber": 32,
+            }
+        )
+        self._write_usage_summary(
+            "32",
+            {
+                "version": 1,
+                "issue": {"id": "32"},
+                "limitation": "permission_denied",
+                "attributableTotals": [],
+                "associatedScopes": [],
+            },
+        )
+
+        result = self._run_helper("--mode", "checkpoint")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("## AI Usage", result.stdout)
+        self.assertIn("AI usage: unavailable for issue attribution", result.stdout)
+        self.assertIn("current credential lacks the required permission", result.stdout)
+        self.assertNotIn("providerData", result.stdout)
+
+    def test_missing_active_issue_usage_summary_keeps_evidence_unchanged(self) -> None:
+        self._write_workflow_state(
+            {
+                "mainBranch": "main",
+                "scratchBranch": "scratch",
+                "checkpoint": 1,
+                "activeIssueNumber": 32,
+            }
+        )
+
+        result = self._run_helper("--mode", "checkpoint")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("## AI Usage", result.stdout)
+        self.assertIn("## Changed Files", result.stdout)
 
     def test_unknown_mode_fails(self) -> None:
         result = self._run_helper("--mode", "everything")
