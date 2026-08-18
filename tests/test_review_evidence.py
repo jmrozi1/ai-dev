@@ -267,6 +267,49 @@ class ReviewEvidenceHelperTests(unittest.TestCase):
         self.assertNotIn("## AI Usage", result.stdout)
         self.assertIn("## Changed Files", result.stdout)
 
+    def test_detailed_usage_summary_includes_compact_cost_evidence(self) -> None:
+        self._write_workflow_state(
+            {
+                "mainBranch": "main",
+                "scratchBranch": "scratch",
+                "checkpoint": 2,
+                "activeIssueNumber": 44,
+            }
+        )
+        self._write_usage_summary(
+            "44",
+            {
+                "version": 1,
+                "issue": {"id": "44"},
+                "limitation": "observed_usage_scope_is_not_issue_attributable",
+                "attributableTotals": [],
+                "associatedScopes": [{"provider": "github-copilot", "scope": {"granularity": "session"}}],
+                "observedNativeUsage": [
+                    {
+                        "provider": "github-copilot",
+                        "unitType": "tokens",
+                        "inputTokens": 100,
+                        "outputTokens": 40,
+                        "scope": {"granularity": "session", "session": "fixture"},
+                        "models": [
+                            {
+                                "requestModel": "gpt-5.6-luna",
+                                "calls": [{"inputTokens": 100, "outputTokens": 40, "inputSize": 100, "cacheReadInputTokens": None, "cacheWriteInputTokens": None}],
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+
+        result = self._run_helper("--mode", "checkpoint")
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("AI cost: partial", result.stdout)
+        self.assertIn("($0.00)", result.stdout)
+        self.assertIn("all-observed-input-treated-as-fresh", result.stdout)
+        self.assertNotIn("inputSize", result.stdout)
+
     def test_unknown_mode_fails(self) -> None:
         result = self._run_helper("--mode", "everything")
 

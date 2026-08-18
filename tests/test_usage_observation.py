@@ -122,6 +122,79 @@ class UsageObservationTests(unittest.TestCase):
         self.assertEqual(item["nativeEvent"], "copilot_chat.agent.turn")
         self.assertEqual(len(item["turns"]), 2)
 
+    def test_otel_preserves_multiple_models_and_unknown_cache_categories(self) -> None:
+        path = self.repo_root / "copilot-otel.jsonl"
+        records = [
+            {
+                "resource": {"_rawAttributes": [["session.id", "session-1"]]},
+                "attributes": {
+                    "event.name": "gen_ai.client.inference.operation.details",
+                    "gen_ai.request.model": "gpt-5.6-luna",
+                    "gen_ai.response.model": "gpt-5.6-luna",
+                    "gen_ai.usage.input_tokens": 200_001,
+                    "gen_ai.usage.output_tokens": 30,
+                },
+            },
+            {
+                "resource": {"_rawAttributes": [["session.id", "session-1"]]},
+                "attributes": {
+                    "event.name": "gen_ai.client.inference.operation.details",
+                    "gen_ai.request.model": "gpt-5.3-codex",
+                    "gen_ai.response.model": "gpt-5.3-codex",
+                    "gen_ai.usage.input_tokens": 10,
+                    "gen_ai.usage.output_tokens": 4,
+                },
+            },
+        ]
+        path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+
+        observation = capture_copilot_otel_usage(path, captured_at="2026-08-18T16:00:00Z")
+        item = observation["providerData"]["usageItems"][0]
+
+        self.assertEqual(item["aggregation"], "inference_calls")
+        self.assertEqual(item["inputTokens"], 200_011)
+        self.assertEqual(item["outputTokens"], 34)
+        self.assertEqual(item["inputTokenCategories"], {"total": 200_011, "fresh": None, "cached": None, "cacheWrite": None})
+        self.assertEqual([model["requestModel"] for model in item["models"]], ["gpt-5.3-codex", "gpt-5.6-luna"])
+        self.assertEqual(item["models"][1]["calls"][0]["inputSize"], 200_001)
+        self.assertEqual(observation["scope"], {"granularity": "session", "session": "session-1"})
+
+        summary = reconcile_issue_usage(self.repo_root, "44", observation, work_period="2026-08-18")
+
+        persisted_item = summary["observedNativeUsage"][0]
+        self.assertEqual(persisted_item["aggregation"], "inference_calls")
+        self.assertEqual(persisted_item["models"][0]["callCount"], 1)
+        self.assertEqual(persisted_item["inputTokenCategories"]["fresh"], None)
+        self.assertEqual(summary["associatedScopes"][0]["scope"]["session"], "session-1")
+
+    def test_otel_preserves_emitted_cache_and_reasoning_categories(self) -> None:
+        path = self.repo_root / "copilot-otel.jsonl"
+        path.write_text(
+            json.dumps({
+                "resource": {"_rawAttributes": [["session.id", "session-2"]]},
+                "attributes": {
+                    "event.name": "gen_ai.client.inference.operation.details",
+                    "gen_ai.request.model": "gpt-5.6-luna",
+                    "gen_ai.response.model": "gpt-5.6-luna",
+                    "gen_ai.usage.input_tokens": 100,
+                    "gen_ai.usage.output_tokens": 40,
+                    "gen_ai.usage.cache_read_input_tokens": 25,
+                    "gen_ai.usage.cache_creation_input_tokens": 5,
+                    "gen_ai.usage.reasoning_tokens": 12,
+                },
+            }),
+            encoding="utf-8",
+        )
+
+        observation = capture_copilot_otel_usage(path, captured_at="2026-08-18T16:00:00Z")
+        item = observation["providerData"]["usageItems"][0]
+
+        self.assertEqual(item["inputTokenCategories"], {"total": 100, "fresh": 70, "cached": 25, "cacheWrite": 5})
+        self.assertEqual(item["outputTokenCategories"], {"total": 40, "reasoning": 12})
+        self.assertEqual(item["models"][0]["calls"][0]["cacheReadInputTokens"], 25)
+        self.assertEqual(item["models"][0]["calls"][0]["cacheWriteInputTokens"], 5)
+        self.assertEqual(item["models"][0]["calls"][0]["reasoningTokens"], 12)
+
     def test_otel_missing_completed_turns_is_explicitly_unavailable(self) -> None:
         path = self.repo_root / "copilot-otel.jsonl"
         path.write_text(

@@ -110,7 +110,11 @@ def _observed_native_usage(observation: dict[str, object]) -> list[dict[str, obj
             continue
         usage = {
             key: item[key]
-            for key in ("unitType", "quantity", "inputTokens", "outputTokens", "scope", "nativeEvent", "turns")
+            for key in (
+                "unitType", "quantity", "inputTokens", "outputTokens", "scope",
+                "nativeEvent", "aggregation", "turns", "models",
+                "inputTokenCategories", "outputTokenCategories",
+            )
             if key in item
         }
         if usage:
