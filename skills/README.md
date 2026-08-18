@@ -19,7 +19,8 @@ The current shared skills are `frontend-design-review`,
 `requirements-driven-development`, and `review-process`. The current
 audience-specific skills are:
 
-- ChatGPT: `auto-review`, `flow`, `orchestrator`;
+- ChatGPT: `auto-review`, `flow`, `orchestrator`, `skill-authoring`,
+  `ticket-creation`, and `work-skill-refinement`;
 - Copilot: `auto-review`, `executor`, `flow`.
 
 Flow remains one deterministic runtime in `ai_dev_flow` with one launcher set,
