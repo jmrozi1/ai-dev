@@ -56,9 +56,32 @@ work. This includes:
 When one of these tasks comes up, recommend using the user, ChatGPT, or another
 stronger development model instead of trying to compensate with a larger prompt.
 
+### Prefer skill-relative paths
+
+When a skill needs to reference files or scripts bundled with itself, prefer
+`${CLAUDE_SKILL_DIR}` over hard-coded user paths or broad path wildcards.
+
+This keeps the skill portable across users and installation locations while
+keeping the execution surface narrow.
+
+Prefer:
+
+`${CLAUDE_SKILL_DIR}/scripts/install.sh`
+
+over:
+
+`/home/specific-user/.claude/skills/example/scripts/install.sh`
+
+or:
+
+`*/skills/example/scripts/install.sh`
+
 ## Under Evaluation
 
-None currently.
+### `${CLAUDE_SKILL_DIR}` in `allowed-tools`
+
+Verify that `${CLAUDE_SKILL_DIR}` expands as expected inside `allowed-tools`
+permission patterns before treating that usage as established.
 
 ## Recording Rules
 
