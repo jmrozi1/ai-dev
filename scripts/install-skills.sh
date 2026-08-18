@@ -13,7 +13,7 @@ Default destination is:
 
 Options:
 	-h, --help  Show this help and exit.
-	--audience <name>  Select chatgpt, copilot, or work (default: copilot).
+	--audience <name>  Select chatgpt or copilot (default: copilot).
 
 Any additional options are forwarded to:
 	python -m ai_dev_flow.skill_installation

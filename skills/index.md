@@ -28,9 +28,9 @@ response must make the selection result observable.
 
 	`Skill: none`
 
-This convention is ChatGPT-facing only. It does not change Copilot or Work
-behavior. The catalog owns only this observable fallback; review and design
-reasoning rules remain in the applicable canonical `SKILL.md` files.
+This convention is ChatGPT-facing only. It does not change Copilot behavior.
+The catalog owns only this observable fallback; review and design reasoning rules
+remain in the applicable canonical `SKILL.md` files.
 
 ## Shared skills
 
@@ -57,15 +57,6 @@ reasoning rules remain in the applicable canonical `SKILL.md` files.
 | `auto-review` | Gathering repository review evidence, running deterministic helpers, executing approved review mechanics, and recording only when explicitly authorized. | `skills/copilot/auto-review/SKILL.md` |
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/copilot/executor/SKILL.md` |
 | `flow` | Executing and validating Flow lifecycle commands, preconditions, checkpoint mechanics, promotion/retry/completion safety, and evidence reporting. | `skills/copilot/flow/SKILL.md` |
-
-## Work
-
-| Skill | Use when | Canonical path |
-| --- | --- | --- |
-| `work-agent-orchestration` | Directing, debugging, or refining constrained work agents and their reference instructions, permissions, and work-agent-specific skills. | `skills/work/work-agent-orchestration/SKILL.md` |
-| `documentation` | Writing, reviewing, or revising project documentation for the constrained work-agent environment, excluding the root README. | `skills/work/documentation/SKILL.md` |
-| `project-readme` | Writing, reviewing, or revising the root README as the constrained work-agent environment's front door and routing page. | `skills/work/project-readme/SKILL.md` |
-| `write-low-reasoning-skills` | Writing or refining skills specifically for the constrained work-agent environment. | `skills/work/write-low-reasoning-skills/SKILL.md` |
 
 Audience sections are a catalog, not a router. Not every capability exists for
 every audience. Duplicate capability names are permitted by the architecture

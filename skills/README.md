@@ -7,8 +7,7 @@ Canonical locations:
 
 - `skills/<skill-name>/SKILL.md` for genuinely shared operational skills;
 - `skills/chatgpt/<skill-name>/SKILL.md` for ChatGPT-oriented skills;
-- `skills/copilot/<skill-name>/SKILL.md` for Copilot-oriented skills;
-- `skills/work/<skill-name>/SKILL.md` for constrained work-agent skills.
+- `skills/copilot/<skill-name>/SKILL.md` for Copilot-oriented skills.
 
 Not every capability exists for every audience. Duplicate capability
 implementations are allowed conceptually when audiences need materially
@@ -21,20 +20,17 @@ The current shared skills are `frontend-design-review`,
 audience-specific skills are:
 
 - ChatGPT: `auto-review`, `flow`, `orchestrator`;
-- Copilot: `auto-review`, `executor`, `flow`;
-- Work: `work-agent-orchestration`, `documentation`, `project-readme`, and
-  `write-low-reasoning-skills`.
+- Copilot: `auto-review`, `executor`, `flow`.
 
 Flow remains one deterministic runtime in `ai_dev_flow` with one launcher set,
 owned by the Copilot Flow package for repository execution. ChatGPT receives
-lifecycle interpretation guidance, and Work receives no Flow package.
+lifecycle interpretation guidance.
 
 Skill discovery is explicit rather than recursive. The installer recognizes
-root shared packages and direct packages under `chatgpt/`, `copilot/`, and
-`work/`. Each installation selects one audience and includes the root shared
-packages in that audience's flat installed destination. Duplicate capability
-names are valid across source audiences but cannot collide within one selected
-installation.
+root shared packages and direct packages under `chatgpt/` and `copilot/`. Each
+installation selects one audience and includes the root shared packages in that
+audience's flat installed destination. Duplicate capability names are valid
+across source audiences but cannot collide within one selected installation.
 
 `skills/index.md` is a thin derivative catalog for providers without native
 skill discovery. Canonical `SKILL.md` files remain authoritative. Do not add a

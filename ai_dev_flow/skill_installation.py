@@ -43,7 +43,7 @@ SKILL_INSTALLATION_OWNERSHIP_VERSION = 1
 _SYMLINK_OWNERSHIP_PREFIX = "symlink:"
 
 
-SUPPORTED_AUDIENCES = ("chatgpt", "copilot", "work")
+SUPPORTED_AUDIENCES = ("chatgpt", "copilot")
 
 
 def discover_skill_packages(

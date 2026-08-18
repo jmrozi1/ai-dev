@@ -59,42 +59,23 @@ class SkillInstallationTests(unittest.TestCase):
         copilot_flow = self.repo_root / "skills" / "copilot" / "flow"
         copilot_flow.mkdir(parents=True, exist_ok=True)
         (copilot_flow / "SKILL.md").write_text("# Copilot Flow\n", encoding="utf-8")
-        work_skill = self.repo_root / "skills" / "work" / "documentation"
-        work_skill.mkdir(parents=True, exist_ok=True)
-        (work_skill / "SKILL.md").write_text("# Work documentation\n", encoding="utf-8")
         nested = self.repo_root / "skills" / "documentation" / "example"
         nested.mkdir(parents=True, exist_ok=True)
         (nested / "SKILL.md").write_text("# Nested\n", encoding="utf-8")
-        deeper = self.repo_root / "skills" / "work" / "documentation" / "example"
-        deeper.mkdir(parents=True, exist_ok=True)
-        (deeper / "SKILL.md").write_text("# Deeper\n", encoding="utf-8")
         (self.repo_root / "skills" / "README.md").write_text("# Index\n", encoding="utf-8")
         (self.repo_root / "skills" / "index.md").write_text("# Catalog\n", encoding="utf-8")
 
         packages = discover_skill_packages(self.repo_root)
 
-        self.assertEqual(len(packages), 6)
+        self.assertEqual(len(packages), 5)
         self.assertEqual(
             [package.name for package in packages],
-            ["documentation", "executor", "flow", "flow", "frontend-design-review", "orchestrator"],
+            ["executor", "flow", "flow", "frontend-design-review", "orchestrator"],
         )
-        self.assertEqual(packages[0].source_directory, work_skill)
-        self.assertEqual(
-            packages[1].source_directory,
-            copilot_skill,
-        )
-        self.assertEqual(
-            packages[3].source_directory,
-            copilot_flow,
-        )
-        self.assertEqual(
-            packages[2].source_directory,
-            chatgpt_flow,
-        )
-        self.assertEqual(
-            packages[5].source_directory,
-            chatgpt_skill,
-        )
+        self.assertEqual(packages[0].source_directory, copilot_skill)
+        self.assertEqual(packages[1].source_directory, chatgpt_flow)
+        self.assertEqual(packages[2].source_directory, copilot_flow)
+        self.assertEqual(packages[4].source_directory, chatgpt_skill)
 
     def test_discovery_does_not_scan_obsolete_or_arbitrary_paths(self) -> None:
         obsolete = self.repo_root / "skills" / "work-agent-skills" / "legacy"
@@ -109,7 +90,7 @@ class SkillInstallationTests(unittest.TestCase):
     def test_each_audience_install_set_has_unique_names(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
 
-        for audience in ("chatgpt", "copilot", "work"):
+        for audience in ("chatgpt", "copilot"):
             with self.subTest(audience=audience):
                 names = [
                     package.name
@@ -129,10 +110,6 @@ class SkillInstallationTests(unittest.TestCase):
         self.assertNotIn(
             "ticket-creation",
             [package.name for package in discover_skill_packages(source_repo, audience="copilot")],
-        )
-        self.assertNotIn(
-            "ticket-creation",
-            [package.name for package in discover_skill_packages(source_repo, audience="work")],
         )
 
     def test_copilot_flow_skill_has_single_windows_local_invocation_mechanism(self) -> None:
@@ -204,7 +181,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 15)
+        self.assertEqual(len(names), 11)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -237,12 +214,6 @@ class SkillInstallationTests(unittest.TestCase):
         expected_audience_skills = {
             "chatgpt": {"auto-review", "flow", "orchestrator", "skill-authoring", "ticket-creation"},
             "copilot": {"auto-review", "executor", "flow"},
-            "work": {
-                "documentation",
-                "project-readme",
-                "work-agent-orchestration",
-                "write-low-reasoning-skills",
-            },
         }
         for audience, audience_skills in expected_audience_skills.items():
             with self.subTest(audience=audience):
@@ -270,9 +241,10 @@ class SkillInstallationTests(unittest.TestCase):
                 audience="all",
             )
 
-    def test_real_repository_has_no_obsolete_work_agent_paths(self) -> None:
+    def test_real_repository_has_no_work_skill_paths(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
 
+        self.assertFalse((source_repo / "skills" / "work").exists())
         self.assertFalse((source_repo / "skills" / "work-agent-skills").exists())
         self.assertFalse((source_repo / "skills" / "flow").exists())
         self.assertEqual(
@@ -280,19 +252,15 @@ class SkillInstallationTests(unittest.TestCase):
             [
                 "auto-review",
                 "auto-review",
-                "documentation",
                 "executor",
                 "flow",
                 "flow",
                 "frontend-design-review",
                 "orchestrator",
-                "project-readme",
                 "requirements-driven-development",
                 "review-process",
                 "skill-authoring",
                 "ticket-creation",
-                "work-agent-orchestration",
-                "write-low-reasoning-skills",
             ],
         )
 
@@ -318,19 +286,15 @@ class SkillInstallationTests(unittest.TestCase):
             [
                 "auto-review",
                 "auto-review",
-                "documentation",
                 "executor",
                 "flow",
                 "flow",
                 "frontend-design-review",
                 "orchestrator",
-                "project-readme",
                 "requirements-driven-development",
                 "review-process",
                 "skill-authoring",
                 "ticket-creation",
-                "work-agent-orchestration",
-                "write-low-reasoning-skills",
             ],
         )
 

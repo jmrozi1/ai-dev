@@ -75,13 +75,12 @@ is merely imaginable.
 
 ## Audience And Placement
 
-Use the Issue #38 audience model:
+Use the current audience model:
 
 ```text
 skills/<name>/                 # genuinely shared operational behavior
 skills/chatgpt/<name>/         # ChatGPT judgment or interaction behavior
 skills/copilot/<name>/         # Copilot repository execution behavior
-skills/work/<name>/            # constrained Work behavior
 ```
 
 Discovery differences alone do not justify an audience split. Split only when
