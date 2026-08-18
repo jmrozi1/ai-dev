@@ -49,6 +49,7 @@ remain in the applicable canonical `SKILL.md` files.
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, and evidence-based decisions. | `skills/chatgpt/orchestrator/SKILL.md` |
 | `skill-authoring` | Creating or refining an AI Dev skill, or performing focused skill-quality review when execution evidence suggests a skill-definition problem. | `skills/chatgpt/skill-authoring/SKILL.md` |
 | `ticket-creation` | Creating task records using the canonical ticket schema and repository ticket-provider contract. | `skills/chatgpt/ticket-creation/SKILL.md` |
+| `work-skill-refinement` | Designing and refining work-side AI skills and capability boundaries from observed work-agent behavior, including deciding when a task should not be delegated to the work AI. | `skills/chatgpt/work-skill-refinement/SKILL.md` |
 
 ## Copilot
 
