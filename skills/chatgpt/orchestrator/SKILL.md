@@ -34,6 +34,14 @@ implementation instructions or deep disposable implementation context. Create
 `.ai-dev/tasking.md` only when work has enough independent steps to benefit from
 a durable rail. Trivial or single-step work does not require a tasking file.
 
+Prefer portable evidence. When the orchestrator will need executor-local
+information for a later decision or review, instruct the executor to print the
+smallest review-sufficient evidence directly in its response so it can be easily
+copied and pasted between agents. Prefer exact command output, targeted diffs,
+SHAs, status, validation results, and material warnings over unsupported
+summaries such as "tests passed." Do not dump large logs or unrelated repository
+state when a focused excerpt or deterministic helper output is sufficient.
+
 A tasking file is current state, not history. Keep it as simple Markdown and
 include only what a fresh executor needs:
 
