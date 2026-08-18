@@ -25,7 +25,7 @@ normalized storage shape. The required form is:
   "title": "Implement the scoped fix",
   "lifecycleState": "open",
   "workflowState": "inactive",
-  "body": "Optional summary of the task.",
+  "body": "## Checkpoints\n\n- [ ] first-checkpoint: Define the first planned slice.\n\n## Acceptance Criteria\n\n- Observable outcome is testable.\n\n## Full Description\n\nDescribe the task and its scope.",
   "acceptanceCriteria": [
     "Outcome is observable and testable.",
     "The change remains within the assigned scope."
@@ -46,6 +46,12 @@ Rules:
   against the repository owner/name format. GitHub URLs are optional and must be
   valid HTTP(S) URLs.
 - `title` is required and must be non-empty after trimming.
+- The title must stand on its own in a backlog, notification, cross-project
+  list, or `/status` output. It should identify the affected behavior or system
+  and the intended change with enough scope to distinguish the work from
+  adjacent tickets.
+- Do not require project prefixes or a rigid naming grammar. Do not add title
+  scores, taxonomies, templates, or another summary field.
 - `lifecycleState` must be `open` or `closed`.
 - `workflowState` must be `inactive`, `active`, or `blocked`.
 - `acceptanceCriteria` and `labels` are arrays of strings, not free-form text.
@@ -60,9 +66,12 @@ When creating a ticket:
   of inventing a custom ticket schema.
 - For local provider creation, write exactly one JSON file for the new numeric
   ticket ID; do not reuse or overwrite an existing ID.
-- Keep the ticket title concise and implementation-oriented.
-- Include optional `body`, `acceptanceCriteria`, and `labels` only when they are
-  materially useful and consistent with the canonical structure.
+- Keep the ticket title self-contained and implementation-oriented; for
+  example, prefer `Add issue-level AI usage accounting and management
+  reporting` over `Add reporting`.
+- When a ticket body is provided, use this section order: `Checkpoints`,
+  `Acceptance Criteria`, then `Full Description`. Do not create or require an
+  `Executive Summary` section.
 - Do not add unsupported fields or alternate naming conventions.
 - If the configured provider cannot create the ticket, report the provider error
   and stop rather than inventing a ticket record outside the canonical format.

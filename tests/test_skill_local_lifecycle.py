@@ -56,11 +56,7 @@ class SkillLocalLifecycleTests(unittest.TestCase):
                     {
                         "reference": {"provider": "local", "ticketId": "1", "path": ".ai-dev/tickets"},
                         "title": "Installed skill lifecycle",
-                        "body": """## Executive Summary
-
-Exercise the installed helper package.
-
-## Checkpoints
+                        "body": """## Checkpoints
 
 - [x] **Started**
   Begin the workflow.
@@ -102,9 +98,33 @@ Detailed lifecycle test context.
         self.assertEqual(subprocess.run(["git", "branch", "--show-current"], cwd=ticket_repo, capture_output=True, text=True, check=True).stdout.strip(), "scratch")
         normal_status = self._run(ticket_repo, "ticket-status")
         verbose_status = self._run(ticket_repo, "ticket-status", "verbose")
-        self.assertIn("Current checkpoint: Validate", normal_status.stdout)
-        self.assertNotIn("Acceptance Criteria", normal_status.stdout)
-        self.assertIn("Full Description:", verbose_status.stdout)
+        self.assertEqual(
+            normal_status.stdout.strip(),
+            "\n".join(
+                (
+                    "Active ticket: #1 Installed skill lifecycle",
+                    "Checkpoints: 1/2 completed",
+                    "Current checkpoint: Validate",
+                )
+            ),
+        )
+        self.assertEqual(
+            verbose_status.stdout.strip(),
+            "\n".join(
+                (
+                    "Active ticket: #1 Installed skill lifecycle",
+                    "Checkpoints: 1/2 completed",
+                    "Current checkpoint: Validate",
+                    "Full Description:",
+                    "Detailed lifecycle test context.",
+                    "Checkpoints:",
+                    "- [x] Started: Begin the workflow.",
+                    "- [ ] Validate: Validate local lifecycle behavior.",
+                )
+            ),
+        )
+        self.assertNotIn("Executive Summary", normal_status.stdout + verbose_status.stdout)
+        self.assertNotIn("Acceptance Criteria", normal_status.stdout + verbose_status.stdout)
         self.assertEqual(self._run(ticket_repo, "flow-block", "waiting").returncode, 0)
         self.assertEqual(self._run(ticket_repo, "flow-resume", "1").returncode, 0)
 

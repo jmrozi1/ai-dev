@@ -104,7 +104,6 @@ def render_active_ticket_status(repo_root: Path, *, verbose: bool = False) -> st
     if ticket.body is None:
         raise TicketStatusError("Active ticket is missing its project-status content.")
 
-    executive_summary = _ticket_section(ticket.body, "Executive Summary")
     checkpoints = _parse_checkpoints(ticket.body)
     completed_count = sum(checkpoint.completed for checkpoint in checkpoints)
     current = next((checkpoint for checkpoint in checkpoints if not checkpoint.completed), None)
@@ -114,8 +113,6 @@ def render_active_ticket_status(repo_root: Path, *, verbose: bool = False) -> st
         f"Active ticket: #{ticket.reference.ticket_id} {ticket.title}",
         f"Checkpoints: {completed_count}/{len(checkpoints)} completed",
         f"Current checkpoint: {current_name}",
-        "Executive Summary:",
-        executive_summary,
     ]
     if verbose:
         lines.extend(
