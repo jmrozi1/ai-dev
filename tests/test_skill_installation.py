@@ -181,7 +181,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 11)
+        self.assertEqual(len(names), 12)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -212,7 +212,14 @@ class SkillInstallationTests(unittest.TestCase):
         }
 
         expected_audience_skills = {
-            "chatgpt": {"auto-review", "flow", "orchestrator", "skill-authoring", "ticket-creation"},
+            "chatgpt": {
+                "auto-review",
+                "flow",
+                "orchestrator",
+                "skill-authoring",
+                "ticket-creation",
+                "work-skill-refinement",
+            },
             "copilot": {"auto-review", "executor", "flow"},
         }
         for audience, audience_skills in expected_audience_skills.items():
@@ -261,6 +268,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "review-process",
                 "skill-authoring",
                 "ticket-creation",
+                "work-skill-refinement",
             ],
         )
 
@@ -295,6 +303,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "review-process",
                 "skill-authoring",
                 "ticket-creation",
+                "work-skill-refinement",
             ],
         )
 
