@@ -92,6 +92,25 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         self.assertIn("checkpoint this", body_text)
         self.assertIn("close this out", body_text)
 
+    def test_start_ticket_uses_canonical_provider_metadata(self) -> None:
+        """Verify start-ticket tasking cannot promote historical catalogs to current intent."""
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+
+        self.assertIn("do not broadly search the repository", normalized_content)
+        self.assertIn("configured ticket provider", normalized_content)
+        self.assertIn("scripts/flow-start <id>", normalized_content)
+        self.assertIn("scripts/ticket-status verbose", normalized_content)
+        self.assertIn("sole current ticket intent", normalized_content)
+        self.assertIn("root `tickets.md`", normalized_content)
+        self.assertIn("current-task.md", normalized_content)
+        self.assertIn("configured provider is explicitly", normalized_content)
+        self.assertIn("local", normalized_content)
+        self.assertIn("historical files may be inspected only when the user explicitly asks", normalized_content)
+
+        self.assertNotIn("read tickets.md for", normalized_content)
+        self.assertNotIn("search tickets.md for", normalized_content)
+
     def test_frontmatter_not_duplicating_table(self) -> None:
         """Verify frontmatter description does not duplicate the intent-mapping table."""
         content = self.flow_skill.read_text(encoding="utf-8")

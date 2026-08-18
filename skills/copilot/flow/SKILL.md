@@ -53,6 +53,22 @@ Map natural-language lifecycle requests to this package's local helpers:
 | `/status` or `what's my status?` | `scripts/ticket-status` |
 | `/status verbose` | `scripts/ticket-status verbose` |
 
+## Start-Ticket Authority
+
+For `start ticket <id>`, do not broadly search the repository for ticket title,
+requirements, acceptance criteria, or description before activation. Run the
+package-local `scripts/flow-start <id>` helper so the configured ticket provider
+activates the requested issue. After it succeeds, use the provider-fetched
+active issue and `scripts/ticket-status verbose` as the sole current ticket
+intent for title, checkpoints, acceptance criteria, and Full Description.
+
+Do not consult or merge root `tickets.md`, `current-task.md`, historical task
+artifacts, or other local catalogs as current ticket intent. A repository may
+still use `.ai-dev/tickets/*.json` when its configured provider is explicitly
+`local`; that local-provider data must not be confused with root historical
+documentation. Historical files may be inspected only when the user explicitly
+asks for historical context.
+
 Named ticket checkpoints are the canonical implementation roadmap. The numeric
 Flow `checkpoint` is deterministic execution state and is not the authoritative
 roadmap index. Review fixes or retries may produce extra Flow checkpoint commits
