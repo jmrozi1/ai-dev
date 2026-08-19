@@ -167,6 +167,14 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         fixed_prefixed_executable=True,
     ),
     CommandSpec(
+        name="abandon",
+        description="Stop tracking the active workflow locally without changing the ticket.",
+        canonical_namespace="flow",
+        order=75,
+        handler_key="abandon",
+        fixed_prefixed_executable=True,
+    ),
+    CommandSpec(
         name="promote",
         description="Squash scratch into one permanent commit on main.",
         canonical_namespace="flow",
@@ -304,6 +312,15 @@ main while preserving the active issue.
 
 Options:
   -h, --help  Show this help.
+""",
+        "abandon": """\
+Usage: {command_name} abandon
+
+Stop tracking the active workflow locally without changing the bound ticket or
+repository content. Requires a clean synchronized scratch branch.
+
+Options:
+    -h, --help  Show this help.
 """,
     "promote": """\
 Usage: {command_name} promote "<commit-message>"
@@ -2531,6 +2548,65 @@ def handle_reset(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
+def handle_abandon(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _usage_error(command_name, "abandon", "")
+
+    repo_root, state_path, state = _resolve_repo_state_context()
+
+    if _active_workflow_type(state) is None:
+        raise FlowError("Cannot abandon workflow: no active workflow is set.")
+
+    _ensure_main_and_scratch_branches_differ(state)
+    _ensure_main_and_scratch_branches_exist(repo_root, state)
+
+    current_branch = current_branch_name(repo_root)
+    if current_branch != state.scratch_branch:
+        raise FlowError(
+            f"Cannot abandon workflow: current branch {current_branch} does not match scratchBranch {state.scratch_branch}."
+        )
+
+    ensure_no_active_git_operations(repo_root)
+    if git_status_short(repo_root):
+        raise FlowError("Cannot abandon workflow: repository must be clean.")
+
+    comparison = compare_main_and_scratch(
+        repo_root,
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+    )
+    assert comparison.scratch_ahead_of_main is not None
+    assert comparison.scratch_behind_main is not None
+    if comparison.scratch_ahead_of_main != 0 or comparison.scratch_behind_main != 0:
+        if comparison.scratch_ahead_of_main != 0 and comparison.scratch_behind_main == 0:
+            detail = f"{state.scratch_branch} is ahead of {state.main_branch}"
+        elif comparison.scratch_ahead_of_main == 0:
+            detail = f"{state.scratch_branch} is behind {state.main_branch}"
+        else:
+            detail = f"{state.scratch_branch} and {state.main_branch} have diverged"
+        raise FlowError(
+            f"Cannot abandon workflow: {detail}; resolve or preserve repository state explicitly first."
+        )
+
+    _clear_promotion_review_record(repo_root)
+    try:
+        clear_promotion_sync_record(repo_root)
+    except PromotionSyncError as exc:
+        raise FlowError(f"Cannot abandon workflow: {exc}") from exc
+    _clear_diff_baseline_after_success(repo_root, operation="abandon")
+    try:
+        clear_state(state_path)
+    except WorkflowStateError as exc:
+        raise FlowError(f"Cannot abandon workflow: failed to clear local workflow state. {exc}") from exc
+
+    print("Abandoned local workflow")
+    print("Workflow: inactive")
+    print(f"mainBranch: {state.main_branch}")
+    print(f"scratchBranch: {state.scratch_branch}")
+    print("checkpoint: 0")
+    return 0
+
+
 def handle_complete(command_name: str, arguments: list[str]) -> int:
     if arguments:
         raise _complete_usage(command_name)
@@ -3410,6 +3486,7 @@ def _resolve_command_handler(handler_key: str):
         "diff": handle_diff,
         "commit": handle_commit,
         "reset": handle_reset,
+        "abandon": handle_abandon,
         "promote": handle_promote,
         "complete": handle_complete,
         "block": handle_block,

@@ -168,6 +168,26 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         self.assertNotIn("standup", frontmatter)
         self.assertNotIn("session history", frontmatter)
 
+    def test_abandon_intent_mapping_and_distinctions_are_explicit(self) -> None:
+        """Verify local abandon intent maps to flow-abandon and is distinct from reset/complete."""
+        content = self.flow_skill.read_text(encoding="utf-8")
+        normalized = " ".join(content.split()).lower()
+
+        self.assertIn("abandon this workflow", normalized)
+        self.assertIn("abandon the current workflow", normalized)
+        self.assertIn("cancel this local workflow", normalized)
+        self.assertIn("stop tracking this issue locally", normalized)
+        self.assertIn("clear the local workflow but leave the ticket alone", normalized)
+        self.assertIn("scripts/flow-abandon", normalized)
+        self.assertIn("flow-reset = destructive execution reset", normalized)
+        self.assertIn("flow-abandon = local-only abandonment", normalized)
+        self.assertIn("flow-complete = provider/ticket completion", normalized)
+        self.assertIn("__test-state-clear", normalized)
+        self.assertIn("never use flow-reset as a substitute for abandon", normalized)
+        self.assertIn("never use flow-complete when the user explicitly wants the ticket left unchanged", normalized)
+        self.assertIn("clean and synchronized", normalized)
+        self.assertIn("fail without mutation", normalized)
+
 
 if __name__ == "__main__":
     unittest.main()

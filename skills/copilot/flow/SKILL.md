@@ -46,12 +46,33 @@ Map natural-language lifecycle requests to this package's local helpers:
 | `start ticket <id>` | `scripts/flow-start <id>` |
 | `start a patch` | `scripts/flow-patch "<description>"` |
 | `checkpoint this` | `scripts/flow-commit` |
+| `abandon this workflow` | `scripts/flow-abandon` |
+| `abandon the current workflow` | `scripts/flow-abandon` |
+| `cancel this local workflow` | `scripts/flow-abandon` |
+| `stop tracking this issue locally` | `scripts/flow-abandon` |
+| `clear the local workflow but leave the ticket alone` | `scripts/flow-abandon` |
 | `reset this` | `scripts/flow-reset` |
 | `block this` | `scripts/flow-block "<reason>"` |
 | `resume ticket <id>` | `scripts/flow-resume <id>` |
 | `close this out` | `scripts/flow-promote "<message>"`, then `scripts/flow-complete` when authorized |
 | `/status` or `what's my status?` | `scripts/ticket-status` |
 | `/status verbose` | `scripts/ticket-status verbose` |
+
+## Lifecycle Distinctions
+
+When the user asks to abandon, cancel, or clear the local workflow without changing the ticket, the executor must read the exact semantics before choosing a command:
+
+- flow-reset = destructive execution reset = keeps the workflow/ticket binding active = resets scratch to main and may discard unpromoted workflow work
+- flow-complete = provider/ticket completion = completes the workflow = may mutate/close/update the bound ticket through its provider
+- flow-abandon = local-only abandonment = never mutates the bound ticket/provider = never resets branches or discards repository content = succeeds only when the repository is already clean and synchronized
+
+Never use flow-reset as a substitute for abandon.
+Never use flow-complete when the user explicitly wants the ticket left unchanged.
+Never use __test-state-clear for production/local-abandon intent.
+
+If flow-abandon refuses because scratch is ahead/behind/diverged, the tree is dirty, or Git has an active operation, report the exact blocker, preserve the workflow and repository state, and fail without mutation. Do not automatically run flow-reset, git reset, cleanup, commit, promote, or another destructive command just to make abandon succeed. The user or orchestrator should decide how to resolve that work first.
+
+This is a local-only lifecycle action; do not broaden it into a generalized recovery or reset framework.
 
 ## Start-Ticket Authority
 
