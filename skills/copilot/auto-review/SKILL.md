@@ -64,6 +64,80 @@ The canonical current-state recorder is:
 
 `skills/copilot/auto-review/scripts/record-promotion-review`
 
+### No-Argument Inference
+
+Run the recorder with **no arguments** when the current Flow repository state is
+safe and unambiguous:
+
+```bash
+skills/copilot/auto-review/scripts/record-promotion-review
+```
+
+No-argument invocation is the normal path. It writes the same promotion-review
+PASS record as the explicit form only when all of these are true:
+
+- An active Flow issue workflow is configured in `.ai-dev/workflow.json`
+- The workflow is issue-based (not patch-based)
+- The active issue number is unambiguous
+- Valid main/scratch branch metadata exists
+- The current branch exactly matches the configured `scratch` branch
+- The working tree is clean (no staged or unstaged changes)
+- No Git operation is active (no rebase, merge, cherry-pick, etc.)
+- `HEAD` is exactly the same commit as the scratch branch tip
+
+**Success confirmation**: The recorder explicitly outputs:
+
+```
+recorded promotion review pass for .ai-dev/promotion-review.json
+```
+
+and creates `.ai-dev/promotion-review.json` with fields:
+- `result: "pass"`
+- `activeIssueNumber: <active-issue>`
+- `scratchCommit: <exact-current-scratch-sha>`
+- `mainBranch`, `scratchBranch`: configured metadata
+
+**Do not claim recording succeeded merely because the command ran**. Verify the
+explicit success output.
+
+### Unsafe Inference
+
+If any precondition fails, the recorder exits nonzero and does not write:
+
+```
+record-promotion-review: no promotion-review record was written
+Use: record-promotion-review --issue <number> --commit <sha>
+```
+
+The exact failure reason appears before the usage line. No record is created,
+and any pre-existing `.ai-dev/promotion-review.json` remains byte-for-byte
+unchanged.
+
+### Explicit Form for Recovery
+
+When inference is unsafe or you need to override the inferred target:
+
+```bash
+skills/copilot/auto-review/scripts/record-promotion-review --issue <number> --commit <sha>
+```
+
+Use only for deliberate recovery/override, not as a normal path. This form
+requires explicit argument validation and does not weaken exact-SHA binding.
+
+### No-Write Failure
+
+Do not proceed with promotion if the no-argument recorder fails. Report the
+failure output to the active task owner and confirm recovery steps are taken
+before retry.
+
+### Promotion Gate Integrity
+
+Never weaken or bypass exact-SHA promotion gating. The `flow-promote` command
+requires a valid PASS record whose `scratchCommit` and workflow identity exactly
+match the current state. This checkpoint does not alter that requirement.
+
+### Recording Authorization
+
 Do not record a promotion pass based only on successful commands. The active
 task must authorize that decision, every applicable review must have passed, and
 the recorder must bind the result to the current scratch SHA and workflow

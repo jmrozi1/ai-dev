@@ -66,12 +66,14 @@ fi
 
 if [[ -z "$issue_number" && -z "$patch_description" ]]; then
   if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
-    echo "record-promotion-review: not inside a Git repository" >&2
+    echo "record-promotion-review: no promotion-review record was written" >&2
+    echo "Use: record-promotion-review --issue <number> --commit <sha>" >&2
     exit 2
   fi
   cd "$repo_root"
   if [[ ! -f .ai-dev/workflow.json ]]; then
-    echo "record-promotion-review: no active workflow state at .ai-dev/workflow.json" >&2
+    echo "record-promotion-review: no promotion-review record was written" >&2
+    echo "Use: record-promotion-review --issue <number> --commit <sha>" >&2
     exit 2
   fi
   python3 - "$repo_root" <<'PY'
@@ -79,24 +81,94 @@ import json
 import sys
 from pathlib import Path
 
+from ai_dev_flow.repository import (
+    current_branch_name,
+    ensure_clean_working_tree_and_index,
+    ensure_no_active_git_operations,
+    branch_exists,
+    resolve_commit_hash,
+)
+from ai_dev_flow.workflow_state import load_state
+
 repo_root = Path(sys.argv[1])
-path = repo_root / ".ai-dev" / "workflow.json"
+workflow_file = repo_root / ".ai-dev" / "workflow.json"
+record_path = repo_root / ".ai-dev" / "promotion-review.json"
+
 try:
-    data = json.loads(path.read_text(encoding="utf-8"))
-except (FileNotFoundError, json.JSONDecodeError) as exc:
-    raise SystemExit(f"record-promotion-review: invalid workflow state: {exc}")
-if not isinstance(data, dict):
-    raise SystemExit("record-promotion-review: workflow state must be a JSON object")
-issue_number = data.get("activeIssueNumber")
-patch_description = data.get("patchDescription")
-if issue_number is None and patch_description is None:
-    raise SystemExit("record-promotion-review: no active issue or patch workflow is set")
-if issue_number is not None and patch_description is not None:
-    raise SystemExit("record-promotion-review: workflow state cannot contain both issue and patch identity")
-if issue_number is not None:
-    print(f"--issue {issue_number}")
-else:
-    print(f"--patch {patch_description}")
+    state = load_state(workflow_file)
+except Exception as exc:  # pragma: no cover - exercised via shell failure output
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        f"record-promotion-review: invalid workflow state: {exc}"
+    )
+
+if state.patch_description is not None or state.active_issue_number is None:
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        "record-promotion-review: no active issue workflow is available for safe no-argument recording"
+    )
+
+if not branch_exists(repo_root, state.main_branch):
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        f"record-promotion-review: required branch does not exist: {state.main_branch}"
+    )
+
+if not branch_exists(repo_root, state.scratch_branch):
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        f"record-promotion-review: required branch does not exist: {state.scratch_branch}"
+    )
+
+if current_branch_name(repo_root) != state.scratch_branch:
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        f"record-promotion-review: current branch {current_branch_name(repo_root)!r} does not match scratch {state.scratch_branch!r}"
+    )
+
+try:
+    ensure_clean_working_tree_and_index(repo_root)
+except Exception as exc:
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        f"record-promotion-review: repository is not safe for inference: {exc}"
+    )
+
+try:
+    ensure_no_active_git_operations(repo_root)
+except Exception as exc:
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        f"record-promotion-review: active Git operation prevents safe inference: {exc}"
+    )
+
+head_sha = resolve_commit_hash(repo_root, "HEAD")
+scratch_sha = resolve_commit_hash(repo_root, state.scratch_branch)
+if head_sha != scratch_sha:
+    raise SystemExit(
+        "record-promotion-review: no promotion-review record was written\n"
+        "Use: record-promotion-review --issue <number> --commit <sha>\n"
+        f"record-promotion-review: HEAD and scratch differ: {head_sha} != {scratch_sha}"
+    )
+
+record = {
+    "version": 1,
+    "scratchCommit": scratch_sha,
+    "result": "pass",
+    "mainBranch": state.main_branch,
+    "scratchBranch": state.scratch_branch,
+    "activeIssueNumber": state.active_issue_number,
+}
+
+record_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+print(f"recorded promotion review pass for {record_path}")
 PY
   exit 0
 fi

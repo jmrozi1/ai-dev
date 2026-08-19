@@ -95,6 +95,24 @@ class PromotionReviewGateTests(unittest.TestCase):
             env=environment,
         )
 
+    def _record(self, *arguments: str) -> subprocess.CompletedProcess[str]:
+        script = REPO_ROOT / "skills" / "copilot" / "auto-review" / "scripts" / "record-promotion-review"
+        return subprocess.run(
+            [str(script), *arguments],
+            cwd=self.repo,
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        )
+
+    def _assert_no_write(self, *, before_bytes: bytes | None, result: subprocess.CompletedProcess[str]) -> None:
+        record_path = self.repo / ".ai-dev" / "promotion-review.json"
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no promotion-review record was written", result.stderr)
+        self.assertIn("record-promotion-review --issue <number> --commit <sha>", result.stderr)
+        after_bytes = record_path.read_bytes() if record_path.exists() else None
+        self.assertEqual(after_bytes, before_bytes)
+
     def test_gate_is_required_by_default(self) -> None:
         (self.repo / "scratch.txt").write_text("scratch\n", encoding="utf-8")
         _git(self.repo, "add", "scratch.txt")
@@ -147,6 +165,90 @@ class PromotionReviewGateTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1)
         self.assertIn("Cannot promote workflow", result.stderr)
+
+    def test_no_argument_records_pass_for_safe_active_issue(self) -> None:
+        (self.repo / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+        _git(self.repo, "add", "scratch.txt")
+        _git(self.repo, "commit", "--quiet", "-m", "scratch change")
+        scratch_sha = _git(self.repo, "rev-parse", "HEAD").strip()
+
+        result = self._record()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recorded promotion review pass", result.stdout)
+        payload = json.loads((self.repo / ".ai-dev" / "promotion-review.json").read_text(encoding="utf-8"))
+        self.assertEqual(payload["scratchCommit"], scratch_sha)
+        self.assertEqual(payload["activeIssueNumber"], 42)
+        self.assertEqual(payload["result"], "pass")
+        self.assertEqual(payload["mainBranch"], "main")
+        self.assertEqual(payload["scratchBranch"], "scratch")
+
+    def test_no_argument_matches_explicit_record_for_same_target(self) -> None:
+        (self.repo / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+        _git(self.repo, "add", "scratch.txt")
+        _git(self.repo, "commit", "--quiet", "-m", "scratch change")
+        scratch_sha = _git(self.repo, "rev-parse", "HEAD").strip()
+
+        no_arg = self._record()
+        self.assertEqual(no_arg.returncode, 0, no_arg.stderr)
+        inferred = json.loads((self.repo / ".ai-dev" / "promotion-review.json").read_text(encoding="utf-8"))
+
+        explicit = self._record("--issue", "42", "--commit", scratch_sha)
+        self.assertEqual(explicit.returncode, 0, explicit.stderr)
+        explicit_payload = json.loads((self.repo / ".ai-dev" / "promotion-review.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(inferred, explicit_payload)
+
+    def test_no_argument_fails_for_inactive_workflow_without_mutation(self) -> None:
+        workflow_path = self.repo / ".ai-dev" / "workflow.json"
+        workflow_path.write_text(json.dumps({"mainBranch": "main", "scratchBranch": "scratch", "checkpoint": 0}, indent=2), encoding="utf-8")
+        record_path = self.repo / ".ai-dev" / "promotion-review.json"
+        before_bytes = record_path.read_bytes() if record_path.exists() else None
+        result = self._record()
+        self._assert_no_write(before_bytes=before_bytes, result=result)
+
+    def test_no_argument_fails_for_patch_workflow_without_mutation(self) -> None:
+        workflow_path = self.repo / ".ai-dev" / "workflow.json"
+        workflow_path.write_text(json.dumps({"mainBranch": "main", "scratchBranch": "scratch", "checkpoint": 0, "patchDescription": "patch"}, indent=2), encoding="utf-8")
+        record_path = self.repo / ".ai-dev" / "promotion-review.json"
+        before_bytes = record_path.read_bytes() if record_path.exists() else None
+        result = self._record()
+        self._assert_no_write(before_bytes=before_bytes, result=result)
+
+    def test_no_argument_fails_for_wrong_branch_without_mutation(self) -> None:
+        _git(self.repo, "checkout", "--quiet", "main")
+        before_bytes = (self.repo / ".ai-dev" / "promotion-review.json").read_bytes() if (self.repo / ".ai-dev" / "promotion-review.json").exists() else None
+        result = self._record()
+        self._assert_no_write(before_bytes=before_bytes, result=result)
+
+    def test_no_argument_fails_for_dirty_worktree_without_mutation(self) -> None:
+        (self.repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        record_path = self.repo / ".ai-dev" / "promotion-review.json"
+        before_bytes = record_path.read_bytes() if record_path.exists() else None
+        result = self._record()
+        self._assert_no_write(before_bytes=before_bytes, result=result)
+
+    def test_no_argument_fails_for_head_and_scratch_mismatch_without_mutation(self) -> None:
+        (self.repo / "scratch.txt").write_text("scratch\n", encoding="utf-8")
+        _git(self.repo, "add", "scratch.txt")
+        _git(self.repo, "commit", "--quiet", "-m", "scratch change")
+        _git(self.repo, "checkout", "--quiet", "main")
+        _git(self.repo, "checkout", "--quiet", "scratch")
+        _git(self.repo, "checkout", "--quiet", "main")
+        record_path = self.repo / ".ai-dev" / "promotion-review.json"
+        before_bytes = record_path.read_bytes() if record_path.exists() else None
+        result = self._record()
+        self._assert_no_write(before_bytes=before_bytes, result=result)
+
+    def test_no_argument_preserves_existing_record_on_failure(self) -> None:
+        existing = {"version": 1, "scratchCommit": "deadbeef", "result": "pass", "mainBranch": "main", "scratchBranch": "scratch", "activeIssueNumber": 42}
+        record_path = self.repo / ".ai-dev" / "promotion-review.json"
+        record_path.write_text(json.dumps(existing, indent=2) + "\n", encoding="utf-8")
+        before_bytes = record_path.read_bytes()
+        workflow_path = self.repo / ".ai-dev" / "workflow.json"
+        workflow_path.write_text(json.dumps({"mainBranch": "main", "scratchBranch": "scratch", "checkpoint": 0}, indent=2), encoding="utf-8")
+        result = self._record()
+        self._assert_no_write(before_bytes=before_bytes, result=result)
 
 
 if __name__ == "__main__":
