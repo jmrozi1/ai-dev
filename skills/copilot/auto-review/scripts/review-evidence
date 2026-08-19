@@ -215,7 +215,33 @@ else
   printf 'no tasking rail at %s\n\n' "$tasking_file"
 fi
 
+# Attempt automatic telemetry sampling if an active issue is present.
+# Capture status to display visibility of availability/failure.
+telemetry_status=""
+telemetry_message=""
+if [[ -n "$active_issue_number" ]]; then
+  telemetry_helper="$script_dir/sample-copilot-usage"
+  if [[ -x "$telemetry_helper" ]]; then
+    # Capture stderr to parse telemetry status.
+    helper_stderr=$("$telemetry_helper" 2>&1 1>/dev/null) || true
+
+    # Parse status line: TELEMETRY_STATUS=<status> [MESSAGE=<message>]
+    if [[ "$helper_stderr" =~ TELEMETRY_STATUS=([^ ]+)(\ MESSAGE=\'(.*)\')?$ ]]; then
+      telemetry_status="${BASH_REMATCH[1]}"
+      telemetry_message="${BASH_REMATCH[3]:-}"
+    fi
+  fi
+fi
+
+# Render AI Usage section with appropriate status.
+# Three cases:
+#   1. Usable summary file exists: render compact usage report
+#   2. Telemetry unavailable: render visible "unavailable" status
+#   3. Telemetry collection failed: render visible "failed" diagnostic
+#   4. No active issue: omit section entirely
+
 if [[ -n "$active_issue_number" && -f ".ai-dev/usage/issue-${active_issue_number}.json" ]]; then
+  # Case 1: Usable summary exists; render compact usage report.
   printf '## AI Usage\n\n'
   python3 - ".ai-dev/usage/issue-${active_issue_number}.json" <<'PY'
 import json
@@ -229,6 +255,22 @@ with open(sys.argv[1], encoding="utf-8") as handle:
 print(render_usage_report(summary))
 print()
 PY
+elif [[ "$telemetry_status" == "unavailable" ]]; then
+  # Case 2: Telemetry unavailable; render visible status.
+  printf '## AI Usage\n\n'
+  if [[ -n "$telemetry_message" ]]; then
+    printf 'AI usage: unavailable — %s\n\n' "$telemetry_message"
+  else
+    printf 'AI usage: unavailable — no telemetry collected\n\n'
+  fi
+elif [[ "$telemetry_status" == "failed" ]]; then
+  # Case 3: Telemetry collection failed; render visible failure diagnostic.
+  printf '## AI Usage\n\n'
+  if [[ -n "$telemetry_message" ]]; then
+    printf 'AI usage collection failed — %s\n\n' "$telemetry_message"
+  else
+    printf 'AI usage collection failed\n\n'
+  fi
 fi
 
 printf '## Skills To Review\n\n'

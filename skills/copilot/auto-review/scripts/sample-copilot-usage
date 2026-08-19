@@ -1,0 +1,168 @@
+#!/usr/bin/env bash
+# Sample fresh Copilot OTel usage and reconcile to active issue.
+# Non-blocking hook for review-evidence; emits structured status on stderr.
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: sample-copilot-usage [--otel-file <path>]
+
+Attempt to sample fresh Copilot usage from OTel and reconcile to active issue.
+
+This is a best-effort helper invoked by review-evidence.
+
+Exit codes:
+  0 - sampling attempted (may report unavailable or success)
+  1 - operational error (check stderr for status)
+
+Stderr output (structured status):
+  TELEMETRY_STATUS=<available|unavailable|failed> [MESSAGE=<reason>]
+
+Options:
+  --otel-file <path>  Path to OTel JSONL file. If omitted, uses
+                      github.copilot.chat.otel.outfile from VS Code settings
+                      or defaults to /tmp/copilot-otel.jsonl.
+EOF
+}
+
+otel_file=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --otel-file)
+      if [[ $# -lt 2 ]]; then
+        echo "sample-copilot-usage: --otel-file requires a value" >&2
+        exit 1
+      fi
+      otel_file="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "sample-copilot-usage: unknown argument: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
+# The package is installed by symlink, so scope comes from the caller's repository.
+if ! repo_root="$(git rev-parse --show-toplevel 2>/dev/null)"; then
+  echo "TELEMETRY_STATUS=failed MESSAGE='not inside a Git repository'" >&2
+  exit 1
+fi
+cd "$repo_root"
+
+# Load Python path for imports.
+script_path="${BASH_SOURCE[0]}"
+while [[ -L "$script_path" ]]; do
+  script_dir="$(cd "$(dirname "$script_path")" && pwd -P)"
+  script_path="$(readlink "$script_path")"
+  if [[ "$script_path" != /* ]]; then
+    script_path="$script_dir/$script_path"
+  fi
+done
+script_dir="$(cd "$(dirname "$script_path")" && pwd -P)"
+package_root="$(cd "$script_dir/../../../.." && pwd)"
+if [[ -n "${PYTHONPATH:-}" ]]; then
+  export PYTHONPATH="$package_root:$PYTHONPATH"
+else
+  export PYTHONPATH="$package_root"
+fi
+
+# Read active issue from workflow state.
+workflow_file=".ai-dev/workflow.json"
+active_issue_number=""
+if [[ -f "$workflow_file" ]]; then
+  active_issue_number=$(python3 << 'PYEOF'
+import json
+try:
+    with open(".ai-dev/workflow.json", encoding="utf-8") as f:
+        data = json.load(f)
+    issue = data.get("activeIssueNumber")
+    if isinstance(issue, int) and issue > 0:
+        print(str(issue))
+except Exception:
+    pass
+PYEOF
+  ) || true
+fi
+
+# If no active issue, nothing to reconcile.
+if [[ -z "$active_issue_number" ]]; then
+  exit 0
+fi
+
+# Determine OTel file path.
+if [[ -z "$otel_file" ]]; then
+  settings_file="$HOME/.config/Code/User/settings.json"
+  if [[ -f "$settings_file" ]]; then
+    otel_file=$(python3 << 'PYEOF'
+import json
+import os
+try:
+    settings_path = os.path.expanduser("~/.config/Code/User/settings.json")
+    with open(settings_path) as f:
+        settings = json.load(f)
+    path = settings.get("github.copilot.chat.otel.outfile", "")
+    if path:
+        print(path)
+except Exception:
+    pass
+PYEOF
+    ) || true
+  fi
+
+  if [[ -z "$otel_file" ]]; then
+    otel_file="/tmp/copilot-otel.jsonl"
+  fi
+fi
+
+# Sample and reconcile using Python.
+ISSUE_ID="$active_issue_number" OTEL_FILE="$otel_file" python3 << 'PYEOF'
+import sys
+import os
+from pathlib import Path
+
+from ai_dev_flow.usage_observation import capture_copilot_otel_usage
+from ai_dev_flow.usage_accounting import reconcile_issue_usage
+
+repo_root = Path(os.getcwd())
+issue_id = os.environ.get('ISSUE_ID', '')
+otel_file = os.environ.get('OTEL_FILE', '')
+
+try:
+    # Sample fresh OTel.
+    observation = capture_copilot_otel_usage(Path(otel_file))
+
+    # Check if observation is unavailable (no usable telemetry).
+    if observation.get("status") == "unavailable":
+        # Emit status: unavailable, with reason.
+        reason = observation.get("reason", "no telemetry available")
+        sys.stderr.write(f"TELEMETRY_STATUS=unavailable MESSAGE='{reason}'\n")
+        sys.exit(0)
+
+    # Reconcile to issue usage summary (idempotent, non-blocking on write).
+    # The work_period is today's date; allows grouping observations by day.
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).date().isoformat()
+
+    reconcile_issue_usage(
+        repo_root,
+        issue_id,
+        observation,
+        work_period=today,
+    )
+
+    # Success: observation was usable and reconciled.
+    sys.stderr.write("TELEMETRY_STATUS=available\n")
+    sys.exit(0)
+except Exception as exc:
+    # Operational error: emit status and exit 1.
+    msg = str(exc).replace("'", "")[:80]  # Truncate for safety.
+    sys.stderr.write(f"TELEMETRY_STATUS=failed MESSAGE='{msg}'\n")
+    sys.exit(1)
+PYEOF
+exit_code=$?
+exit $exit_code

@@ -38,25 +38,29 @@ surface must show relevant GUI or front-end design work.
 
 ## Copilot Token Telemetry Evidence
 
-When checkpoint or promotion review expects Copilot token evidence, use the
-supported VS Code/Copilot metadata-only OpenTelemetry export. The user-facing
-settings are `github.copilot.chat.otel.enabled`,
-`github.copilot.chat.otel.exporterType`, `github.copilot.chat.otel.outfile`,
-and `github.copilot.chat.otel.captureContent`; conceptually configure them as
-`enabled = true`, `exporterType = file`, `outfile =` a local non-repository or
-ignored telemetry file, and `captureContent = false`. Token, model, and usage
-metadata are sufficient; never enable prompt, response, or tool-content
-capture. These are user-level VS Code settings: the executor must not silently
-modify them. If they are missing or incorrect, report the exact human action
-required and stop where necessary.
+For meaningful checkpoint and promotion reviews, `review-evidence` automatically
+attempts one fresh metadata-only Copilot OTel sample and reconciliation before
+rendering the existing AI Usage evidence. The orchestrator does not need to ask
+for a separate telemetry refresh. Available telemetry is management evidence
+included automatically; unavailable or insufficient telemetry is reported
+concisely and remains non-blocking. Genuine collection failure is also reported
+concisely and remains non-blocking, without being converted into apparent
+success. Telemetry availability, token counts, and cost values never determine
+review PASS/FAIL and are not executor optimization targets.
 
-If expected token reporting is absent, first check that the configured output
-file exists and is nonempty and that the exporter is active. A newly enabled or
-restarted Copilot host may require a subsequent Copilot interaction before
-telemetry exists. Do not substitute GitHub billing or API-credit data for
-Copilot token telemetry, and do not scrape private Copilot SDK or session state
-when the supported OTel surface is available. Preserve the distinction among
-token consumption, context-window occupancy, and billing or account usage.
+Preserve the existing report wording for attribution, unresolved pricing or
+input-cache information, and scenario values. Session-scoped or unattributable
+usage must not be presented as issue-attributable, and scenarios must not be
+presented as actual totals or bounds. Keep collection metadata-only under the
+existing privacy contract; never enable prompt, response, or tool-content
+capture. Ordinary Flow lifecycle commands remain telemetry-independent.
+
+The user-facing VS Code settings are `github.copilot.chat.otel.enabled`,
+`github.copilot.chat.otel.exporterType`, `github.copilot.chat.otel.outfile`,
+and `github.copilot.chat.otel.captureContent`. These are user-level settings:
+the executor must not silently modify them. If telemetry is unavailable, rely
+on the concise status emitted by review evidence rather than adding a manual
+refresh instruction or substituting GitHub billing/API-credit data.
 
 ## Recording Boundary
 
