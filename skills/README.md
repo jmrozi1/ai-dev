@@ -15,9 +15,9 @@ different operational guidance, but this checkpoint introduces no duplicates.
 Audience specialization is justified by behavioral differences, not merely by
 different wording or examples.
 
-The current shared skills are `frontend-design-review`,
-`requirements-driven-development`, and `review-process`. The current
-audience-specific skills are:
+The current shared skills are `feedback-loop-design`,
+`frontend-design-review`, `requirements-driven-development`, and
+`review-process`. The current audience-specific skills are:
 
 - ChatGPT: `auto-review`, `flow`, `orchestrator`, `skill-authoring`,
   `ticket-creation`, and `work-skill-refinement`;
@@ -38,5 +38,5 @@ skill discovery. Canonical `SKILL.md` files remain authoritative. Do not add a
 router, inheritance system, synchronization framework, or speculative category
 tree.
 
-Optional subdirectories such as `scripts/`, `src/`, `tests/`, and `references/`
-are allowed only when real skill content requires them.
+Optional subdirectories such as `scripts/`, `src/`, `tests/`, and
+`references/` are allowed only when real skill content requires them.
