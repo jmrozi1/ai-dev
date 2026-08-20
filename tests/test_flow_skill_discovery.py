@@ -92,6 +92,18 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         self.assertIn("checkpoint this", body_text)
         self.assertIn("close this out", body_text)
 
+    def test_skill_body_describes_prerequisite_handoff_contract(self) -> None:
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+        self.assertIn("flow-start <b> --prerequisite-for <a>", normalized_content)
+        self.assertIn("active issue a", normalized_content)
+        self.assertIn("checkpoint 0", normalized_content)
+        self.assertIn("complete physical a+b tree", normalized_content)
+        self.assertIn("completing b closes only b", normalized_content)
+        self.assertIn("next checkpoint is n+1", normalized_content)
+        self.assertIn("must not edit workflow json", normalized_content)
+        self.assertIn("flow-patch --adopt", normalized_content)
+
     def test_start_ticket_uses_canonical_provider_metadata(self) -> None:
         """Verify start-ticket tasking cannot promote historical catalogs to current intent."""
         content = self.flow_skill.read_text(encoding="utf-8").lower()

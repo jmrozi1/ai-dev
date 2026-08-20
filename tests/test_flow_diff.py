@@ -207,6 +207,25 @@ class FlowDiffTests(unittest.TestCase):
         baseline_path.write_text('{"version":1,"repository":{"root":"x"},"workflow":{},"status":{},"snapshots":{"working":{}}}\n', encoding="utf-8")
         return baseline_path
 
+    def _write_promotion_review_pass(self, repo_root: Path) -> None:
+        record_path = repo_root / ".ai-dev" / "promotion-review.json"
+        record_path.parent.mkdir(parents=True, exist_ok=True)
+        record_path.write_text(
+            json.dumps(
+                {
+                    "version": 1,
+                    "scratchCommit": self._run_git(repo_root, "rev-parse", "scratch"),
+                    "result": "pass",
+                    "mainBranch": "main",
+                    "scratchBranch": "scratch",
+                    "activeIssueNumber": 23,
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
     def test_diff_help_lists_options(self) -> None:
         repo_root = self._init_repo("repo-diff-help")
 
@@ -219,6 +238,16 @@ class FlowDiffTests(unittest.TestCase):
         self.assertIn("--all", stdout)
         self.assertIn("--git", stdout)
         self.assertNotIn("--stdout", stdout)
+
+    def test_promote_argument_validation_precedes_workflow_validation(self) -> None:
+        repo_root = self._init_repo("repo-promote-argument-validation")
+        for arguments in ((), ("",), ("message", "extra")):
+            with self.subTest(arguments=arguments):
+                code, stdout, stderr = self._invoke(repo_root, "promote", *arguments)
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn('Usage: flow-promote "<commit-message>"', stderr)
+                self.assertNotIn("no active issue is set", stderr)
 
     def test_diff_default_includes_staged_unstaged_and_untracked(self) -> None:
         repo_root = self._init_repo("repo-diff-default")
@@ -1224,6 +1253,7 @@ class FlowDiffTests(unittest.TestCase):
         self.assertFalse(baseline_path.exists())
 
         baseline_path = self._write_diff_baseline_marker(repo_root)
+        self._write_promotion_review_pass(repo_root)
         code, out, err = self._invoke(repo_root, "promote", "Promote baseline cleanup")
         self.assertEqual(code, 0)
         self.assertEqual(err, "")
@@ -1252,6 +1282,7 @@ class FlowDiffTests(unittest.TestCase):
             "ai_dev_flow.cli.clear_diff_baseline_for_repo_root",
             side_effect=cli.RepositoryError("cleanup denied"),
         ):
+            self._write_promotion_review_pass(repo_root)
             code, out, err = self._invoke(repo_root, "promote", "Promote cleanup warning")
 
         self.assertEqual(code, 0)

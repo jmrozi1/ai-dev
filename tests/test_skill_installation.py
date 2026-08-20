@@ -181,7 +181,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 12)
+        self.assertEqual(len(names), 13)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -206,6 +206,7 @@ class SkillInstallationTests(unittest.TestCase):
     def test_each_audience_install_includes_shared_and_selected_skills(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
         shared_names = {
+            "feedback-loop-design",
             "frontend-design-review",
             "requirements-driven-development",
             "review-process",
@@ -260,6 +261,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "auto-review",
                 "auto-review",
                 "executor",
+                "feedback-loop-design",
                 "flow",
                 "flow",
                 "frontend-design-review",
@@ -295,6 +297,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "auto-review",
                 "auto-review",
                 "executor",
+                "feedback-loop-design",
                 "flow",
                 "flow",
                 "frontend-design-review",

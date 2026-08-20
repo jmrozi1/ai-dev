@@ -25,6 +25,8 @@ from .repository import (
     create_or_reset_branch_from_source,
     create_commit,
     compare_main_and_scratch,
+    commit_count_between,
+    create_managed_ref,
     compare_main_to_tracked_upstream,
     current_branch_name,
     ensure_branches_point_to_same_commit,
@@ -49,6 +51,8 @@ from .repository import (
     TrackedUpstream,
     workflow_state_file_for_repo_root,
     diff_baseline_file_for_repo_root,
+    delete_managed_ref,
+    resolve_managed_ref,
 )
 from .blocked_workflows import (
     BlockedWorkflowRecord,
@@ -61,6 +65,7 @@ from .blocked_workflows import (
     upsert_blocked_workflow,
 )
 from .workflow_state import (
+    StackedHandoff,
     WorkflowState,
     WorkflowStateError,
     clear_state,
@@ -91,6 +96,7 @@ from .tickets import TicketReference
 _DIRECT_FLOW_ROUTE_TOKEN = "__ai_dev_flow_exec__"
 _FLOW_DIFF_BASELINE_INVALID = "Review baseline is stale or invalid; run flow-diff --refresh."
 _PROMOTION_REVIEW_RECORD_PATH = ".ai-dev/promotion-review.json"
+_SUSPENDED_REF_PREFIX = "refs/ai-dev/suspended/"
 
 
 @dataclass(frozen=True)
@@ -254,9 +260,11 @@ FIXED_FLOW_EXECUTABLE_COMMANDS: tuple[str, ...] = tuple(
 COMMAND_HELP: dict[str, str] = {
     "start": """\
 Usage: {command_name} start <issue-number>
+    {command_name} start <issue-number> --prerequisite-for <active-issue>
 
-Begin new work on an unblocked issue by resetting scratch to main,
-checking out scratch, and recording the active issue.
+Begin independent work on an unblocked issue from main. The prerequisite form
+is only for active issue A handing off to prerequisite B; it keeps A's current
+scratch tree, starts B at checkpoint 0, and preserves A's checkpoint ownership.
 
 Options:
   -h, --help  Show this help.
@@ -326,7 +334,8 @@ Options:
 Usage: {command_name} promote "<commit-message>"
 
 Squash the complete scratch change into one permanent commit on main, then
-reset scratch to the promoted main commit.
+reset scratch to the promoted main commit. For stacked work, this publishes
+the complete physical A+B tree, including A's partial work.
 
 Options:
   -h, --help  Show this help.
@@ -335,6 +344,8 @@ Options:
 Usage: {command_name} complete
 
 Clear the active local workflow after scratch and main are synchronized.
+Completing a prerequisite closes only that issue; a suspended original remains
+blocked with its resume metadata.
 
 Options:
   -h, --help  Show this help.
@@ -351,7 +362,9 @@ Options:
     "resume": """\
 Usage: {command_name} resume <ticket-number>
 
-Reactivate a blocked issue workflow as the local active issue.
+Reactivate a blocked issue workflow as the local active issue. Resuming a
+suspended original restores its historical checkpoint progression and starts a
+new active scope from the promoted canonical base.
 
 Options:
   -h, --help  Show this help.
@@ -518,7 +531,63 @@ def _resolve_repo_state_context() -> tuple[Path, Path, WorkflowState]:
     repo_root = resolve_repo_root()
     state_path = workflow_state_file_for_repo_root(repo_root)
     state = load_state(state_path)
+    if state.stacked_handoff is not None:
+        _validate_stacked_scope(repo_root, state)
     return repo_root, state_path, state
+
+
+def _validate_stacked_scope(repo_root: Path, state: WorkflowState) -> None:
+    handoff = state.stacked_handoff
+    if handoff is None:
+        return
+
+    try:
+        suspended_ref = resolve_managed_ref(repo_root, handoff.suspended_ref_name)
+        if suspended_ref != handoff.suspended_commit:
+            raise FlowError(
+                "Invalid stacked workflow state: suspended ref does not match its persisted commit."
+            )
+        if handoff.inherited_base_commit != handoff.suspended_commit:
+            raise FlowError(
+                "Invalid stacked workflow state: inherited base does not match suspended commit."
+            )
+        if resolve_tree_hash(repo_root, handoff.inherited_base_commit) != handoff.inherited_base_tree:
+            raise FlowError(
+                "Invalid stacked workflow state: inherited base tree does not match its commit."
+            )
+        _ensure_main_and_scratch_branches_exist(repo_root, state)
+        if not branch_is_ancestor(
+            repo_root,
+            ancestor_revision=handoff.inherited_base_commit,
+            descendant_revision=state.scratch_branch,
+        ) and resolve_commit_hash(repo_root, state.main_branch) != resolve_commit_hash(repo_root, state.scratch_branch):
+            raise FlowError(
+                "Invalid stacked workflow state: inherited base is not an ancestor of scratch."
+            )
+    except FlowError:
+        raise
+    except RepositoryError as exc:
+        raise FlowError(
+            f"Invalid stacked workflow state: inherited base or ref is unreachable. {exc}"
+        ) from exc
+
+
+def _validate_stacked_resume(repo_root: Path, state: WorkflowState) -> None:
+    resume = state.stacked_resume
+    if resume is None:
+        return
+    try:
+        promoted_commit = resume["promotedMainCommit"]
+        if resolve_commit_hash(repo_root, state.main_branch) != promoted_commit:
+            raise FlowError("Invalid stacked resume state: main is not the recorded promoted commit.")
+        if resolve_commit_hash(repo_root, state.scratch_branch) != promoted_commit:
+            raise FlowError("Invalid stacked resume state: scratch is not the recorded promoted commit.")
+        if resolve_managed_ref(repo_root, resume["suspendedRefName"]) != resume["suspendedCommit"]:
+            raise FlowError("Invalid stacked resume state: suspended ref does not match its checkpoint.")
+    except FlowError:
+        raise
+    except (KeyError, RepositoryError) as exc:
+        raise FlowError(f"Invalid stacked resume state: {exc}") from exc
 
 
 def _promotion_review_record_path(repo_root: Path) -> Path:
@@ -823,6 +892,22 @@ def _parse_issue_number(command_name: str, arguments: list[str]) -> int:
     return issue_number
 
 
+def _parse_prerequisite_start(command_name: str, arguments: list[str]) -> tuple[int, int] | None:
+    if "--prerequisite-for" not in arguments:
+        return None
+    if len(arguments) != 3 or arguments[1] != "--prerequisite-for":
+        raise _usage_error(
+            command_name,
+            "start",
+            "<issue-number> [--prerequisite-for <active-issue>]",
+        )
+    prerequisite_number = _parse_issue_number(command_name, [arguments[0]])
+    active_number = _parse_issue_number(command_name, [arguments[2]])
+    if prerequisite_number == active_number:
+        raise FlowError("Cannot start prerequisite workflow: issue numbers must be distinct.")
+    return prerequisite_number, active_number
+
+
 def _resolve_issue_details_with_labels(issue_number: int) -> tuple[str, str, list[str]]:
     completed = subprocess.run(
         ["gh", "issue", "view", str(issue_number), "--json", "title,url,labels"],
@@ -933,10 +1018,13 @@ def _validate_patch_prerequisites(
 
 
 def handle_start(command_name: str, arguments: list[str]) -> int:
+    prerequisite_arguments = _parse_prerequisite_start(command_name, arguments)
+    if prerequisite_arguments is not None:
+        return _handle_prerequisite_start(command_name, *prerequisite_arguments)
+
     issue_number = _parse_issue_number(command_name, arguments)
 
     repo_root, state_path, state = _resolve_repo_state_context()
-
     active_workflow_type = _active_workflow_type(state)
     if active_workflow_type is not None:
         if state.active_issue_number is not None:
@@ -1048,6 +1136,194 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
     print(f"scratchBranch: {state.scratch_branch}")
     print("checkpoint: 0")
 
+    return 0
+
+
+def _handle_prerequisite_start(
+    command_name: str,
+    prerequisite_number: int,
+    active_number: int,
+) -> int:
+    repo_root, state_path, state = _resolve_repo_state_context()
+    if state.patch_description is not None:
+        raise FlowError("Cannot start prerequisite workflow: patch workflows are unsupported.")
+    if state.active_issue_number is None:
+        raise FlowError("Cannot start prerequisite workflow: no active issue workflow exists.")
+    if state.active_issue_number != active_number:
+        raise FlowError(
+            f"Cannot start prerequisite workflow: active issue is {state.active_issue_number}, not {active_number}."
+        )
+    if state.stacked_handoff is not None:
+        try:
+            current_ref = resolve_managed_ref(
+                repo_root,
+                state.stacked_handoff.suspended_ref_name,
+            )
+        except RepositoryError as exc:
+            raise FlowError(f"Cannot start prerequisite workflow: cannot validate suspended ref. {exc}") from exc
+        if current_ref != state.stacked_handoff.suspended_commit:
+            raise FlowError(
+                "Cannot start prerequisite workflow: persisted suspended ref does not match its commit."
+            )
+        raise FlowError("Cannot start prerequisite workflow: nested handoffs are unsupported.")
+    if state.ticket_reference is None:
+        raise FlowError("Cannot start prerequisite workflow: active issue has no ticket reference.")
+
+    _ensure_main_and_scratch_branches_exist(repo_root, state)
+    if current_branch_name(repo_root) != state.scratch_branch:
+        raise FlowError(
+            f"Cannot start prerequisite workflow: current branch must be {state.scratch_branch}."
+        )
+    if git_status_short(repo_root):
+        raise FlowError("Cannot start prerequisite workflow: repository must be clean.")
+    ensure_no_active_git_operations(repo_root)
+    comparison = compare_main_and_scratch(
+        repo_root,
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+    )
+    if comparison.scratch_behind_main != 0 or not branch_is_ancestor(
+        repo_root,
+        ancestor_revision=state.main_branch,
+        descendant_revision=state.scratch_branch,
+    ):
+        raise FlowError(
+            f"Cannot start prerequisite workflow: {state.scratch_branch} must be at or ahead of {state.main_branch}."
+        )
+
+    blocked_file = blocked_workflows_file_for_repo_root(repo_root)
+    blocked_file_existed_before = blocked_file.exists()
+    blocked_before = load_blocked_workflows(blocked_file)
+    if get_blocked_workflow(blocked_file, prerequisite_number) is not None:
+        raise FlowError(
+            f"Cannot start prerequisite workflow: issue {prerequisite_number} is already blocked."
+        )
+
+    try:
+        provider = resolve_ticket_provider_for_reference(
+            repo_root=repo_root,
+            reference=state.ticket_reference,
+        )
+        active_ticket = provider.get(str(active_number))
+        prerequisite_ticket = provider.get(str(prerequisite_number))
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+    if active_ticket.workflow_state != "active":
+        raise FlowError(
+            f"Cannot start prerequisite workflow: issue {active_number} is not active in the ticket provider."
+        )
+    if prerequisite_ticket.lifecycle_state != "open":
+        raise FlowError(
+            f"Cannot start prerequisite workflow: ticket {prerequisite_number} is {prerequisite_ticket.lifecycle_state}."
+        )
+    if prerequisite_ticket.workflow_state != "inactive":
+        raise FlowError(
+            f"Cannot start prerequisite workflow: issue {prerequisite_number} is already {prerequisite_ticket.workflow_state}."
+        )
+
+    try:
+        inherited_commit = resolve_commit_hash(repo_root, state.scratch_branch)
+        inherited_tree = resolve_tree_hash(repo_root, state.scratch_branch)
+        suspended_base_commit = resolve_commit_hash(repo_root, state.main_branch)
+        suspended_tree = inherited_tree
+    except RepositoryError as exc:
+        raise FlowError(f"Cannot start prerequisite workflow: cannot record Git identity. {exc}") from exc
+
+    handoff = StackedHandoff(
+        relationship="prerequisite",
+        prerequisite_for_issue_number=active_number,
+        inherited_base_commit=inherited_commit,
+        inherited_base_tree=inherited_tree,
+        suspended_issue_number=active_number,
+        suspended_issue_title=active_ticket.title,
+        suspended_issue_url=active_ticket.reference.url or state.active_issue_url,
+        suspended_ticket_reference=active_ticket.reference,
+        suspended_checkpoint=state.checkpoint,
+        suspended_commit=inherited_commit,
+        suspended_tree=suspended_tree,
+        suspended_base_commit=suspended_base_commit,
+        suspended_ref_name=f"{_SUSPENDED_REF_PREFIX}{active_number}",
+    )
+    next_state = normalize_and_validate(
+        WorkflowState(
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+            checkpoint=0,
+            active_issue_number=prerequisite_number,
+            active_issue_title=prerequisite_ticket.title,
+            active_issue_url=prerequisite_ticket.reference.url,
+            ticket_reference=prerequisite_ticket.reference,
+            stacked_handoff=handoff,
+        ).to_dict(),
+        context="prerequisite start command",
+    )
+    blocked_record = BlockedWorkflowRecord(
+        issue_number=active_number,
+        issue_title=active_ticket.title,
+        issue_url=active_ticket.reference.url or state.active_issue_url,
+        reason=f"Suspended for prerequisite issue {prerequisite_number}.",
+        blocked_at=_now_utc_iso_timestamp(),
+        ticket_reference=active_ticket.reference,
+    )
+
+    ref_created = False
+    provider_changed = False
+    try:
+        ref_created = create_managed_ref(
+            repo_root,
+            handoff.suspended_ref_name,
+            inherited_commit,
+        )
+        provider_changed = True
+        provider.block(active_ticket.reference, blocked_record.reason)
+        provider.mark_active(prerequisite_ticket.reference)
+        upsert_blocked_workflow(blocked_file, blocked_record)
+        save_state(state_path, next_state)
+    except (RepositoryError, TicketProviderError, BlockedWorkflowsError, WorkflowStateError) as exc:
+        rollback_errors: list[str] = []
+        try:
+            save_state(state_path, state)
+        except WorkflowStateError as rollback_exc:
+            rollback_errors.append(f"workflow state rollback failed: {rollback_exc}")
+        try:
+            save_blocked_workflows(blocked_file, blocked_before)
+            if not blocked_file_existed_before and blocked_file.exists():
+                blocked_file.unlink()
+        except BlockedWorkflowsError as rollback_exc:
+            rollback_errors.append(f"blocked registry rollback failed: {rollback_exc}")
+        except OSError as rollback_exc:
+            rollback_errors.append(f"blocked registry rollback failed: {rollback_exc}")
+        if provider_changed:
+            try:
+                provider.deactivate(
+                    prerequisite_ticket.reference,
+                    prerequisite_ticket.labels,
+                )
+            except TicketProviderError as rollback_exc:
+                rollback_errors.append(f"prerequisite provider rollback failed: {rollback_exc}")
+            try:
+                provider.resume(active_ticket.reference)
+            except TicketProviderError as rollback_exc:
+                rollback_errors.append(f"active issue provider rollback failed: {rollback_exc}")
+        if ref_created:
+            try:
+                delete_managed_ref(
+                    repo_root,
+                    handoff.suspended_ref_name,
+                    inherited_commit,
+                )
+            except RepositoryError as rollback_exc:
+                rollback_errors.append(f"suspended ref rollback failed: {rollback_exc}")
+        message = f"Cannot start prerequisite workflow: handoff failed. {exc}"
+        if rollback_errors:
+            message += " Remaining recovery state: " + " | ".join(rollback_errors)
+        raise FlowError(message) from exc
+
+    print(f"Started prerequisite issue {prerequisite_number} for issue {active_number}")
+    print(f"mainBranch: {state.main_branch}")
+    print(f"scratchBranch: {state.scratch_branch}")
+    print("checkpoint: 0")
+    print(f"inheritedBase: {inherited_commit}")
     return 0
 
 
@@ -1590,11 +1866,15 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
     commit_message = arguments[0].strip() if arguments else ""
     if arguments and not commit_message:
         raise _promote_usage(command_name)
+
     if not arguments:
         try:
-            resolve_repo_root()
-        except RepositoryError as exc:
-            raise _promote_usage(command_name) from exc
+            repo_root_for_retry = resolve_repo_root()
+            pending_record = load_promotion_sync_record(repo_root_for_retry)
+        except (RepositoryError, PromotionSyncError):
+            pending_record = None
+        if pending_record is None or pending_record.status != "pending":
+            raise _promote_usage(command_name)
 
     repo_root, state_path, state = _resolve_repo_state_context()
 
@@ -1656,6 +1936,12 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
     upstream = _require_tracked_upstream_preflight(repo_root, state)
     _require_valid_promotion_review_gate(repo_root, state)
 
+    if state.stacked_handoff is not None:
+        print(
+            "Warning: promoting this prerequisite publishes the complete physical "
+            "A+B tree, including suspended issue A's partial tree."
+        )
+
     original_branch = current_branch
     original_main_commit = resolve_commit_hash(repo_root, state.main_branch)
     original_scratch_commit = resolve_commit_hash(repo_root, state.scratch_branch)
@@ -1693,9 +1979,52 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
                 "Cannot promote workflow: promoted tree does not match scratch tree."
             )
 
-        updated_state = replace(state, checkpoint=0)
+        updated_resume = state.stacked_resume
+        if state.stacked_handoff is not None:
+            updated_resume = {
+                "suspendedIssueNumber": state.stacked_handoff.suspended_issue_number,
+                "promotedMainCommit": commit_hash,
+                "suspendedCommit": state.stacked_handoff.suspended_commit,
+                "suspendedRefName": state.stacked_handoff.suspended_ref_name,
+                "checkpoint": state.stacked_handoff.suspended_checkpoint,
+            }
+        if updated_resume is not None:
+            updated_resume = {
+                **updated_resume,
+                "promotedMainCommit": commit_hash,
+            }
+        updated_state = replace(
+            state,
+            checkpoint=0,
+            stacked_resume=updated_resume,
+        )
         save_state(state_path, updated_state)
         workflow_state_updated = True
+
+        if state.stacked_handoff is not None:
+            blocked_file = blocked_workflows_file_for_repo_root(repo_root)
+            blocked_records = load_blocked_workflows(blocked_file)
+            suspended_record = get_blocked_workflow(
+                blocked_file,
+                state.stacked_handoff.suspended_issue_number,
+            )
+            if suspended_record is None:
+                raise FlowError(
+                    "Cannot promote workflow: suspended issue blocked record is missing."
+                )
+            assert updated_resume is not None
+            resume_metadata = updated_resume
+            updated_record = replace(
+                suspended_record,
+                resume_metadata=resume_metadata,
+            )
+            save_blocked_workflows(
+                blocked_file,
+                [
+                    updated_record if item.issue_number == updated_record.issue_number else item
+                    for item in blocked_records
+                ],
+            )
 
         sync_record: PromotionSyncRecord | None = None
         if upstream is not None:
@@ -1804,9 +2133,14 @@ def _flow_diff_cached_changes(repo_root: Path) -> str:
     return diff_completed.stdout
 
 
-def _flow_diff_workflow_changes(repo_root: Path, *, main_branch: str, scratch_branch: str) -> str:
+def _flow_diff_workflow_changes(
+    repo_root: Path,
+    *,
+    base_revision: str,
+    scratch_branch: str,
+) -> str:
     diff_completed = subprocess.run(
-        ["git", "-C", str(repo_root), "diff", "--binary", "--no-ext-diff", f"{main_branch}...{scratch_branch}"],
+        ["git", "-C", str(repo_root), "diff", "--binary", "--no-ext-diff", f"{base_revision}...{scratch_branch}"],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -2174,6 +2508,20 @@ def _validate_flow_diff_baseline_identity(
     if workflow.get("patchDescription") != state.patch_description:
         raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
 
+    baseline_stacked = workflow.get("stackedScope")
+    if state.stacked_handoff is None:
+        if baseline_stacked is not None:
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+    else:
+        expected_stacked = {
+            "activeIssueNumber": state.active_issue_number,
+            "inheritedBaseCommit": state.stacked_handoff.inherited_base_commit,
+            "suspendedIssueNumber": state.stacked_handoff.suspended_issue_number,
+            "suspendedRefName": state.stacked_handoff.suspended_ref_name,
+        }
+        if baseline_stacked != expected_stacked:
+            raise FlowError(_FLOW_DIFF_BASELINE_INVALID)
+
     return baseline_head
 
 
@@ -2384,6 +2732,14 @@ def _flow_diff_refresh_baseline(repo_root: Path, state: WorkflowState) -> None:
         working_snapshots[path_text] = base64.b64encode(content).decode("ascii")
 
     workflow_type = _active_workflow_type(state) or "none"
+    stacked_scope = None
+    if state.stacked_handoff is not None:
+        stacked_scope = {
+            "activeIssueNumber": state.active_issue_number,
+            "inheritedBaseCommit": state.stacked_handoff.inherited_base_commit,
+            "suspendedIssueNumber": state.stacked_handoff.suspended_issue_number,
+            "suspendedRefName": state.stacked_handoff.suspended_ref_name,
+        }
     baseline_payload = {
         "version": 1,
         "capturedAt": _now_utc_iso_timestamp(),
@@ -2399,6 +2755,7 @@ def _flow_diff_refresh_baseline(repo_root: Path, state: WorkflowState) -> None:
             "checkpoint": state.checkpoint,
             "activeIssueNumber": state.active_issue_number,
             "patchDescription": state.patch_description,
+            "stackedScope": stacked_scope,
         },
         "status": {
             "staged": sorted(staged_paths),
@@ -2448,9 +2805,12 @@ def handle_diff(command_name: str, arguments: list[str]) -> int:
 
     committed_diff = ""
     if include_all:
+        base_revision = state.main_branch
+        if state.stacked_handoff is not None:
+            base_revision = state.stacked_handoff.inherited_base_commit
         committed_diff = _flow_diff_workflow_changes(
             repo_root,
-            main_branch=state.main_branch,
+            base_revision=base_revision,
             scratch_branch=state.scratch_branch,
         )
 
@@ -2508,17 +2868,21 @@ def handle_reset(command_name: str, arguments: list[str]) -> int:
     sync_local_excludes(repo_root)
 
     try:
+        reset_revision = state.main_branch
+        if state.stacked_handoff is not None:
+            reset_revision = state.stacked_handoff.inherited_base_commit
         hard_reset_branch_to_revision(
             repo_root,
             branch_name=state.scratch_branch,
-            revision=state.main_branch,
+            revision=reset_revision,
         )
         clean_untracked_non_ignored(repo_root)
-        ensure_branches_point_to_same_commit(
-            repo_root,
-            left_branch=state.main_branch,
-            right_branch=state.scratch_branch,
-        )
+        if state.stacked_handoff is None:
+            ensure_branches_point_to_same_commit(
+                repo_root,
+                left_branch=state.main_branch,
+                right_branch=state.scratch_branch,
+            )
     except RepositoryError as exc:
         raise FlowError(f"Git reset failed: {exc}") from exc
 
@@ -2538,7 +2902,8 @@ def handle_reset(command_name: str, arguments: list[str]) -> int:
         raise FlowError(f"Scratch was reset but stale promotion synchronization state could not be cleared. {exc}") from exc
     _clear_diff_baseline_after_success(repo_root, operation="reset")
 
-    print(f"Reset {state.scratch_branch} to {state.main_branch}")
+    reset_target = "inherited base" if state.stacked_handoff is not None else state.main_branch
+    print(f"Reset {state.scratch_branch} to {reset_target}")
     print("checkpoint: 0")
     if state.patch_description is not None:
         print(f"patch: {state.patch_description}")
@@ -2612,6 +2977,7 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
         raise _complete_usage(command_name)
 
     repo_root, state_path, state = _resolve_repo_state_context()
+    _validate_stacked_resume(repo_root, state)
 
     if _active_workflow_type(state) is None:
         raise FlowError("Cannot complete workflow: no active issue is set.")
@@ -2698,6 +3064,19 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
                     "Cannot complete workflow: failed to complete bound ticket "
                     f"{state.active_issue_number}. {exc}"
                 ) from exc
+
+    if state.stacked_resume is not None and state.stacked_handoff is None:
+        try:
+            delete_managed_ref(
+                repo_root,
+                state.stacked_resume["suspendedRefName"],
+                state.stacked_resume["suspendedCommit"],
+            )
+        except RepositoryError as exc:
+            raise FlowError(
+                "Cannot complete workflow: ticket completion succeeded but suspended ref cleanup failed. "
+                f"Retry flow-complete after fixing the managed ref. {exc}"
+            ) from exc
 
     inactive_state = WorkflowState(
         main_branch=state.main_branch,
@@ -2931,6 +3310,7 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
     issue_number = int(issue_text)
 
     repo_root, state_path, state = _resolve_repo_state_context()
+    _validate_stacked_resume(repo_root, state)
 
     if _active_workflow_type(state) is not None:
         if state.active_issue_number is not None:
@@ -2965,6 +3345,15 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
             f"Cannot resume workflow: no blocked record exists for issue {issue_number}."
         )
 
+    stacked_resume = blocked_record.resume_metadata
+    if stacked_resume is not None:
+        if resolve_commit_hash(repo_root, state.main_branch) != stacked_resume["promotedMainCommit"]:
+            raise FlowError("Cannot resume workflow: canonical main is not the recorded promoted commit.")
+        if resolve_commit_hash(repo_root, state.scratch_branch) != stacked_resume["promotedMainCommit"]:
+            raise FlowError("Cannot resume workflow: scratch is not synchronized with the recorded promoted commit.")
+        if resolve_managed_ref(repo_root, stacked_resume["suspendedRefName"]) != stacked_resume["suspendedCommit"]:
+            raise FlowError("Cannot resume workflow: suspended ref does not match its recorded checkpoint.")
+
     if blocked_record.ticket_reference is None:
         # Compatibility path for blocked records created before ticket
         # references were persisted.
@@ -2989,7 +3378,6 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
                     "GitHub invocation error during rollback "
                     f"({exc.__class__.__name__}): {message}"
                 )
-            return None
 
         def _resume_transition_failure_message(
             *,
@@ -3017,10 +3405,12 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
         resumed_state = WorkflowState(
             main_branch=state.main_branch,
             scratch_branch=state.scratch_branch,
-            checkpoint=0,
+            checkpoint=stacked_resume["checkpoint"] if stacked_resume is not None else 0,
             active_issue_number=issue_number,
             active_issue_title=blocked_record.issue_title,
             active_issue_url=blocked_record.issue_url,
+            ticket_reference=blocked_record.ticket_reference,
+            stacked_resume=stacked_resume,
         )
 
         try:
@@ -3074,11 +3464,12 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
         resumed_state = WorkflowState(
             main_branch=state.main_branch,
             scratch_branch=state.scratch_branch,
-            checkpoint=0,
+            checkpoint=stacked_resume["checkpoint"] if stacked_resume is not None else 0,
             active_issue_number=issue_number,
             active_issue_title=resumed_ticket.title,
             active_issue_url=resumed_ticket.reference.url,
             ticket_reference=resumed_ticket.reference,
+            stacked_resume=stacked_resume,
         )
 
         try:
@@ -3131,7 +3522,10 @@ def handle_resume(command_name: str, arguments: list[str]) -> int:
     print(f"Resumed issue {issue_number}")
     print(f"mainBranch: {state.main_branch}")
     print(f"scratchBranch: {state.scratch_branch}")
-    print("checkpoint: 0")
+    print(
+        "checkpoint: "
+        f"{stacked_resume['checkpoint'] if stacked_resume is not None else 0}"
+    )
     return 0
 
 
@@ -3168,6 +3562,13 @@ def handle_status(command_name: str, arguments: list[str]) -> int:
     relation_state, main_only_count, scratch_only_count = _branch_relation_info(comparison)
 
     workflow_type = _workflow_type(state)
+    stacked_scope_checkpoint: int | None = None
+    if state.stacked_handoff is not None:
+        stacked_scope_checkpoint = commit_count_between(
+            repo_root,
+            ancestor_revision=state.stacked_handoff.inherited_base_commit,
+            descendant_revision=state.scratch_branch,
+        )
 
     if not verbose:
         if workflow_type == "issue" and state.active_issue_number is not None:
@@ -3188,6 +3589,12 @@ def handle_status(command_name: str, arguments: list[str]) -> int:
             main_only_count,
             scratch_only_count,
         )
+        if (
+            state.stacked_handoff is not None
+            and relation_state == "ahead"
+            and stacked_scope_checkpoint == state.checkpoint
+        ):
+            relationship_line = ""
 
         has_deviation = False
         if workflow_type != "none" and current_branch != state.scratch_branch:
@@ -3197,7 +3604,11 @@ def handle_status(command_name: str, arguments: list[str]) -> int:
         if staged_count > 0 or modified_count > 0 or untracked_count > 0:
             has_deviation = True
 
-        checkpoint_conveyed = relation_state == "ahead" and scratch_only_count == state.checkpoint
+        checkpoint_conveyed = relation_state == "ahead" and (
+            stacked_scope_checkpoint == state.checkpoint
+            if state.stacked_handoff is not None
+            else scratch_only_count == state.checkpoint
+        )
         if state.checkpoint != 0 and not checkpoint_conveyed:
             has_deviation = True
 
@@ -3241,16 +3652,32 @@ def handle_status(command_name: str, arguments: list[str]) -> int:
     print(f"  current branch: {current_branch}")
     print(f"  main branch: {state.main_branch}")
     print(f"  scratch branch: {state.scratch_branch}")
-    print(
-        "  relation: "
-        + _relationship_line_for_verbose_status(
-            relation_state,
-            main_only_count,
-            scratch_only_count,
-            state.main_branch,
-            state.scratch_branch,
-        )
+    physical_relationship = _relationship_line_for_verbose_status(
+        relation_state,
+        main_only_count,
+        scratch_only_count,
+        state.main_branch,
+        state.scratch_branch,
     )
+    if state.stacked_handoff is not None:
+        physical_relationship += "; includes inherited A tree"
+    print("  relation: " + physical_relationship)
+
+    if state.stacked_handoff is not None:
+        handoff = state.stacked_handoff
+        print("Stacked workflow:")
+        print(f"  active prerequisite: issue {state.active_issue_number}")
+        print(
+            "  suspended original: issue "
+            f"{handoff.suspended_issue_number}"
+        )
+        print(f"  suspended checkpoint: {handoff.suspended_checkpoint}")
+        print(f"  inherited base commit: {handoff.inherited_base_commit}")
+        print(f"  managed suspended ref: {handoff.suspended_ref_name}")
+        print(
+            "  active scope: "
+            f"checkpoint {state.checkpoint}, {stacked_scope_checkpoint} commit(s) from inherited base"
+        )
 
     print("Working tree:")
     if working_tree == "clean":

@@ -527,6 +527,57 @@ def resolve_tree_hash(repo_root: Path, revision: str = "HEAD") -> str:
     return tree_hash
 
 
+def resolve_managed_ref(repo_root: Path, ref_name: str) -> str | None:
+    completed = _run_git(
+        repo_root,
+        ["show-ref", "--verify", "--hash", ref_name],
+        check=False,
+    )
+    if completed.returncode == 1:
+        return None
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        if completed.returncode == 128 and "not a valid ref" in stderr:
+            return None
+        raise RepositoryError(stderr or f"Cannot resolve Git ref {ref_name}.")
+    return completed.stdout.strip()
+
+
+def create_managed_ref(repo_root: Path, ref_name: str, commit: str) -> bool:
+    existing = resolve_managed_ref(repo_root, ref_name)
+    if existing is not None:
+        if existing != commit:
+            raise RepositoryError(
+                f"Managed ref {ref_name} already points to {existing}, not {commit}."
+            )
+        return False
+
+    completed = _run_git(repo_root, ["update-ref", ref_name, commit], check=False)
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        raise RepositoryError(stderr or f"Cannot create managed Git ref {ref_name}.")
+    return True
+
+
+def delete_managed_ref(repo_root: Path, ref_name: str, commit: str) -> None:
+    existing = resolve_managed_ref(repo_root, ref_name)
+    if existing is None:
+        return
+    if existing != commit:
+        raise RepositoryError(
+            f"Refusing to delete managed ref {ref_name}: it points to {existing}, not {commit}."
+        )
+
+    completed = _run_git(
+        repo_root,
+        ["update-ref", "-d", ref_name, commit],
+        check=False,
+    )
+    if completed.returncode != 0:
+        stderr = completed.stderr.strip()
+        raise RepositoryError(stderr or f"Cannot delete managed Git ref {ref_name}.")
+
+
 def hard_reset_branch_to_revision(
     repo_root: Path,
     *,
@@ -769,6 +820,23 @@ def max_numbered_checkpoint_relative_to_main(
                 max_checkpoint = value
 
     return max_checkpoint
+
+
+def commit_count_between(
+    repo_root: Path,
+    *,
+    ancestor_revision: str,
+    descendant_revision: str,
+) -> int:
+    completed = _run_git(
+        repo_root,
+        ["rev-list", "--count", f"{ancestor_revision}..{descendant_revision}"],
+        check=True,
+    )
+    count_text = completed.stdout.strip()
+    if not count_text:
+        return 0
+    return int(count_text)
 
 
 def _pathspec_arguments(excluded_paths: Sequence[str]) -> list[str]:

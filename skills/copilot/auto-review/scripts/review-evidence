@@ -194,6 +194,14 @@ else
   printf 'none in scope\n\n'
 fi
 
+if [[ "$mode" == "promotion" && -n "$range" ]]; then
+  printf '## Promotion Physical Scope\n\n'
+  printf 'published range: %s\n' "$range"
+  printf 'This is the complete physical tree published by promotion; active stacked diff remains inherited-base-relative.\n\n'
+  git diff --stat "$range"
+  printf '\n'
+fi
+
 printf '## Uncommitted\n\n'
 if [[ -n "$uncommitted" ]]; then
   printf '%s\n\n' "$uncommitted"

@@ -70,6 +70,9 @@ init_repo() {
 	"tickets": {
 		"provider": "local",
 		"path": ".ai-dev/tickets"
+	},
+	"review": {
+		"promotionGate": false
 	}
 }
 EOF
@@ -198,6 +201,18 @@ issue_state = issue.get('state', '')
 if not isinstance(issue_state, str):
 	issue_state = ''
 print(issue_state)
+PY
+}
+
+read_local_ticket_lifecycle() {
+	local repo_root="$1"
+	local issue_number="$2"
+	python3 - "$repo_root/.ai-dev/tickets/${issue_number}.json" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as handle:
+	print(json.load(handle).get('lifecycleState', ''))
 PY
 }
 
@@ -333,7 +348,7 @@ complete_output="$(run_flow "$lifecycle_repo/subdir" complete)"
 assert_contains "$complete_output" 'Completed issue 123'
 assert_contains "$complete_output" 'Workflow: inactive'
 assert_contains "$complete_output" 'checkpoint: 0'
-assert_equals "$(read_gh_issue_state "$gh_state_file" '123')" 'closed'
+assert_equals "$(read_local_ticket_lifecycle "$lifecycle_repo" '123')" 'closed'
 
 status_after_complete="$(run_flow "$lifecycle_repo/subdir" status)"
 assert_equals "$status_after_complete" $'No active workflow.\nBranch: scratch'

@@ -22,6 +22,7 @@ class BlockedWorkflowRecord:
     reason: str
     blocked_at: str
     ticket_reference: TicketReference | None = None
+    resume_metadata: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -33,6 +34,11 @@ class BlockedWorkflowRecord:
             **(
                 {"ticket": self.ticket_reference.to_dict()}
                 if self.ticket_reference is not None
+                else {}
+            ),
+            **(
+                {"stackedResume": self.resume_metadata}
+                if self.resume_metadata is not None
                 else {}
             ),
         }
@@ -104,6 +110,37 @@ def _normalize_record(record_data: dict[str, Any], *, context: str) -> BlockedWo
                     f"Invalid blocked workflow record in {context}: ticket.ticketId must match issueNumber."
                 )
 
+    resume_metadata = record_data.get("stackedResume")
+    if resume_metadata is not None and not isinstance(resume_metadata, dict):
+        raise BlockedWorkflowsError(
+            f"Invalid blocked workflow record in {context}: stackedResume must be an object."
+        )
+    if resume_metadata is not None:
+        required_resume = {
+            "suspendedIssueNumber",
+            "promotedMainCommit",
+            "suspendedCommit",
+            "suspendedRefName",
+            "checkpoint",
+        }
+        if set(resume_metadata) != required_resume:
+            raise BlockedWorkflowsError(
+                f"Invalid blocked workflow record in {context}: stackedResume has malformed fields."
+            )
+        if (
+            not _is_int(resume_metadata["suspendedIssueNumber"])
+            or resume_metadata["suspendedIssueNumber"] != issue_number
+            or not _is_int(resume_metadata["checkpoint"])
+            or resume_metadata["checkpoint"] < 0
+            or any(
+                not isinstance(resume_metadata[key], str) or not resume_metadata[key].strip()
+                for key in ("promotedMainCommit", "suspendedCommit", "suspendedRefName")
+            )
+        ):
+            raise BlockedWorkflowsError(
+                f"Invalid blocked workflow record in {context}: stackedResume contains invalid values."
+            )
+
     blocked_at = record_data["blockedAt"]
     if not isinstance(blocked_at, str) or not blocked_at.strip():
         raise BlockedWorkflowsError(
@@ -125,6 +162,7 @@ def _normalize_record(record_data: dict[str, Any], *, context: str) -> BlockedWo
         reason=reason.strip(),
         blocked_at=blocked_at.strip(),
         ticket_reference=ticket_reference,
+        resume_metadata=resume_metadata,
     )
 
 

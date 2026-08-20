@@ -64,6 +64,12 @@ class TicketProvider(Protocol):
 
     def mark_active(self, reference: TicketReference) -> Ticket: ...
 
+    def deactivate(
+        self,
+        reference: TicketReference,
+        previous_labels: tuple[str, ...] = (),
+    ) -> Ticket: ...
+
     def block(self, reference: TicketReference, reason: str) -> Ticket: ...
 
     def resume(self, reference: TicketReference) -> Ticket: ...
@@ -398,6 +404,34 @@ class LocalTicketProvider:
             labels=ticket.labels,
             lifecycle_state=ticket.lifecycle_state,
             workflow_state="active",
+            block_reason=None,
+            created_at=ticket.created_at,
+            updated_at=now,
+            closed_at=ticket.closed_at,
+        )
+        self._write_ticket(updated)
+        return updated
+
+    def deactivate(
+        self,
+        reference: TicketReference,
+        previous_labels: tuple[str, ...] = (),
+    ) -> Ticket:
+        ticket = self._require_local_reference(reference)
+        now = _now_utc_iso_timestamp()
+        workflow_state = "inactive"
+        if "active" in previous_labels:
+            workflow_state = "active"
+        elif "blocked" in previous_labels:
+            workflow_state = "blocked"
+        updated = Ticket(
+            reference=ticket.reference,
+            title=ticket.title,
+            body=ticket.body,
+            acceptance_criteria=ticket.acceptance_criteria,
+            labels=previous_labels,
+            lifecycle_state=ticket.lifecycle_state,
+            workflow_state=workflow_state,
             block_reason=None,
             created_at=ticket.created_at,
             updated_at=now,
@@ -1117,6 +1151,33 @@ class GitHubTicketProvider:
             issue_number=reference.ticket_id,
             target_label="active",
             labels=ticket.labels,
+        )
+        return self.get(reference.ticket_id)
+
+    def deactivate(
+        self,
+        reference: TicketReference,
+        previous_labels: tuple[str, ...] = (),
+    ) -> Ticket:
+        repository = self._reference_repository(reference)
+        if "active" in previous_labels:
+            target_label = "active"
+        elif "blocked" in previous_labels:
+            target_label = "blocked"
+        elif "backlog" in previous_labels:
+            target_label = "backlog"
+        else:
+            self._remove_workflow_membership_labels(
+                repository=repository,
+                issue_number=reference.ticket_id,
+                labels=self.get(reference.ticket_id).labels,
+            )
+            return self.get(reference.ticket_id)
+        self._reconcile_workflow_label(
+            repository=repository,
+            issue_number=reference.ticket_id,
+            target_label=target_label,
+            labels=self.get(reference.ticket_id).labels,
         )
         return self.get(reference.ticket_id)
 

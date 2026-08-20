@@ -64,6 +64,9 @@ init_repo() {
   "tickets": {
     "provider": "local",
     "path": ".ai-dev/tickets"
+	},
+	"review": {
+		"promotionGate": false
   }
 }
 EOF

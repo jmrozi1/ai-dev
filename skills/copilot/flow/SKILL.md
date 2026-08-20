@@ -58,6 +58,23 @@ Map natural-language lifecycle requests to this package's local helpers:
 | `/status` or `what's my status?` | `scripts/ticket-status` |
 | `/status verbose` | `scripts/ticket-status verbose` |
 
+### Prerequisite Handoff
+
+- Use `scripts/flow-start <issue>` for independent work that starts from `main`.
+- Use `scripts/flow-start <B> --prerequisite-for <A>` only when A is the active
+  issue and B must inherit A's current clean `scratch` tree. The handoff
+  requires no active Git operation, an exact active-A match, and a supported
+  non-nested relationship.
+- A becomes open/blocked and keeps its historical checkpoint ownership; B is
+  active at checkpoint 0 and its diff/checkpoints begin at the inherited base.
+- Promoting B intentionally publishes the complete physical A+B tree to `main`,
+  including A's partial work. Completing B closes only B. Resuming A restores
+  its prior checkpoint progression but starts a new empty scope from the
+  promoted canonical commit; its next checkpoint is N+1.
+- Managed refs and relationship metadata are internal Flow state. Users must not
+  edit workflow JSON or manufacture branches, refs, or stashes. Patch adoption
+  remains a distinct `flow-patch --adopt` workflow.
+
 ## Lifecycle Distinctions
 
 When the user asks to abandon, cancel, or clear the local workflow without changing the ticket, the executor must read the exact semantics before choosing a command:
