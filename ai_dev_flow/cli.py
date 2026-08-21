@@ -3018,12 +3018,34 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
             f"Cannot complete workflow: {state.scratch_branch} and {state.main_branch} have diverged."
         )
 
-    if state.checkpoint != 0:
+    direct_empty_resumed_completion = (
+        state.stacked_resume is not None
+        and state.stacked_handoff is None
+        and state.checkpoint == state.stacked_resume["checkpoint"]
+        and resolve_commit_hash(repo_root, state.main_branch)
+        == state.stacked_resume["promotedMainCommit"]
+    )
+
+    if state.checkpoint != 0 and not direct_empty_resumed_completion:
         raise FlowError(
             f"Cannot complete workflow: checkpoint must be 0 (current: {state.checkpoint})."
         )
 
-    _require_synchronized_completion_state(repo_root, state)
+    if direct_empty_resumed_completion:
+        try:
+            pending_sync = load_promotion_sync_record(repo_root)
+        except PromotionSyncError as exc:
+            raise FlowError(
+                "Cannot complete workflow: promotion synchronization state is invalid. "
+                f"{exc}"
+            ) from exc
+        if pending_sync is not None and pending_sync.status == "pending":
+            raise FlowError(
+                "Cannot complete workflow: promotion synchronization is pending. "
+                "Rerun flow-promote to retry remote synchronization."
+            )
+    else:
+        _require_synchronized_completion_state(repo_root, state)
 
     if state.active_issue_number is not None:
         if state.ticket_reference is None:

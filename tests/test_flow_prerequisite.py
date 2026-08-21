@@ -311,6 +311,113 @@ class FlowPrerequisiteTests(unittest.TestCase):
             0,
         )
 
+    def test_empty_resumed_original_completes_without_synthetic_work(self) -> None:
+        repo = self._repo("direct-complete")
+        self.assertEqual(self._invoke(repo, "20", "--prerequisite-for", "10")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "promote", "Publish")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "complete")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "resume", "10")[0], 0)
+        (repo / ".ai-dev" / "promotion-sync.json").unlink(missing_ok=True)
+        (repo / ".ai-dev" / "promotion-review.json").unlink(missing_ok=True)
+
+        code, output, err = self._invoke_command(repo, "complete")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Completed issue 10", output)
+        self.assertEqual(json.loads((repo / ".ai-dev/tickets/10.json").read_text())["lifecycleState"], "closed")
+        self.assertFalse((repo / ".ai-dev/workflow.json").read_text().find("stackedResume") >= 0)
+        self.assertNotEqual(
+            subprocess.run(
+                ["git", "-C", str(repo), "show-ref", "--verify", "--hash", "refs/ai-dev/suspended/10"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            ).returncode,
+            0,
+        )
+
+    def test_new_resumed_work_still_requires_promotion(self) -> None:
+        repo = self._repo("direct-complete-new-work")
+        self.assertEqual(self._invoke(repo, "20", "--prerequisite-for", "10")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "promote", "Publish")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "complete")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "resume", "10")[0], 0)
+        (repo / "new-a.txt").write_text("new A\n", encoding="utf-8")
+        self._git(repo, "add", "new-a.txt")
+        self.assertEqual(self._invoke_command(repo, "commit")[0], 0)
+
+        code, _, err = self._invoke_command(repo, "complete")
+
+        self.assertEqual(code, 1)
+        self.assertIn("scratch is not the recorded promoted commit", err)
+        self.assertEqual(json.loads((repo / ".ai-dev/tickets/10.json").read_text())["lifecycleState"], "open")
+
+    def test_direct_completion_rejects_canonical_or_ref_mismatch_before_provider(self) -> None:
+        repo = self._repo("direct-complete-mismatch")
+        self.assertEqual(self._invoke(repo, "20", "--prerequisite-for", "10")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "promote", "Publish")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "complete")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "resume", "10")[0], 0)
+        self._git(repo, "update-ref", "refs/ai-dev/suspended/10", self._git(repo, "rev-parse", "main"))
+
+        with patch.object(LocalTicketProvider, "complete", side_effect=AssertionError("provider must not run")):
+            code, _, err = self._invoke_command(repo, "complete")
+
+        self.assertEqual(code, 1)
+        self.assertIn("suspended ref does not match", err)
+
+    def test_resumed_original_rejects_canonical_drift_before_provider(self) -> None:
+        repo = self._repo("canonical-drift")
+        self.assertEqual(self._invoke(repo, "20", "--prerequisite-for", "10")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "promote", "Publish")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "complete")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "resume", "10")[0], 0)
+
+        drift_branch = "canonical-drift"
+        self._git(repo, "branch", drift_branch)
+        (repo / "canonical-drift.txt").write_text("canonical drift\n", encoding="utf-8")
+        self._git(repo, "add", "canonical-drift.txt")
+        self._git(repo, "commit", "-q", "-m", "canonical drift")
+        drift_commit = self._git(repo, "rev-parse", "HEAD")
+        self._git(repo, "checkout", "-q", "main")
+        self._git(repo, "merge", "--ff-only", drift_commit)
+        self._git(repo, "checkout", "-q", "scratch")
+        ref_before = self._git(repo, "show-ref", "--verify", "--hash", "refs/ai-dev/suspended/10")
+
+        with patch.object(LocalTicketProvider, "complete", side_effect=AssertionError("provider must not run")):
+            code, _, err = self._invoke_command(repo, "complete")
+
+        self.assertEqual(code, 1)
+        self.assertIn("main is not the recorded promoted commit", err)
+        self.assertEqual(json.loads((repo / ".ai-dev/tickets/10.json").read_text())["lifecycleState"], "open")
+        self.assertEqual(self._git(repo, "show-ref", "--verify", "--hash", "refs/ai-dev/suspended/10"), ref_before)
+
+    def test_direct_completion_rejects_pending_synchronization(self) -> None:
+        repo = self._repo("direct-complete-pending")
+        self.assertEqual(self._invoke(repo, "20", "--prerequisite-for", "10")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "promote", "Publish")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "complete")[0], 0)
+        self.assertEqual(self._invoke_command(repo, "resume", "10")[0], 0)
+        (repo / ".ai-dev" / "promotion-sync.json").write_text(
+            json.dumps({
+                "version": 1,
+                "status": "pending",
+                "mainBranch": "main",
+                "scratchBranch": "scratch",
+                "promotedMainCommit": self._git(repo, "rev-parse", "main"),
+                "remote": "origin",
+                "upstreamRef": "refs/heads/main",
+                "activeIssueNumber": 10,
+            }),
+            encoding="utf-8",
+        )
+
+        code, _, err = self._invoke_command(repo, "complete")
+
+        self.assertEqual(code, 1)
+        self.assertIn("promotion synchronization is pending", err)
+        self.assertEqual(json.loads((repo / ".ai-dev/tickets/10.json").read_text())["lifecycleState"], "open")
+
     def test_b_completion_provider_failure_preserves_relationship_and_ref(self) -> None:
         repo = self._repo("completion-failure")
         self.assertEqual(self._invoke(repo, "20", "--prerequisite-for", "10")[0], 0)

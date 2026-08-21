@@ -74,6 +74,9 @@ Map natural-language lifecycle requests to this package's local helpers:
 - Managed refs and relationship metadata are internal Flow state. Users must not
   edit workflow JSON or manufacture branches, refs, or stashes. Patch adoption
   remains a distinct `flow-patch --adopt` workflow.
+- After B is promoted and completed, a resumed A with no new active-scope work
+  may complete directly at its recorded promoted commit; new A work still
+  requires the normal checkpoint, review, promotion, and synchronization path.
 
 ## Lifecycle Distinctions
 

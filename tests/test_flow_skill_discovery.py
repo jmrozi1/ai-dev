@@ -103,6 +103,8 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         self.assertIn("next checkpoint is n+1", normalized_content)
         self.assertIn("must not edit workflow json", normalized_content)
         self.assertIn("flow-patch --adopt", normalized_content)
+        self.assertIn("may complete directly", normalized_content)
+        self.assertIn("new a work still requires", normalized_content)
 
     def test_start_ticket_uses_canonical_provider_metadata(self) -> None:
         """Verify start-ticket tasking cannot promote historical catalogs to current intent."""
