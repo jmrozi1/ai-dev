@@ -7,8 +7,13 @@ disable-model-invocation: true
 
 # Copilot Report
 
-Run the installed Copilot Flow helper `scripts/flow-report` from the current
-repository and return its output unchanged. The helper is the sole execution
-adapter; it owns source discovery and parser-health handling, while the shared
-Python renderer owns report semantics. Do not synthesize, summarize, or modify
-the report, repository, Flow state, telemetry, settings, approvals, or logs.
+Use the packaged adapter for this environment:
+
+- [POSIX adapter](./scripts/flow-report)
+- [PowerShell adapter](./scripts/flow-report.ps1)
+
+Each adapter resolves its own installed or source location, finds the sibling
+Flow skill package, and delegates to that package's existing report helper.
+Return the canonical helper output unchanged without synthesizing, summarizing,
+modifying, or reimplementing the report, repository, Flow state, telemetry,
+settings, approvals, or logs.
