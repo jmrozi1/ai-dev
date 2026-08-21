@@ -227,28 +227,9 @@ def parse_otel(path: Path, *, session: str, start: float, end: float) -> dict[st
 
 
 def parse_terminal_diagnostics(path: Path, *, start: float | None = None, end: float | None = None) -> dict[str, Any]:
-    try:
-        if path.suffix == ".log":
-            return _parse_terminal_plaintext(path, start=start, end=end)
-    except OSError as exc:
-        return {"source": "terminal-diagnostic", "status": "unavailable", "detail": str(exc)}
-    actions = []
-    try:
-        records = _iter_jsonl(path)
-        for record in records:
-            timestamp = _timestamp(record.get("timestamp", record.get("ts")))
-            if start is not None and (timestamp is None or timestamp < start): continue
-            if end is not None and (timestamp is None or timestamp > end): continue
-            if not isinstance(record.get("command"), str) or not isinstance(record.get("status"), (str, int)):
-                return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": "terminal record missing command/status"}
-            actions.append({"command": record["command"][:MAX_CONTENT], "status": record["status"], "durationMs": record.get("durationMs"), "autoApprovalReason": record.get("autoApprovalReason")})
-    except OSError as exc:
-        return {"source": "terminal-diagnostic", "status": "unavailable", "detail": str(exc)}
-    except ValueError as exc:
-        return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": str(exc)[:240]}
-    if not actions:
-        return {"source": "terminal-diagnostic", "status": "unavailable", "detail": "no terminal records"}
-    return {"source": "terminal-diagnostic", "status": "validated", "actions": _state(actions[:MAX_ACTIONS]), "count": _state(len(actions))}
+    if path.suffix != ".log":
+        return {"source": "terminal-diagnostic", "status": "unavailable", "detail": "validated source is plaintext terminal.log"}
+    return _parse_terminal_plaintext(path, start=start, end=end)
 
 
 _TERMINAL_LINE = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2} [0-9:.]+) \[[^]]+\] (?P<body>.*)$")
@@ -258,7 +239,9 @@ _FINISHED = re.compile(r"RunInTerminalTool: Finished .*? with exitCode `(?P<code
 
 
 def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | None) -> dict[str, Any]:
-    entries: list[dict[str, Any]] = []
+    analyzers: list[dict[str, Any]] = []
+    executions: list[dict[str, Any]] = []
+    pending: dict[str, Any] | None = None
     try:
         with path.open(encoding="utf-8", errors="replace") as stream:
             for line_number, line in enumerate(stream, 1):
@@ -277,41 +260,42 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
                         return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": f"invalid parsed commands at line {line_number}"}
                     if not isinstance(commands, list) or not all(isinstance(command, str) for command in commands):
                         return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": f"parsed commands are not strings at line {line_number}"}
-                    entries.append({"timestamp": timestamp, "commands": commands, "denied": False, "reason": None})
+                    pending = {"timestamp": timestamp, "commands": commands, "denied": False, "reason": None}
+                    analyzers.append(pending)
                     continue
                 if "RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands" in body:
                     return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": f"unparseable analyzer record at line {line_number}"}
                 if "Sub-command DENIED auto approval" in body or "Command line NOT auto-approved" in body:
-                    if entries:
-                        entries[-1]["denied"] = True
+                    if pending is not None:
+                        pending["denied"] = True
                     continue
                 if "no matching auto approve entries" in body.lower():
-                    if entries:
-                        entries[-1]["reason"] = body[:MAX_CONTENT]
+                    if pending is not None:
+                        pending["reason"] = body[:MAX_CONTENT]
                     continue
                 using = _USING.search(body)
                 if using:
-                    entries.append({"timestamp": timestamp, "executed": using.group("command")[:MAX_CONTENT]})
+                    executions.append({"timestamp": timestamp, "command": using.group("command")[:MAX_CONTENT]})
                     continue
                 finished = _FINISHED.search(body)
-                if finished and entries:
-                    entries[-1]["exitCode"] = finished.group("code") or None
-                    entries[-1]["resultLength"] = int(finished.group("length"))
-                    entries[-1]["error"] = finished.group("error")
+                if finished and executions:
+                    executions[-1]["exitCode"] = finished.group("code") or None
+                    executions[-1]["resultLength"] = int(finished.group("length"))
+                    executions[-1]["error"] = finished.group("error")
     except OSError as exc:
         return {"source": "terminal-diagnostic", "status": "unavailable", "detail": str(exc)}
-    if not entries:
+    if not analyzers and not executions:
         return {"source": "terminal-diagnostic", "status": "unavailable", "detail": "no bounded plaintext terminal records"}
     requests: list[dict[str, Any]] = []
     seen: set[tuple[str, ...]] = set()
     denied_commands = {
-        command
-        for entry in entries
+        _normalize_command(command): entry
+        for entry in analyzers
         if entry.get("denied")
-        for command in entry.get("commands", [])
+        for command in entry["commands"]
     }
-    for entry in entries:
-        commands = entry.get("commands")
+    for entry in analyzers:
+        commands = entry["commands"]
         if not commands:
             continue
         key = tuple(commands)
@@ -319,12 +303,16 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
             continue
         seen.add(key)
         command = commands[-1]
-        execution = next((candidate for candidate in entries if isinstance(candidate.get("executed"), str) and _normalize_command(candidate["executed"]) == _normalize_command(command) and candidate["timestamp"] >= entry["timestamp"]), None)
-        wait = execution["timestamp"] - entry["timestamp"] if execution else None
-        requests.append({"command": command[:MAX_CONTENT], "denied": command in denied_commands, "denialReason": entry.get("reason"), "disposition": "executed" if execution else "unresolved", "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "waitSeconds": wait})
+        denied_entry = denied_commands.get(_normalize_command(command))
+        denied = denied_entry is not None
+        execution = next((candidate for candidate in executions if _normalize_command(candidate["command"]) == _normalize_command(command) and candidate["timestamp"] >= entry["timestamp"]), None)
+        wait = execution["timestamp"] - entry["timestamp"] if denied and execution else None
+        requests.append({"command": command[:MAX_CONTENT], "terminalApprovalRequest": denied, "denialReason": denied_entry.get("reason") if denied_entry else None, "disposition": "executed" if execution else "unresolved", "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "approvalWaitSeconds": wait})
     if not requests:
-        return {"source": "terminal-diagnostic", "status": "validated", "requests": _state([]), "approvalCount": _state(0)}
-    return {"source": "terminal-diagnostic", "status": "validated", "requests": _state(requests[:MAX_ACTIONS]), "approvalCount": _state(sum(1 for request in requests if request["denied"]))}
+        return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": _state(0)}
+    approvals = [request for request in requests if request["terminalApprovalRequest"]]
+    waits = [request["approvalWaitSeconds"] for request in approvals if request["approvalWaitSeconds"] is not None]
+    return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(len(requests)), "terminalApprovalRequestCount": _state(len(approvals)), "approvalRequests": _state(approvals[:MAX_ACTIONS]), "approvalWaitSeconds": _state(sum(waits))}
 
 
 def _normalize_command(command: str) -> str:
@@ -362,7 +350,18 @@ def render_copilot_report(
         lines.append("Prompt: unavailable")
     final = agent_debug.get("finalResponse", {})
     lines.append(f"Final outcome: {final.get('value') if final.get('status') == 'validated' else 'unavailable'}")
-    lines.append(f"Approvals: unavailable")
+    if terminal is None or terminal.get("status") != "validated":
+        lines.append(f"Approvals: {terminal.get('status', 'unavailable') if terminal else 'unavailable'}")
+        lines.append("Approval timing: unavailable")
+    else:
+        requests = terminal.get("approvalRequests", {}).get("value", [])
+        lines.append(f"Approvals: {terminal['terminalApprovalRequestCount']['value']} terminal approval requests")
+        for request in requests[:MAX_ACTIONS]:
+            wait = request.get("approvalWaitSeconds")
+            wait_text = f"; approval wait {wait:.3f}s" if isinstance(wait, (int, float)) else "; approval wait unavailable"
+            reason = request.get("denialReason") or "denial reason unavailable"
+            lines.append(f"Approval request: {request['command']} ({reason}; {request['disposition']}{wait_text})")
+        lines.append(f"Approval timing: {terminal['approvalWaitSeconds']['value']} seconds validated")
     if otel.get("status") == "validated":
         lines.append(f"Tokens: {otel['inputTokens']['value']} input, {otel['outputTokens']['value']} output")
         usage = {"inputTokens": otel["inputTokens"]["value"], "outputTokens": otel["outputTokens"]["value"], "models": [{"requestModel": model, "calls": calls} for model, calls in otel.get("modelCalls", {}).get("value", {}).items()]}
