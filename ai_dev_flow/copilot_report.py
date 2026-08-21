@@ -362,6 +362,10 @@ def render_copilot_report(
             reason = request.get("denialReason") or "denial reason unavailable"
             lines.append(f"Approval request: {request['command']} ({reason}; {request['disposition']}{wait_text})")
         lines.append(f"Approval timing: {terminal['approvalWaitSeconds']['value']} seconds validated")
+    if terminal is not None and terminal.get("status") == "validated":
+        lines.append(f"Timing: approval wait {terminal['approvalWaitSeconds']['value']} seconds validated")
+    else:
+        lines.append("Timing: partial - approval timing unavailable")
     if otel.get("status") == "validated":
         lines.append(f"Tokens: {otel['inputTokens']['value']} input, {otel['outputTokens']['value']} output")
         usage = {"inputTokens": otel["inputTokens"]["value"], "outputTokens": otel["outputTokens"]["value"], "models": [{"requestModel": model, "calls": calls} for model, calls in otel.get("modelCalls", {}).get("value", {}).items()]}
@@ -373,3 +377,59 @@ def render_copilot_report(
     else:
         lines.append("Tokens: unavailable")
     return "\n".join(lines)
+
+
+def _latest_file(root: Path, pattern: str) -> Path | None:
+    candidates = [path for path in root.glob(pattern) if path.is_file()]
+    return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
+
+
+def render_latest_copilot_report(repo_root: Path, *, exclude_session: str | None = None) -> str:
+    """Discover local Copilot sources and render one read-only report."""
+    settings_path = Path.home() / ".config/Code/User/settings.json"
+    otel_path: Path | None = None
+    if settings_path.is_file():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+            configured = settings.get("github.copilot.chat.otel.outfile")
+            if isinstance(configured, str) and configured.strip():
+                otel_path = Path(configured).expanduser()
+        except (OSError, json.JSONDecodeError):
+            otel_path = None
+    debug_path = _latest_file(Path.home() / ".config/Code/User/workspaceStorage", "*/GitHub.copilot-chat/debug-logs/*/main.jsonl")
+    terminal_path = _latest_file(Path.home() / ".config/Code/logs", "*/terminal.log")
+    agent = parse_agent_debug(debug_path, str(repo_root), exclude_session=exclude_session) if debug_path else {"source": "agent-debug", **_unavailable("Agent Debug Log was not found")}
+    session = agent.get("session", {}).get("value")
+    first = agent.get("firstTimestamp", {}).get("value")
+    last = agent.get("lastTimestamp", {}).get("value")
+    if otel_path and isinstance(session, str) and isinstance(first, (int, float)) and isinstance(last, (int, float)):
+        otel = parse_otel(otel_path, session=session, start=first, end=last)
+    elif otel_path is None:
+        otel = {"source": "otel", **_unavailable("OTel output path is not configured")}
+    else:
+        otel = {"source": "otel", **_unavailable("Agent Debug turn boundary is unavailable for OTel correlation")}
+    terminal = parse_terminal_diagnostics(terminal_path, start=first, end=last) if terminal_path and isinstance(first, (int, float)) and isinstance(last, (int, float)) else {"source": "terminal-diagnostic", **_unavailable("terminal.log or completed turn boundary is unavailable")}
+    active_issue = None
+    workflow_path = repo_root / ".ai-dev/workflow.json"
+    try:
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+        issue = workflow.get("activeIssueNumber")
+        if isinstance(issue, int) and issue > 0:
+            active_issue = str(issue)
+    except (OSError, json.JSONDecodeError):
+        pass
+    return render_copilot_report(agent_debug=agent, otel=otel, terminal=terminal, active_issue=active_issue)
+
+
+def main() -> int:
+    import argparse
+
+    parser = argparse.ArgumentParser(prog="flow-report")
+    parser.add_argument("--exclude-session")
+    arguments = parser.parse_args()
+    print(render_latest_copilot_report(Path.cwd(), exclude_session=arguments.exclude_session))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
