@@ -384,9 +384,16 @@ def _latest_file(root: Path, pattern: str) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
-def render_latest_copilot_report(repo_root: Path, *, exclude_session: str | None = None) -> str:
+def render_latest_copilot_report(
+    repo_root: Path,
+    *,
+    exclude_session: str | None = None,
+    settings_path: Path | None = None,
+    debug_root: Path | None = None,
+    terminal_root: Path | None = None,
+) -> str:
     """Discover local Copilot sources and render one read-only report."""
-    settings_path = Path.home() / ".config/Code/User/settings.json"
+    settings_path = settings_path or (Path.home() / ".config/Code/User/settings.json")
     otel_path: Path | None = None
     if settings_path.is_file():
         try:
@@ -396,8 +403,8 @@ def render_latest_copilot_report(repo_root: Path, *, exclude_session: str | None
                 otel_path = Path(configured).expanduser()
         except (OSError, json.JSONDecodeError):
             otel_path = None
-    debug_path = _latest_file(Path.home() / ".config/Code/User/workspaceStorage", "*/GitHub.copilot-chat/debug-logs/*/main.jsonl")
-    terminal_path = _latest_file(Path.home() / ".config/Code/logs", "*/terminal.log")
+    debug_path = _latest_file(debug_root or (Path.home() / ".config/Code/User/workspaceStorage"), "*/GitHub.copilot-chat/debug-logs/*/main.jsonl")
+    terminal_path = _latest_file(terminal_root or (Path.home() / ".config/Code/logs"), "*/terminal.log")
     agent = parse_agent_debug(debug_path, str(repo_root), exclude_session=exclude_session) if debug_path else {"source": "agent-debug", **_unavailable("Agent Debug Log was not found")}
     session = agent.get("session", {}).get("value")
     first = agent.get("firstTimestamp", {}).get("value")
@@ -410,15 +417,21 @@ def render_latest_copilot_report(repo_root: Path, *, exclude_session: str | None
         otel = {"source": "otel", **_unavailable("Agent Debug turn boundary is unavailable for OTel correlation")}
     terminal = parse_terminal_diagnostics(terminal_path, start=first, end=last) if terminal_path and isinstance(first, (int, float)) and isinstance(last, (int, float)) else {"source": "terminal-diagnostic", **_unavailable("terminal.log or completed turn boundary is unavailable")}
     active_issue = None
+    active_issue_title = None
     workflow_path = repo_root / ".ai-dev/workflow.json"
     try:
         workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
         issue = workflow.get("activeIssueNumber")
         if isinstance(issue, int) and issue > 0:
             active_issue = str(issue)
+        if isinstance(workflow.get("activeIssueTitle"), str) and workflow["activeIssueTitle"].strip():
+            active_issue_title = workflow["activeIssueTitle"].strip()
     except (OSError, json.JSONDecodeError):
         pass
-    return render_copilot_report(agent_debug=agent, otel=otel, terminal=terminal, active_issue=active_issue)
+    report = render_copilot_report(agent_debug=agent, otel=otel, terminal=terminal, active_issue=active_issue)
+    if active_issue_title:
+        report = report.replace(f"Issue: {active_issue}", f"Issue: {active_issue} {active_issue_title}", 1)
+    return report
 
 
 def main() -> int:

@@ -6,6 +6,9 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+import json
+
+from ai_dev_flow.copilot_report import render_latest_copilot_report
 
 
 class CopilotReportEntrypointTests(unittest.TestCase):
@@ -49,6 +52,46 @@ class CopilotReportEntrypointTests(unittest.TestCase):
         script = self.repo_root / "skills/copilot/flow/scripts/flow-report"
         self.assertTrue(os.access(script, os.X_OK))
         self.assertIn('invoke-flow.ps1', (script.parent / "flow-report.ps1").read_text(encoding="utf-8"))
+
+    def test_latest_report_excludes_in_progress_report_turn(self) -> None:
+        debug_root = self.repo / "debug"
+        debug_dir = debug_root / "workspace" / "GitHub.copilot-chat" / "debug-logs" / "session"
+        debug_dir.mkdir(parents=True)
+        records = [
+            {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": "eligible work", "repository": str(self.repo)}},
+            {"ts": 1100, "sid": "session-1", "type": "agent_response", "attrs": {"response": "completed work"}},
+            {"ts": 1200, "sid": "session-1", "type": "turn_end", "attrs": {"turnId": "work"}},
+            {"ts": 1300, "sid": "session-1", "type": "user_message", "attrs": {"content": "/report", "repository": str(self.repo)}},
+            {"ts": 1400, "sid": "session-1", "type": "agent_response", "attrs": {"response": "in progress report"}},
+        ]
+        (debug_dir / "main.jsonl").write_text("\n".join(json.dumps(item) for item in records), encoding="utf-8")
+        settings = self.repo / "settings.json"
+        settings.write_text("{}", encoding="utf-8")
+        report = render_latest_copilot_report(self.repo, settings_path=settings, debug_root=debug_root, terminal_root=self.repo / "missing-terminal")
+        self.assertIn("Prompt: eligible work", report)
+        self.assertNotIn("Prompt: /report", report)
+
+    def test_latest_report_includes_active_issue_identity_and_source_health(self) -> None:
+        (self.repo / ".ai-dev").mkdir()
+        (self.repo / ".ai-dev/workflow.json").write_text(json.dumps({"activeIssueNumber": 49, "activeIssueTitle": "Report work"}), encoding="utf-8")
+        settings = self.repo / "settings.json"
+        settings.write_text("{}", encoding="utf-8")
+        report = render_latest_copilot_report(self.repo, settings_path=settings, debug_root=self.repo / "missing-debug", terminal_root=self.repo / "missing-terminal")
+        self.assertIn("Issue: 49 Report work", report)
+        self.assertIn("agent-debug: unavailable", report)
+        self.assertIn("otel: unavailable", report)
+        self.assertNotIn("Tokens: 0", report)
+
+    def test_latest_report_surfaces_unexpected_source_format(self) -> None:
+        debug_root = self.repo / "debug"
+        debug_dir = debug_root / "workspace" / "GitHub.copilot-chat" / "debug-logs" / "session"
+        debug_dir.mkdir(parents=True)
+        (debug_dir / "main.jsonl").write_text("not-json\n", encoding="utf-8")
+        settings = self.repo / "settings.json"
+        settings.write_text("{}", encoding="utf-8")
+        report = render_latest_copilot_report(self.repo, settings_path=settings, debug_root=debug_root, terminal_root=self.repo / "missing-terminal")
+        self.assertIn("agent-debug: error: unexpected log format", report)
+        self.assertNotIn("Tokens: 0", report)
 
 
 if __name__ == "__main__":
