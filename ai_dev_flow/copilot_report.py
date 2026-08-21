@@ -60,6 +60,77 @@ def _bounded_text(value: Any) -> dict[str, Any]:
     }
 
 
+def _readable_text(value: Any, preferred_role: str | None = None) -> str | None:
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("[", "{")):
+            try:
+                decoded = json.loads(value)
+            except json.JSONDecodeError:
+                return None
+            if decoded == value:
+                return value
+            return _readable_text(decoded, preferred_role)
+        return value
+    if isinstance(value, list):
+        parts = [_readable_text(item, preferred_role) for item in value]
+        readable = [part for part in parts if part]
+        return "\n".join(readable) if readable else None
+    if isinstance(value, dict):
+        role = value.get("role")
+        if isinstance(role, str) and preferred_role and role != preferred_role:
+            return None
+        if isinstance(value.get("parts"), list):
+            return _readable_text(value["parts"], preferred_role)
+        for key in ("messages", "message", "content", "response", "text"):
+            if key in value:
+                readable = _readable_text(value[key], preferred_role)
+                if readable:
+                    return readable
+    return None
+
+
+def _bounded_readable(value: Any, preferred_role: str) -> dict[str, Any]:
+    text = _readable_text(value, preferred_role)
+    if text is None:
+        return _unavailable("structured content is absent or malformed")
+    return _bounded_text(text)
+
+
+def _attachment_label(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    match = re.search(r"#attachment:(.+)$", value.strip())
+    return match.group(1).strip() if match else None
+
+
+def _find_attachment_content(value: Any, label: str, *, attachment_context: bool = False) -> Any:
+    if isinstance(value, dict):
+        keys = {str(key).lower() for key in value}
+        is_attachment = attachment_context or any("attachment" in key for key in keys)
+        names = [value.get(key) for key in ("name", "label", "title", "filename")]
+        matches = any(isinstance(name, str) and (name == label or label in name) for name in names)
+        if (is_attachment or matches) and "content" in value:
+            return value["content"]
+        for key, child in value.items():
+            found = _find_attachment_content(child, label, attachment_context=is_attachment or "attachment" in str(key).lower())
+            if found is not None:
+                return found
+    elif isinstance(value, list):
+        for child in value:
+            found = _find_attachment_content(child, label, attachment_context=attachment_context)
+            if found is not None:
+                return found
+    return None
+
+
+def _partial_attachment(label: str) -> dict[str, Any]:
+    result = _bounded_text(f"#attachment:{label} (content unavailable)")
+    result["status"] = "partial"
+    result["detail"] = "attachment content unavailable in accepted sources"
+    return result
+
+
 def _timestamp(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value) / (1000 if value > 10_000_000_000 else 1)
@@ -133,6 +204,12 @@ def parse_agent_debug(path: Path, repo_root: str, *, exclude_session: str | None
     user_content = attrs.get("content") if isinstance(attrs, dict) else None
     final_attrs = responses[-1].get("attrs", {}) if responses else {}
     final_response = final_attrs.get("response") if isinstance(final_attrs, dict) else None
+    prompt_label = _attachment_label(user_content)
+    if prompt_label:
+        attachment_content = _find_attachment_content(segment, prompt_label)
+        prompt = _bounded_readable(attachment_content, "user") if attachment_content is not None else _partial_attachment(prompt_label)
+    else:
+        prompt = _bounded_readable(user_content, "user")
     actions = []
     for record in segment:
         if record.get("type") != "tool_call":
@@ -155,8 +232,8 @@ def parse_agent_debug(path: Path, repo_root: str, *, exclude_session: str | None
         "firstTimestamp": _state(first),
         "lastTimestamp": _state(last),
         "completion": _state(True if ends else False),
-        "prompt": _bounded_text(user_content),
-        "finalResponse": _bounded_text(final_response),
+        "prompt": prompt,
+        "finalResponse": _bounded_readable(final_response, "assistant"),
         "turnCount": _state(len(ends)),
         "records": _state(len(segment)),
         "actions": _state(actions[:MAX_ACTIONS]),
@@ -353,7 +430,7 @@ def render_copilot_report(
     for source in (agent_debug, otel, terminal or {"source": "terminal-diagnostic", "status": "unavailable"}):
         lines.append(f"{source.get('source', 'source')}: {source.get('status', 'unavailable')}")
     lines.append(f"Provenance: {agent_debug.get('session', {}).get('value', 'unavailable')}")
-    if agent_debug.get("prompt", {}).get("status") == "validated":
+    if agent_debug.get("prompt", {}).get("status") in {"validated", "partial"}:
         lines.append(f"Prompt: {agent_debug['prompt']['value']}")
     else:
         lines.append("Prompt: unavailable")

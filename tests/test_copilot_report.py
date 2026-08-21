@@ -103,6 +103,51 @@ class CopilotReportTests(unittest.TestCase):
         self.assertTrue(result["prompt"]["truncated"])
         self.assertEqual(result["prompt"]["length"], 1000)
 
+    def test_structured_assistant_parts_become_readable_text(self) -> None:
+        debug = self._write("structured-response.jsonl", [
+            {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": "plain prompt", "repository": self.repo}},
+            {"ts": 1100, "sid": "session-1", "type": "agent_response", "attrs": {"response": [{"role": "assistant", "parts": [{"type": "text", "content": "readable outcome"}]}]}},
+            {"ts": 1200, "sid": "session-1", "type": "turn_end", "attrs": {}},
+        ])
+        result = parse_agent_debug(debug, self.repo)
+        self.assertEqual(result["finalResponse"]["value"], "readable outcome")
+
+    def test_json_string_structured_content_becomes_readable_text(self) -> None:
+        debug = self._write("json-string-content.jsonl", [
+            {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": '{"role":"user","parts":[{"type":"text","content":"structured prompt"}]}', "repository": self.repo}},
+            {"ts": 1100, "sid": "session-1", "type": "agent_response", "attrs": {"response": '[{"role":"assistant","parts":[{"type":"text","content":"structured outcome"}]}]'}},
+            {"ts": 1200, "sid": "session-1", "type": "turn_end", "attrs": {}},
+        ])
+        result = parse_agent_debug(debug, self.repo)
+        self.assertEqual(result["prompt"]["value"], "structured prompt")
+        self.assertEqual(result["finalResponse"]["value"], "structured outcome")
+
+    def test_attachment_only_prompt_without_accepted_content_is_partial(self) -> None:
+        debug = self._write("attachment-only.jsonl", [
+            {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": "#attachment:Pasted text #1", "repository": self.repo}},
+            {"ts": 1100, "sid": "session-1", "type": "agent_response", "attrs": {"response": "done"}},
+            {"ts": 1200, "sid": "session-1", "type": "turn_end", "attrs": {}},
+        ])
+        result = parse_agent_debug(debug, self.repo)
+        self.assertEqual(result["prompt"]["status"], "partial")
+        self.assertIn("#attachment:Pasted text #1", result["prompt"]["value"])
+        self.assertIn("content unavailable", result["prompt"]["value"])
+
+    def test_plaintext_prompt_and_outcome_remain_unchanged(self) -> None:
+        result = parse_agent_debug(self._debug(), self.repo)
+        self.assertEqual(result["prompt"]["value"], "do work")
+        self.assertEqual(result["finalResponse"]["value"], "done")
+
+    def test_malformed_structured_content_fails_closed_without_crashing(self) -> None:
+        debug = self._write("malformed-structured.jsonl", [
+            {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": "[{\"role\":", "repository": self.repo}},
+            {"ts": 1100, "sid": "session-1", "type": "agent_response", "attrs": {"response": "[{\"role\":"}},
+            {"ts": 1200, "sid": "session-1", "type": "turn_end", "attrs": {}},
+        ])
+        result = parse_agent_debug(debug, self.repo)
+        self.assertEqual(result["prompt"]["status"], "unavailable")
+        self.assertEqual(result["finalResponse"]["status"], "unavailable")
+
     def test_plaintext_terminal_approval_correlation_and_wait(self) -> None:
         log = self._terminal_log([
             "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"chmod --version\"]]",
