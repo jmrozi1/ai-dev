@@ -114,6 +114,34 @@ class ScriptEntrypointTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertIn("Safely remove AI Dev-managed legacy Flow launchers", completed.stdout)
 
+    def test_python_selection_ps1_parses_in_powershell(self) -> None:
+        powershell = shutil.which("powershell")
+        if powershell is None:
+            self.skipTest("powershell is not available")
+
+        script = self.repo_root / "tools" / "bootstrap" / "PythonSelection.ps1"
+        escaped_script = str(script).replace("'", "''")
+        parse_command = f"""
+$errors = $null
+[System.Management.Automation.Language.Parser]::ParseFile('{escaped_script}', [ref]$null, [ref]$errors) | Out-Null
+if ($errors.Count -gt 0) {{
+    $errors | ForEach-Object {{
+        [Console]::Error.WriteLine($_.ToString())
+    }}
+    exit 1
+}}
+"""
+        completed = subprocess.run(
+            [powershell, "-NoProfile", "-Command", parse_command],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            cwd=self.repo_root,
+        )
+        self.assertEqual(completed.returncode, 0, msg=completed.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

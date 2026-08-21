@@ -93,7 +93,7 @@ function Resolve-AiDevPythonExecutable {
 
         if ([string]::IsNullOrWhiteSpace($ResolvedPath)) {
             if ($Explicit) {
-                throw "$CallerName: AI_DEV_PYTHON is set but was not found or not executable: $env:AI_DEV_PYTHON"
+                throw "${CallerName}: AI_DEV_PYTHON is set but was not found or not executable: $env:AI_DEV_PYTHON"
             }
             return $null
         }
@@ -107,7 +107,7 @@ function Resolve-AiDevPythonExecutable {
         if (-not $probe.Ok) {
             Add-Rejected "$Label -> $ResolvedPath ($($probe.Detail))"
             if ($Explicit) {
-                throw "$CallerName: AI_DEV_PYTHON could not be validated: $Label -> $ResolvedPath ($($probe.Detail))"
+                throw "${CallerName}: AI_DEV_PYTHON could not be validated: $Label -> $ResolvedPath ($($probe.Detail))"
             }
             return $null
         }
@@ -118,7 +118,7 @@ function Resolve-AiDevPythonExecutable {
 
         Add-Rejected "$Label -> $ResolvedPath (version $($probe.Detail))"
         if ($Explicit) {
-            throw "$CallerName: AI_DEV_PYTHON points to unsupported Python version $($probe.Detail). Minimum supported version is $minimumVersion."
+            throw "${CallerName}: AI_DEV_PYTHON points to unsupported Python version $($probe.Detail). Minimum supported version is $minimumVersion."
         }
         return $null
     }
@@ -129,7 +129,7 @@ function Resolve-AiDevPythonExecutable {
         if (-not [string]::IsNullOrWhiteSpace($explicitSelected)) {
             return $explicitSelected
         }
-        throw "$CallerName: AI_DEV_PYTHON must point to Python >= $minimumVersion."
+        throw "${CallerName}: AI_DEV_PYTHON must point to Python >= $minimumVersion."
     }
 
     $pyCommand = Get-Command py -ErrorAction SilentlyContinue
@@ -175,14 +175,14 @@ function Resolve-AiDevPythonExecutable {
         return $pythonSelected
     }
 
-    $details = @("$CallerName: No compatible Python interpreter found. Minimum supported version is $minimumVersion.")
+    $details = @("${CallerName}: No compatible Python interpreter found. Minimum supported version is $minimumVersion.")
     if ($rejected.Count -gt 0) {
-        $details += "$CallerName: Discovered but rejected interpreters:"
+        $details += "${CallerName}: Discovered but rejected interpreters:"
         foreach ($line in $rejected) {
             $details += "  - $line"
         }
     }
-    $details += "$CallerName: Set AI_DEV_PYTHON to a compatible interpreter path to continue."
+    $details += "${CallerName}: Set AI_DEV_PYTHON to a compatible interpreter path to continue."
 
     throw ($details -join [Environment]::NewLine)
 }
