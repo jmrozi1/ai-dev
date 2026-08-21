@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import ctypes
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -43,27 +44,45 @@ class PlatformNeutralReportTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_canonical_report_uses_python_cli(self) -> None:
-        """Canonical report must use Python CLI, not Bash."""
+    def test_canonical_report_uses_current_interpreter(self) -> None:
+        """Canonical report must use the current interpreter, never a literal launcher."""
         canonical_report = "Issue: 49\nTokens: 100\n"
-
-        # Mock subprocess to verify Python invocation
         subprocess_calls = []
 
         def mock_run(*args, **kwargs):
             subprocess_calls.append((args, kwargs))
-            return mock.MagicMock(returncode=0, stdout=canonical_report)
+            return mock.MagicMock(returncode=0, stdout=canonical_report.encode("utf-8"))
 
         with mock.patch("subprocess.run", side_effect=mock_run):
             result = get_canonical_report(self.repo_root, self.original_cwd)
 
-        # Verify Python CLI was invoked
         self.assertEqual(len(subprocess_calls), 1)
         args, kwargs = subprocess_calls[0]
-        self.assertIn(sys.executable, args[0])
-        self.assertIn("ai_dev_flow.cli", " ".join(args[0]))
-        self.assertIn("__ai_dev_flow_exec__", " ".join(args[0]))
-        self.assertIn("report", " ".join(args[0]))
+        self.assertEqual(args[0][0], sys.executable)
+        self.assertEqual(args[0][1], "-m")
+        self.assertEqual(args[0][2], "ai_dev_flow.cli")
+        self.assertEqual(args[0][3], "__ai_dev_flow_exec__")
+        self.assertEqual(args[0][4], "report")
+        self.assertEqual(result, canonical_report)
+
+    def test_existing_pythonpath_is_preserved(self) -> None:
+        """Existing PYTHONPATH content must be retained while source root is added."""
+        canonical_report = "Issue: 49\nTokens: 100\n"
+        subprocess_calls = []
+
+        def mock_run(*args, **kwargs):
+            subprocess_calls.append((args, kwargs))
+            return mock.MagicMock(returncode=0, stdout=canonical_report.encode("utf-8"))
+
+        with mock.patch.dict(os.environ, {"PYTHONPATH": "/existing/one:/existing/two"}, clear=False):
+            with mock.patch("subprocess.run", side_effect=mock_run):
+                get_canonical_report(self.repo_root, self.original_cwd)
+
+        _, kwargs = subprocess_calls[0]
+        env = kwargs["env"]
+        self.assertIn("/existing/one", env["PYTHONPATH"])
+        self.assertIn("/existing/two", env["PYTHONPATH"])
+        self.assertIn(str(wrapper_path.parents[4]), env["PYTHONPATH"])
 
     def test_caller_working_directory_preserved(self) -> None:
         """Report must execute from caller's original directory, not AI Dev root."""
@@ -293,18 +312,13 @@ class OSC52Tests(unittest.TestCase):
         self.assertEqual(decoded, report)
 
     def test_osc52_size_limit(self) -> None:
-        """OSC 52 must fail without truncation if report exceeds limit."""
-        # Create report exceeding 16 KB
-        large_report = "X" * 16385
-
-        result = OSC52Backend.copy(large_report)
-        self.assertFalse(result)
+        """OSC 52 must fail without truncation if UTF-8 byte length exceeds limit."""
+        large_report = "X" * (OSC52Backend.MAX_OSC52_BYTES + 1)
+        self.assertFalse(OSC52Backend.copy(large_report))
 
     def test_osc52_at_size_limit(self) -> None:
-        """OSC 52 must succeed at exactly the size limit."""
-        # Create report at exactly 16 KB
-        report_at_limit = "X" * 16384
-
+        """OSC 52 must succeed at exactly the UTF-8 byte limit."""
+        report_at_limit = "é" * (OSC52Backend.MAX_OSC52_BYTES // 2)
         captured_output = []
 
         def mock_write(data):
@@ -320,6 +334,15 @@ class OSC52Tests(unittest.TestCase):
             result = OSC52Backend.copy(report_at_limit)
 
         self.assertTrue(result)
+        output = captured_output[0].decode("utf-8")
+        self.assertTrue(output.startswith("\x1b]52;c;"))
+        self.assertTrue(output.endswith("\x1b\\"))
+        self.assertEqual(output[7:-2], base64.b64encode(report_at_limit.encode("utf-8")).decode("ascii"))
+
+    def test_osc52_one_byte_over_limit_fails(self) -> None:
+        """A report one UTF-8 byte over the limit must fail without truncation."""
+        report = "A" * (OSC52Backend.MAX_OSC52_BYTES + 1)
+        self.assertFalse(OSC52Backend.copy(report))
 
     def test_osc52_only_to_terminal_not_copied_content(self) -> None:
         """OSC 52 sequence must write to stdout.buffer only, not contaminate copied content."""
@@ -352,67 +375,283 @@ class OSC52Tests(unittest.TestCase):
 class WindowsClipboardTests(unittest.TestCase):
     """Tests for Windows clipboard lifecycle and encoding."""
 
-    def test_windows_uses_utf16le(self) -> None:
-        """Windows backend must encode as UTF-16LE, not UTF-8."""
-        # Note: This test verifies the code structure, not real Windows API
-        # because ctypes.windll is Windows-only
-        content = "café"
+    def test_windows_utf16le_payload_with_null_terminator(self) -> None:
+        """Windows backend must supply UTF-16LE payload with two-byte terminator."""
+        calls = []
 
-        # We can at least verify the code path by checking the source
-        import inspect
+        class FakeWin32:
+            def __init__(self):
+                self.buffers = {}
 
-        source = inspect.getsource(WindowsClipboard.copy)
-        self.assertIn('encode("utf-16-le")', source)
-        self.assertIn("CF_UNICODETEXT", source)
-        self.assertNotIn('encode("utf-8")', source)
-        self.assertNotIn("CF_TEXT", source.replace("CF_UNICODETEXT", ""))
+            class kernel32:
+                def __init__(self):
+                    self.owner = None
 
-    def test_windows_proper_lifecycle(self) -> None:
-        """Windows clipboard must follow correct ownership lifecycle."""
-        import inspect
+                def GlobalAlloc(self, flags, size):
+                    calls.append(("GlobalAlloc", flags, size))
+                    handle = 0x1000
+                    self.owner = self.owner or {"handle": handle, "buffer": ctypes.create_string_buffer(size)}
+                    return handle
 
-        source = inspect.getsource(WindowsClipboard.copy)
+                def GlobalLock(self, handle):
+                    calls.append(("GlobalLock", handle))
+                    buffer = ctypes.create_string_buffer(4096)
+                    self.owner["buffer"] = buffer
+                    return ctypes.addressof(buffer)
 
-        # Verify proper sequence: Alloc -> Lock -> Copy -> Unlock -> OpenClipboard -> EmptyClipboard -> SetClipboardData -> CloseClipboard
-        alloc_pos = source.find("GlobalAlloc")
-        lock_pos = source.find("GlobalLock")
-        unlock_pos = source.find("GlobalUnlock")
-        open_pos = source.find("OpenClipboard")
-        set_pos = source.find("SetClipboardData")
-        close_pos = source.find("CloseClipboard")
+                def GlobalUnlock(self, handle):
+                    calls.append(("GlobalUnlock", handle))
+                    return True
 
-        # Verify ordering
-        self.assertLess(alloc_pos, lock_pos)
-        self.assertLess(lock_pos, unlock_pos)
-        self.assertLess(unlock_pos, open_pos)
-        self.assertLess(open_pos, set_pos)
-        self.assertLess(set_pos, close_pos)
+                def GlobalFree(self, handle):
+                    calls.append(("GlobalFree", handle))
+                    return 0
 
-    def test_windows_cleanup_on_allocation_failure(self) -> None:
-        """Windows backend must handle allocation failure."""
-        import inspect
+            class user32:
+                def OpenClipboard(self, hwnd):
+                    calls.append(("OpenClipboard", hwnd))
+                    return True
 
-        source = inspect.getsource(WindowsClipboard.copy)
-        # Verify error handling after GlobalAlloc
-        self.assertIn("if not hglob:", source)
+                def EmptyClipboard(self):
+                    calls.append(("EmptyClipboard",))
+                    return True
 
-    def test_windows_cleanup_on_lock_failure(self) -> None:
-        """Windows backend must free memory on lock failure."""
-        import inspect
+                def SetClipboardData(self, format_id, handle):
+                    calls.append(("SetClipboardData", format_id, handle))
+                    return 0x3000
 
-        source = inspect.getsource(WindowsClipboard.copy)
-        # Verify GlobalFree is called in error handling (check for the pattern)
-        self.assertIn("if not lpglob:", source)
-        self.assertIn("GlobalFree(hglob)", source)
+                def CloseClipboard(self):
+                    calls.append(("CloseClipboard",))
+                    return True
 
-    def test_windows_cleanup_on_open_clipboard_failure(self) -> None:
-        """Windows backend must free memory on OpenClipboard failure."""
-        import inspect
+        fake = FakeWin32()
+        fake.kernel32 = FakeWin32.kernel32()
+        fake.user32 = FakeWin32.user32()
+        payload = "café"
+        result = WindowsClipboard.copy(payload, api=fake)
+        self.assertTrue(result)
+        self.assertIn(("SetClipboardData", 13, 0x1000), calls)
 
-        source = inspect.getsource(WindowsClipboard.copy)
-        # Verify GlobalFree is called when OpenClipboard fails
-        self.assertIn("if not user32.OpenClipboard(None):", source)
-        self.assertIn("GlobalFree(hglob)", source)
+    def test_windows_success_transfers_ownership_without_globalfree(self) -> None:
+        """Successful SetClipboardData transfers ownership and does not free."""
+        calls = []
+
+        class FakeWin32:
+            def __init__(self):
+                self._buffer = ctypes.create_string_buffer(4096)
+
+            class kernel32:
+                def __init__(self, owner):
+                    self.owner = owner
+
+                def GlobalAlloc(self, flags, size):
+                    calls.append(("GlobalAlloc", flags, size))
+                    return 0x1000
+
+                def GlobalLock(self, handle):
+                    calls.append(("GlobalLock", handle))
+                    return ctypes.addressof(self.owner._buffer)
+
+                def GlobalUnlock(self, handle):
+                    calls.append(("GlobalUnlock", handle))
+                    return True
+
+                def GlobalFree(self, handle):
+                    calls.append(("GlobalFree", handle))
+                    return 0
+
+            class user32:
+                def OpenClipboard(self, hwnd):
+                    calls.append(("OpenClipboard", hwnd))
+                    return True
+
+                def EmptyClipboard(self):
+                    calls.append(("EmptyClipboard",))
+                    return True
+
+                def SetClipboardData(self, format_id, handle):
+                    calls.append(("SetClipboardData", format_id, handle))
+                    return 0x3000
+
+                def CloseClipboard(self):
+                    calls.append(("CloseClipboard",))
+                    return True
+
+        fake = FakeWin32()
+        fake.kernel32 = FakeWin32.kernel32(fake)
+        fake.user32 = FakeWin32.user32()
+        result = WindowsClipboard.copy("hello", api=fake)
+        self.assertTrue(result)
+        self.assertNotIn(("GlobalFree", 0x1000), calls)
+        self.assertIn(("CloseClipboard",), calls)
+
+    def test_windows_failure_frees_global_memory_before_transfer(self) -> None:
+        """All pre-transfer failures must free allocated memory."""
+        for failure_step in ("GlobalAlloc", "GlobalLock", "OpenClipboard", "EmptyClipboard", "SetClipboardData"):
+            calls = []
+
+            class FakeWin32:
+                def __init__(self):
+                    self._buffer = ctypes.create_string_buffer(4096)
+
+                class kernel32:
+                    def __init__(self, owner):
+                        self.owner = owner
+
+                    def GlobalAlloc(self, flags, size):
+                        calls.append(("GlobalAlloc", flags, size))
+                        return 0x1000 if failure_step != "GlobalAlloc" else 0
+
+                    def GlobalLock(self, handle):
+                        calls.append(("GlobalLock", handle))
+                        if failure_step == "GlobalLock":
+                            return 0
+                        return ctypes.addressof(self.owner._buffer)
+
+                    def GlobalUnlock(self, handle):
+                        calls.append(("GlobalUnlock", handle))
+                        return True
+
+                    def GlobalFree(self, handle):
+                        calls.append(("GlobalFree", handle))
+                        return 0
+
+                class user32:
+                    def __init__(self, owner):
+                        self.owner = owner
+
+                    def OpenClipboard(self, hwnd):
+                        calls.append(("OpenClipboard", hwnd))
+                        return True if failure_step != "OpenClipboard" else False
+
+                    def EmptyClipboard(self):
+                        calls.append(("EmptyClipboard",))
+                        return True if failure_step != "EmptyClipboard" else False
+
+                    def SetClipboardData(self, format_id, handle):
+                        calls.append(("SetClipboardData", format_id, handle))
+                        return 0x3000 if failure_step != "SetClipboardData" else 0
+
+                    def CloseClipboard(self):
+                        calls.append(("CloseClipboard",))
+                        return True
+
+            fake = FakeWin32()
+            fake.kernel32 = FakeWin32.kernel32(fake)
+            fake.user32 = FakeWin32.user32(fake)
+            self.assertFalse(WindowsClipboard.copy("hello", api=fake))
+            if failure_step != "GlobalAlloc":
+                self.assertIn(("GlobalFree", 0x1000), calls)
+            else:
+                self.assertNotIn(("GlobalFree", 0x1000), calls)
+
+    def test_windows_closes_clipboard_after_successful_open(self) -> None:
+        """CloseClipboard must always run after a successful open."""
+        calls = []
+
+        class FakeWin32:
+            def __init__(self):
+                self._buffer = ctypes.create_string_buffer(4096)
+
+            class kernel32:
+                def __init__(self, owner):
+                    self.owner = owner
+
+                def GlobalAlloc(self, flags, size):
+                    calls.append(("GlobalAlloc", flags, size))
+                    return 0x1000
+
+                def GlobalLock(self, handle):
+                    calls.append(("GlobalLock", handle))
+                    return ctypes.addressof(self.owner._buffer)
+
+                def GlobalUnlock(self, handle):
+                    calls.append(("GlobalUnlock", handle))
+                    return True
+
+                def GlobalFree(self, handle):
+                    calls.append(("GlobalFree", handle))
+                    return 0
+
+            class user32:
+                def __init__(self, owner):
+                    self.owner = owner
+
+                def OpenClipboard(self, hwnd):
+                    calls.append(("OpenClipboard", hwnd))
+                    return True
+
+                def EmptyClipboard(self):
+                    calls.append(("EmptyClipboard",))
+                    return True
+
+                def SetClipboardData(self, format_id, handle):
+                    calls.append(("SetClipboardData", format_id, handle))
+                    return 0x3000
+
+                def CloseClipboard(self):
+                    calls.append(("CloseClipboard",))
+                    return True
+
+        fake = FakeWin32()
+        fake.kernel32 = FakeWin32.kernel32(fake)
+        fake.user32 = FakeWin32.user32(fake)
+        self.assertTrue(WindowsClipboard.copy("hello", api=fake))
+        self.assertIn(("CloseClipboard",), calls)
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.repo_root = Path(self.temp_dir.name) / "repo"
+        self.repo_root.mkdir(parents=True)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    def test_windows_failure_reaches_printable_recovery(self) -> None:
+        """Windows failure path must be reported through printable recovery output."""
+        class FakeWin32:
+            def __init__(self):
+                self._buffer = ctypes.create_string_buffer(4096)
+
+            class kernel32:
+                def __init__(self, owner):
+                    self.owner = owner
+
+                def GlobalAlloc(self, flags, size):
+                    return 0
+
+                def GlobalLock(self, handle):
+                    return 0
+
+                def GlobalUnlock(self, handle):
+                    return True
+
+                def GlobalFree(self, handle):
+                    return 0
+
+            class user32:
+                def __init__(self, owner):
+                    self.owner = owner
+
+                def OpenClipboard(self, hwnd):
+                    return True
+
+                def EmptyClipboard(self):
+                    return True
+
+                def SetClipboardData(self, format_id, handle):
+                    return 0
+
+                def CloseClipboard(self):
+                    return True
+
+        with mock.patch.object(clipboard_module, "get_canonical_report") as mock_get:
+            mock_get.return_value = "Issue: 49\n"
+            with mock.patch.object(clipboard_module, "get_clipboard_backends") as mock_backends:
+                mock_backends.return_value = [lambda content: WindowsClipboard.copy(content, api=FakeWin32())]
+                success, message = copy_report_to_clipboard(self.repo_root)
+                self.assertFalse(success)
+                self.assertIn("--- Report (recoverable) ---", message)
 
 
 class BackendSelectionTests(unittest.TestCase):
@@ -572,16 +811,38 @@ class MainEntryPointTests(unittest.TestCase):
 class SymlinkResolutionTests(unittest.TestCase):
     """Tests for symlinked wrapper execution."""
 
-    def test_wrapper_file_exists(self) -> None:
-        """Wrapper file must exist at expected location."""
-        self.assertTrue(wrapper_path.exists())
+    def test_actual_symlink_invocation_resolves_source_and_runs_report(self) -> None:
+        """A real symlink should resolve the repository and execute the canonical report."""
+        if not hasattr(os, "symlink"):
+            self.skipTest("symbolic links are unavailable on this platform")
 
-    def test_wrapper_has_python_shebang(self) -> None:
-        """Wrapper must have python3 shebang for direct execution."""
-        with open(wrapper_path, "r") as f:
-            first_line = f.readline().strip()
-        self.assertTrue(first_line.startswith("#!"))
-        self.assertIn("python", first_line)
+        temp_dir = tempfile.TemporaryDirectory()
+        try:
+            target_dir = Path(temp_dir.name)
+            symlink_path = target_dir / "flow-report-clipboard-link.py"
+            try:
+                symlink_path.symlink_to(wrapper_path)
+            except (OSError, NotImplementedError):
+                self.skipTest("symbolic links are unavailable on this platform")
+
+            completed = subprocess.run(
+                [sys.executable, str(symlink_path)],
+                capture_output=True,
+                text=True,
+                cwd=str(Path(__file__).resolve().parent.parent),
+                env=os.environ.copy(),
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("Report copied to OSC 52 (terminal).", completed.stdout)
+            self.assertIn("\x1b]52;c;", completed.stdout)
+
+            payload = completed.stdout.split("\x1b]52;c;", 1)[1].split("\x1b\\", 1)[0]
+            decoded = base64.b64decode(payload).decode("utf-8")
+            self.assertIn("Issue:", decoded)
+            self.assertNotIn("Traceback", completed.stderr)
+        finally:
+            temp_dir.cleanup()
 
 
 if __name__ == "__main__":

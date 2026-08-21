@@ -37,81 +37,70 @@ class WindowsClipboard:
     name = "Windows clipboard (ctypes)"
 
     @staticmethod
-    def copy(content: str) -> bool:
+    def _get_winapi():
+        """Return the default Windows Win32 API handles."""
+        kernel32 = ctypes.windll.kernel32
+        user32 = ctypes.windll.user32
+
+        kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+        kernel32.GlobalAlloc.restype = ctypes.c_void_p
+        kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalLock.restype = ctypes.c_void_p
+        kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalUnlock.restype = ctypes.c_bool
+        kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+        kernel32.GlobalFree.restype = ctypes.c_void_p
+        user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+        user32.OpenClipboard.restype = ctypes.c_bool
+        user32.EmptyClipboard.restype = ctypes.c_bool
+        user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+        user32.SetClipboardData.restype = ctypes.c_void_p
+        user32.CloseClipboard.restype = ctypes.c_bool
+
+        return type("WinApi", (), {"kernel32": kernel32, "user32": user32})()
+
+    @staticmethod
+    def copy(content: str, api: object | None = None) -> bool:
         """Copy content to Windows clipboard."""
         try:
-            # Configure ctypes for proper handle management on 64-bit Windows
-            kernel32 = ctypes.windll.kernel32
-            user32 = ctypes.windll.user32
+            api = api or WindowsClipboard._get_winapi()
+            kernel32 = api.kernel32
+            user32 = api.user32
 
-            # Set up function signatures for proper pointer handling
-            kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
-            kernel32.GlobalAlloc.restype = ctypes.c_void_p
-            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
-            kernel32.GlobalLock.restype = ctypes.c_void_p
-            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
-            kernel32.GlobalUnlock.restype = ctypes.c_bool
-            kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
-            kernel32.GlobalFree.restype = ctypes.c_void_p
-            user32.OpenClipboard.argtypes = [ctypes.c_void_p]
-            user32.OpenClipboard.restype = ctypes.c_bool
-            user32.EmptyClipboard.restype = ctypes.c_bool
-            user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
-            user32.SetClipboardData.restype = ctypes.c_void_p
-            user32.CloseClipboard.restype = ctypes.c_bool
-
-            # Encode as UTF-16LE with null terminator
+            # Encode as UTF-16LE with a two-byte null terminator.
             text_utf16 = content.encode("utf-16-le")
-            text_len = len(text_utf16) + 2  # +2 for null terminator (2 bytes in UTF-16LE)
+            text_len = len(text_utf16) + 2
 
-            # Allocate global memory (GMEM_MOVEABLE = 0x0002)
             hglob = kernel32.GlobalAlloc(0x0002, text_len)
             if not hglob:
                 return False
 
-            # Lock memory and copy
             lpglob = kernel32.GlobalLock(hglob)
             if not lpglob:
                 kernel32.GlobalFree(hglob)
                 return False
 
-            # Copy the data
             ctypes.memmove(lpglob, text_utf16, len(text_utf16))
-            # Add null terminator
-            ctypes.memmove(
-                ctypes.cast(lpglob, ctypes.POINTER(ctypes.c_byte))[len(text_utf16)],
-                b"\x00\x00",
-                2,
-            )
-
-            # Unlock
+            ctypes.memmove(lpglob + len(text_utf16), b"\x00\x00", 2)
             kernel32.GlobalUnlock(hglob)
 
-            # Open clipboard
             if not user32.OpenClipboard(None):
                 kernel32.GlobalFree(hglob)
                 return False
 
             try:
-                # Empty clipboard
                 if not user32.EmptyClipboard():
                     kernel32.GlobalFree(hglob)
                     return False
 
-                # Set clipboard data (CF_UNICODETEXT = 13)
                 CF_UNICODETEXT = 13
                 result = user32.SetClipboardData(CF_UNICODETEXT, hglob)
-
                 if not result:
-                    # SetClipboardData failed, must free memory
                     kernel32.GlobalFree(hglob)
                     return False
-
-                # On success, Windows owns the memory; we must NOT free it
                 return True
             finally:
                 user32.CloseClipboard()
-
         except Exception:
             return False
 
@@ -180,9 +169,9 @@ class OSC52Backend:
     """OSC 52 control sequence backend for terminal-based copying."""
 
     name = "OSC 52 (terminal)"
-    # Conservative bound: typical reports are 3-5 KB, complex with 50 actions ~10-15 KB,
-    # plus 30% overhead for base64 expansion and terminal multiplexer buffering.
-    # 16 KB safely accommodates realistic bounds without truncation.
+    # Operational policy, not a proven renderer-derived maximum:
+    # realistic Flow reports land around 3-15 KB, and we fail closed above this bound
+    # without truncation so the printable recovery output remains recoverable.
     MAX_OSC52_BYTES = 16384
 
     @staticmethod
@@ -218,7 +207,7 @@ def _get_ai_dev_root() -> Path | None:
     Returns:
         Path to the AI Dev root, or None if not found.
     """
-    script_dir = Path(__file__).parent.resolve()
+    script_dir = Path(__file__).resolve().parent
     current = script_dir
     # Traverse up at most 5 levels (scripts/ -> flow/ -> copilot/ -> skills/ -> ai-dev/ -> possible parent)
     for _ in range(5):
@@ -255,24 +244,31 @@ def get_canonical_report(repo_root: Path | None = None, original_cwd: Path | Non
         if not ai_dev_root:
             return None
 
-        # Build the canonical CLI invocation
-        # ai_dev_flow.cli is the canonical entry point for all Flow commands
         python_executable = sys.executable
         env = os.environ.copy()
-        env["PYTHONPATH"] = str(ai_dev_root) + (
-            f":{env.get('PYTHONPATH')}" if env.get("PYTHONPATH") else ""
-        )
+        existing_pythonpath = env.get("PYTHONPATH")
+        parts = [str(ai_dev_root)]
+        if existing_pythonpath:
+            parts.append(existing_pythonpath)
+        env["PYTHONPATH"] = os.pathsep.join(p for p in parts if p)
 
         result = subprocess.run(
             [python_executable, "-m", "ai_dev_flow.cli", "__ai_dev_flow_exec__", "report"],
             cwd=str(original_cwd),
             env=env,
-            capture_output=True,
-            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
         )
 
-        # Preserve exact output including final newline if present
-        return result.stdout if result.returncode == 0 else None
+        stdout_raw = result.stdout
+        stderr_raw = result.stderr
+        stdout = stdout_raw.decode("utf-8") if isinstance(stdout_raw, (bytes, bytearray)) else (stdout_raw or "")
+        stderr = stderr_raw.decode("utf-8", errors="replace") if isinstance(stderr_raw, (bytes, bytearray)) else (stderr_raw or "")
+        if result.returncode != 0:
+            return None
+
+        return stdout
     except Exception:
         return None
 
