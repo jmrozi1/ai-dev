@@ -8,6 +8,7 @@ using platform-native backends (Windows, Linux, or OSC 52).
 from __future__ import annotations
 
 import base64
+import ctypes
 import os
 import platform
 import shutil
@@ -31,7 +32,7 @@ class ClipboardBackend(Protocol):
 
 
 class WindowsClipboard:
-    """Windows clipboard backend using ctypes."""
+    """Windows clipboard backend using ctypes with proper UTF-16LE encoding."""
 
     name = "Windows clipboard (ctypes)"
 
@@ -39,37 +40,78 @@ class WindowsClipboard:
     def copy(content: str) -> bool:
         """Copy content to Windows clipboard."""
         try:
-            import ctypes
+            # Configure ctypes for proper handle management on 64-bit Windows
+            kernel32 = ctypes.windll.kernel32
+            user32 = ctypes.windll.user32
 
-            # Allocate memory for the text
-            text_bytes = content.encode("utf-8")
-            text_len = len(text_bytes) + 1
+            # Set up function signatures for proper pointer handling
+            kernel32.GlobalAlloc.argtypes = [ctypes.c_uint, ctypes.c_size_t]
+            kernel32.GlobalAlloc.restype = ctypes.c_void_p
+            kernel32.GlobalLock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalLock.restype = ctypes.c_void_p
+            kernel32.GlobalUnlock.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalUnlock.restype = ctypes.c_bool
+            kernel32.GlobalFree.argtypes = [ctypes.c_void_p]
+            kernel32.GlobalFree.restype = ctypes.c_void_p
+            user32.OpenClipboard.argtypes = [ctypes.c_void_p]
+            user32.OpenClipboard.restype = ctypes.c_bool
+            user32.EmptyClipboard.restype = ctypes.c_bool
+            user32.SetClipboardData.argtypes = [ctypes.c_uint, ctypes.c_void_p]
+            user32.SetClipboardData.restype = ctypes.c_void_p
+            user32.CloseClipboard.restype = ctypes.c_bool
 
-            # Allocate global memory
-            hglob = ctypes.windll.kernel32.GlobalAlloc(0x0002, text_len)
+            # Encode as UTF-16LE with null terminator
+            text_utf16 = content.encode("utf-16-le")
+            text_len = len(text_utf16) + 2  # +2 for null terminator (2 bytes in UTF-16LE)
+
+            # Allocate global memory (GMEM_MOVEABLE = 0x0002)
+            hglob = kernel32.GlobalAlloc(0x0002, text_len)
             if not hglob:
                 return False
 
-            # Lock and copy
-            lpglob = ctypes.windll.kernel32.GlobalLock(hglob)
+            # Lock memory and copy
+            lpglob = kernel32.GlobalLock(hglob)
             if not lpglob:
-                ctypes.windll.kernel32.GlobalFree(hglob)
+                kernel32.GlobalFree(hglob)
                 return False
 
-            ctypes.memmove(lpglob, text_bytes, text_len - 1)
-            ctypes.windll.kernel32.GlobalUnlock(hglob)
+            # Copy the data
+            ctypes.memmove(lpglob, text_utf16, len(text_utf16))
+            # Add null terminator
+            ctypes.memmove(
+                ctypes.cast(lpglob, ctypes.POINTER(ctypes.c_byte))[len(text_utf16)],
+                b"\x00\x00",
+                2,
+            )
 
-            # Open clipboard, set data, close
-            if not ctypes.windll.user32.OpenClipboard(None):
-                ctypes.windll.kernel32.GlobalFree(hglob)
+            # Unlock
+            kernel32.GlobalUnlock(hglob)
+
+            # Open clipboard
+            if not user32.OpenClipboard(None):
+                kernel32.GlobalFree(hglob)
                 return False
 
-            ctypes.windll.user32.EmptyClipboard()
-            cf_text = 1  # CF_TEXT
-            result = ctypes.windll.user32.SetClipboardData(cf_text, hglob)
-            ctypes.windll.user32.CloseClipboard()
+            try:
+                # Empty clipboard
+                if not user32.EmptyClipboard():
+                    kernel32.GlobalFree(hglob)
+                    return False
 
-            return bool(result)
+                # Set clipboard data (CF_UNICODETEXT = 13)
+                CF_UNICODETEXT = 13
+                result = user32.SetClipboardData(CF_UNICODETEXT, hglob)
+
+                if not result:
+                    # SetClipboardData failed, must free memory
+                    kernel32.GlobalFree(hglob)
+                    return False
+
+                # On success, Windows owns the memory; we must NOT free it
+                return True
+            finally:
+                user32.CloseClipboard()
+
         except Exception:
             return False
 
@@ -138,8 +180,10 @@ class OSC52Backend:
     """OSC 52 control sequence backend for terminal-based copying."""
 
     name = "OSC 52 (terminal)"
-    # Safe byte limit for OSC 52: 8KB to account for terminal/multiplexer overhead
-    MAX_OSC52_BYTES = 8192
+    # Conservative bound: typical reports are 3-5 KB, complex with 50 actions ~10-15 KB,
+    # plus 30% overhead for base64 expansion and terminal multiplexer buffering.
+    # 16 KB safely accommodates realistic bounds without truncation.
+    MAX_OSC52_BYTES = 16384
 
     @staticmethod
     def copy(content: str) -> bool:
@@ -167,31 +211,64 @@ class OSC52Backend:
             return False
 
 
-def get_canonical_report(repo_root: Path) -> str | None:
+def _get_ai_dev_root() -> Path | None:
     """
-    Obtain the canonical report from the existing renderer.
-    
+    Find the AI Dev repository root by traversing up from this script.
+
+    Returns:
+        Path to the AI Dev root, or None if not found.
+    """
+    script_dir = Path(__file__).parent.resolve()
+    current = script_dir
+    # Traverse up at most 5 levels (scripts/ -> flow/ -> copilot/ -> skills/ -> ai-dev/ -> possible parent)
+    for _ in range(5):
+        if (current / "ai_dev_flow").exists():
+            return current
+        current = current.parent
+    return None
+
+
+def get_canonical_report(repo_root: Path | None = None, original_cwd: Path | None = None) -> str | None:
+    """
+    Obtain the canonical report from the existing Python renderer.
+
+    The report is generated using the current Python interpreter and the AI Dev CLI,
+    executed from the caller's original working directory (not the AI Dev repo).
+
     Args:
-        repo_root: The repository root directory.
-        
+        repo_root: Repository root for report context. If None, uses cwd.
+        original_cwd: The working directory to use for execution.
+                      If None, uses the current working directory.
+
     Returns:
         The canonical report content, or None if unavailable.
     """
     try:
-        # Resolve the flow-report script relative to this script's location
-        script_dir = Path(__file__).parent.resolve()
-        report_script = script_dir / "flow-report"
+        if repo_root is None:
+            repo_root = Path.cwd()
 
-        if not report_script.exists():
+        if original_cwd is None:
+            original_cwd = Path.cwd()
+
+        # Find AI Dev root for module lookup
+        ai_dev_root = _get_ai_dev_root()
+        if not ai_dev_root:
             return None
 
-        # Run the canonical report renderer
+        # Build the canonical CLI invocation
+        # ai_dev_flow.cli is the canonical entry point for all Flow commands
+        python_executable = sys.executable
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(ai_dev_root) + (
+            f":{env.get('PYTHONPATH')}" if env.get("PYTHONPATH") else ""
+        )
+
         result = subprocess.run(
-            [str(report_script)],
-            cwd=str(repo_root),
+            [python_executable, "-m", "ai_dev_flow.cli", "__ai_dev_flow_exec__", "report"],
+            cwd=str(original_cwd),
+            env=env,
             capture_output=True,
             text=True,
-            timeout=10,
         )
 
         # Preserve exact output including final newline if present
@@ -255,26 +332,36 @@ def get_backend_names() -> list[str]:
     return names
 
 
-def copy_report_to_clipboard(repo_root: Path | None = None, backends: list[Callable[[str], bool]] | None = None) -> tuple[bool, str]:
+def copy_report_to_clipboard(
+    repo_root: Path | None = None,
+    original_cwd: Path | None = None,
+    backends: list[Callable[[str], bool]] | None = None,
+) -> tuple[bool, str]:
     """
     Copy the canonical report to the clipboard.
 
+    The caller's original working directory is preserved for report generation.
+
     Args:
         repo_root: The repository root directory (defaults to cwd).
+        original_cwd: The caller's original working directory (defaults to cwd).
         backends: List of clipboard backend functions to try (for testing).
 
     Returns:
         Tuple of (success: bool, message: str).
+        On failure, the report is printed to stdout for manual recovery.
     """
     if repo_root is None:
         repo_root = Path.cwd()
 
-    # Get the canonical report
-    report = get_canonical_report(repo_root)
+    if original_cwd is None:
+        original_cwd = Path.cwd()
+
+    # Get the canonical report (executed from caller's original directory)
+    report = get_canonical_report(repo_root, original_cwd)
     if report is None:
         return False, "Error: Could not obtain canonical report. Ensure flow-report is available."
 
-    # Check OSC 52 size limit early if it's the only backend
     if backends is None:
         backends = get_clipboard_backends()
 
@@ -303,7 +390,7 @@ def copy_report_to_clipboard(repo_root: Path | None = None, backends: list[Calla
         except Exception:
             continue
 
-    # All backends failed
+    # All backends failed: print report to stdout for recovery
     available_backends = get_backend_names()
     system = platform.system()
 
@@ -321,7 +408,7 @@ def copy_report_to_clipboard(repo_root: Path | None = None, backends: list[Calla
             "Install one of these tools or run in a compatible VS Code integrated terminal."
         )
 
-    return False, f"Error: All clipboard backends failed.\n{guidance}"
+    return False, f"Error: All clipboard backends failed.\n{guidance}\n\n--- Report (recoverable) ---\n{report}"
 
 
 def main() -> int:
@@ -332,7 +419,19 @@ def main() -> int:
         print(message, file=sys.stdout)
         return 0
     else:
-        print(message, file=sys.stderr)
+        # On failure: print report to stdout for manual recovery, guidance to stderr
+        if "--- Report (recoverable) ---" in message:
+            # Split recovery message: error guidance + report
+            parts = message.split("\n\n--- Report (recoverable) ---\n", 1)
+            error_guidance = parts[0] if parts else message
+            report = parts[1] if len(parts) > 1 else ""
+
+            print(error_guidance, file=sys.stderr)
+            if report:
+                print(report, file=sys.stdout)
+        else:
+            print(message, file=sys.stderr)
+
         return 1
 
 
