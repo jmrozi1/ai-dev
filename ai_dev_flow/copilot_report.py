@@ -231,6 +231,7 @@ def parse_agent_debug(path: Path, repo_root: str, *, exclude_session: str | None
         "session": _state(next(iter({r.get("sid") for r in segment if isinstance(r.get("sid"), str)}), None)),
         "firstTimestamp": _state(first),
         "lastTimestamp": _state(last),
+        "turnEndTimestamp": _state(_timestamp(ends[-1].get("ts"))),
         "completion": _state(True if ends else False),
         "prompt": prompt,
         "finalResponse": _bounded_readable(final_response, "assistant"),
@@ -238,6 +239,24 @@ def parse_agent_debug(path: Path, repo_root: str, *, exclude_session: str | None
         "records": _state(len(segment)),
         "actions": _state(actions[:MAX_ACTIONS]),
     }
+
+
+def parse_agent_debug_files(paths: Iterable[Path], repo_root: str, *, exclude_session: str | None = None) -> dict[str, Any]:
+    candidates: list[tuple[float, str, int, dict[str, Any]]] = []
+    errors: list[dict[str, Any]] = []
+    for path in paths:
+        parsed = parse_agent_debug(path, repo_root, exclude_session=exclude_session)
+        if parsed.get("status") == "validated":
+            completion = parsed.get("turnEndTimestamp", {}).get("value")
+            if isinstance(completion, (int, float)):
+                candidates.append((completion, str(path), len(candidates), parsed))
+        elif parsed.get("status", "").startswith("error:"):
+            errors.append(parsed)
+    if candidates:
+        return sorted(candidates, key=lambda item: (-item[0], item[1], item[2]))[0][3]
+    if errors:
+        return errors[0]
+    return {"source": "agent-debug", **_unavailable("no completed repository-associated turn")}
 
 
 def _hr_time(record: dict[str, Any]) -> float | None:
@@ -475,6 +494,10 @@ def _latest_file(root: Path, pattern: str) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime) if candidates else None
 
 
+def _debug_files(root: Path) -> list[Path]:
+    return sorted(root.glob("*/GitHub.copilot-chat/debug-logs/*/main.jsonl"))
+
+
 def render_latest_copilot_report(
     repo_root: Path,
     *,
@@ -494,9 +517,9 @@ def render_latest_copilot_report(
                 otel_path = Path(configured).expanduser()
         except (OSError, json.JSONDecodeError):
             otel_path = None
-    debug_path = _latest_file(debug_root or (Path.home() / ".config/Code/User/workspaceStorage"), "*/GitHub.copilot-chat/debug-logs/*/main.jsonl")
+    debug_paths = _debug_files(debug_root or (Path.home() / ".config/Code/User/workspaceStorage"))
     terminal_path = _latest_file(terminal_root or (Path.home() / ".config/Code/logs"), "*/terminal.log")
-    agent = parse_agent_debug(debug_path, str(repo_root), exclude_session=exclude_session) if debug_path else {"source": "agent-debug", **_unavailable("Agent Debug Log was not found")}
+    agent = parse_agent_debug_files(debug_paths, str(repo_root), exclude_session=exclude_session) if debug_paths else {"source": "agent-debug", **_unavailable("Agent Debug Log was not found")}
     session = agent.get("session", {}).get("value")
     first = agent.get("firstTimestamp", {}).get("value")
     last = agent.get("lastTimestamp", {}).get("value")

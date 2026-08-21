@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -8,9 +9,11 @@ import unittest
 from ai_dev_flow.copilot_report import (
     merge_intervals,
     parse_agent_debug,
+    parse_agent_debug_files,
     parse_otel,
     parse_terminal_diagnostics,
     render_copilot_report,
+    render_latest_copilot_report,
 )
 
 
@@ -190,6 +193,63 @@ class CopilotReportTests(unittest.TestCase):
         self.assertEqual(request["command"], "chmod --version")
         self.assertEqual(request["disposition"], "executed")
         self.assertAlmostEqual(request["approvalWaitSeconds"], 2.5)
+
+    def _global_debug_file(self, root: Path, name: str, records: list[dict[str, object]]) -> Path:
+        path = root / name / "GitHub.copilot-chat" / "debug-logs" / "session" / "main.jsonl"
+        path.parent.mkdir(parents=True)
+        path.write_text("\n".join(json.dumps(record) for record in records), encoding="utf-8")
+        return path
+
+    def _turn_records(self, session: str, prompt: str, outcome: str, end: int, *, complete: bool = True) -> list[dict[str, object]]:
+        records: list[dict[str, object]] = [
+            {"ts": end - 20, "sid": session, "type": "user_message", "attrs": {"content": prompt, "repository": self.repo}},
+            {"ts": end - 10, "sid": session, "type": "agent_response", "attrs": {"response": outcome}},
+        ]
+        if complete:
+            records.append({"ts": end, "sid": session, "type": "turn_end", "attrs": {}})
+        return records
+
+    def test_global_selection_uses_completion_timestamp_over_file_mtime(self) -> None:
+        old = self._global_debug_file(self.root / "mtime", "newer-file", self._turn_records("old", "old prompt", "old outcome", 100))
+        new = self._global_debug_file(self.root / "mtime", "older-file", self._turn_records("new", "new prompt", "new outcome", 200))
+        os.utime(old, (300, 300))
+        os.utime(new, (100, 100))
+        result = parse_agent_debug_files([old, new], self.repo)
+        self.assertEqual(result["session"]["value"], "new")
+        self.assertEqual(result["prompt"]["value"], "new prompt")
+        self.assertEqual(result["finalResponse"]["value"], "new outcome")
+        self.assertEqual(result["firstTimestamp"]["value"], 180)
+        self.assertEqual(result["lastTimestamp"]["value"], 200)
+
+    def test_global_selection_is_independent_of_discovery_order(self) -> None:
+        first = self._global_debug_file(self.root / "order", "z-file", self._turn_records("z", "z prompt", "z outcome", 300))
+        second = self._global_debug_file(self.root / "order", "a-file", self._turn_records("a", "a prompt", "a outcome", 400))
+        forward = parse_agent_debug_files([first, second], self.repo)
+        reverse = parse_agent_debug_files([second, first], self.repo)
+        self.assertEqual(forward["session"], reverse["session"])
+        self.assertEqual(forward["finalResponse"], reverse["finalResponse"])
+
+    def test_global_selection_ignores_newer_incomplete_report_segment(self) -> None:
+        records = self._turn_records("session", "completed prompt", "completed outcome", 500)
+        records.extend(self._turn_records("session", "/report", "in progress report", 700, complete=False))
+        path = self._global_debug_file(self.root / "incomplete", "current", records)
+        result = parse_agent_debug_files([path], self.repo)
+        self.assertEqual(result["prompt"]["value"], "completed prompt")
+        self.assertEqual(result["finalResponse"]["value"], "completed outcome")
+        self.assertEqual(result["turnEndTimestamp"]["value"], 500)
+
+    def test_global_selection_equal_completion_timestamps_has_deterministic_tie(self) -> None:
+        first = self._global_debug_file(self.root / "tie", "b-file", self._turn_records("b", "b prompt", "b outcome", 600))
+        second = self._global_debug_file(self.root / "tie", "a-file", self._turn_records("a", "a prompt", "a outcome", 600))
+        result = parse_agent_debug_files([first, second], self.repo)
+        self.assertEqual(result["session"]["value"], "a")
+
+    def test_global_selection_preserves_single_file_behavior(self) -> None:
+        path = self._write("single-file.jsonl", self._turn_records("single", "single prompt", "single outcome", 800))
+        result = parse_agent_debug_files([path], self.repo)
+        self.assertEqual(result["session"]["value"], "single")
+        self.assertEqual(result["prompt"]["value"], "single prompt")
+        self.assertEqual(result["finalResponse"]["value"], "single outcome")
 
     def test_plaintext_terminal_zero_duplicate_unresolved_and_malformed(self) -> None:
         empty = self._terminal_log(["2026-08-21 14:00:00.000 [info] unrelated diagnostic []"])
