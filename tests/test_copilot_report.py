@@ -95,11 +95,13 @@ class CopilotReportTests(unittest.TestCase):
         other_session = parse_otel(self._otel(session="other"), session="session-1", start=1.0, end=1.5)
         self.assertEqual(other_session["status"], "partial")
         self.assertIn("session unmatched", other_session["detail"])
+        self.assertIn("3 in-window records", other_session["detail"])
         self.assertNotIn("0", str(other_session.get("inputTokens", {}).get("value", "")))
 
         no_window = parse_otel(self._otel(), session="session-1", start=10.0, end=20.0)
         self.assertEqual(no_window["status"], "partial")
         self.assertIn("no in-window records", no_window["detail"])
+        self.assertIn("3 recognized records", no_window["detail"])
         self.assertNotIn("0", str(no_window.get("inputTokens", {}).get("value", "")))
 
     def test_valid_otel_sessions_remain_validated_and_exact_match_keeps_totals(self) -> None:
@@ -170,6 +172,35 @@ class CopilotReportTests(unittest.TestCase):
         ]), self.repo)
         report = render_copilot_report(agent_debug=debug, otel={"source": "otel", "status": "unavailable"})
         self.assertIn("Prompt [partial]: #attachment:Pasted text #1 (content unavailable)", report)
+
+    def test_renderer_exposes_bounded_otel_detail_for_partial_and_error_states(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        session_unmatched = parse_otel(self._otel(session="other"), session="session-1", start=1.0, end=1.5)
+        report = render_copilot_report(agent_debug=debug, otel=session_unmatched)
+        self.assertIn("otel: partial - validated source; session unmatched", report)
+        self.assertIn("3 in-window records", report)
+
+        no_window = parse_otel(self._otel(), session="session-1", start=10.0, end=20.0)
+        report = render_copilot_report(agent_debug=debug, otel=no_window)
+        self.assertIn("otel: partial - validated source; no in-window records", report)
+        self.assertIn("3 recognized records", report)
+
+        validated = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        compact = render_copilot_report(agent_debug=debug, otel=validated)
+        self.assertIn("otel: validated", compact)
+        self.assertNotIn("otel: validated -", compact)
+
+        missing_detail = render_copilot_report(agent_debug=debug, otel={"source": "otel", "status": "partial"})
+        self.assertIn("otel: partial", missing_detail)
+        self.assertNotIn("otel: partial -", missing_detail)
+
+        error_detail = parse_otel(self._write("bad-shape-otel.jsonl", [{"hrTime": [1, 1], "resource": {"_rawAttributes": [["session.id", "session-1"]]}, "attributes": {"event.name": "gen_ai.client.inference.operation.details", "gen_ai.request.model": "m", "gen_ai.usage.input_tokens": "zero", "gen_ai.usage.output_tokens": 1}}]), session="session-1", start=0, end=2)
+        bad_report = render_copilot_report(agent_debug=debug, otel=error_detail)
+        self.assertIn("otel: error: unexpected log format -", bad_report)
+        self.assertIn("inference record missing model/tokens", bad_report)
+
+        unavailable = render_copilot_report(agent_debug=debug, otel={"source": "otel", "status": "unavailable", "detail": "validated source is empty"})
+        self.assertIn("otel: unavailable - validated source is empty", unavailable)
 
     def test_renderer_marks_truncated_final_outcome_with_metadata(self) -> None:
         outcome = "outcome " * 100

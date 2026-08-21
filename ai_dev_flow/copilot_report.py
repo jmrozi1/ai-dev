@@ -300,24 +300,28 @@ def parse_otel(path: Path, *, session: str, start: float, end: float) -> dict[st
         return {"source": "otel", "status": "unavailable", "detail": "validated source is empty"}
 
     if not in_window:
+        detail = f"validated source; no in-window records ({len(recognized)} recognized records, 0 in-window records)"
         return {
             "source": "otel",
             "status": "partial",
-            "detail": "validated source; no in-window records",
+            "detail": detail,
             "recognizedCount": _state(len(recognized)),
             "inWindowCount": _state(0),
+            "matchedCount": _state(0),
             "session": _state(session),
             "inputTokens": _state(None, "partial"),
             "outputTokens": _state(None, "partial"),
         }
 
     if not matched:
+        detail = f"validated source; session unmatched ({len(in_window)} in-window records, 0 exact-session matches)"
         return {
             "source": "otel",
             "status": "partial",
-            "detail": "validated source; session unmatched",
+            "detail": detail,
             "recognizedCount": _state(len(recognized)),
             "inWindowCount": _state(len(in_window)),
+            "matchedCount": _state(0),
             "session": _state(session),
             "inputTokens": _state(None, "partial"),
             "outputTokens": _state(None, "partial"),
@@ -481,6 +485,17 @@ def merge_intervals(intervals: Iterable[tuple[float, float]]) -> dict[str, Any]:
     return _state(total)
 
 
+def _source_line(source: dict[str, Any]) -> str:
+    label = source.get("source", "source")
+    status = source.get("status", "unavailable")
+    if status == "validated":
+        return f"{label}: {status}"
+    detail = source.get("detail")
+    if isinstance(detail, str) and detail.strip():
+        return f"{label}: {status} - {detail[:240]}"
+    return f"{label}: {status}"
+
+
 def render_copilot_report(
     *, agent_debug: dict[str, Any], otel: dict[str, Any], terminal: dict[str, Any] | None = None,
     active_issue: str | None = None,
@@ -488,7 +503,7 @@ def render_copilot_report(
     """Render a bounded report; source failures remain visible and never become zero."""
     lines = ["Copilot work report", f"Issue: {active_issue or 'unavailable'}"]
     for source in (agent_debug, otel, terminal or {"source": "terminal-diagnostic", "status": "unavailable"}):
-        lines.append(f"{source.get('source', 'source')}: {source.get('status', 'unavailable')}")
+        lines.append(_source_line(source))
     lines.append(f"Provenance: {agent_debug.get('session', {}).get('value', 'unavailable')}")
     def format_content(label: str, content: dict[str, Any]) -> str:
         status = content.get("status", "unavailable")
