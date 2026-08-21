@@ -112,18 +112,12 @@ class SkillInstallationTests(unittest.TestCase):
             [package.name for package in discover_skill_packages(source_repo, audience="copilot")],
         )
 
-    def test_copilot_report_skill_is_explicit_and_delegates_to_flow_helper(self) -> None:
+    def test_copilot_report_skill_is_not_discoverable(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
-        packages = discover_skill_packages(source_repo, audience="copilot")
-        report = next(package for package in packages if package.name == "report")
-        content = (report.source_directory / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("user-invocable: true", content)
-        self.assertIn("disable-model-invocation: true", content)
-        self.assertIn("scripts/flow-report", content)
-        self.assertNotIn("parse_", content)
-        self.assertNotIn("jsonl", content)
+        names = [package.name for package in discover_skill_packages(source_repo, audience="copilot")]
+        self.assertNotIn("report", names)
 
-    def test_installed_copilot_package_contains_report_skill(self) -> None:
+    def test_installed_copilot_package_does_not_include_report_skill(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
         destination = self.tmp_path / "installed-skills"
         home = self.tmp_path / "home"
@@ -133,9 +127,9 @@ class SkillInstallationTests(unittest.TestCase):
             home=home,
             audience="copilot",
         )
-        self.assertIn("report", [package.name for package in discover_skill_packages(source_repo, audience="copilot")])
-        self.assertTrue((destination / "report" / "SKILL.md").is_file())
-        self.assertIn("report", [status.name for status in result.statuses])
+        self.assertNotIn("report", [package.name for package in discover_skill_packages(source_repo, audience="copilot")])
+        self.assertFalse((destination / "report").exists())
+        self.assertNotIn("report", [status.name for status in result.statuses])
 
     def test_copilot_flow_skill_has_single_windows_local_invocation_mechanism(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -207,7 +201,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 14)
+        self.assertEqual(len(names), 13)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -247,7 +241,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "ticket-creation",
                 "work-skill-refinement",
             },
-            "copilot": {"auto-review", "executor", "flow", "report"},
+            "copilot": {"auto-review", "executor", "flow"},
         }
         for audience, audience_skills in expected_audience_skills.items():
             with self.subTest(audience=audience):
@@ -292,7 +286,6 @@ class SkillInstallationTests(unittest.TestCase):
                 "flow",
                 "frontend-design-review",
                 "orchestrator",
-                "report",
                 "requirements-driven-development",
                 "review-process",
                 "skill-authoring",
@@ -329,7 +322,6 @@ class SkillInstallationTests(unittest.TestCase):
                 "flow",
                 "frontend-design-review",
                 "orchestrator",
-                "report",
                 "requirements-driven-development",
                 "review-process",
                 "skill-authoring",

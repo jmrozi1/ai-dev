@@ -19,14 +19,11 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
             f"Expected {self.flow_skill} to exist",
         )
 
-    def test_report_slash_command_is_owned_by_explicit_report_skill(self) -> None:
-        report_skill = self.repo_root / "skills" / "copilot" / "report" / "SKILL.md"
-        content = report_skill.read_text(encoding="utf-8")
-        self.assertIn("name: report", content)
-        self.assertIn("user-invocable: true", content)
-        self.assertIn("disable-model-invocation: true", content)
-        self.assertIn("scripts/flow-report", content)
-        self.assertIn("/report", self.flow_skill.read_text(encoding="utf-8"))
+    def test_report_skill_is_not_a_repository_owned_slash_surface(self) -> None:
+        flow_content = self.flow_skill.read_text(encoding="utf-8")
+        self.assertNotIn("/report", flow_content)
+        self.assertNotIn("report this turn", flow_content)
+        self.assertFalse((self.repo_root / "skills" / "copilot" / "report").exists())
 
     def test_frontmatter_includes_status_keywords(self) -> None:
         """Verify frontmatter description advertises active-ticket/project status."""

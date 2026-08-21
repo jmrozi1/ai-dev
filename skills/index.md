@@ -59,7 +59,6 @@ remain in the applicable canonical `SKILL.md` files.
 | `auto-review` | Gathering repository review evidence, running deterministic helpers, executing approved review mechanics, and recording only when explicitly authorized. | `skills/copilot/auto-review/SKILL.md` |
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/copilot/executor/SKILL.md` |
 | `flow` | Executing and validating Flow lifecycle commands, preconditions, checkpoint mechanics, promotion/retry/completion safety, and evidence reporting. | `skills/copilot/flow/SKILL.md` |
-| `report` | Invoking the explicit repository-scoped Copilot report command through the canonical Flow helper. | `skills/copilot/report/SKILL.md` |
 
 Audience sections are a catalog, not a router. Not every capability exists for
 every audience. Duplicate capability names are permitted by the architecture
