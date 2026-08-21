@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import re
 from typing import Any, Iterable, Iterator
 
 from .copilot_pricing import estimate_copilot_cost
@@ -226,6 +227,11 @@ def parse_otel(path: Path, *, session: str, start: float, end: float) -> dict[st
 
 
 def parse_terminal_diagnostics(path: Path, *, start: float | None = None, end: float | None = None) -> dict[str, Any]:
+    try:
+        if path.suffix == ".log":
+            return _parse_terminal_plaintext(path, start=start, end=end)
+    except OSError as exc:
+        return {"source": "terminal-diagnostic", "status": "unavailable", "detail": str(exc)}
     actions = []
     try:
         records = _iter_jsonl(path)
@@ -243,6 +249,86 @@ def parse_terminal_diagnostics(path: Path, *, start: float | None = None, end: f
     if not actions:
         return {"source": "terminal-diagnostic", "status": "unavailable", "detail": "no terminal records"}
     return {"source": "terminal-diagnostic", "status": "validated", "actions": _state(actions[:MAX_ACTIONS]), "count": _state(len(actions))}
+
+
+_TERMINAL_LINE = re.compile(r"^(?P<date>\d{4}-\d{2}-\d{2} [0-9:.]+) \[[^]]+\] (?P<body>.*)$")
+_PARSED_COMMANDS = re.compile(r"Parsed sub-commands via .*? grammar (?P<commands>\[\[.*\]\])$")
+_USING = re.compile(r"RunInTerminalTool: Using .*? execute strategy for command `(?P<command>.*)` \[\]$")
+_FINISHED = re.compile(r"RunInTerminalTool: Finished .*? with exitCode `(?P<code>[^`]*)`, result\.length `(?P<length>\d+)`, error `(?P<error>[^`]*)` \[\]$")
+
+
+def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | None) -> dict[str, Any]:
+    entries: list[dict[str, Any]] = []
+    try:
+        with path.open(encoding="utf-8", errors="replace") as stream:
+            for line_number, line in enumerate(stream, 1):
+                match = _TERMINAL_LINE.match(line.rstrip("\n"))
+                if not match:
+                    continue
+                timestamp = _timestamp(match.group("date"))
+                if timestamp is None or (start is not None and timestamp < start) or (end is not None and timestamp > end):
+                    continue
+                body = match.group("body")
+                parsed = _PARSED_COMMANDS.search(body)
+                if parsed:
+                    try:
+                        commands = json.loads(parsed.group("commands"))[0]
+                    except (json.JSONDecodeError, IndexError, TypeError):
+                        return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": f"invalid parsed commands at line {line_number}"}
+                    if not isinstance(commands, list) or not all(isinstance(command, str) for command in commands):
+                        return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": f"parsed commands are not strings at line {line_number}"}
+                    entries.append({"timestamp": timestamp, "commands": commands, "denied": False, "reason": None})
+                    continue
+                if "RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands" in body:
+                    return {"source": "terminal-diagnostic", "status": "error: unexpected log format", "detail": f"unparseable analyzer record at line {line_number}"}
+                if "Sub-command DENIED auto approval" in body or "Command line NOT auto-approved" in body:
+                    if entries:
+                        entries[-1]["denied"] = True
+                    continue
+                if "no matching auto approve entries" in body.lower():
+                    if entries:
+                        entries[-1]["reason"] = body[:MAX_CONTENT]
+                    continue
+                using = _USING.search(body)
+                if using:
+                    entries.append({"timestamp": timestamp, "executed": using.group("command")[:MAX_CONTENT]})
+                    continue
+                finished = _FINISHED.search(body)
+                if finished and entries:
+                    entries[-1]["exitCode"] = finished.group("code") or None
+                    entries[-1]["resultLength"] = int(finished.group("length"))
+                    entries[-1]["error"] = finished.group("error")
+    except OSError as exc:
+        return {"source": "terminal-diagnostic", "status": "unavailable", "detail": str(exc)}
+    if not entries:
+        return {"source": "terminal-diagnostic", "status": "unavailable", "detail": "no bounded plaintext terminal records"}
+    requests: list[dict[str, Any]] = []
+    seen: set[tuple[str, ...]] = set()
+    denied_commands = {
+        command
+        for entry in entries
+        if entry.get("denied")
+        for command in entry.get("commands", [])
+    }
+    for entry in entries:
+        commands = entry.get("commands")
+        if not commands:
+            continue
+        key = tuple(commands)
+        if key in seen:
+            continue
+        seen.add(key)
+        command = commands[-1]
+        execution = next((candidate for candidate in entries if isinstance(candidate.get("executed"), str) and _normalize_command(candidate["executed"]) == _normalize_command(command) and candidate["timestamp"] >= entry["timestamp"]), None)
+        wait = execution["timestamp"] - entry["timestamp"] if execution else None
+        requests.append({"command": command[:MAX_CONTENT], "denied": command in denied_commands, "denialReason": entry.get("reason"), "disposition": "executed" if execution else "unresolved", "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "waitSeconds": wait})
+    if not requests:
+        return {"source": "terminal-diagnostic", "status": "validated", "requests": _state([]), "approvalCount": _state(0)}
+    return {"source": "terminal-diagnostic", "status": "validated", "requests": _state(requests[:MAX_ACTIONS]), "approvalCount": _state(sum(1 for request in requests if request["denied"]))}
+
+
+def _normalize_command(command: str) -> str:
+    return " ".join(command.strip().split())
 
 
 def merge_intervals(intervals: Iterable[tuple[float, float]]) -> dict[str, Any]:

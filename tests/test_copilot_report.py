@@ -51,6 +51,11 @@ class CopilotReportTests(unittest.TestCase):
             ],
         )
 
+    def _terminal_log(self, lines: list[str]) -> Path:
+        path = self.root / "terminal.log"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
     def test_successful_correlation_and_bounded_render(self) -> None:
         debug = parse_agent_debug(self._debug(), self.repo)
         otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
@@ -95,6 +100,40 @@ class CopilotReportTests(unittest.TestCase):
         result = parse_agent_debug(long_debug, self.repo)
         self.assertTrue(result["prompt"]["truncated"])
         self.assertEqual(result["prompt"]["length"], 1000)
+
+    def test_plaintext_terminal_approval_correlation_and_wait(self) -> None:
+        log = self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"chmod --version\"]]",
+            "2026-08-21 14:00:00.010 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 14:00:00.011 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: - Command 'chmod --version' has no matching auto approve entries",
+            "2026-08-21 14:00:02.500 [info] RunInTerminalTool: Using `rich` execute strategy for command ` chmod --version` []",
+            "2026-08-21 14:00:02.600 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `42`, error `undefined` []",
+        ])
+        result = parse_terminal_diagnostics(log, start= datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:03"))
+        self.assertEqual(result["status"], "validated")
+        request = result["requests"]["value"][0]
+        self.assertEqual(request["command"], "chmod --version")
+        self.assertEqual(request["disposition"], "executed")
+        self.assertAlmostEqual(request["waitSeconds"], 2.5)
+
+    def test_plaintext_terminal_zero_duplicate_unresolved_and_malformed(self) -> None:
+        empty = self._terminal_log(["2026-08-21 14:00:00.000 [info] unrelated diagnostic []"])
+        self.assertEqual(parse_terminal_diagnostics(empty, start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))["status"], "unavailable")
+        duplicate = self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"chmod --version\"]]",
+            "2026-08-21 14:00:00.001 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"chmod --version\"]]",
+            "2026-08-21 14:00:00.002 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+        ])
+        result = parse_terminal_diagnostics(duplicate, start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(result["approvalCount"]["value"], 1)
+        self.assertEqual(result["requests"]["value"][0]["disposition"], "unresolved")
+        malformed = self._terminal_log(["2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [not-json]"])
+        self.assertEqual(parse_terminal_diagnostics(malformed, start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))["status"], "error: unexpected log format")
+
+
+def datetime_timestamp(value: str) -> float:
+    from datetime import datetime
+    return datetime.strptime(value, "%Y-%m-%d %H:%M:%S").timestamp()
 
 
 if __name__ == "__main__":
