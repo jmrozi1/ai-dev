@@ -275,22 +275,55 @@ def _hr_time(record: dict[str, Any]) -> float | None:
 
 
 def parse_otel(path: Path, *, session: str, start: float, end: float) -> dict[str, Any]:
-    selected: list[dict[str, Any]] = []
+    recognized: list[dict[str, Any]] = []
+    in_window: list[dict[str, Any]] = []
+    matched: list[dict[str, Any]] = []
     try:
         for record in _iter_jsonl(path):
             timestamp = _hr_time(record)
             resource = record.get("resource")
             resource_attrs = resource.get("_rawAttributes") if isinstance(resource, dict) else []
             sessions = {item[1] for item in resource_attrs if isinstance(item, list) and len(item) == 2 and item[0] == "session.id"}
-            if timestamp is None or not start <= timestamp <= end or session not in sessions:
+            if timestamp is None:
                 continue
-            selected.append(record)
+            recognized.append(record)
+            if start <= timestamp <= end:
+                in_window.append(record)
+                if session in sessions:
+                    matched.append(record)
     except OSError as exc:
         return {"source": "otel", "status": "unavailable", "detail": str(exc)}
     except ValueError as exc:
         return {"source": "otel", "status": "error: unexpected log format", "detail": str(exc)[:240]}
-    if not selected:
-        return {"source": "otel", "status": "unavailable", "detail": "no correlated records"}
+
+    if not recognized:
+        return {"source": "otel", "status": "unavailable", "detail": "validated source is empty"}
+
+    if not in_window:
+        return {
+            "source": "otel",
+            "status": "partial",
+            "detail": "validated source; no in-window records",
+            "recognizedCount": _state(len(recognized)),
+            "inWindowCount": _state(0),
+            "session": _state(session),
+            "inputTokens": _state(None, "partial"),
+            "outputTokens": _state(None, "partial"),
+        }
+
+    if not matched:
+        return {
+            "source": "otel",
+            "status": "partial",
+            "detail": "validated source; session unmatched",
+            "recognizedCount": _state(len(recognized)),
+            "inWindowCount": _state(len(in_window)),
+            "session": _state(session),
+            "inputTokens": _state(None, "partial"),
+            "outputTokens": _state(None, "partial"),
+        }
+
+    selected = matched
     counts = Counter()
     models = Counter()
     model_calls: dict[str, list[dict[str, int]]] = {}

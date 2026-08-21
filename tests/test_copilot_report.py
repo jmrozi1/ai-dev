@@ -91,7 +91,28 @@ class CopilotReportTests(unittest.TestCase):
     def test_incomplete_and_partial_correlation_are_not_totals(self) -> None:
         self.assertEqual(parse_agent_debug(self._debug(complete=False), self.repo)["status"], "unavailable")
         self.assertEqual(parse_agent_debug(self._debug(repo="/other"), self.repo)["status"], "unavailable")
-        self.assertEqual(parse_otel(self._otel(session="other"), session="session-1", start=1.0, end=1.5)["status"], "unavailable")
+
+        other_session = parse_otel(self._otel(session="other"), session="session-1", start=1.0, end=1.5)
+        self.assertEqual(other_session["status"], "partial")
+        self.assertIn("session unmatched", other_session["detail"])
+        self.assertNotIn("0", str(other_session.get("inputTokens", {}).get("value", "")))
+
+        no_window = parse_otel(self._otel(), session="session-1", start=10.0, end=20.0)
+        self.assertEqual(no_window["status"], "partial")
+        self.assertIn("no in-window records", no_window["detail"])
+        self.assertNotIn("0", str(no_window.get("inputTokens", {}).get("value", "")))
+
+    def test_valid_otel_sessions_remain_validated_and_exact_match_keeps_totals(self) -> None:
+        result = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        self.assertEqual(result["status"], "validated")
+        self.assertEqual(result["inputTokens"]["value"], 10)
+        self.assertEqual(result["outputTokens"]["value"], 2)
+        self.assertEqual(result["models"]["value"], {"gpt-test": 1})
+
+    def test_source_health_states_are_explicit_for_missing_and_malformed_otel(self) -> None:
+        self.assertEqual(parse_otel(self.root / "missing-otel.jsonl", session="session-1", start=1.0, end=1.5)["status"], "unavailable")
+        malformed = self._write("bad-shape-otel.jsonl", [{"hrTime": [1, 1], "resource": {"_rawAttributes": [["session.id", "session-1"]]}, "attributes": {"event.name": "gen_ai.client.inference.operation.details", "gen_ai.request.model": "m", "gen_ai.usage.input_tokens": "zero", "gen_ai.usage.output_tokens": 1}}])
+        self.assertEqual(parse_otel(malformed, session="session-1", start=0, end=2)["status"], "error: unexpected log format")
 
     def test_unexpected_otel_format_and_long_content(self) -> None:
         bad = self._write("bad-shape.jsonl", [{"hrTime": [1, 1], "resource": {"_rawAttributes": [["session.id", "s"]]}, "attributes": {"event.name": "gen_ai.client.inference.operation.details", "gen_ai.request.model": "m", "gen_ai.usage.input_tokens": "zero", "gen_ai.usage.output_tokens": 1}}])
