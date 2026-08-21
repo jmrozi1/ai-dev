@@ -157,6 +157,27 @@ class CopilotReportTests(unittest.TestCase):
         self.assertIn("Approval timing: 2.5 seconds validated", report)
         self.assertIn("approval wait 2.500s", report)
 
+    def test_multiple_repositories_and_bounded_sensitive_fields(self) -> None:
+        other_repo = str(self.root / "other")
+        Path(other_repo).mkdir()
+        debug_path = self._write("multi-debug.jsonl", [
+            {"ts": 1000, "sid": "other-session", "type": "user_message", "attrs": {"content": "other secret", "repository": other_repo}},
+            {"ts": 1100, "sid": "other-session", "type": "turn_end", "attrs": {"turnId": "other"}},
+            {"ts": 2000, "sid": "repo-session", "type": "user_message", "attrs": {"content": "repo secret", "repository": self.repo}},
+            {"ts": 2100, "sid": "repo-session", "type": "agent_response", "attrs": {"response": "response secret"}},
+            {"ts": 2200, "sid": "repo-session", "type": "turn_end", "attrs": {"turnId": "repo"}},
+        ])
+        result = parse_agent_debug(debug_path, self.repo)
+        self.assertEqual(result["session"]["value"], "repo-session")
+        self.assertEqual(result["prompt"]["value"], "repo secret")
+        self.assertEqual(result["finalResponse"]["value"], "response secret")
+        bounded = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"python -c 'print(\\\"secret\\\")'\"]]",
+            "2026-08-21 14:00:00.001 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(bounded["status"], "validated")
+        self.assertLessEqual(len(bounded["approvalRequests"]["value"][0]["command"]), 400)
+
 
 def datetime_timestamp(value: str) -> float:
     from datetime import datetime

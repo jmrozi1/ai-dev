@@ -82,7 +82,16 @@ def _repo_match(record: dict[str, Any], repo_root: str) -> bool:
         value = attrs.get(key)
         if isinstance(value, str) and (value == repo_root or repo_root in value):
             return True
-    return False
+    def contains_repo(value: Any) -> bool:
+        if isinstance(value, str):
+            return value == repo_root or repo_root in value
+        if isinstance(value, dict):
+            return any(contains_repo(item) for item in value.values())
+        if isinstance(value, list):
+            return any(contains_repo(item) for item in value)
+        return False
+
+    return contains_repo(attrs)
 
 
 def parse_agent_debug(path: Path, repo_root: str, *, exclude_session: str | None = None) -> dict[str, Any]:
