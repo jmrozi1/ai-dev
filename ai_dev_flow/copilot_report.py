@@ -430,12 +430,17 @@ def render_copilot_report(
     for source in (agent_debug, otel, terminal or {"source": "terminal-diagnostic", "status": "unavailable"}):
         lines.append(f"{source.get('source', 'source')}: {source.get('status', 'unavailable')}")
     lines.append(f"Provenance: {agent_debug.get('session', {}).get('value', 'unavailable')}")
-    if agent_debug.get("prompt", {}).get("status") in {"validated", "partial"}:
-        lines.append(f"Prompt: {agent_debug['prompt']['value']}")
-    else:
-        lines.append("Prompt: unavailable")
-    final = agent_debug.get("finalResponse", {})
-    lines.append(f"Final outcome: {final.get('value') if final.get('status') == 'validated' else 'unavailable'}")
+    def format_content(label: str, content: dict[str, Any]) -> str:
+        status = content.get("status", "unavailable")
+        prefix = label if status == "validated" else f"{label} [{status}]"
+        value = content.get("value") if status in {"validated", "partial"} else "unavailable"
+        metadata = ""
+        if status == "validated" and content.get("truncated"):
+            metadata = f" (truncated; length {content.get('length', 'unknown')}; sha256 {content.get('sha256', 'unknown')})"
+        return f"{prefix}: {value}{metadata}"
+
+    lines.append(format_content("Prompt", agent_debug.get("prompt", {})))
+    lines.append(format_content("Final outcome", agent_debug.get("finalResponse", {})))
     if terminal is None or terminal.get("status") != "validated":
         lines.append(f"Approvals: {terminal.get('status', 'unavailable') if terminal else 'unavailable'}")
         lines.append("Approval timing: unavailable")

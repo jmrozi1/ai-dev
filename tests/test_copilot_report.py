@@ -138,6 +138,34 @@ class CopilotReportTests(unittest.TestCase):
         self.assertEqual(result["prompt"]["value"], "do work")
         self.assertEqual(result["finalResponse"]["value"], "done")
 
+    def test_renderer_labels_partial_prompt(self) -> None:
+        debug = parse_agent_debug(self._write("partial-prompt.jsonl", [
+            {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": "#attachment:Pasted text #1", "repository": self.repo}},
+            {"ts": 1100, "sid": "session-1", "type": "agent_response", "attrs": {"response": "done"}},
+            {"ts": 1200, "sid": "session-1", "type": "turn_end", "attrs": {}},
+        ]), self.repo)
+        report = render_copilot_report(agent_debug=debug, otel={"source": "otel", "status": "unavailable"})
+        self.assertIn("Prompt [partial]: #attachment:Pasted text #1 (content unavailable)", report)
+
+    def test_renderer_marks_truncated_final_outcome_with_metadata(self) -> None:
+        outcome = "outcome " * 100
+        debug = parse_agent_debug(self._write("truncated-outcome.jsonl", [
+            {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": "plain prompt", "repository": self.repo}},
+            {"ts": 1100, "sid": "session-1", "type": "agent_response", "attrs": {"response": outcome}},
+            {"ts": 1200, "sid": "session-1", "type": "turn_end", "attrs": {}},
+        ]), self.repo)
+        report = render_copilot_report(agent_debug=debug, otel={"source": "otel", "status": "unavailable"})
+        self.assertIn("Final outcome:", report)
+        self.assertIn("truncated; length 800; sha256 ", report)
+        self.assertIn(debug["finalResponse"]["sha256"], report)
+
+    def test_renderer_keeps_complete_content_compact(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        report = render_copilot_report(agent_debug=debug, otel={"source": "otel", "status": "unavailable"})
+        self.assertIn("Prompt: do work", report)
+        self.assertIn("Final outcome: done", report)
+        self.assertNotIn("truncated;", report)
+
     def test_malformed_structured_content_fails_closed_without_crashing(self) -> None:
         debug = self._write("malformed-structured.jsonl", [
             {"ts": 1000, "sid": "session-1", "type": "user_message", "attrs": {"content": "[{\"role\":", "repository": self.repo}},
