@@ -131,6 +131,14 @@ def _partial_attachment(label: str) -> dict[str, Any]:
     return result
 
 
+def _is_report_prompt(segment: list[dict[str, Any]]) -> bool:
+    user = next((record for record in segment if record.get("type") == "user_message"), None)
+    attrs = user.get("attrs", {}) if isinstance(user, dict) else {}
+    content = attrs.get("content") if isinstance(attrs, dict) else None
+    readable = _readable_text(content, "user")
+    return isinstance(readable, str) and " ".join(readable.split()) == "/report"
+
+
 def _timestamp(value: Any) -> float | None:
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         return float(value) / (1000 if value > 10_000_000_000 else 1)
@@ -174,7 +182,7 @@ def parse_agent_debug(path: Path, repo_root: str, *, exclude_session: str | None
                 if current is not None:
                     if any(item.get("type") == "turn_end" for item in current):
                         session_ids = {item.get("sid") for item in current if isinstance(item.get("sid"), str)}
-                        if not exclude_session or exclude_session not in session_ids:
+                        if (not exclude_session or exclude_session not in session_ids) and not _is_report_prompt(current):
                             if any(_repo_match(item, repo_root) for item in current):
                                 candidate = current
                 current = []
@@ -183,7 +191,7 @@ def parse_agent_debug(path: Path, repo_root: str, *, exclude_session: str | None
         if current is not None:
             if any(item.get("type") == "turn_end" for item in current):
                 session_ids = {item.get("sid") for item in current if isinstance(item.get("sid"), str)}
-                if not exclude_session or exclude_session not in session_ids:
+                if (not exclude_session or exclude_session not in session_ids) and not _is_report_prompt(current):
                     if any(_repo_match(item, repo_root) for item in current):
                         candidate = current
     except OSError as exc:

@@ -251,6 +251,44 @@ class CopilotReportTests(unittest.TestCase):
         self.assertEqual(result["prompt"]["value"], "single prompt")
         self.assertEqual(result["finalResponse"]["value"], "single outcome")
 
+    def test_global_selection_skips_completed_report_after_work(self) -> None:
+        records = self._turn_records("session", "work prompt", "work outcome", 900)
+        records.extend(self._turn_records("session", " /report ", "report outcome", 1000))
+        result = parse_agent_debug_files([self._global_debug_file(self.root / "report-skip", "one", records)], self.repo)
+        self.assertEqual(result["prompt"]["value"], "work prompt")
+        self.assertEqual(result["finalResponse"]["value"], "work outcome")
+
+    def test_global_selection_skips_multiple_completed_reports(self) -> None:
+        records = self._turn_records("session", "work prompt", "work outcome", 1100)
+        records.extend(self._turn_records("session", "/report", "first report", 1200))
+        records.extend(self._turn_records("session", "\n/report\n", "second report", 1300))
+        result = parse_agent_debug_files([self._global_debug_file(self.root / "report-skip", "many", records)], self.repo)
+        self.assertEqual(result["prompt"]["value"], "work prompt")
+        self.assertEqual(result["finalResponse"]["value"], "work outcome")
+
+    def test_newer_report_in_another_file_cannot_beat_latest_work(self) -> None:
+        work = self._global_debug_file(self.root / "cross-file", "work", self._turn_records("work", "latest work", "latest outcome", 1400))
+        report = self._global_debug_file(self.root / "cross-file", "report", self._turn_records("report", "/report", "report outcome", 1500))
+        result = parse_agent_debug_files([work, report], self.repo)
+        self.assertEqual(result["session"]["value"], "work")
+        self.assertEqual(result["finalResponse"]["value"], "latest outcome")
+
+    def test_prompt_mentioning_report_remains_eligible(self) -> None:
+        records = self._turn_records("session", "fix the /report command", "fixed report command", 1600)
+        result = parse_agent_debug_files([self._global_debug_file(self.root / "report-skip", "mention", records)], self.repo)
+        self.assertEqual(result["prompt"]["value"], "fix the /report command")
+
+    def test_report_only_sources_are_explicitly_unavailable(self) -> None:
+        records = self._turn_records("session", "/report", "report outcome", 1700)
+        result = parse_agent_debug_files([self._global_debug_file(self.root / "report-skip", "only", records)], self.repo)
+        self.assertEqual(result["status"], "unavailable")
+
+    def test_incomplete_report_remains_excluded(self) -> None:
+        records = self._turn_records("session", "work prompt", "work outcome", 1800)
+        records.extend(self._turn_records("session", "/report", "in progress report", 1900, complete=False))
+        result = parse_agent_debug_files([self._global_debug_file(self.root / "report-skip", "incomplete", records)], self.repo)
+        self.assertEqual(result["finalResponse"]["value"], "work outcome")
+
     def test_plaintext_terminal_zero_duplicate_unresolved_and_malformed(self) -> None:
         empty = self._terminal_log(["2026-08-21 14:00:00.000 [info] unrelated diagnostic []"])
         self.assertEqual(parse_terminal_diagnostics(empty, start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))["status"], "unavailable")
