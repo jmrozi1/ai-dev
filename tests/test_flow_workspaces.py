@@ -1535,5 +1535,357 @@ class SingleWorkspacePromotionRegressionTests(PromotionSetupMixin):
         self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
 
 
+class RefreshTestBase(PromotionSetupMixin):
+    def _workspace_with_work(self, name: str, ticket_id: str = "301"):
+        repo_root = self._init_repo(name)
+        self._write_ticket(repo_root, ticket_id)
+        code, _, stderr = self._invoke(repo_root, "start", ticket_id)
+        self.assertEqual(code, 0, msg=stderr)
+        (repo_root / "mine.txt").write_text("mine\n", encoding="utf-8")
+        code, _, stderr = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+        return repo_root
+
+    def _advance_main(self, repo_root: Path, marker: str, *, path: str = None) -> str:
+        advancer = self.tmp_path / f"advance-{marker}"
+        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(advancer), "main")
+        target = path or f"{marker}.txt"
+        (advancer / target).write_text(f"{marker}\n", encoding="utf-8")
+        self._run_git(advancer, "add", target)
+        self._run_git(advancer, "commit", "-q", "-m", f"advance {marker}")
+        new_commit = self._run_git(advancer, "rev-parse", "HEAD")
+        self._run_git(repo_root, "branch", "-f", "main", new_commit)
+        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
+        return new_commit
+
+    def _checkpoint_inference(self, repo_root: Path, scratch_branch: str) -> int:
+        from ai_dev_flow.repository import max_numbered_checkpoint_relative_to_main
+
+        return max_numbered_checkpoint_relative_to_main(
+            repo_root, main_branch="main", scratch_branch=scratch_branch
+        )
+
+
+class WorkspaceRefreshTests(RefreshTestBase):
+    def test_successful_refresh_merges_main_without_touching_it(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-ok")
+        new_main = self._advance_main(repo_root, "one")
+        scratch_before = self._run_git(repo_root, "rev-parse", "scratch")
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("Refreshed scratch from main", stdout)
+        self.assertIn(new_main, stdout)
+
+        # main is untouched and is now an ancestor of scratch.
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "main"), new_main)
+        self.assertTrue(
+            workspaces.list_worktrees(repo_root) is not None
+        )
+        merge_base = self._run_git(repo_root, "merge-base", "main", "scratch")
+        self.assertEqual(merge_base, new_main)
+        self.assertNotEqual(self._run_git(repo_root, "rev-parse", "scratch"), scratch_before)
+
+        # Local work survived the merge.
+        self.assertTrue((repo_root / "mine.txt").exists())
+        self.assertTrue((repo_root / "one.txt").exists())
+        self.assertEqual(self._run_git(repo_root, "status", "--porcelain"), "")
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_merge_subject_is_nonnumeric_so_inference_is_unchanged(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-subject", "302")
+        before = self._checkpoint_inference(repo_root, "scratch")
+        self.assertEqual(before, 1)
+
+        self._advance_main(repo_root, "two")
+        code, _, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+
+        subject = self._run_git(repo_root, "log", "-1", "--format=%s")
+        self.assertTrue(subject.startswith("Refresh workspace base from main"), subject)
+        self.assertFalse(subject.strip().isdigit())
+        self.assertEqual(
+            self._checkpoint_inference(repo_root, "scratch"),
+            before,
+            "a refresh merge must not change numbered-checkpoint inference",
+        )
+        self.assertEqual(self._read_state(repo_root)["checkpoint"], before)
+
+    def test_already_current_workspace_is_a_no_op(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-current", "303")
+        before = self._snapshot(repo_root) if False else {
+            "scratch": self._run_git(repo_root, "rev-parse", "scratch"),
+            "main": self._run_git(repo_root, "rev-parse", "main"),
+            "state": (repo_root / ".ai-dev" / "workflow.json").read_text(encoding="utf-8"),
+            "status": self._run_git(repo_root, "status", "--porcelain"),
+        }
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("Workspace is current with main", stdout)
+        self.assertIn("No changes were made.", stdout)
+
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "scratch"), before["scratch"])
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "main"), before["main"])
+        self.assertEqual(
+            (repo_root / ".ai-dev" / "workflow.json").read_text(encoding="utf-8"),
+            before["state"],
+        )
+        self.assertEqual(self._run_git(repo_root, "status", "--porcelain"), before["status"])
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_another_workspace_scratch_advancing_leaves_refresh_a_no_op(self) -> None:
+        """Staleness is measured against main only, never another workspace."""
+        repo_root = self._workspace_with_work("repo-refresh-sibling", "304")
+        self._write_ticket(repo_root, "305")
+
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "305")
+        self.assertEqual(code, 0, msg=stderr)
+        sibling = self.tmp_path / "repo-refresh-sibling-issue-305"
+        sibling_branch = self._read_state(sibling)["scratchBranch"]
+
+        # The sibling races far ahead on its own branch; main never moves.
+        main_before = self._run_git(repo_root, "rev-parse", "main")
+        for index in range(3):
+            (sibling / f"sib{index}.txt").write_text("s\n", encoding="utf-8")
+            code, _, stderr = self._invoke(sibling, "commit")
+            self.assertEqual(code, 0, msg=stderr)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "main"), main_before)
+
+        scratch_before = self._run_git(repo_root, "rev-parse", "scratch")
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("Workspace is current with main", stdout)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "scratch"), scratch_before)
+
+        # The sibling workspace is untouched by the other workspace's refresh.
+        self.assertEqual(self._read_state(sibling)["activeIssueNumber"], 305)
+        self.assertEqual(self._read_state(sibling)["checkpoint"], 3)
+        self.assertEqual(
+            self._run_git(sibling, "rev-parse", "--abbrev-ref", "HEAD"), sibling_branch
+        )
+
+    def test_refresh_fails_closed_on_lock_contention(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-contention", "306")
+        self._advance_main(repo_root, "three")
+        scratch_before = self._run_git(repo_root, "rev-parse", "scratch")
+
+        held = workspaces.acquire_promotion_lock(
+            repo_root,
+            worktree_id="other-worktree",
+            workspace_path=self.tmp_path / "other-ws",
+            ticket_key="local:888",
+            operation="promote",
+        )
+        try:
+            code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        finally:
+            workspaces.release_promotion_lock(repo_root, token=held.token)
+
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("promotion lock is held by", stderr)
+        self.assertIn("local:888", stderr)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "scratch"), scratch_before)
+
+    def test_main_advancing_between_preflight_and_locked_reread_uses_the_newer_commit(
+        self,
+    ) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-race", "307")
+        first_main = self._advance_main(repo_root, "four")
+
+        raced = {"done": False, "commit": ""}
+        original_acquire = cli.acquire_promotion_lock
+
+        def acquire_then_race(*args, **kwargs):
+            record = original_acquire(*args, **kwargs)
+            if not raced["done"]:
+                raced["commit"] = self._advance_main(repo_root, "five")
+                raced["done"] = True
+            return record
+
+        cli.acquire_promotion_lock = acquire_then_race
+        try:
+            code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        finally:
+            cli.acquire_promotion_lock = original_acquire
+
+        self.assertTrue(raced["done"], "the race must actually have been injected")
+        self.assertNotEqual(raced["commit"], first_main)
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn(f"main moved from {first_main} to {raced['commit']}", stderr)
+        self.assertIn(raced["commit"], stdout)
+
+        # The merge used the commit observed under the lock, not the preflight one.
+        self.assertEqual(
+            self._run_git(repo_root, "merge-base", "main", "scratch"), raced["commit"]
+        )
+
+    def test_conflicted_refresh_preserves_merge_state_claim_and_checkpoint(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-conflict", "308")
+        # Both sides edit the same path so the merge must conflict.
+        (repo_root / "shared.txt").write_text("workspace side\n", encoding="utf-8")
+        self._run_git(repo_root, "add", "shared.txt")
+        self._run_git(repo_root, "commit", "-q", "-m", "2")
+
+        advancer = self.tmp_path / "conflict-advancer"
+        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(advancer), "main")
+        (advancer / "shared.txt").write_text("main side\n", encoding="utf-8")
+        self._run_git(advancer, "add", "shared.txt")
+        self._run_git(advancer, "commit", "-q", "-m", "advance conflict")
+        new_main = self._run_git(advancer, "rev-parse", "HEAD")
+        self._run_git(repo_root, "branch", "-f", "main", new_main)
+        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
+
+        state_before = (repo_root / ".ai-dev" / "workflow.json").read_text(encoding="utf-8")
+        claim_before = self._claim_path(repo_root, "308").read_text(encoding="utf-8")
+        checkpoint_before = self._read_state(repo_root)["checkpoint"]
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("conflicted", stderr)
+        self.assertIn("shared.txt", stderr)
+        self.assertIn("git merge --abort", stderr)
+        self.assertIn("keeps its ticket claim", stderr)
+
+        # The ordinary Git merge state is left in place, not aborted.
+        self.assertTrue(cli.merge_in_progress(repo_root))
+        self.assertIn("shared.txt", cli.unmerged_paths(repo_root))
+
+        # Workflow state, claim, and checkpoint are intact.
+        self.assertEqual(
+            (repo_root / ".ai-dev" / "workflow.json").read_text(encoding="utf-8"),
+            state_before,
+        )
+        self.assertEqual(
+            self._claim_path(repo_root, "308").read_text(encoding="utf-8"), claim_before
+        )
+        self.assertEqual(self._read_state(repo_root)["checkpoint"], checkpoint_before)
+
+        # The lock was released despite the conflict.
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_refresh_invalidates_review_and_baseline_evidence(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-evidence", "309")
+        self._record_review_pass(repo_root, "309")
+        review_path = repo_root / ".ai-dev" / "promotion-review.json"
+        baseline_path = repo_root / ".ai-dev" / "diff-baseline" / "baseline.json"
+        baseline_path.parent.mkdir(parents=True, exist_ok=True)
+        baseline_path.write_text("{}\n", encoding="utf-8")
+        self.assertTrue(review_path.exists())
+        self.assertTrue(baseline_path.exists())
+
+        self._advance_main(repo_root, "six")
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+
+        self.assertFalse(review_path.exists(), "promotion review evidence must be cleared")
+        self.assertFalse(baseline_path.exists(), "diff baseline must be cleared")
+        self.assertIn("Review evidence tied to the previous base was cleared", stdout)
+
+    def test_refresh_leaves_main_and_other_workspaces_untouched(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-others", "310")
+        self._write_ticket(repo_root, "311")
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "311")
+        self.assertEqual(code, 0, msg=stderr)
+        sibling = self.tmp_path / "repo-refresh-others-issue-311"
+
+        (sibling / "sib.txt").write_text("sib\n", encoding="utf-8")
+        code, _, stderr = self._invoke(sibling, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+
+        sibling_head_before = self._run_git(sibling, "rev-parse", "HEAD")
+        sibling_state_before = (sibling / ".ai-dev" / "workflow.json").read_text(encoding="utf-8")
+        sibling_status_before = self._run_git(sibling, "status", "--porcelain")
+
+        new_main = self._advance_main(repo_root, "seven")
+        code, _, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "main"), new_main)
+        self.assertEqual(self._run_git(sibling, "rev-parse", "HEAD"), sibling_head_before)
+        self.assertEqual(
+            (sibling / ".ai-dev" / "workflow.json").read_text(encoding="utf-8"),
+            sibling_state_before,
+        )
+        self.assertEqual(self._run_git(sibling, "status", "--porcelain"), sibling_status_before)
+        self.assertTrue(self._claim_path(repo_root, "311").exists())
+
+    def test_refresh_keeps_claim_and_checkpoint_intact(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-claim", "312")
+        claim_before = self._claim_path(repo_root, "312").read_text(encoding="utf-8")
+        checkpoint_before = self._read_state(repo_root)["checkpoint"]
+
+        self._advance_main(repo_root, "eight")
+        code, _, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+
+        self.assertEqual(
+            self._claim_path(repo_root, "312").read_text(encoding="utf-8"), claim_before
+        )
+        state = self._read_state(repo_root)
+        self.assertEqual(state["checkpoint"], checkpoint_before)
+        self.assertEqual(state["activeIssueNumber"], 312)
+
+    def test_refresh_requires_a_clean_tree_and_no_merge_in_progress(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-dirty", "313")
+        self._advance_main(repo_root, "nine")
+        (repo_root / "dirty.txt").write_text("dirty\n", encoding="utf-8")
+        scratch_before = self._run_git(repo_root, "rev-parse", "scratch")
+
+        code, _, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 1)
+        self.assertIn("index and working tree must be clean", stderr)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "scratch"), scratch_before)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_refresh_refuses_a_claim_owned_by_another_workspace(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-foreign", "314")
+        claim_file = self._claim_path(repo_root, "314")
+        payload = json.loads(claim_file.read_text(encoding="utf-8"))
+        payload["worktreeId"] = "someone-elses-worktree"
+        claim_file.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        code, _, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 1)
+        self.assertIn("owned by workspace", stderr)
+
+    def test_stale_promotion_message_points_at_refresh(self) -> None:
+        repo_root = self._ready_to_promote("repo-refresh-pointer", "315")
+        self._advance_main(repo_root, "ten")
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("base is stale", stderr)
+        self.assertIn("flow-workspace refresh", stderr)
+
+    def test_promotion_succeeds_after_a_refresh_then_stales_again(self) -> None:
+        repo_root = self._workspace_with_work("repo-refresh-then-promote", "316")
+        self._advance_main(repo_root, "eleven")
+
+        code, _, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+
+        # Review evidence must be earned again against the refreshed base.
+        self._record_review_pass(repo_root, "316")
+        code, stdout, stderr = self._invoke(repo_root, "promote", "promoted after refresh")
+        self.assertEqual(code, 0, msg=stderr)
+
+        # A later advance makes it stale again and ordinary refusal returns.
+        self._advance_main(repo_root, "twelve")
+        (repo_root / "more.txt").write_text("more\n", encoding="utf-8")
+        code, _, stderr = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+        self._record_review_pass(repo_root, "316")
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("base is stale", stderr)
+        self.assertIn("refresh", stderr)
+
+
 if __name__ == "__main__":
     unittest.main()

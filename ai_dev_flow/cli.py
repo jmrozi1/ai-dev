@@ -54,6 +54,9 @@ from .repository import (
     delete_managed_ref,
     resolve_managed_ref,
     add_worktree,
+    merge_revision_no_fast_forward,
+    unmerged_paths,
+    merge_in_progress,
     remove_worktree,
     prune_worktrees,
     delete_branch_if_at_revision,
@@ -425,6 +428,7 @@ Options:
 Usage: {command_name} add <ticket-id> [path]
        {command_name} adopt <ticket-id>
        {command_name} list
+       {command_name} refresh
        {command_name} remove [path]
        {command_name} prune [--claim <ticket-id>]
        {command_name} unlock [--force] <holder-path>
@@ -440,6 +444,10 @@ Subcommands:
   adopt <ticket-id>       Claim and activate the current worktree without
                           resetting its branch or working tree.
   list                    Show every claim and its live workspace path.
+  refresh                 Merge the current main into this workspace's scratch
+                          branch after main advanced. Never rebases, force-
+                          updates, or changes main. Leaves a conflicted merge
+                          in place for explicit resolution.
   remove [path]           Remove an inactive, clean workspace and its claim.
   prune [--claim <id>]    Remove claims whose worktree is gone or prunable.
                           --claim recovers one unreadable claim record.
@@ -2043,11 +2051,20 @@ def _print_promote_partial_success(
     )
 
 
+def _workspace_command_name(command_name: str) -> str:
+    """The sibling workspace executable for whatever prefix is in use."""
+    if "-" in command_name:
+        prefix, _, _ = command_name.rpartition("-")
+        return f"{prefix}-workspace"
+    return "flow-workspace"
+
+
 def _promote_stale_base_message(
     repo_root: Path,
     state: WorkflowState,
     comparison: BranchComparison,
     *,
+    command_name: str,
     observed_main_commit: str,
     preflight_main_commit: str | None = None,
 ) -> str:
@@ -2099,9 +2116,10 @@ def _promote_stale_base_message(
             "breadcrumb; inspect the workspaces with the workspace list command."
         )
 
+    workspace_command = _workspace_command_name(command_name)
     lines.append(
-        "  Nothing was changed. Reconcile this workspace against the new "
-        f"{state.main_branch} before promoting again."
+        f"  Nothing was changed. Run {workspace_command} refresh to merge the current "
+        f"{state.main_branch} into this workspace, then promote again."
     )
     return "\n".join(lines)
 
@@ -2110,6 +2128,7 @@ def _promote_locked_revalidation(
     repo_root: Path,
     state: WorkflowState,
     *,
+    command_name: str,
     preflight_main_commit: str | None,
 ):
     """Re-prove every promotion precondition while the lock is held.
@@ -2154,6 +2173,7 @@ def _promote_locked_revalidation(
                 repo_root,
                 state,
                 comparison,
+                command_name=command_name,
                 observed_main_commit=observed_main_commit,
                 preflight_main_commit=preflight_main_commit,
             )
@@ -2165,6 +2185,7 @@ def _promote_locked_revalidation(
                 repo_root,
                 state,
                 comparison,
+                command_name=command_name,
                 observed_main_commit=observed_main_commit,
                 preflight_main_commit=preflight_main_commit,
             )
@@ -2310,6 +2331,7 @@ def _promote_under_lock(
     comparison, upstream, observed_main_commit = _promote_locked_revalidation(
         repo_root,
         state,
+        command_name=command_name,
         preflight_main_commit=preflight_main_commit,
     )
 
@@ -4130,7 +4152,7 @@ def _workspace_usage(command_name: str) -> FlowError:
     return _usage_error(
         command_name,
         "workspace",
-        "<add|adopt|list|remove|prune|unlock> ...",
+        "<add|adopt|list|refresh|remove|prune|unlock> ...",
     )
 
 
@@ -4806,6 +4828,208 @@ def _handle_workspace_prune(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
+REFRESH_MERGE_SUBJECT_PREFIX = "Refresh workspace base from"
+
+
+def _owned_active_claim_for_state(repo_root: Path, state: WorkflowState):
+    """The claim this workspace owns for its active ticket, or a refusal."""
+    if state.ticket_reference is None:
+        raise FlowError(
+            "Cannot refresh workspace: the active workflow has no bound ticket, so it "
+            "owns no workspace claim."
+        )
+
+    key = canonical_ticket_key(state.ticket_reference)
+    try:
+        record = read_claim(repo_root, key)
+    except WorkspaceError as exc:
+        raise FlowError(f"Cannot refresh workspace: {exc}") from exc
+
+    if record is None:
+        raise FlowError(
+            f"Cannot refresh workspace: no workspace claim exists for {key}."
+        )
+    if isinstance(record, MalformedClaim):
+        raise FlowError(
+            f"Cannot refresh workspace: the claim at {record.path} is unreadable "
+            f"({record.detail})."
+        )
+    if record.status != "active":
+        raise FlowError(
+            f"Cannot refresh workspace: the claim for {key} is not active."
+        )
+
+    try:
+        owner = effective_worktree_id(repo_root)
+    except WorkspaceError as exc:
+        raise FlowError(f"Cannot refresh workspace: {exc}") from exc
+
+    if record.worktree_id != owner:
+        raise FlowError(
+            f"Cannot refresh workspace: the claim for {key} is owned by workspace "
+            f"{record.intended_path or record.worktree_id}, not this one."
+        )
+    return record
+
+
+def _handle_workspace_refresh(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _workspace_usage(command_name)
+
+    repo_root, state_path, state = _resolve_repo_state_context()
+
+    if _active_workflow_type(state) is None:
+        raise FlowError("Cannot refresh workspace: no active workflow is set.")
+
+    _owned_active_claim_for_state(repo_root, state)
+
+    _ensure_main_and_scratch_branches_differ(state)
+    _ensure_main_and_scratch_branches_exist(repo_root, state)
+
+    current_branch = current_branch_name(repo_root)
+    if current_branch != state.scratch_branch:
+        raise FlowError(
+            f"Cannot refresh workspace: current branch {current_branch} does not match "
+            f"scratchBranch {state.scratch_branch}."
+        )
+
+    ensure_no_active_git_operations(repo_root)
+
+    excluded_paths = [".ai-dev/"]
+    if git_status_short_filtered(repo_root, excluded_paths=excluded_paths):
+        raise FlowError(
+            "Cannot refresh workspace: the index and working tree must be clean."
+        )
+
+    # Read-only preflight. Only the locked reread below decides anything.
+    preflight_main_commit = resolve_commit_hash(repo_root, state.main_branch)
+
+    with _held_promotion_lock(repo_root, state, operation="refresh"):
+        return _refresh_under_lock(
+            command_name,
+            repo_root=repo_root,
+            state=state,
+            preflight_main_commit=preflight_main_commit,
+        )
+
+
+def _refresh_under_lock(
+    command_name: str,
+    *,
+    repo_root: Path,
+    state: WorkflowState,
+    preflight_main_commit: str,
+) -> int:
+    # Everything is re-proved under the lock; main may have moved since preflight.
+    _ensure_main_and_scratch_branches_exist(repo_root, state)
+    ensure_no_active_git_operations(repo_root)
+
+    current_branch = current_branch_name(repo_root)
+    if current_branch != state.scratch_branch:
+        raise FlowError(
+            f"Cannot refresh workspace: current branch {current_branch} does not match "
+            f"scratchBranch {state.scratch_branch}."
+        )
+
+    if git_status_short_filtered(repo_root, excluded_paths=[".ai-dev/"]):
+        raise FlowError(
+            "Cannot refresh workspace: the index and working tree must be clean."
+        )
+
+    observed_main_commit = resolve_commit_hash(repo_root, state.main_branch)
+
+    # Staleness is measured only against main. Another workspace's scratch branch
+    # advancing has no bearing on whether this workspace needs a refresh.
+    if branch_is_ancestor(
+        repo_root,
+        ancestor_revision=observed_main_commit,
+        descendant_revision=state.scratch_branch,
+    ):
+        print(f"Workspace is current with {state.main_branch}")
+        print(f"{state.main_branch}: {observed_main_commit}")
+        print("No changes were made.")
+        return 0
+
+    if observed_main_commit != preflight_main_commit:
+        print(
+            f"Note: {state.main_branch} moved from {preflight_main_commit} to "
+            f"{observed_main_commit} while the promotion lock was being acquired; "
+            "refreshing onto the newer commit.",
+            file=sys.stderr,
+        )
+
+    short_main = resolve_short_commit_hash(repo_root, observed_main_commit)
+    # A non-numeric subject keeps numbered-checkpoint inference unchanged.
+    merge_subject = (
+        f"{REFRESH_MERGE_SUBJECT_PREFIX} {state.main_branch} {short_main}"
+    )
+
+    # Evidence bound to the old base cannot survive a merge that moves the base.
+    _clear_promotion_review_record(repo_root)
+    try:
+        clear_diff_baseline_for_repo_root(repo_root)
+    except RepositoryError as exc:
+        raise FlowError(
+            f"Cannot refresh workspace: review baseline could not be cleared. {exc}"
+        ) from exc
+
+    try:
+        merge_revision_no_fast_forward(
+            repo_root,
+            revision=observed_main_commit,
+            message=merge_subject,
+        )
+    except RepositoryError as exc:
+        conflicted = unmerged_paths(repo_root)
+        if conflicted or merge_in_progress(repo_root):
+            # The ordinary Git merge state is left exactly as Git produced it.
+            print(
+                f"Cannot refresh workspace: merging {state.main_branch} "
+                f"({observed_main_commit}) into {state.scratch_branch} conflicted.",
+                file=sys.stderr,
+            )
+            if conflicted:
+                print("Conflicted paths:", file=sys.stderr)
+                for path_text in conflicted:
+                    print(f"  {path_text}", file=sys.stderr)
+            workspace_command = _workspace_command_name(command_name)
+            print(
+                "The merge was left in progress for explicit resolution. Resolve the "
+                "conflicts and run 'git commit' to finish it, or run 'git merge --abort' "
+                f"to return to the previous base and rerun {workspace_command} refresh.",
+                file=sys.stderr,
+            )
+            print(
+                "This workspace keeps its ticket claim, workflow state, and checkpoint. "
+                "Review evidence tied to the previous base was cleared and must be "
+                "earned again.",
+                file=sys.stderr,
+            )
+            return 1
+        raise FlowError(f"Cannot refresh workspace: {exc}") from exc
+
+    if not branch_is_ancestor(
+        repo_root,
+        ancestor_revision=observed_main_commit,
+        descendant_revision=state.scratch_branch,
+    ):
+        raise FlowError(
+            "Cannot refresh workspace: the merge completed but "
+            f"{state.main_branch} is still not an ancestor of {state.scratch_branch}."
+        )
+
+    merge_commit = resolve_commit_hash(repo_root, "HEAD")
+    print(f"Refreshed {state.scratch_branch} from {state.main_branch}")
+    print(f"{state.main_branch}: {observed_main_commit}")
+    print(f"merge commit: {merge_commit}")
+    print(f"checkpoint: {state.checkpoint}")
+    print(
+        "Review evidence tied to the previous base was cleared; re-run review before "
+        "promoting."
+    )
+    return 0
+
+
 def _handle_workspace_unlock(command_name: str, arguments: list[str]) -> int:
     force = False
     remaining = list(arguments)
@@ -4859,6 +5083,8 @@ def handle_workspace(command_name: str, arguments: list[str]) -> int:
         return _handle_workspace_list(command_name, rest)
     if subcommand == "remove":
         return _handle_workspace_remove(command_name, rest)
+    if subcommand == "refresh":
+        return _handle_workspace_refresh(command_name, rest)
     if subcommand == "prune":
         return _handle_workspace_prune(command_name, rest)
     if subcommand == "unlock":

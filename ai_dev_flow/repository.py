@@ -930,3 +930,42 @@ def delete_branch_if_at_revision(
             completed.stderr.strip() or f"Cannot delete branch {branch_name}."
         )
     return True
+
+
+def merge_revision_no_fast_forward(
+    repo_root: Path,
+    *,
+    revision: str,
+    message: str,
+) -> None:
+    """Merge one exact revision into the current branch, always recording a merge.
+
+    --no-ff guarantees a real merge commit even when the current branch is only
+    behind, so the resulting subject is always available to carry a non-numeric
+    label.
+    """
+    completed = _run_git(
+        repo_root,
+        ["merge", "--no-ff", "--no-edit", "-m", message, revision],
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RepositoryError(
+            (completed.stderr.strip() or completed.stdout.strip())
+            or f"git merge {revision} failed."
+        )
+
+
+def unmerged_paths(repo_root: Path) -> list[str]:
+    completed = _run_git(
+        repo_root,
+        ["diff", "--name-only", "--diff-filter=U"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    return [line for line in completed.stdout.splitlines() if line]
+
+
+def merge_in_progress(repo_root: Path) -> bool:
+    return _git_operation_sentinel_exists(repo_root, "MERGE_HEAD")
