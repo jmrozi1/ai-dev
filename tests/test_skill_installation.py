@@ -201,7 +201,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 13)
+        self.assertEqual(len(names), 14)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -228,6 +228,7 @@ class SkillInstallationTests(unittest.TestCase):
         shared_names = {
             "feedback-loop-design",
             "frontend-design-review",
+            "investigation-synthesis",
             "requirements-driven-development",
             "review-process",
         }
@@ -285,6 +286,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "flow",
                 "flow",
                 "frontend-design-review",
+                "investigation-synthesis",
                 "orchestrator",
                 "requirements-driven-development",
                 "review-process",
@@ -321,6 +323,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "flow",
                 "flow",
                 "frontend-design-review",
+                "investigation-synthesis",
                 "orchestrator",
                 "requirements-driven-development",
                 "review-process",
