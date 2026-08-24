@@ -402,6 +402,92 @@ class CopilotReportTests(unittest.TestCase):
         self.assertEqual(terminal["approvalWaitSeconds"]["status"], "partial")
         self.assertNotEqual(terminal["approvalWaitSeconds"]["value"], 0)
 
+    def test_terminal_action_unique_exit_zero_is_successful(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `ok-cmd` []",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(terminal["actions"]["status"], "validated")
+        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "successful")
+        self.assertEqual(terminal["actions"]["value"][0]["exitCode"], "0")
+
+    def test_terminal_action_nonzero_exit_is_visible(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `bad-cmd` []",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `7`, result.length `2`, error `failed` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "failed")
+        self.assertEqual(terminal["errors"]["value"][0]["category"], "nonzero_exit")
+        self.assertEqual(terminal["errors"]["value"][0]["outcome"], "unresolved_failure")
+
+    def test_terminal_action_undefined_exit_is_unknown(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `unknown-cmd` []",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `undefined`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(terminal["actions"]["status"], "partial")
+        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "unknown")
+        self.assertEqual(terminal["errors"]["value"][0]["category"], "unknown_outcome")
+
+    def test_unassociated_finish_is_preserved_as_unknown(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(terminal["actions"]["status"], "partial")
+        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "unassociated")
+        self.assertIsNone(terminal["actions"]["value"][0]["command"])
+
+    def test_multiple_unfinished_executions_make_finish_ambiguous(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `first-cmd` []",
+            "2026-08-21 14:00:00.010 [info] RunInTerminalTool: Using `rich` execute strategy for command `second-cmd` []",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(terminal["actions"]["status"], "partial")
+        self.assertEqual(terminal["actions"]["value"][-1]["executionStatus"], "ambiguous")
+        self.assertEqual(sum(action["executionStatus"] == "unknown" for action in terminal["actions"]["value"]), 2)
+
+    def test_unique_approval_attaches_to_one_action(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"approved-cmd\"]]",
+            "2026-08-21 14:00:00.001 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Using `rich` execute strategy for command `approved-cmd` []",
+            "2026-08-21 14:00:00.200 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        actions = terminal["actions"]["value"]
+        self.assertEqual(len(actions), 1)
+        self.assertTrue(actions[0]["approvalRequest"])
+        self.assertEqual(terminal["terminalApprovalRequestCount"]["value"], 1)
+
+    def test_auto_approved_action_has_no_approval_wait(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"auto-cmd\"]]",
+            "2026-08-21 14:00:00.001 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: All sub-commands auto-approved",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Using `rich` execute strategy for command `auto-cmd` []",
+            "2026-08-21 14:00:00.200 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertNotIn("approvalRequest", terminal["actions"]["value"][0])
+        self.assertEqual(terminal["approvalWaitSeconds"]["value"], 0)
+
+    def test_nonzero_followed_by_same_command_success_is_recovered(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `retry-cmd` []",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `7`, result.length `2`, error `failed` []",
+            "2026-08-21 14:00:01.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `retry-cmd` []",
+            "2026-08-21 14:00:01.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:02"))
+        self.assertEqual(terminal["errors"]["value"][0]["category"], "nonzero_exit")
+        self.assertEqual(terminal["errors"]["value"][0]["outcome"], "recovered_failure")
+
+    def test_action_renderer_is_chronological_and_bounded(self) -> None:
+        lines = []
+        for index in range(52):
+            lines.append(f"2026-08-21 14:00:{index % 60:02d}.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `cmd-{index}` []")
+        terminal = parse_terminal_diagnostics(self._terminal_log(lines), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:01:00"))
+        self.assertEqual(len(terminal["actions"]["value"]), 50)
+        self.assertTrue(terminal["actions"]["truncated"])
+        self.assertEqual(terminal["actions"]["length"], 52)
+
     def test_multiple_repositories_and_bounded_sensitive_fields(self) -> None:
         other_repo = str(self.root / "other")
         Path(other_repo).mkdir()
