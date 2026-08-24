@@ -48,6 +48,11 @@ authorization. Propose the change and let the orchestrator decide.
 A published handoff is bounded current state. Replace it. Never append to it, and
 never let it become a transcript, message log, or execution diary.
 
+Executor identity is disposable; the rail is durable. You may be taking over a
+rail a previous executor started. Treat any published handoff as current state to
+continue from rather than as your own memory, and do not assume you authored it.
+Work only the rail you were given, even when other rails are running.
+
 Local executors publish through `python -m ai_dev_flow.control_plane`, which
 enforces artifact ownership, resolves remote state freshly rather than trusting
 cached branch status, and fails closed on stale or diverged publication. On a

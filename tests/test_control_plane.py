@@ -8,6 +8,7 @@ import unittest
 
 from ai_dev_flow.control_plane import (
     ControlPlaneError,
+    collect_rail_states,
     publish,
     resolve_control_plane_config,
     resolve_read_source,
@@ -61,7 +62,7 @@ class ControlPlaneTests(unittest.TestCase):
         arguments: dict[str, object] = {
             "project": "ai-dev", "ticket": "issue-51",
             "artifact": "rail", "role": "orchestrator",
-            "content": "# Rail\n\nbounded work\n", "rail": "control-plane-surface",
+            "content": "# Rail\n\nStatus: ready\n\nbounded work\n", "rail": "control-plane-surface",
         }
         arguments.update(overrides)
         return publish(self.coordination, **arguments)  # type: ignore[arg-type]
@@ -95,8 +96,8 @@ class ControlPlaneTests(unittest.TestCase):
 
     def test_rail_read_excludes_sibling_rails_and_accepted_state(self) -> None:
         self._publish(artifact="state", role="orchestrator", rail=None, content="# Accepted\n\nsecret-accepted-state\n")
-        self._publish(rail="control-plane-surface", content="# Rail A\n\nmine\n")
-        self._publish(rail="provider-evidence-intake", content="# Rail B\n\nsibling-only-content\n")
+        self._publish(rail="control-plane-surface", content="# Rail A\n\nStatus: ready\n\nmine\n")
+        self._publish(rail="provider-evidence-intake", content="# Rail B\n\nStatus: ready\n\nsibling-only-content\n")
         rendered = render_rail(self.coordination, project="ai-dev", ticket="issue-51", rail="control-plane-surface")
         self.assertIn("mine", rendered)
         self.assertNotIn("sibling-only-content", rendered)
@@ -108,8 +109,8 @@ class ControlPlaneTests(unittest.TestCase):
         self._publish(rail="provider-evidence-intake")
         self._publish(artifact="handoff", role="executor", rail="control-plane-surface", content="# Handoff\n")
         rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
-        self.assertIn("- control-plane-surface: rail, handoff", rendered)
-        self.assertIn("- provider-evidence-intake: rail", rendered)
+        self.assertIn("- control-plane-surface: ready; artifacts: rail, handoff", rendered)
+        self.assertIn("- provider-evidence-intake: ready; artifacts: rail", rendered)
 
     def test_unknown_rail_read_fails_closed(self) -> None:
         with self.assertRaises(ControlPlaneError):
@@ -277,6 +278,119 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(self._git(product, "status", "--porcelain"), "")
         self.assertEqual(self._git(product, "rev-parse", "--abbrev-ref", "HEAD"), "main")
 
+    # Multiple bounded rails
+
+    def _authorize(self, rail: str, status: str, *, depends_on: str = "", resource: str = "") -> None:
+        header = [f"# Rail: {rail}", "", f"Status: {status}"]
+        if depends_on:
+            header.append(f"Depends on: {depends_on}")
+        if resource:
+            header.append(f"Shared resource: {resource}")
+        header.extend(["", "## Goal", "", f"bounded work for {rail}"])
+        self._publish(rail=rail, content="\n".join(header) + "\n")
+
+    def _states(self) -> dict[str, object]:
+        source = resolve_read_source(self.coordination)
+        return {state.identifier: state for state in collect_rail_states(source, project="ai-dev", ticket="issue-51")}
+
+    def test_four_status_classes_are_represented_and_surfaced(self) -> None:
+        for rail, status in (
+            ("rail-ready", "ready"), ("rail-running", "running"),
+            ("rail-blocked", "blocked"), ("rail-completed", "completed"),
+        ):
+            self._authorize(rail, status)
+        states = self._states()
+        self.assertEqual({identifier: state.status for identifier, state in states.items()}, {  # type: ignore[attr-defined]
+            "rail-ready": "ready", "rail-running": "running",
+            "rail-blocked": "blocked", "rail-completed": "completed",
+        })
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        for rail, status in (("rail-ready", "ready"), ("rail-running", "running"),
+                             ("rail-blocked", "blocked"), ("rail-completed", "completed")):
+            with self.subTest(rail=rail):
+                self.assertIn(f"- {rail}: {status}; artifacts: rail", rendered)
+
+    def test_target_rail_read_stays_bounded_with_many_rails(self) -> None:
+        self._authorize("rail-alpha", "running")
+        self._authorize("rail-beta", "ready")
+        self._authorize("rail-gamma", "blocked")
+        rendered = render_rail(self.coordination, project="ai-dev", ticket="issue-51", rail="rail-beta")
+        self.assertIn("bounded work for rail-beta", rendered)
+        self.assertNotIn("rail-alpha", rendered)
+        self.assertNotIn("rail-gamma", rendered)
+
+    def test_dependency_holds_one_rail_without_blocking_an_independent_rail(self) -> None:
+        self._authorize("rail-prerequisite", "running")
+        self._authorize("rail-dependent", "blocked", depends_on="rail-prerequisite")
+        self._authorize("rail-independent", "ready")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("depends on: rail-prerequisite (running)", rendered)
+        self.assertIn("dependencies satisfied: no", rendered)
+        self.assertIn("- rail-independent: ready; artifacts: rail", rendered)
+        independent = self._states()["rail-independent"]
+        self.assertEqual(independent.depends_on, [])  # type: ignore[attr-defined]
+
+    def test_satisfied_dependencies_are_reported_as_satisfied(self) -> None:
+        self._authorize("rail-prerequisite", "completed")
+        self._authorize("rail-dependent", "ready", depends_on="rail-prerequisite")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("dependencies satisfied: yes", rendered)
+
+    def test_singleton_resource_contention_is_surfaced_but_unrelated_work_is_not(self) -> None:
+        self._authorize("rail-live-runtime", "running", resource="wow-server")
+        self._authorize("rail-live-second", "ready", resource="wow-server")
+        self._authorize("rail-source-only", "ready")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("shared resource: wow-server", rendered)
+        self.assertIn("resource in use by: rail-live-runtime", rendered)
+        source_only = self._states()["rail-source-only"]
+        self.assertIsNone(source_only.shared_resource)  # type: ignore[attr-defined]
+        self.assertNotIn("rail-source-only: ready; artifacts: rail\n    shared resource", rendered)
+
+    def test_helper_reports_facts_and_never_a_recommendation(self) -> None:
+        self._authorize("rail-prerequisite", "running", resource="wow-server")
+        self._authorize("rail-dependent", "blocked", depends_on="rail-prerequisite", resource="wow-server")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51").lower()
+        for verdict in ("launch", "continue", "hold", "recommend", "next agent", "schedule"):
+            with self.subTest(verdict=verdict):
+                self.assertNotIn(verdict, rendered)
+
+    def test_missing_or_invalid_rail_status_fails_closed(self) -> None:
+        self._publish(rail="rail-no-status", content="# Rail\n\nno status header\n")
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("expected one of ready, running, blocked, completed", str(caught.exception))
+
+    def test_unknown_status_value_fails_closed(self) -> None:
+        self._authorize("rail-bad-status", "almost-done")
+        with self.assertRaises(ControlPlaneError):
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+
+    def test_rail_without_orchestrator_authorization_fails_closed(self) -> None:
+        self._publish(artifact="handoff", role="executor", rail="rail-unauthorized", content="# Handoff\n")
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("no orchestrator authorization", str(caught.exception))
+
+    def test_unknown_dependency_fails_closed(self) -> None:
+        self._authorize("rail-dependent", "ready", depends_on="rail-that-does-not-exist")
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("depends on unknown rail", str(caught.exception))
+
+    def test_self_dependency_fails_closed(self) -> None:
+        self._authorize("rail-selfish", "ready", depends_on="rail-selfish")
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("dependency on itself", str(caught.exception))
+
+    def test_contradictory_dependency_cycle_fails_closed(self) -> None:
+        self._authorize("rail-one", "ready", depends_on="rail-two")
+        self._authorize("rail-two", "ready", depends_on="rail-one")
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("contradictory", str(caught.exception))
+
     # Fresh reads: a stale clone must never serve stale authorization
 
     def _publish_from_upstream(self, upstream: Path, **overrides: object) -> None:
@@ -284,7 +398,7 @@ class ControlPlaneTests(unittest.TestCase):
         arguments: dict[str, object] = {
             "project": "ai-dev", "ticket": "issue-51",
             "artifact": "rail", "role": "orchestrator",
-            "content": "# Rail\n\npublished remotely\n", "rail": "remote-only-rail",
+            "content": "# Rail\n\nStatus: ready\n\npublished remotely\n", "rail": "remote-only-rail",
         }
         arguments.update(overrides)
         publish(upstream, **arguments)  # type: ignore[arg-type]

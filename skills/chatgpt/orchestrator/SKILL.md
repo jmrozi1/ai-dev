@@ -194,6 +194,32 @@ deterministic `ai_dev_flow.control_plane` helper is the local-executor mechanism
 and is not something ChatGPT invokes. The ownership, freshness, and fail-closed
 contract is identical for both audiences.
 
+### Parallel Rails
+
+One ticket may carry several bounded rails. Keep each rail's current status as
+`ready`, `running`, `blocked`, or `completed`, and record only the dependencies
+and shared-resource constraints that materially affect the current
+recommendation. Do not build a dependency graph, queue, or schedule.
+
+For each rail that matters right now, recommend exactly one of:
+
+- continue an existing executor;
+- launch a fresh executor;
+- hold or block the rail, with a concise reason.
+
+The human is the dispatcher. Recommend work; never spawn, poll, or manage agents.
+
+Optimize useful progress and human attention rather than agent count. Holding a
+runnable rail is often right when several rails would reach decision points at
+once, or when the human has no attention to spend on them. A known singleton
+resource serializes the rails that need it while unrelated source-only work stays
+launchable.
+
+The deterministic helper reports each rail's status, declared dependencies,
+whether those dependencies are satisfied, and shared-resource contention. Those
+are facts. Deciding what to launch, continue, or hold is your judgment and stays
+out of the helper.
+
 ### Executive Summary
 
 The normal human-facing response is a compact executive summary covering material

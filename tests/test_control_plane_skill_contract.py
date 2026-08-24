@@ -144,6 +144,42 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
                 self.assertIn(category, self.executor)
         self.assertIn("do not decide or state that a skill is defective", self.executor)
 
+    # Parallel rails
+
+    def test_orchestrator_tracks_four_rail_status_classes(self) -> None:
+        self.assertIn("`ready`, `running`, `blocked`, or `completed`", self.orchestrator)
+        self.assertIn(
+            "record only the dependencies and shared-resource constraints that materially affect the current recommendation",
+            self.orchestrator,
+        )
+
+    def test_orchestrator_recommends_continue_launch_or_hold(self) -> None:
+        self.assertIn("continue an existing executor", self.orchestrator)
+        self.assertIn("launch a fresh executor", self.orchestrator)
+        self.assertIn("hold or block the rail, with a concise reason", self.orchestrator)
+
+    def test_orchestrator_leaves_dispatch_to_the_human(self) -> None:
+        self.assertIn("the human is the dispatcher", self.orchestrator)
+        self.assertIn("never spawn, poll, or manage agents", self.orchestrator)
+
+    def test_orchestrator_optimizes_attention_not_agent_count(self) -> None:
+        self.assertIn("optimize useful progress and human attention rather than agent count", self.orchestrator)
+        self.assertIn("holding a runnable rail is often right", self.orchestrator)
+
+    def test_orchestrator_serializes_only_singleton_resource_rails(self) -> None:
+        self.assertIn("a known singleton resource serializes the rails that need it", self.orchestrator)
+        self.assertIn("unrelated source-only work stays launchable", self.orchestrator)
+
+    def test_orchestrator_keeps_judgment_out_of_the_helper(self) -> None:
+        self.assertIn("those are facts", self.orchestrator)
+        self.assertIn("deciding what to launch, continue, or hold is your judgment", self.orchestrator)
+        self.assertIn("do not build a dependency graph, queue, or schedule", self.orchestrator)
+
+    def test_executor_identity_is_disposable_and_rail_scoped(self) -> None:
+        self.assertIn("executor identity is disposable; the rail is durable", self.executor)
+        self.assertIn("do not assume you authored it", self.executor)
+        self.assertIn("work only the rail you were given, even when other rails are running", self.executor)
+
     # Negative boundaries
 
     def test_no_separate_shared_control_plane_skill_was_created(self) -> None:
@@ -152,7 +188,7 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.assertNotIn("`control-plane`", catalog)
 
     def test_neither_skill_introduces_forbidden_machinery(self) -> None:
-        for forbidden in ("message bus", "inbox", "outbox", "scheduler", "polling loop", "worker queue", "heartbeat", "agent database"):
+        for forbidden in ("message bus", "inbox", "outbox", "polling loop", "worker queue", "heartbeat", "agent database", "worker registry"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.orchestrator)
                 self.assertNotIn(forbidden, self.executor)

@@ -486,6 +486,151 @@ def resolve_read_source(repo_root: Path) -> ReadSource:
     )
 
 
+RAIL_STATUSES = ("ready", "running", "blocked", "completed")
+_RAIL_HEADER_KEYS = {"status", "depends on", "shared resource"}
+
+
+class RailState:
+    """Deterministic facts about one rail. Recommendations are not facts."""
+
+    def __init__(
+        self,
+        identifier: str,
+        status: str,
+        artifacts: list[str],
+        depends_on: list[str],
+        shared_resource: str | None,
+    ) -> None:
+        self.identifier = identifier
+        self.status = status
+        self.artifacts = artifacts
+        self.depends_on = depends_on
+        self.shared_resource = shared_resource
+
+
+def _parse_rail_header(text: str, *, rail_id: str) -> tuple[str, list[str], str | None]:
+    """Read the small current-state header the rail files already carry."""
+    header: dict[str, str] = {}
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            break
+        if ":" not in stripped:
+            continue
+        key, _, value = stripped.partition(":")
+        key = key.strip().lower().lstrip("#").strip()
+        if key in _RAIL_HEADER_KEYS:
+            header[key] = value.strip()
+
+    status = header.get("status", "").lower()
+    if status not in RAIL_STATUSES:
+        raise ControlPlaneError(
+            f"Rail '{rail_id}' has status '{header.get('status', '')or 'missing'}'; "
+            f"expected one of {', '.join(RAIL_STATUSES)}."
+        )
+
+    raw_depends = header.get("depends on", "").strip()
+    depends_on: list[str] = []
+    if raw_depends and raw_depends.lower() != "none":
+        for entry in raw_depends.split(","):
+            candidate = entry.strip().strip("`")
+            if not candidate:
+                continue
+            dependency = validate_identifier(candidate, label="rail dependency")
+            if dependency == rail_id:
+                raise ControlPlaneError(f"Rail '{rail_id}' declares a dependency on itself.")
+            depends_on.append(dependency)
+
+    raw_resource = header.get("shared resource", "").strip()
+    resource = None
+    if raw_resource and raw_resource.lower() != "none":
+        resource = validate_identifier(raw_resource.strip("`"), label="shared resource")
+    return status, depends_on, resource
+
+
+def collect_rail_states(source: ReadSource, *, project: str, ticket: str) -> list[RailState]:
+    """Surface every rail's current status, dependencies, and shared resource.
+
+    This reports facts only. Whether to continue, launch, or hold a rail is
+    orchestrator judgment and is deliberately not computed here.
+    """
+    scope = scope_relative(project, ticket)
+    states: list[RailState] = []
+    for rail_id in source.rails(scope):
+        validate_identifier(rail_id, label="rail identifier")
+
+        def relative(artifact: str, rail: str = rail_id) -> str:
+            return artifact_relative(project=project, ticket=ticket, artifact=artifact, rail=rail)
+
+        authorization = source.read(relative("rail"))
+        if authorization is None:
+            raise ControlPlaneError(
+                f"Rail '{rail_id}' has no orchestrator authorization. An executor cannot "
+                "create a rail; publish the authorization or remove the directory."
+            )
+        status, depends_on, resource = _parse_rail_header(authorization, rail_id=rail_id)
+        artifacts = [name for name in ("rail", "handoff", "evidence") if source.exists(relative(name))]
+        states.append(RailState(rail_id, status, artifacts, depends_on, resource))
+
+    known = {state.identifier for state in states}
+    for state in states:
+        unknown = [name for name in state.depends_on if name not in known]
+        if unknown:
+            raise ControlPlaneError(
+                f"Rail '{state.identifier}' depends on unknown rail(s): {', '.join(unknown)}."
+            )
+    _reject_dependency_cycles(states)
+    return states
+
+
+def _reject_dependency_cycles(states: list[RailState]) -> None:
+    dependencies = {state.identifier: state.depends_on for state in states}
+    visiting: set[str] = set()
+    settled: set[str] = set()
+
+    def walk(identifier: str, trail: list[str]) -> None:
+        if identifier in settled:
+            return
+        if identifier in visiting:
+            cycle = " -> ".join(trail + [identifier])
+            raise ControlPlaneError(f"Rail dependencies are contradictory: {cycle}.")
+        visiting.add(identifier)
+        for dependency in dependencies.get(identifier, []):
+            walk(dependency, trail + [identifier])
+        visiting.discard(identifier)
+        settled.add(identifier)
+
+    for state in states:
+        walk(state.identifier, [])
+
+
+def _render_rail_index(states: list[RailState]) -> list[str]:
+    by_identifier = {state.identifier: state for state in states}
+    lines: list[str] = []
+    for state in states:
+        artifacts = ", ".join(state.artifacts) if state.artifacts else "none"
+        lines.append(f"- {state.identifier}: {state.status}; artifacts: {artifacts}")
+        if state.depends_on:
+            rendered = ", ".join(
+                f"{name} ({by_identifier[name].status})" for name in state.depends_on
+            )
+            satisfied = all(by_identifier[name].status == "completed" for name in state.depends_on)
+            lines.append(f"    depends on: {rendered}")
+            lines.append(f"    dependencies satisfied: {'yes' if satisfied else 'no'}")
+        if state.shared_resource is not None:
+            contenders = [
+                other.identifier
+                for other in states
+                if other.identifier != state.identifier
+                and other.shared_resource == state.shared_resource
+                and other.status == "running"
+            ]
+            lines.append(f"    shared resource: {state.shared_resource}")
+            if contenders:
+                lines.append(f"    resource in use by: {', '.join(contenders)}")
+    return lines
+
+
 def render_status(repo_root: Path, *, project: str, ticket: str) -> str:
     """Bounded orchestrator read: accepted state plus the rails that exist."""
     source = resolve_read_source(repo_root)
@@ -502,16 +647,11 @@ def render_status(repo_root: Path, *, project: str, ticket: str) -> str:
     state = source.read(artifact_relative(project=project, ticket=ticket, artifact="state", rail=None))
     lines.append(state.rstrip("\n") if state else "no accepted state published")
     lines.extend(["", "## Rails Present", ""])
-    rail_ids = source.rails(scope)
-    if not rail_ids:
+    states = collect_rail_states(source, project=project, ticket=ticket)
+    if not states:
         lines.append("none")
-    for rail_id in rail_ids:
-        present = [
-            name
-            for name in ("rail", "handoff", "evidence")
-            if source.exists(artifact_relative(project=project, ticket=ticket, artifact=name, rail=rail_id))
-        ]
-        lines.append(f"- {rail_id}: {', '.join(present) if present else 'empty'}")
+    else:
+        lines.extend(_render_rail_index(states))
     return "\n".join(lines)
 
 
