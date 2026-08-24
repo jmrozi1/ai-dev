@@ -1066,5 +1066,474 @@ class PostAcquisitionFailureTests(WorkspaceTestBase):
         self.assertEqual(self._read_state(workspace)["activeIssueNumber"], 142)
 
 
+class PromotionSetupMixin(WorkspaceTestBase):
+    """A repository where a promotion is genuinely ready to run."""
+
+    def _ready_to_promote(self, name: str, ticket_id: str = "201"):
+        repo_root = self._init_repo(name)
+        self._write_ticket(repo_root, ticket_id)
+        code, _, stderr = self._invoke(repo_root, "start", ticket_id)
+        self.assertEqual(code, 0, msg=stderr)
+
+        (repo_root / "work.txt").write_text("work\n", encoding="utf-8")
+        code, _, stderr = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+
+        self._record_review_pass(repo_root, ticket_id)
+        return repo_root
+
+    def _record_review_pass(self, repo_root: Path, ticket_id: str) -> None:
+        scratch_commit = self._run_git(repo_root, "rev-parse", "scratch")
+        record = {
+            "version": 1,
+            "result": "pass",
+            "scratchCommit": scratch_commit,
+            "mainBranch": "main",
+            "scratchBranch": "scratch",
+            "activeIssueNumber": int(ticket_id),
+        }
+        path = repo_root / ".ai-dev" / "promotion-review.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+    def _snapshot(self, repo_root: Path) -> dict:
+        return {
+            "main": self._run_git(repo_root, "rev-parse", "main"),
+            "scratch": self._run_git(repo_root, "rev-parse", "scratch"),
+            "head": self._run_git(repo_root, "rev-parse", "HEAD"),
+            "branch": self._run_git(repo_root, "rev-parse", "--abbrev-ref", "HEAD"),
+            "status": self._run_git(repo_root, "status", "--porcelain"),
+            "state": (repo_root / ".ai-dev" / "workflow.json").read_text(encoding="utf-8"),
+            "review": (repo_root / ".ai-dev" / "promotion-review.json").read_text(encoding="utf-8"),
+            "sync": (repo_root / ".ai-dev" / "promotion-sync.json").exists(),
+        }
+
+
+class PromotionLockTests(PromotionSetupMixin):
+    def test_promotion_takes_and_releases_the_shared_lock(self) -> None:
+        repo_root = self._ready_to_promote("repo-lock-happy")
+        lock_path = workspaces.promotion_lock_path(repo_root)
+        self.assertEqual(
+            lock_path,
+            workspaces.git_common_dir(repo_root) / "ai-dev" / "promotion.lock",
+        )
+        self.assertFalse(lock_path.exists())
+
+        code, stdout, stderr = self._invoke(repo_root, "promote", "promoted work")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertFalse(lock_path.exists(), "the lock must be released in finally")
+
+    def test_contention_fails_closed_and_names_the_holder(self) -> None:
+        repo_root = self._ready_to_promote("repo-lock-contention", "202")
+
+        held = workspaces.acquire_promotion_lock(
+            repo_root,
+            worktree_id="some-other-worktree",
+            workspace_path=self.tmp_path / "other-workspace",
+            ticket_key="local:999",
+            operation="promote",
+        )
+        before = self._snapshot(repo_root)
+
+        code, stdout, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("promotion lock is held by", stderr)
+        self.assertIn("local:999", stderr, "the holder's ticket must be named")
+        self.assertIn(str(self.tmp_path / "other-workspace"), stderr)
+        self.assertIn("serialized across workspaces", stderr)
+
+        self.assertEqual(self._snapshot(repo_root), before)
+        self.assertTrue(workspaces.promotion_lock_path(repo_root).exists())
+        workspaces.release_promotion_lock(repo_root, token=held.token)
+
+    def test_release_refuses_when_the_generation_token_changed(self) -> None:
+        repo_root = self._init_repo("repo-lock-generation")
+        record = workspaces.acquire_promotion_lock(
+            repo_root,
+            worktree_id="w",
+            workspace_path=repo_root,
+            ticket_key="local:1",
+        )
+        lock_path = workspaces.promotion_lock_path(repo_root)
+
+        payload = json.loads(lock_path.read_text(encoding="utf-8"))
+        payload["token"] = "a" * 32
+        lock_path.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(workspaces.PromotionLockError) as caught:
+            workspaces.release_promotion_lock(repo_root, token=record.token)
+        self.assertIn("replaced since it was acquired", str(caught.exception))
+        self.assertTrue(lock_path.exists())
+
+        self.assertTrue(workspaces.release_promotion_lock(repo_root, token="a" * 32))
+        self.assertFalse(lock_path.exists())
+
+    def test_unreadable_lock_is_held_not_free(self) -> None:
+        repo_root = self._ready_to_promote("repo-lock-unreadable", "203")
+        lock_path = workspaces.promotion_lock_path(repo_root)
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("{ not json", encoding="utf-8")
+        before = self._snapshot(repo_root)
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("unreadable", stderr)
+        self.assertIn("treated as held", stderr)
+        self.assertEqual(self._snapshot(repo_root), before)
+
+
+class PromotionLockRecoveryTests(PromotionSetupMixin):
+    def _dead_pid(self) -> int:
+        import subprocess as _subprocess
+
+        completed = _subprocess.run(["true"], check=False)
+        del completed
+        for candidate in range(4000000, 4000200):
+            try:
+                os.kill(candidate, 0)
+            except ProcessLookupError:
+                return candidate
+            except (PermissionError, OSError):
+                continue
+        self.skipTest("could not find a provably absent pid")
+
+    def _write_lock(self, repo_root: Path, **overrides) -> dict:
+        import socket
+
+        payload = {
+            "version": 1,
+            "token": "b" * 32,
+            "worktreeId": "gone-worktree",
+            "workspacePath": str(self.tmp_path / "gone-workspace"),
+            "ticketKey": "local:777",
+            "pid": os.getpid(),
+            "hostname": socket.gethostname(),
+            "acquiredAt": "2026-08-24T00:00:00Z",
+            "operation": "promote",
+        }
+        payload.update(overrides)
+        path = workspaces.promotion_lock_path(repo_root)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return payload
+
+    @unittest.skipUnless(os.name == "posix", "pid liveness proof is POSIX-only here")
+    def test_same_host_absent_pid_is_released_without_force(self) -> None:
+        repo_root = self._init_repo("repo-unlock-dead")
+        payload = self._write_lock(repo_root, pid=self._dead_pid())
+
+        code, stdout, stderr = self._invoke(
+            repo_root, "workspace", "unlock", payload["workspacePath"]
+        )
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("owner state: absent", stdout)
+        self.assertIn("Released the promotion lock", stdout)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_live_owner_requires_explicit_force(self) -> None:
+        repo_root = self._init_repo("repo-unlock-live")
+        payload = self._write_lock(repo_root, pid=os.getpid())
+
+        code, stdout, stderr = self._invoke(
+            repo_root, "workspace", "unlock", payload["workspacePath"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("still running", stderr)
+        self.assertTrue(workspaces.promotion_lock_path(repo_root).exists())
+
+        code, stdout, stderr = self._invoke(
+            repo_root, "workspace", "unlock", "--force", payload["workspacePath"]
+        )
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_foreign_host_liveness_is_undetermined_and_requires_force(self) -> None:
+        repo_root = self._init_repo("repo-unlock-foreign")
+        payload = self._write_lock(repo_root, hostname="some-other-host")
+
+        state = workspaces.promotion_lock_owner_state(
+            workspaces.read_promotion_lock(repo_root)
+        )
+        self.assertEqual(state, workspaces.LOCK_OWNER_UNDETERMINED)
+
+        code, _, stderr = self._invoke(
+            repo_root, "workspace", "unlock", payload["workspacePath"]
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("liveness cannot be established", stderr)
+        self.assertTrue(workspaces.promotion_lock_path(repo_root).exists())
+
+        code, _, stderr = self._invoke(
+            repo_root, "workspace", "unlock", "--force", payload["workspacePath"]
+        )
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_unlock_refuses_a_mismatched_holder_path(self) -> None:
+        repo_root = self._init_repo("repo-unlock-path")
+        self._write_lock(repo_root)
+
+        code, _, stderr = self._invoke(
+            repo_root, "workspace", "unlock", "--force", str(self.tmp_path / "wrong")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("Pass the holder's own workspace path", stderr)
+        self.assertTrue(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_unlock_refuses_when_the_observed_token_changed(self) -> None:
+        repo_root = self._init_repo("repo-unlock-race")
+        payload = self._write_lock(repo_root)
+        lock_path = workspaces.promotion_lock_path(repo_root)
+
+        original_reader = workspaces.read_promotion_lock
+        calls = {"count": 0}
+
+        def racing_reader(root):
+            calls["count"] += 1
+            result = original_reader(root)
+            # Between the decision read and the verify read, the lock is re-taken.
+            if calls["count"] == 1:
+                replaced = dict(payload)
+                replaced["token"] = "c" * 32
+                lock_path.write_text(
+                    json.dumps(replaced, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+                )
+            return result
+
+        workspaces.read_promotion_lock = racing_reader
+        try:
+            with self.assertRaises(workspaces.PromotionLockError) as caught:
+                workspaces.force_release_promotion_lock(
+                    repo_root,
+                    holder_path=payload["workspacePath"],
+                    force=True,
+                )
+        finally:
+            workspaces.read_promotion_lock = original_reader
+
+        self.assertIn("changed while it was being inspected", str(caught.exception))
+        self.assertTrue(lock_path.exists())
+
+
+class StaleBaseRefusalTests(PromotionSetupMixin):
+    def _advance_main(self, repo_root: Path, marker: str) -> str:
+        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(self.tmp_path / f"adv-{marker}"), "main")
+        advancer = self.tmp_path / f"adv-{marker}"
+        (advancer / f"{marker}.txt").write_text(marker + "\n", encoding="utf-8")
+        self._run_git(advancer, "add", f"{marker}.txt")
+        self._run_git(advancer, "commit", "-q", "-m", f"advance {marker}")
+        new_commit = self._run_git(advancer, "rev-parse", "HEAD")
+        self._run_git(repo_root, "branch", "-f", "main", new_commit)
+        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
+        return new_commit
+
+    def test_stale_base_refuses_without_touching_anything(self) -> None:
+        repo_root = self._ready_to_promote("repo-stale-base", "211")
+        new_main = self._advance_main(repo_root, "one")
+        before = self._snapshot(repo_root)
+
+        code, stdout, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("main advanced and this workspace's base is stale", stderr)
+        self.assertIn("commit(s) ahead of and", stderr)
+        self.assertIn("commit(s) behind", stderr)
+        self.assertIn(new_main, stderr)
+        self.assertIn("Nothing was changed", stderr)
+
+        self.assertEqual(self._snapshot(repo_root), before)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_stale_base_message_is_useful_without_a_breadcrumb(self) -> None:
+        repo_root = self._ready_to_promote("repo-stale-no-crumb", "212")
+        self._advance_main(repo_root, "two")
+        self.assertIsNone(workspaces.read_last_promotion(repo_root))
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("could not be identified", stderr)
+        self.assertIn("workspace list", stderr)
+
+    def test_stale_breadcrumb_is_not_used_to_attribute_a_different_transition(self) -> None:
+        repo_root = self._ready_to_promote("repo-stale-crumb", "213")
+        new_main = self._advance_main(repo_root, "three")
+
+        workspaces.write_last_promotion(
+            repo_root,
+            commit_before="0" * 40,
+            commit_after="1" * 40,
+            workspace_path=self.tmp_path / "unrelated-workspace",
+            ticket_key="local:404",
+            main_branch="main",
+        )
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn(new_main, stderr)
+        self.assertNotIn("unrelated-workspace", stderr)
+        self.assertNotIn("local:404", stderr)
+        self.assertIn("could not be identified", stderr)
+
+    def test_matching_breadcrumb_names_the_promoting_workspace(self) -> None:
+        repo_root = self._ready_to_promote("repo-stale-attributed", "214")
+        old_main = self._run_git(repo_root, "rev-parse", "main")
+        new_main = self._advance_main(repo_root, "four")
+
+        workspaces.write_last_promotion(
+            repo_root,
+            commit_before=old_main,
+            commit_after=new_main,
+            workspace_path=self.tmp_path / "promoting-workspace",
+            ticket_key="local:314",
+            main_branch="main",
+        )
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("Promoted by workspace", stderr)
+        self.assertIn("promoting-workspace", stderr)
+        self.assertIn("local:314", stderr)
+
+    def test_locked_revalidation_catches_main_advancing_after_preflight(self) -> None:
+        """Workspace B passes preflight, A advances main, then B takes the lock."""
+        repo_root = self._ready_to_promote("repo-locked-race", "215")
+        before_main = self._run_git(repo_root, "rev-parse", "main")
+        before = self._snapshot(repo_root)
+
+        raced = {"done": False, "commit": ""}
+        original_acquire = cli.acquire_promotion_lock
+
+        def acquire_then_race(*args, **kwargs):
+            record = original_acquire(*args, **kwargs)
+            if not raced["done"]:
+                # Another workspace promoted between preflight and this lock.
+                raced["commit"] = self._advance_main(repo_root, "race")
+                raced["done"] = True
+            return record
+
+        cli.acquire_promotion_lock = acquire_then_race
+        try:
+            code, stdout, stderr = self._invoke(repo_root, "promote", "should not run")
+        finally:
+            cli.acquire_promotion_lock = original_acquire
+
+        self.assertTrue(raced["done"], "the race must actually have been injected")
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("base is stale", stderr)
+        self.assertIn(raced["commit"], stderr)
+        self.assertIn(
+            f"main moved from {before_main} to {raced['commit']}",
+            stderr,
+            "the message must report the transition observed under the lock",
+        )
+
+        after = self._snapshot(repo_root)
+        self.assertEqual(after["scratch"], before["scratch"])
+        self.assertEqual(after["head"], before["head"])
+        self.assertEqual(after["status"], before["status"])
+        self.assertEqual(after["state"], before["state"])
+        self.assertEqual(after["review"], before["review"])
+        self.assertEqual(after["sync"], before["sync"])
+        self.assertEqual(after["main"], raced["commit"])
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+
+class PromotionBreadcrumbTests(PromotionSetupMixin):
+    def test_successful_promotion_writes_the_breadcrumb(self) -> None:
+        repo_root = self._ready_to_promote("repo-crumb-success", "221")
+        main_before = self._run_git(repo_root, "rev-parse", "main")
+        self.assertIsNone(workspaces.read_last_promotion(repo_root))
+
+        code, stdout, stderr = self._invoke(repo_root, "promote", "promoted work")
+        self.assertEqual(code, 0, msg=stderr)
+
+        crumb = workspaces.read_last_promotion(repo_root)
+        self.assertIsNotNone(crumb)
+        self.assertEqual(crumb.commit_before, main_before)
+        self.assertEqual(crumb.commit_after, self._run_git(repo_root, "rev-parse", "main"))
+        self.assertEqual(crumb.main_branch, "main")
+        self.assertEqual(crumb.ticket_key, "local:221")
+        self.assertEqual(
+            Path(os.path.abspath(crumb.workspace_path)),
+            Path(os.path.abspath(str(repo_root))),
+        )
+        self.assertEqual(
+            workspaces.last_promotion_path(repo_root),
+            workspaces.git_common_dir(repo_root) / "ai-dev" / "last-promotion.json",
+        )
+
+    def test_failed_promotion_never_writes_or_updates_the_breadcrumb(self) -> None:
+        repo_root = self._ready_to_promote("repo-crumb-failure", "222")
+
+        workspaces.write_last_promotion(
+            repo_root,
+            commit_before="9" * 40,
+            commit_after="8" * 40,
+            workspace_path=self.tmp_path / "earlier-workspace",
+            ticket_key="local:111",
+            main_branch="main",
+        )
+        preserved = workspaces.last_promotion_path(repo_root).read_text(encoding="utf-8")
+
+        self._advance_main(repo_root, "crumb")
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("base is stale", stderr)
+        self.assertEqual(
+            workspaces.last_promotion_path(repo_root).read_text(encoding="utf-8"),
+            preserved,
+            "a failed promotion must not touch the breadcrumb",
+        )
+
+    def _advance_main(self, repo_root: Path, marker: str) -> str:
+        advancer = self.tmp_path / f"adv-{marker}"
+        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(advancer), "main")
+        (advancer / f"{marker}.txt").write_text(marker + "\n", encoding="utf-8")
+        self._run_git(advancer, "add", f"{marker}.txt")
+        self._run_git(advancer, "commit", "-q", "-m", f"advance {marker}")
+        new_commit = self._run_git(advancer, "rev-parse", "HEAD")
+        self._run_git(repo_root, "branch", "-f", "main", new_commit)
+        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
+        return new_commit
+
+
+class SingleWorkspacePromotionRegressionTests(PromotionSetupMixin):
+    def test_ordinary_promotion_is_unchanged_and_leaves_no_lock(self) -> None:
+        repo_root = self._ready_to_promote("repo-single-promote", "231")
+        scratch_tree = self._run_git(repo_root, "rev-parse", "scratch^{tree}")
+
+        code, stdout, stderr = self._invoke(repo_root, "promote", "promoted work")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("Promoted", stdout)
+
+        self.assertEqual(
+            self._run_git(repo_root, "rev-parse", "main"),
+            self._run_git(repo_root, "rev-parse", "scratch"),
+        )
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "main^{tree}"), scratch_tree)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "--abbrev-ref", "HEAD"), "scratch")
+        self.assertEqual(self._read_state(repo_root)["checkpoint"], 0)
+        self.assertEqual(self._read_state(repo_root)["activeIssueNumber"], 231)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_promotion_review_gate_refusal_still_takes_no_lock_residue(self) -> None:
+        repo_root = self._init_repo("repo-single-gate")
+        self._write_ticket(repo_root, "232")
+        code, _, stderr = self._invoke(repo_root, "start", "232")
+        self.assertEqual(code, 0, msg=stderr)
+        (repo_root / "work.txt").write_text("work\n", encoding="utf-8")
+        code, _, stderr = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+
+        code, _, stderr = self._invoke(repo_root, "promote", "no review record")
+        self.assertEqual(code, 1)
+        self.assertIn("promotion review gate", stderr)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

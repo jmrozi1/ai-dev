@@ -100,7 +100,12 @@ from .workspaces import (
     MalformedClaim,
     WorkspaceError,
     canonical_ticket_key,
+    LastPromotion,
+    MalformedLock,
+    PromotionLockError,
+    PromotionLockHeldError,
     acquire_active_claim,
+    acquire_promotion_lock,
     claim_is_live,
     claim_path,
     create_active_claim,
@@ -119,8 +124,15 @@ from .workspaces import (
     relocate_config_for_workspace,
     release_claim,
     reserve_claim,
+    force_release_promotion_lock,
+    promotion_lock_owner_state,
+    promotion_lock_path,
+    read_last_promotion,
+    read_promotion_lock,
+    release_promotion_lock,
     validate_branch_name,
     workspace_branch_name,
+    write_last_promotion,
     worktree_id_for_repo_root,
 )
 
@@ -415,6 +427,7 @@ Usage: {command_name} add <ticket-id> [path]
        {command_name} list
        {command_name} remove [path]
        {command_name} prune [--claim <ticket-id>]
+       {command_name} unlock [--force] <holder-path>
 
 Manage concurrent ticket workspaces. Each workspace is a linked Git worktree
 with its own scratch branch and its own .ai-dev state, so ordinary status,
@@ -430,6 +443,9 @@ Subcommands:
   remove [path]           Remove an inactive, clean workspace and its claim.
   prune [--claim <id>]    Remove claims whose worktree is gone or prunable.
                           --claim recovers one unreadable claim record.
+  unlock <holder-path>    Release an abandoned promotion lock. Removal is
+                          automatic only for a same-host process proven gone;
+                          --force is required when liveness is undetermined.
 
 Options:
   -h, --help  Show this help.
@@ -2027,6 +2043,183 @@ def _print_promote_partial_success(
     )
 
 
+def _promote_stale_base_message(
+    repo_root: Path,
+    state: WorkflowState,
+    comparison: BranchComparison,
+    *,
+    observed_main_commit: str,
+    preflight_main_commit: str | None = None,
+) -> str:
+    """Explain a stale base without guessing at who caused it.
+
+    The breadcrumb is advisory, so it is quoted only when it describes the exact
+    transition actually observed. Otherwise the message still carries the branch
+    facts, which are enough to act on.
+    """
+    ahead = comparison.scratch_ahead_of_main
+    behind = comparison.scratch_behind_main
+    lines = [
+        f"Cannot promote workflow: {state.main_branch} advanced and this workspace's "
+        f"base is stale.",
+        f"  {state.scratch_branch} is {ahead if ahead is not None else 'an unknown number of'} "
+        f"commit(s) ahead of and {behind if behind is not None else 'an unknown number of'} "
+        f"commit(s) behind {state.main_branch}.",
+        f"  {state.main_branch} is now at {observed_main_commit}.",
+    ]
+    if preflight_main_commit and preflight_main_commit != observed_main_commit:
+        lines.append(
+            f"  {state.main_branch} moved from {preflight_main_commit} to "
+            f"{observed_main_commit} while this promotion was being prepared."
+        )
+
+    breadcrumb = read_last_promotion(repo_root)
+    attributed = False
+    if (
+        breadcrumb is not None
+        and breadcrumb.main_branch == state.main_branch
+        and breadcrumb.commit_after == observed_main_commit
+    ):
+        # When main moved during this invocation the breadcrumb must also explain
+        # that exact step; otherwise matching the observed head is enough.
+        observed_a_move = (
+            preflight_main_commit is not None
+            and preflight_main_commit != observed_main_commit
+        )
+        if not observed_a_move or breadcrumb.commit_before == preflight_main_commit:
+            attributed = True
+            ticket = breadcrumb.ticket_key or "an unrecorded ticket"
+            lines.append(
+                f"  Promoted by workspace {breadcrumb.workspace_path} for {ticket} "
+                f"at {breadcrumb.at}."
+            )
+    if not attributed:
+        lines.append(
+            "  The promoting workspace could not be identified from the promotion "
+            "breadcrumb; inspect the workspaces with the workspace list command."
+        )
+
+    lines.append(
+        "  Nothing was changed. Reconcile this workspace against the new "
+        f"{state.main_branch} before promoting again."
+    )
+    return "\n".join(lines)
+
+
+def _promote_locked_revalidation(
+    repo_root: Path,
+    state: WorkflowState,
+    *,
+    preflight_main_commit: str | None,
+):
+    """Re-prove every promotion precondition while the lock is held.
+
+    A preflight observation is only a hint: another workspace may advance main
+    between that read and this one. Nothing here mutates anything, so a refusal
+    from this point still leaves the workspace exactly as it was found.
+    """
+    _ensure_main_and_scratch_branches_exist(repo_root, state)
+
+    current_branch = current_branch_name(repo_root)
+    if current_branch != state.scratch_branch:
+        raise FlowError(
+            "Cannot promote workflow: current branch "
+            f"{current_branch} does not match scratchBranch {state.scratch_branch}."
+        )
+
+    ensure_no_active_git_operations(repo_root)
+
+    if git_status_short_filtered(repo_root, excluded_paths=[".ai-dev/"]):
+        raise FlowError("Cannot promote workflow: repository must be clean.")
+
+    observed_main_commit = resolve_commit_hash(repo_root, state.main_branch)
+
+    comparison = compare_main_and_scratch(
+        repo_root,
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+    )
+    if comparison.scratch_ahead_of_main is None or comparison.scratch_behind_main is None:
+        raise FlowError(
+            "Cannot promote workflow: unable to determine branch relationship."
+        )
+
+    if not branch_is_ancestor(
+        repo_root,
+        ancestor_revision=state.main_branch,
+        descendant_revision=state.scratch_branch,
+    ):
+        raise FlowError(
+            _promote_stale_base_message(
+                repo_root,
+                state,
+                comparison,
+                observed_main_commit=observed_main_commit,
+                preflight_main_commit=preflight_main_commit,
+            )
+        )
+
+    if comparison.scratch_behind_main:
+        raise FlowError(
+            _promote_stale_base_message(
+                repo_root,
+                state,
+                comparison,
+                observed_main_commit=observed_main_commit,
+                preflight_main_commit=preflight_main_commit,
+            )
+        )
+
+    relationship_error = _promote_branch_relationship_error(comparison)
+    if relationship_error:
+        raise FlowError(relationship_error)
+
+    upstream = _require_tracked_upstream_preflight(repo_root, state)
+    _require_valid_promotion_review_gate(repo_root, state)
+    return comparison, upstream, observed_main_commit
+
+
+@contextmanager
+def _held_promotion_lock(repo_root: Path, state: WorkflowState, *, operation: str):
+    """Hold the repository-wide promotion lock for one canonical-main mutation.
+
+    Contention fails closed and names the holder rather than waiting: two agents
+    silently queueing behind one another is exactly the ambiguity this ticket
+    exists to remove.
+    """
+    ticket_key = None
+    if state.ticket_reference is not None:
+        ticket_key = canonical_ticket_key(state.ticket_reference)
+
+    try:
+        record = acquire_promotion_lock(
+            repo_root,
+            worktree_id=effective_worktree_id(repo_root),
+            workspace_path=repo_root,
+            ticket_key=ticket_key,
+            operation=operation,
+        )
+    except PromotionLockHeldError as exc:
+        raise FlowError(
+            f"Cannot promote workflow: {exc} Promotion is serialized across workspaces; "
+            "retry once that workspace finishes, or recover an abandoned lock with the "
+            "workspace unlock command."
+        ) from exc
+    except PromotionLockError as exc:
+        raise FlowError(f"Cannot promote workflow: {exc}") from exc
+
+    try:
+        yield record
+    finally:
+        try:
+            release_promotion_lock(repo_root, token=record.token)
+        except PromotionLockError as exc:
+            print(
+                f"Warning: the promotion lock could not be released: {exc}",
+                file=sys.stderr,
+            )
+
+
 def handle_promote(command_name: str, arguments: list[str]) -> int:
     if len(arguments) > 1:
         raise _promote_usage(command_name)
@@ -2066,43 +2259,59 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
     if git_status_short_filtered(repo_root, excluded_paths=excluded_paths):
         raise FlowError("Cannot promote workflow: repository must be clean.")
 
+    # Read-only preflight. It is an early, cheap refusal and never authorizes a
+    # mutation on its own; the locked revalidation below is what decides.
+    preflight_main_commit: str | None = None
+    if branch_exists(repo_root, state.main_branch):
+        preflight_main_commit = resolve_commit_hash(repo_root, state.main_branch)
+
     retry_context = _pending_sync_retry_context(repo_root, state)
     if retry_context is not None:
         record, upstream = retry_context
-        return _retry_pending_remote_synchronization(
-            repo_root,
-            state=state,
-            record=record,
-            upstream=upstream,
-        )
+        with _held_promotion_lock(repo_root, state, operation="promote-sync-retry"):
+            retry_context = _pending_sync_retry_context(repo_root, state)
+            if retry_context is None:
+                raise FlowError(
+                    "Cannot retry remote synchronization: the pending synchronization "
+                    "state changed while the promotion lock was being acquired."
+                )
+            record, upstream = retry_context
+            return _retry_pending_remote_synchronization(
+                repo_root,
+                state=state,
+                record=record,
+                upstream=upstream,
+            )
     if not commit_message:
         raise _promote_usage(command_name)
 
-    comparison = compare_main_and_scratch(
-        repo_root,
-        main_branch=state.main_branch,
-        scratch_branch=state.scratch_branch,
-    )
-    if comparison.scratch_ahead_of_main is None or comparison.scratch_behind_main is None:
-        raise FlowError(
-            "Cannot promote workflow: unable to determine branch relationship."
+    with _held_promotion_lock(repo_root, state, operation="promote") as _lock_record:
+        return _promote_under_lock(
+            command_name,
+            repo_root=repo_root,
+            state_path=state_path,
+            state=state,
+            commit_message=commit_message,
+            current_branch=current_branch,
+            preflight_main_commit=preflight_main_commit,
         )
 
-    if not branch_is_ancestor(
+
+def _promote_under_lock(
+    command_name: str,
+    *,
+    repo_root: Path,
+    state_path: Path,
+    state: WorkflowState,
+    commit_message: str,
+    current_branch: str,
+    preflight_main_commit: str | None,
+) -> int:
+    comparison, upstream, observed_main_commit = _promote_locked_revalidation(
         repo_root,
-        ancestor_revision=state.main_branch,
-        descendant_revision=state.scratch_branch,
-    ):
-        relationship_error = _promote_branch_relationship_error(comparison)
-        if relationship_error:
-            raise FlowError(relationship_error)
-
-    relationship_error = _promote_branch_relationship_error(comparison)
-    if relationship_error:
-        raise FlowError(relationship_error)
-
-    upstream = _require_tracked_upstream_preflight(repo_root, state)
-    _require_valid_promotion_review_gate(repo_root, state)
+        state,
+        preflight_main_commit=preflight_main_commit,
+    )
 
     if state.stacked_handoff is not None:
         print(
@@ -2236,6 +2445,26 @@ def handle_promote(command_name: str, arguments: list[str]) -> int:
                 print(f"Remote push failed: {exc}", file=sys.stderr)
                 return 1
             _save_synchronized_promotion_record(repo_root, sync_record)
+
+        # Written only here, on the success path, while the lock is still held.
+        try:
+            write_last_promotion(
+                repo_root,
+                commit_before=original_main_commit,
+                commit_after=commit_hash,
+                workspace_path=repo_root,
+                ticket_key=(
+                    canonical_ticket_key(state.ticket_reference)
+                    if state.ticket_reference is not None
+                    else None
+                ),
+                main_branch=state.main_branch,
+            )
+        except WorkspaceError as exc:
+            print(
+                f"Warning: promotion succeeded but its breadcrumb was not recorded: {exc}",
+                file=sys.stderr,
+            )
 
         _print_promote_success(
             commit_hash=commit_hash,
@@ -3901,7 +4130,7 @@ def _workspace_usage(command_name: str) -> FlowError:
     return _usage_error(
         command_name,
         "workspace",
-        "<add|adopt|list|remove|prune> ...",
+        "<add|adopt|list|remove|prune|unlock> ...",
     )
 
 
@@ -4577,6 +4806,44 @@ def _handle_workspace_prune(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
+def _handle_workspace_unlock(command_name: str, arguments: list[str]) -> int:
+    force = False
+    remaining = list(arguments)
+    if remaining and remaining[0] == "--force":
+        force = True
+        remaining = remaining[1:]
+    if len(remaining) != 1 or not remaining[0].strip():
+        raise _workspace_usage(command_name)
+
+    holder_path = remaining[0].strip()
+    repo_root = resolve_repo_root()
+
+    current = read_promotion_lock(repo_root)
+    if current is None:
+        raise FlowError(
+            f"There is no promotion lock to release at {promotion_lock_path(repo_root)}."
+        )
+    if not isinstance(current, MalformedLock):
+        owner_state = promotion_lock_owner_state(current)
+        print(f"Promotion lock holder: {current.describe()}")
+        print(f"owner state: {owner_state}")
+
+    try:
+        released = force_release_promotion_lock(
+            repo_root,
+            holder_path=holder_path,
+            force=force,
+        )
+    except PromotionLockError as exc:
+        raise FlowError(str(exc)) from exc
+
+    if released is None:
+        print("Removed an unreadable promotion lock record.")
+    else:
+        print(f"Released the promotion lock held by {released.workspace_path}")
+    return 0
+
+
 def handle_workspace(command_name: str, arguments: list[str]) -> int:
     if not arguments:
         raise _workspace_usage(command_name)
@@ -4594,6 +4861,8 @@ def handle_workspace(command_name: str, arguments: list[str]) -> int:
         return _handle_workspace_remove(command_name, rest)
     if subcommand == "prune":
         return _handle_workspace_prune(command_name, rest)
+    if subcommand == "unlock":
+        return _handle_workspace_unlock(command_name, rest)
 
     raise _workspace_usage(command_name)
 

@@ -919,3 +919,404 @@ def default_workspace_path(repo_root: Path, reference: TicketReference) -> Path:
     primary = entries[0].path if entries else Path(os.path.abspath(str(repo_root)))
     suffix = _sanitize_branch_segment(reference.ticket_id) or "ticket"
     return primary.parent / "{0}-issue-{1}".format(primary.name, suffix)
+
+
+# ---------------------------------------------------------------------------
+# Promotion lock
+# ---------------------------------------------------------------------------
+
+
+PROMOTION_LOCK_FILENAME = "promotion.lock"
+LAST_PROMOTION_FILENAME = "last-promotion.json"
+
+_LOCK_REQUIRED_KEYS = frozenset(
+    {"version", "token", "worktreeId", "workspacePath", "pid", "hostname", "acquiredAt", "operation"}
+)
+_LOCK_ALLOWED_KEYS = _LOCK_REQUIRED_KEYS | frozenset({"ticketKey"})
+
+
+class PromotionLockError(WorkspaceError):
+    """Raised when the promotion lock cannot be taken or released safely."""
+
+
+class PromotionLockHeldError(PromotionLockError):
+    """Raised when another workspace already holds the promotion lock."""
+
+    def __init__(self, message: str, holder=None) -> None:
+        super().__init__(message)
+        self.holder = holder
+
+
+@dataclass(frozen=True)
+class PromotionLockRecord:
+    token: str
+    worktree_id: str
+    workspace_path: str
+    pid: int
+    hostname: str
+    acquired_at: str
+    operation: str
+    ticket_key: Optional[str] = None
+
+    def to_dict(self) -> dict:
+        payload = {
+            "version": 1,
+            "token": self.token,
+            "worktreeId": self.worktree_id,
+            "workspacePath": self.workspace_path,
+            "pid": self.pid,
+            "hostname": self.hostname,
+            "acquiredAt": self.acquired_at,
+            "operation": self.operation,
+        }
+        if self.ticket_key is not None:
+            payload["ticketKey"] = self.ticket_key
+        return payload
+
+    def describe(self) -> str:
+        ticket = self.ticket_key or "an unidentified ticket"
+        return (
+            "ticket {0} in workspace {1} (pid {2} on {3}, since {4})".format(
+                ticket, self.workspace_path, self.pid, self.hostname, self.acquired_at
+            )
+        )
+
+
+@dataclass(frozen=True)
+class MalformedLock:
+    path: Path
+    detail: str
+
+
+def promotion_lock_path(repo_root: Path) -> Path:
+    return registry_directory(repo_root) / PROMOTION_LOCK_FILENAME
+
+
+def last_promotion_path(repo_root: Path) -> Path:
+    return registry_directory(repo_root) / LAST_PROMOTION_FILENAME
+
+
+def _lock_from_payload(payload: Any, path: Path):
+    if not isinstance(payload, dict):
+        return MalformedLock(path=path, detail="lock is not a JSON object")
+    unknown = sorted(set(payload) - _LOCK_ALLOWED_KEYS)
+    if unknown:
+        return MalformedLock(path=path, detail="unknown key(s): " + ", ".join(unknown))
+    missing = sorted(_LOCK_REQUIRED_KEYS - set(payload))
+    if missing:
+        return MalformedLock(path=path, detail="missing field(s): " + ", ".join(missing))
+    if payload.get("version") != 1:
+        return MalformedLock(path=path, detail="version must be 1")
+
+    for name in ("token", "worktreeId", "workspacePath", "hostname", "acquiredAt", "operation"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value.strip():
+            return MalformedLock(path=path, detail="{0} must be a non-empty string".format(name))
+
+    pid = payload.get("pid")
+    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+        return MalformedLock(path=path, detail="pid must be a positive integer")
+
+    ticket_key = payload.get("ticketKey")
+    if ticket_key is not None and (not isinstance(ticket_key, str) or not ticket_key.strip()):
+        return MalformedLock(path=path, detail="ticketKey must be a non-empty string")
+
+    return PromotionLockRecord(
+        token=payload["token"].strip(),
+        worktree_id=payload["worktreeId"].strip(),
+        workspace_path=payload["workspacePath"].strip(),
+        pid=pid,
+        hostname=payload["hostname"].strip(),
+        acquired_at=payload["acquiredAt"].strip(),
+        operation=payload["operation"].strip(),
+        ticket_key=ticket_key.strip() if isinstance(ticket_key, str) else None,
+    )
+
+
+def read_promotion_lock(repo_root: Path):
+    """Return a PromotionLockRecord, a MalformedLock, or None when free."""
+    path = promotion_lock_path(repo_root)
+    if not path.exists():
+        return None
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        return MalformedLock(path=path, detail="cannot read lock: {0}".format(exc))
+    if not text.strip():
+        return MalformedLock(path=path, detail="lock file is empty")
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        return MalformedLock(path=path, detail="invalid JSON: {0}".format(exc.msg))
+    return _lock_from_payload(payload, path)
+
+
+def acquire_promotion_lock(
+    repo_root: Path,
+    *,
+    worktree_id: str,
+    workspace_path: Path,
+    ticket_key: Optional[str],
+    operation: str = "promote",
+) -> PromotionLockRecord:
+    """Take the repository-wide promotion lock. Never blocks, never spins."""
+    path = promotion_lock_path(repo_root)
+    record = PromotionLockRecord(
+        token=_generate_token(),
+        worktree_id=worktree_id,
+        workspace_path=str(Path(os.path.abspath(str(workspace_path)))),
+        pid=os.getpid(),
+        hostname=_current_hostname(),
+        acquired_at=_now_utc_iso(),
+        operation=operation,
+        ticket_key=ticket_key,
+    )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(record.to_dict(), indent=2, sort_keys=True) + "\n"
+    try:
+        descriptor = os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except OSError as exc:
+        if exc.errno != errno.EEXIST:
+            raise PromotionLockError(
+                "Cannot acquire the promotion lock at {0}: {1}".format(path, exc)
+            ) from exc
+        holder = read_promotion_lock(repo_root)
+        if isinstance(holder, MalformedLock):
+            raise PromotionLockHeldError(
+                "the promotion lock at {0} is unreadable ({1}); it is treated as held "
+                "until explicit recovery".format(path, holder.detail),
+                holder=None,
+            ) from exc
+        if holder is None:
+            raise PromotionLockHeldError(
+                "the promotion lock at {0} was taken concurrently".format(path),
+                holder=None,
+            ) from exc
+        raise PromotionLockHeldError(
+            "the promotion lock is held by {0}".format(holder.describe()),
+            holder=holder,
+        ) from exc
+
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except OSError as exc:
+        try:
+            os.unlink(str(path))
+        except OSError:
+            pass
+        raise PromotionLockError(
+            "Cannot write the promotion lock at {0}: {1}".format(path, exc)
+        ) from exc
+
+    return record
+
+
+def release_promotion_lock(repo_root: Path, *, token: str) -> bool:
+    """Release the lock only while it still holds this generation's token.
+
+    The file is renamed aside before it is unlinked so a concurrent reader
+    never observes a truncated lock.
+    """
+    path = promotion_lock_path(repo_root)
+    current = read_promotion_lock(repo_root)
+    if current is None:
+        return False
+    if isinstance(current, MalformedLock):
+        raise PromotionLockError(
+            "Refusing to release the promotion lock at {0}: {1}".format(path, current.detail)
+        )
+    if current.token != token:
+        raise PromotionLockError(
+            "Refusing to release the promotion lock at {0}: the record was replaced "
+            "since it was acquired.".format(path)
+        )
+
+    staged = path.parent / "{0}.releasing-{1}".format(PROMOTION_LOCK_FILENAME, token)
+    try:
+        os.replace(str(path), str(staged))
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise PromotionLockError(
+            "Cannot release the promotion lock at {0}: {1}".format(path, exc)
+        ) from exc
+    try:
+        os.unlink(str(staged))
+    except OSError as exc:
+        raise PromotionLockError(
+            "Promotion lock was staged for removal but could not be deleted at {0}: {1}".format(
+                staged, exc
+            )
+        ) from exc
+    return True
+
+
+LOCK_OWNER_ABSENT = "absent"
+LOCK_OWNER_ALIVE = "alive"
+LOCK_OWNER_UNDETERMINED = "undetermined"
+
+
+def promotion_lock_owner_state(record: PromotionLockRecord) -> str:
+    """Classify the lock holder using only portable, fail-closed evidence."""
+    absent = process_is_absent(record.pid, record.hostname)
+    if absent is True:
+        return LOCK_OWNER_ABSENT
+    if absent is False:
+        return LOCK_OWNER_ALIVE
+    return LOCK_OWNER_UNDETERMINED
+
+
+def force_release_promotion_lock(
+    repo_root: Path,
+    *,
+    holder_path: str,
+    force: bool,
+):
+    """Explicit recovery for a lock whose owner is gone.
+
+    A same-host, provably absent pid authorizes removal on its own. Anything
+    less certain -- a live pid, a foreign host, an unreadable record, or a
+    platform where liveness cannot be established -- requires explicit force.
+    The token observed before the decision must still be present at removal, so
+    a lock re-taken in the meantime is never deleted.
+    """
+    path = promotion_lock_path(repo_root)
+    current = read_promotion_lock(repo_root)
+    if current is None:
+        raise PromotionLockError("There is no promotion lock to release at {0}.".format(path))
+
+    if isinstance(current, MalformedLock):
+        if not force:
+            raise PromotionLockError(
+                "The promotion lock at {0} is unreadable ({1}), so its owner cannot be "
+                "verified. Rerun with --force to remove it.".format(path, current.detail)
+            )
+        force_remove_claim(path)
+        return None
+
+    expected = os.path.normcase(os.path.abspath(os.path.expanduser(holder_path)))
+    actual = os.path.normcase(os.path.abspath(current.workspace_path))
+    if expected != actual:
+        raise PromotionLockError(
+            "The promotion lock is held by {0}, not {1}. Pass the holder's own workspace "
+            "path.".format(current.workspace_path, holder_path)
+        )
+
+    owner_state = promotion_lock_owner_state(current)
+    if owner_state != LOCK_OWNER_ABSENT and not force:
+        if owner_state == LOCK_OWNER_ALIVE:
+            detail = "its owning process {0} is still running".format(current.pid)
+        else:
+            detail = (
+                "its owner's liveness cannot be established on this platform or host"
+            )
+        raise PromotionLockError(
+            "Refusing to release the promotion lock held by {0}: {1}. Rerun with --force "
+            "only if that process is definitely gone.".format(current.describe(), detail)
+        )
+
+    observed_token = current.token
+    verify = read_promotion_lock(repo_root)
+    if verify is None:
+        raise PromotionLockError("The promotion lock was released before it could be removed.")
+    if isinstance(verify, MalformedLock) or verify.token != observed_token:
+        raise PromotionLockError(
+            "Refusing to release the promotion lock at {0}: it changed while it was being "
+            "inspected.".format(path)
+        )
+
+    force_remove_claim(path)
+    return current
+
+
+# ---------------------------------------------------------------------------
+# Promotion breadcrumb
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LastPromotion:
+    commit_before: str
+    commit_after: str
+    workspace_path: str
+    ticket_key: Optional[str]
+    main_branch: str
+    at: str
+
+    def to_dict(self) -> dict:
+        payload = {
+            "version": 1,
+            "commitBefore": self.commit_before,
+            "commitAfter": self.commit_after,
+            "workspacePath": self.workspace_path,
+            "mainBranch": self.main_branch,
+            "at": self.at,
+        }
+        if self.ticket_key is not None:
+            payload["ticketKey"] = self.ticket_key
+        return payload
+
+
+def write_last_promotion(
+    repo_root: Path,
+    *,
+    commit_before: str,
+    commit_after: str,
+    workspace_path: Path,
+    ticket_key: Optional[str],
+    main_branch: str,
+) -> LastPromotion:
+    """Record the transition a successful promotion just made.
+
+    Advisory only: it names the promoting workspace in a later stale-base
+    refusal. A missing or non-matching breadcrumb degrades the message and
+    nothing else, so it is never written for a failed promotion.
+    """
+    record = LastPromotion(
+        commit_before=commit_before,
+        commit_after=commit_after,
+        workspace_path=str(Path(os.path.abspath(str(workspace_path)))),
+        ticket_key=ticket_key,
+        main_branch=main_branch,
+        at=_now_utc_iso(),
+    )
+    try:
+        write_json_object_atomic(last_promotion_path(repo_root), record.to_dict())
+    except JsonFileError as exc:
+        raise WorkspaceError(
+            "Cannot record the promotion breadcrumb: {0}".format(exc)
+        ) from exc
+    return record
+
+
+def read_last_promotion(repo_root: Path):
+    path = last_promotion_path(repo_root)
+    if not path.exists():
+        return None
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        return None
+    values = {}
+    for name in ("commitBefore", "commitAfter", "workspacePath", "mainBranch", "at"):
+        value = payload.get(name)
+        if not isinstance(value, str) or not value.strip():
+            return None
+        values[name] = value.strip()
+    ticket_key = payload.get("ticketKey")
+    if ticket_key is not None and not isinstance(ticket_key, str):
+        return None
+    return LastPromotion(
+        commit_before=values["commitBefore"],
+        commit_after=values["commitAfter"],
+        workspace_path=values["workspacePath"],
+        ticket_key=ticket_key,
+        main_branch=values["mainBranch"],
+        at=values["at"],
+    )
