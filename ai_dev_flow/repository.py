@@ -884,3 +884,49 @@ def _compose_exclude_text(
         return ""
 
     return "\n".join(lines) + "\n"
+
+
+def add_worktree(
+    repo_root: Path,
+    *,
+    workspace_path: Path,
+    branch_name: str,
+    source_branch: str,
+) -> None:
+    _run_git(
+        repo_root,
+        ["worktree", "add", "-b", branch_name, str(workspace_path), source_branch],
+        check=True,
+    )
+
+
+def remove_worktree(repo_root: Path, *, workspace_path: Path) -> None:
+    _run_git(repo_root, ["worktree", "remove", str(workspace_path)], check=True)
+
+
+def prune_worktrees(repo_root: Path) -> None:
+    _run_git(repo_root, ["worktree", "prune"], check=True)
+
+
+def delete_branch_if_at_revision(
+    repo_root: Path,
+    *,
+    branch_name: str,
+    expected_commit: str,
+) -> bool:
+    """Delete a branch only while it still points where this caller left it."""
+    current = _resolve_branch_head(repo_root, branch_name)
+    if current is None:
+        return False
+    if current != expected_commit:
+        raise RepositoryError(
+            f"Refusing to delete branch {branch_name}: it moved to {current}, "
+            f"not {expected_commit}."
+        )
+
+    completed = _run_git(repo_root, ["branch", "-D", branch_name], check=False)
+    if completed.returncode != 0:
+        raise RepositoryError(
+            completed.stderr.strip() or f"Cannot delete branch {branch_name}."
+        )
+    return True

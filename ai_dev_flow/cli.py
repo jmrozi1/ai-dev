@@ -53,6 +53,10 @@ from .repository import (
     diff_baseline_file_for_repo_root,
     delete_managed_ref,
     resolve_managed_ref,
+    add_worktree,
+    remove_worktree,
+    prune_worktrees,
+    delete_branch_if_at_revision,
 )
 from .blocked_workflows import (
     BlockedWorkflowRecord,
@@ -91,6 +95,34 @@ from .promotion_sync import (
     save_promotion_sync_record,
 )
 from .tickets import TicketReference
+from .workspaces import (
+    ClaimOccupiedError,
+    MalformedClaim,
+    WorkspaceError,
+    canonical_ticket_key,
+    acquire_active_claim,
+    claim_is_live,
+    claim_path,
+    create_active_claim,
+    default_workspace_path,
+    describe_occupancy,
+    effective_worktree_id,
+    evaluate_claim,
+    find_foreign_out_path,
+    force_remove_claim,
+    list_claim_files,
+    list_worktrees,
+    promote_claim,
+    read_claim,
+    read_claim_file,
+    registry_directory,
+    relocate_config_for_workspace,
+    release_claim,
+    reserve_claim,
+    validate_branch_name,
+    workspace_branch_name,
+    worktree_id_for_repo_root,
+)
 
 
 _DIRECT_FLOW_ROUTE_TOKEN = "__ai_dev_flow_exec__"
@@ -210,6 +242,14 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         canonical_namespace="flow",
         order=110,
         handler_key="resume",
+        fixed_prefixed_executable=True,
+    ),
+    CommandSpec(
+        name="workspace",
+        description="Manage concurrent ticket workspaces backed by Git worktrees.",
+        canonical_namespace="flow",
+        order=115,
+        handler_key="workspace",
         fixed_prefixed_executable=True,
     ),
     CommandSpec(
@@ -365,6 +405,31 @@ Usage: {command_name} resume <ticket-number>
 Reactivate a blocked issue workflow as the local active issue. Resuming a
 suspended original restores its historical checkpoint progression and starts a
 new active scope from the promoted canonical base.
+
+Options:
+  -h, --help  Show this help.
+""",
+    "workspace": """\
+Usage: {command_name} add <ticket-id> [path]
+       {command_name} adopt <ticket-id>
+       {command_name} list
+       {command_name} remove [path]
+       {command_name} prune [--claim <ticket-id>]
+
+Manage concurrent ticket workspaces. Each workspace is a linked Git worktree
+with its own scratch branch and its own .ai-dev state, so ordinary status,
+diff, checkpoint, reset, abandon, and completion act only on the workspace they
+are run from. Ordinary single-workspace repositories never need these commands.
+
+Subcommands:
+  add <ticket-id> [path]  Reserve the ticket, create its worktree and branch,
+                          then activate it. Defaults to a sibling directory.
+  adopt <ticket-id>       Claim and activate the current worktree without
+                          resetting its branch or working tree.
+  list                    Show every claim and its live workspace path.
+  remove [path]           Remove an inactive, clean workspace and its claim.
+  prune [--claim <id>]    Remove claims whose worktree is gone or prunable.
+                          --claim recovers one unreadable claim record.
 
 Options:
   -h, --help  Show this help.
@@ -1017,6 +1082,67 @@ def _validate_patch_prerequisites(
         )
 
 
+def _release_workspace_claim_for_state(repo_root: Path, state: WorkflowState) -> None:
+    """Release this workspace's ticket claim when its workflow ends.
+
+    Authorization is the worktree id: a workspace only ever gives back a claim
+    it owns, so ending one workflow can never free another workspace's ticket.
+    """
+    if state.ticket_reference is None:
+        return
+
+    key = canonical_ticket_key(state.ticket_reference)
+    try:
+        record = read_claim(repo_root, key)
+    except WorkspaceError as exc:
+        print(f"Warning: could not read the workspace claim for {key}: {exc}", file=sys.stderr)
+        return
+
+    if record is None:
+        return
+    if isinstance(record, MalformedClaim):
+        print(
+            f"Warning: the workspace claim at {record.path} is unreadable and was kept: "
+            f"{record.detail}",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        owner = effective_worktree_id(repo_root)
+    except WorkspaceError as exc:
+        print(f"Warning: could not resolve this workspace identity: {exc}", file=sys.stderr)
+        return
+
+    if record.worktree_id != owner:
+        print(
+            f"Warning: the claim for {key} belongs to another workspace and was kept.",
+            file=sys.stderr,
+        )
+        return
+
+    try:
+        release_claim(repo_root, key=key, token=record.token, worktree_id=owner)
+    except WorkspaceError as exc:
+        print(f"Warning: could not release the workspace claim for {key}: {exc}", file=sys.stderr)
+
+
+def _release_claim_quietly(repo_root: Path, record) -> None:
+    """Give back a claim this invocation created; never mask the real failure."""
+    try:
+        release_claim(
+            repo_root,
+            key=record.key,
+            token=record.token,
+            worktree_id=record.worktree_id,
+        )
+    except WorkspaceError as exc:
+        print(
+            f"Warning: could not release the workspace claim for {record.key}: {exc}",
+            file=sys.stderr,
+        )
+
+
 def handle_start(command_name: str, arguments: list[str]) -> int:
     prerequisite_arguments = _parse_prerequisite_start(command_name, arguments)
     if prerequisite_arguments is not None:
@@ -1072,6 +1198,34 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
             f"Cannot start workflow: ticket {issue_number} is {ticket.lifecycle_state}."
         )
 
+    # Claim the ticket before any repository or provider mutation so the same
+    # ticket can never become two independent writable workspaces.
+    claim_key = canonical_ticket_key(ticket.reference)
+    try:
+        requesting_worktree = effective_worktree_id(repo_root)
+        occupancy = describe_occupancy(
+            repo_root,
+            claim_key,
+            requesting_worktree_id=requesting_worktree,
+        )
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+    if occupancy is not None:
+        raise FlowError(f"Cannot start workflow for ticket {issue_number}: {occupancy}")
+
+    try:
+        claim_record = acquire_active_claim(
+            repo_root,
+            reference=ticket.reference,
+            worktree_id=worktree_id_for_repo_root(repo_root),
+            workspace_path=repo_root,
+            branch=state.scratch_branch,
+        )
+    except ClaimOccupiedError as exc:
+        raise FlowError(f"Cannot start workflow for ticket {issue_number}: {exc}") from exc
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+
     # Validate prospective state before any git mutation.
     issue_state = WorkflowState(
         main_branch=state.main_branch,
@@ -1087,22 +1241,27 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
         context="start command",
     )
 
-    checkout_branch(repo_root, state.main_branch)
-    create_or_reset_branch_from_source(
-        repo_root,
-        branch_name=state.scratch_branch,
-        source_branch=state.main_branch,
-    )
-    checkout_branch(repo_root, state.scratch_branch)
-    ensure_branches_point_to_same_commit(
-        repo_root,
-        left_branch=state.main_branch,
-        right_branch=state.scratch_branch,
-    )
+    try:
+        checkout_branch(repo_root, state.main_branch)
+        create_or_reset_branch_from_source(
+            repo_root,
+            branch_name=state.scratch_branch,
+            source_branch=state.main_branch,
+        )
+        checkout_branch(repo_root, state.scratch_branch)
+        ensure_branches_point_to_same_commit(
+            repo_root,
+            left_branch=state.main_branch,
+            right_branch=state.scratch_branch,
+        )
+    except (RepositoryError, FlowError):
+        _release_claim_quietly(repo_root, claim_record)
+        raise
 
     try:
         active_ticket = provider.mark_active(ticket.reference)
     except TicketProviderError as exc:
+        _release_claim_quietly(repo_root, claim_record)
         raise FlowError(
             f"Cannot start workflow: failed to mark ticket {issue_number} active. {exc}"
         ) from exc
@@ -1124,7 +1283,16 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
     )
 
     ensure_local_state_excluded(repo_root)
-    save_state(state_path, issue_state)
+    try:
+        save_state(state_path, issue_state)
+    except WorkflowStateError as exc:
+        # The ticket is already active with the provider, so the claim stays with
+        # this workspace rather than being released into an inconsistent state.
+        raise FlowError(
+            f"Ticket {issue_number} was marked active but workflow state could not be "
+            f"saved. This workspace keeps the ticket claim; rerun start from this "
+            f"workspace after fixing local state persistence. {exc}"
+        ) from exc
     try:
         clear_promotion_sync_record(repo_root)
     except PromotionSyncError as exc:
@@ -2959,6 +3127,7 @@ def handle_abandon(command_name: str, arguments: list[str]) -> int:
     except PromotionSyncError as exc:
         raise FlowError(f"Cannot abandon workflow: {exc}") from exc
     _clear_diff_baseline_after_success(repo_root, operation="abandon")
+    _release_workspace_claim_for_state(repo_root, state)
     try:
         clear_state(state_path)
     except WorkflowStateError as exc:
@@ -3099,6 +3268,8 @@ def handle_complete(command_name: str, arguments: list[str]) -> int:
                 "Cannot complete workflow: ticket completion succeeded but suspended ref cleanup failed. "
                 f"Retry flow-complete after fixing the managed ref. {exc}"
             ) from exc
+
+    _release_workspace_claim_for_state(repo_root, state)
 
     inactive_state = WorkflowState(
         main_branch=state.main_branch,
@@ -3726,6 +3897,707 @@ def handle_status(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
+def _workspace_usage(command_name: str) -> FlowError:
+    return _usage_error(
+        command_name,
+        "workspace",
+        "<add|adopt|list|remove|prune> ...",
+    )
+
+
+def _workspace_reference_for_ticket_id(repo_root: Path, ticket_id: str) -> TicketReference:
+    """Build a canonical reference from local configuration, without network I/O."""
+    try:
+        configuration = load_ticket_configuration_for_repo_root(repo_root)
+    except TicketConfigError as exc:
+        raise FlowError(str(exc)) from exc
+
+    provider = getattr(configuration, "provider", "")
+    if provider == "github":
+        return TicketReference(
+            provider="github",
+            ticket_id=ticket_id,
+            repository=getattr(configuration, "repository"),
+        )
+    if provider == "local":
+        return TicketReference(provider="local", ticket_id=ticket_id)
+    raise FlowError(
+        "Cannot derive a workspace identity for provider "
+        f"'{provider}'. Pass the claim filename instead."
+    )
+
+
+def _workspace_state_for_root(workspace_root: Path) -> WorkflowState:
+    return load_state(workflow_state_file_for_repo_root(workspace_root))
+
+
+def _print_workspace_residue(residue: list) -> None:
+    print("Preserved artifacts that must be resolved manually:", file=sys.stderr)
+    for item in residue:
+        print(f"  {item}", file=sys.stderr)
+
+
+def _rollback_workspace_creation(
+    repo_root: Path,
+    record,
+    *,
+    workspace_path: Path,
+    branch_name: str,
+    branch_commit: str,
+    worktree_created: bool,
+) -> list:
+    """Undo only what this invocation created; stop at the first failure."""
+    residue: list = []
+    claim_note = (
+        f"claim {claim_path(repo_root, record.key)} (release token {record.token})"
+    )
+
+    if worktree_created:
+        try:
+            remove_worktree(repo_root, workspace_path=workspace_path)
+        except RepositoryError as exc:
+            residue.append(f"worktree {workspace_path}: {exc}")
+            residue.append(f"branch {branch_name}")
+            residue.append(claim_note)
+            return residue
+
+    if branch_commit:
+        try:
+            delete_branch_if_at_revision(
+                repo_root,
+                branch_name=branch_name,
+                expected_commit=branch_commit,
+            )
+        except RepositoryError as exc:
+            residue.append(f"branch {branch_name}: {exc}")
+            residue.append(claim_note)
+            return residue
+
+    try:
+        release_claim(
+            repo_root,
+            key=record.key,
+            token=record.token,
+            worktree_id=record.worktree_id,
+        )
+    except WorkspaceError as exc:
+        residue.append(f"{claim_note}: {exc}")
+
+    return residue
+
+
+def _seed_workspace_ai_dev(
+    *,
+    source_root: Path,
+    workspace_root: Path,
+    main_branch: str,
+    scratch_branch: str,
+) -> str:
+    """Copy configuration into the new workspace and write inactive state."""
+    source_config_path = config_file_for_repo_root(source_root)
+    target_config_path = config_file_for_repo_root(workspace_root)
+    detail = "no configuration to seed"
+
+    if source_config_path.exists():
+        try:
+            payload = load_json_object(source_config_path, missing_default={})
+        except JsonFileError as exc:
+            raise FlowError(f"Cannot read source configuration: {exc}") from exc
+
+        relocation = relocate_config_for_workspace(
+            payload,
+            source_root=source_root,
+            target_root=workspace_root,
+        )
+        detail = relocation.detail
+        try:
+            write_json_object_atomic(target_config_path, relocation.config)
+        except JsonFileError as exc:
+            raise FlowError(f"Cannot seed workspace configuration: {exc}") from exc
+
+    inactive_state = WorkflowState(
+        main_branch=main_branch,
+        scratch_branch=scratch_branch,
+        checkpoint=0,
+    )
+    save_state(workflow_state_file_for_repo_root(workspace_root), inactive_state)
+    return detail
+
+
+def _handle_workspace_add(command_name: str, arguments: list[str]) -> int:
+    if not arguments or len(arguments) > 2:
+        raise _workspace_usage(command_name)
+
+    issue_number = _parse_issue_number(command_name, arguments[:1])
+    explicit_path = arguments[1].strip() if len(arguments) == 2 else ""
+    if len(arguments) == 2 and not explicit_path:
+        raise _workspace_usage(command_name)
+
+    repo_root, _, state = _resolve_repo_state_context()
+    ensure_no_active_git_operations(repo_root)
+
+    if not branch_exists(repo_root, state.main_branch):
+        raise FlowError(f"Main branch does not exist locally: {state.main_branch}")
+
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+    try:
+        ticket = provider.get(str(issue_number))
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    if ticket.lifecycle_state != "open":
+        raise FlowError(
+            f"Cannot add workspace: ticket {issue_number} is {ticket.lifecycle_state}."
+        )
+
+    reference = ticket.reference
+    key = canonical_ticket_key(reference)
+    branch_name = workspace_branch_name(reference)
+    try:
+        validate_branch_name(repo_root, branch_name)
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+
+    # Ticket-level occupancy is the most informative refusal, so it is checked
+    # before any path or branch precondition.
+    try:
+        occupancy = describe_occupancy(repo_root, key)
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+    if occupancy is not None:
+        raise FlowError(f"Cannot add workspace for ticket {issue_number}: {occupancy}")
+
+    if explicit_path:
+        workspace_path = Path(os.path.abspath(os.path.expanduser(explicit_path)))
+    else:
+        try:
+            workspace_path = default_workspace_path(repo_root, reference)
+        except WorkspaceError as exc:
+            raise FlowError(str(exc)) from exc
+
+    # Every precondition is checked before the reservation so an ordinary
+    # refusal never leaves a claim behind.
+    if workspace_path.exists():
+        if not workspace_path.is_dir() or any(workspace_path.iterdir()):
+            raise FlowError(
+                f"Cannot add workspace: {workspace_path} already exists and is not empty."
+            )
+
+    try:
+        worktrees = list_worktrees(repo_root)
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+    for entry in worktrees:
+        if _workspace_path_conflicts(workspace_path, entry.path):
+            raise FlowError(
+                f"Cannot add workspace: {workspace_path} is inside the existing "
+                f"worktree at {entry.path}."
+            )
+
+    if branch_exists(repo_root, branch_name):
+        raise FlowError(
+            f"Cannot add workspace: branch {branch_name} already exists."
+        )
+
+    # Phase A: reserve before creating anything.
+    try:
+        record = reserve_claim(
+            repo_root,
+            reference=reference,
+            intended_path=workspace_path,
+            intended_branch=branch_name,
+        )
+    except ClaimOccupiedError as exc:
+        raise FlowError(f"Cannot add workspace for ticket {issue_number}: {exc}") from exc
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+
+    # Phase B: create the branch and worktree.
+    worktree_created = False
+    branch_commit = ""
+    try:
+        add_worktree(
+            repo_root,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            source_branch=state.main_branch,
+        )
+        worktree_created = True
+        branch_commit = resolve_commit_hash(repo_root, branch_name)
+    except RepositoryError as exc:
+        residue = _rollback_workspace_creation(
+            repo_root,
+            record,
+            workspace_path=workspace_path,
+            branch_name=branch_name,
+            branch_commit=branch_commit,
+            worktree_created=worktree_created,
+        )
+        if residue:
+            print(f"Cannot add workspace: {exc}", file=sys.stderr)
+            _print_workspace_residue(residue)
+            return 1
+        raise FlowError(f"Cannot add workspace: {exc}") from exc
+
+    # Phase C: promote the reservation to an active claim.
+    promoted = None
+    promotion_error = None
+    for _ in range(2):
+        try:
+            worktree_id = effective_worktree_id(workspace_path)
+            promoted = promote_claim(
+                repo_root,
+                record=record,
+                worktree_id=worktree_id,
+                workspace_path=workspace_path,
+            )
+            break
+        except WorkspaceError as exc:
+            promotion_error = exc
+    if promoted is None:
+        print(
+            f"Cannot add workspace: claim promotion failed. {promotion_error}",
+            file=sys.stderr,
+        )
+        _print_workspace_residue(
+            [
+                f"worktree {workspace_path}",
+                f"branch {branch_name}",
+                f"reservation {claim_path(repo_root, record.key)} (release token {record.token})",
+            ]
+        )
+        return 1
+
+    # Phase D: seed and activate. Artifacts are preserved on failure.
+    try:
+        seed_detail = _seed_workspace_ai_dev(
+            source_root=repo_root,
+            workspace_root=workspace_path,
+            main_branch=state.main_branch,
+            scratch_branch=branch_name,
+        )
+
+        try:
+            active_ticket = provider.mark_active(reference)
+        except TicketProviderError as exc:
+            raise FlowError(
+                f"failed to mark ticket {issue_number} active. {exc}"
+            ) from exc
+
+        active_state = WorkflowState(
+            main_branch=state.main_branch,
+            scratch_branch=branch_name,
+            checkpoint=0,
+            active_issue_number=issue_number,
+            active_issue_title=active_ticket.title,
+            active_issue_url=active_ticket.reference.url,
+            ticket_reference=active_ticket.reference,
+        )
+        active_state = normalize_and_validate(
+            active_state.to_dict(),
+            context="workspace add command",
+        )
+        save_state(workflow_state_file_for_repo_root(workspace_path), active_state)
+    except (FlowError, WorkflowStateError, RepositoryError) as exc:
+        print(f"Cannot add workspace: {exc}", file=sys.stderr)
+        _print_workspace_residue(
+            [
+                f"worktree {workspace_path}",
+                f"branch {branch_name}",
+                f"active claim {claim_path(repo_root, promoted.key)}",
+                f"resolve with: {command_name} remove {workspace_path}",
+            ]
+        )
+        return 1
+
+    print(f"Added workspace for issue {issue_number}")
+    print(f"path: {workspace_path}")
+    print(f"branch: {branch_name}")
+    print(f"mainBranch: {state.main_branch}")
+    print("checkpoint: 0")
+    print(f"claim: {claim_path(repo_root, promoted.key)}")
+    print(f"config: {seed_detail}")
+    return 0
+
+
+def _workspace_path_conflicts(candidate: Path, existing: Path) -> bool:
+    candidate_text = os.path.normcase(os.path.abspath(str(candidate)))
+    existing_text = os.path.normcase(os.path.abspath(str(existing)))
+    if candidate_text == existing_text:
+        return True
+    return candidate_text.startswith(existing_text.rstrip(os.sep) + os.sep)
+
+
+def _handle_workspace_adopt(command_name: str, arguments: list[str]) -> int:
+    if len(arguments) != 1:
+        raise _workspace_usage(command_name)
+
+    issue_number = _parse_issue_number(command_name, arguments)
+    repo_root, state_path, state = _resolve_repo_state_context()
+
+    if _active_workflow_type(state) is not None:
+        raise FlowError(
+            "Cannot adopt workspace: this workspace already has an active workflow."
+        )
+
+    _ensure_main_and_scratch_branches_differ(state)
+    _ensure_main_and_scratch_branches_exist(repo_root, state)
+    ensure_no_active_git_operations(repo_root)
+
+    current_branch = current_branch_name(repo_root)
+    if current_branch != state.scratch_branch:
+        raise FlowError(
+            f"Cannot adopt workspace: current branch {current_branch} does not match "
+            f"scratchBranch {state.scratch_branch}."
+        )
+
+    config_path = config_file_for_repo_root(repo_root)
+    if config_path.exists():
+        try:
+            config_payload = load_json_object(config_path, missing_default={})
+        except JsonFileError as exc:
+            raise FlowError(f"Cannot adopt workspace: {exc}") from exc
+        try:
+            foreign = find_foreign_out_path(
+                repo_root,
+                config_payload,
+                workspace_root=repo_root,
+            )
+        except WorkspaceError as exc:
+            raise FlowError(str(exc)) from exc
+        if foreign is not None:
+            raise FlowError(
+                "Cannot adopt workspace: configured out path "
+                f"{foreign.out_path} is inside another worktree at "
+                f"{foreign.owning_worktree.path}. Point out at a path inside this "
+                "workspace so the two workspaces do not share one artifact."
+            )
+
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+    try:
+        ticket = provider.get(str(issue_number))
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    if ticket.lifecycle_state != "open":
+        raise FlowError(
+            f"Cannot adopt workspace: ticket {issue_number} is {ticket.lifecycle_state}."
+        )
+
+    reference = ticket.reference
+    key = canonical_ticket_key(reference)
+    try:
+        requesting_worktree = effective_worktree_id(repo_root)
+        occupancy = describe_occupancy(
+            repo_root,
+            key,
+            requesting_worktree_id=requesting_worktree,
+        )
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+    if occupancy is not None:
+        raise FlowError(f"Cannot adopt workspace for ticket {issue_number}: {occupancy}")
+
+    try:
+        record = acquire_active_claim(
+            repo_root,
+            reference=reference,
+            worktree_id=worktree_id_for_repo_root(repo_root),
+            workspace_path=repo_root,
+            branch=state.scratch_branch,
+        )
+    except ClaimOccupiedError as exc:
+        raise FlowError(f"Cannot adopt workspace for ticket {issue_number}: {exc}") from exc
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+
+    checkpoint = max_numbered_checkpoint_relative_to_main(
+        repo_root,
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+    )
+
+    try:
+        active_ticket = provider.mark_active(reference)
+    except TicketProviderError as exc:
+        # Nothing outside the registry changed yet, so give the claim back.
+        try:
+            release_claim(
+                repo_root,
+                key=key,
+                token=record.token,
+                worktree_id=record.worktree_id,
+            )
+        except WorkspaceError as release_exc:
+            print(
+                f"Warning: could not release the workspace claim for {key}: {release_exc}",
+                file=sys.stderr,
+            )
+        raise FlowError(
+            f"Cannot adopt workspace: failed to mark ticket {issue_number} active. {exc}"
+        ) from exc
+
+    adopted_state = WorkflowState(
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        checkpoint=checkpoint,
+        active_issue_number=issue_number,
+        active_issue_title=active_ticket.title,
+        active_issue_url=active_ticket.reference.url,
+        ticket_reference=active_ticket.reference,
+    )
+    adopted_state = normalize_and_validate(
+        adopted_state.to_dict(),
+        context="workspace adopt command",
+    )
+    try:
+        save_state(state_path, adopted_state)
+    except WorkflowStateError as exc:
+        # The provider already marks the ticket active, so the claim stays with
+        # this workspace; retrying adopt here reuses it rather than colliding.
+        raise FlowError(
+            f"Ticket {issue_number} was marked active but workflow state could not be "
+            f"saved. This workspace keeps the ticket claim; rerun adopt from this "
+            f"workspace after fixing local state persistence. {exc}"
+        ) from exc
+    ensure_local_state_excluded(repo_root)
+
+    print(f"Adopted issue {issue_number} into this workspace")
+    print(f"path: {repo_root}")
+    print(f"branch: {state.scratch_branch}")
+    print(f"mainBranch: {state.main_branch}")
+    print(f"checkpoint: {checkpoint}")
+    print(f"claim: {claim_path(repo_root, key)}")
+    return 0
+
+
+def _handle_workspace_list(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise _workspace_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    current_id = effective_worktree_id(repo_root)
+
+    try:
+        claim_files = list_claim_files(repo_root)
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+
+    print(f"Registry: {registry_directory(repo_root)}")
+    if not claim_files:
+        print("No workspace claims.")
+        return 0
+
+    for path in claim_files:
+        entry = read_claim_file(path)
+        if entry is None:
+            continue
+        if isinstance(entry, MalformedClaim):
+            print(f"- {path.name}")
+            print(f"    state: occupied (unreadable: {entry.detail})")
+            continue
+
+        status = evaluate_claim(repo_root, entry, path)
+        marker = " (current)" if entry.worktree_id == current_id else ""
+        print(f"- {entry.key}{marker}")
+        print(f"    state: {status.state}")
+        print(f"    branch: {entry.intended_branch or 'unknown'}")
+        print(f"    path: {status.live_path or entry.intended_path or 'unknown'}")
+        print(f"    worktreeId: {entry.worktree_id or 'pending'}")
+        if status.detail:
+            print(f"    detail: {status.detail}")
+    return 0
+
+
+def _handle_workspace_remove(command_name: str, arguments: list[str]) -> int:
+    if len(arguments) > 1:
+        raise _workspace_usage(command_name)
+
+    repo_root = resolve_repo_root()
+    if arguments:
+        target_argument = arguments[0].strip()
+        if not target_argument:
+            raise _workspace_usage(command_name)
+        target_root = Path(os.path.abspath(os.path.expanduser(target_argument)))
+    else:
+        target_root = repo_root
+
+    try:
+        worktrees = list_worktrees(repo_root)
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+
+    target_entry = None
+    for entry in worktrees:
+        if os.path.normcase(str(entry.path)) == os.path.normcase(str(target_root)):
+            target_entry = entry
+            break
+
+    if target_entry is None:
+        raise FlowError(f"Cannot remove workspace: {target_root} is not a registered worktree.")
+    if target_entry.is_primary:
+        raise FlowError("Cannot remove workspace: the primary worktree is not removable.")
+
+    target_state = _workspace_state_for_root(target_entry.path)
+    if _active_workflow_type(target_state) is not None:
+        raise FlowError(
+            "Cannot remove workspace: it still has an active workflow. "
+            "Complete or abandon it first."
+        )
+
+    if git_status_short(target_entry.path):
+        raise FlowError("Cannot remove workspace: its working tree is not clean.")
+
+    branch_name = target_entry.branch
+    if branch_name:
+        comparison = compare_main_and_scratch(
+            repo_root,
+            main_branch=target_state.main_branch,
+            scratch_branch=branch_name,
+        )
+        if comparison.scratch_ahead_of_main:
+            raise FlowError(
+                f"Cannot remove workspace: {branch_name} is ahead of "
+                f"{target_state.main_branch}; preserve or promote that work first."
+            )
+
+    matching_claim = None
+    for path in list_claim_files(repo_root):
+        entry = read_claim_file(path)
+        if isinstance(entry, MalformedClaim) or entry is None:
+            continue
+        if entry.worktree_id and entry.worktree_id == target_entry.worktree_id:
+            matching_claim = entry
+            break
+
+    branch_commit = ""
+    if branch_name and branch_exists(repo_root, branch_name):
+        branch_commit = resolve_commit_hash(repo_root, branch_name)
+
+    try:
+        remove_worktree(repo_root, workspace_path=target_entry.path)
+    except RepositoryError as exc:
+        raise FlowError(f"Cannot remove workspace: {exc}") from exc
+
+    removed_branch = False
+    if branch_name and branch_commit:
+        try:
+            removed_branch = delete_branch_if_at_revision(
+                repo_root,
+                branch_name=branch_name,
+                expected_commit=branch_commit,
+            )
+        except RepositoryError as exc:
+            print(f"Removed the worktree, but the branch was preserved: {exc}", file=sys.stderr)
+
+    released = False
+    if matching_claim is not None:
+        try:
+            released = release_claim(
+                repo_root,
+                key=matching_claim.key,
+                token=matching_claim.token,
+                worktree_id=target_entry.worktree_id,
+            )
+        except WorkspaceError as exc:
+            print(f"Removed the worktree, but the claim was preserved: {exc}", file=sys.stderr)
+
+    print(f"Removed workspace {target_entry.path}")
+    print(f"branch removed: {'yes' if removed_branch else 'no'}")
+    print(f"claim released: {'yes' if released else 'no'}")
+    return 0
+
+
+def _handle_workspace_prune(command_name: str, arguments: list[str]) -> int:
+    claim_selector = ""
+    if arguments:
+        if len(arguments) != 2 or arguments[0] != "--claim":
+            raise _workspace_usage(command_name)
+        claim_selector = arguments[1].strip()
+        if not claim_selector:
+            raise _workspace_usage(command_name)
+
+    repo_root = resolve_repo_root()
+
+    if claim_selector:
+        if claim_selector.endswith(".json") or (
+            len(claim_selector) == 64
+            and all(character in "0123456789abcdef" for character in claim_selector)
+        ):
+            filename = claim_selector if claim_selector.endswith(".json") else f"{claim_selector}.json"
+            target_path = registry_directory(repo_root) / "claims" / filename
+        else:
+            reference = _workspace_reference_for_ticket_id(repo_root, claim_selector)
+            target_path = claim_path(repo_root, canonical_ticket_key(reference))
+
+        if not target_path.exists():
+            raise FlowError(f"Cannot prune claim: no claim record at {target_path}.")
+
+        existing = read_claim_file(target_path)
+        if existing is not None and not isinstance(existing, MalformedClaim):
+            if claim_is_live(repo_root, existing, target_path):
+                status = evaluate_claim(repo_root, existing, target_path)
+                location = status.live_path or existing.intended_path or "its workspace"
+                raise FlowError(
+                    "Cannot prune claim: the claim for "
+                    f"{existing.key} is live and owned by workspace {location}. "
+                    "A blocked workflow keeps its claim on purpose. Recover it from "
+                    f"that workspace with resume {existing.ticket_id}, then end it with "
+                    "the appropriate lifecycle command such as abandon."
+                )
+
+        try:
+            force_remove_claim(target_path)
+        except WorkspaceError as exc:
+            raise FlowError(str(exc)) from exc
+        print(f"Removed claim record {target_path}")
+        return 0
+
+    removed = 0
+    for path in list_claim_files(repo_root):
+        entry = read_claim_file(path)
+        if entry is None:
+            continue
+        if isinstance(entry, MalformedClaim):
+            print(f"Kept unreadable claim {path.name}: {entry.detail}")
+            print(f"  recover with: {command_name} prune --claim {path.stem}")
+            continue
+        status = evaluate_claim(repo_root, entry, path)
+        if status.state != "stale":
+            continue
+        try:
+            force_remove_claim(path)
+        except WorkspaceError as exc:
+            raise FlowError(str(exc)) from exc
+        removed += 1
+        print(f"Removed stale claim {entry.key}: {status.detail}")
+
+    if removed == 0:
+        print("No stale claims.")
+    return 0
+
+
+def handle_workspace(command_name: str, arguments: list[str]) -> int:
+    if not arguments:
+        raise _workspace_usage(command_name)
+
+    subcommand = arguments[0]
+    rest = arguments[1:]
+
+    if subcommand == "add":
+        return _handle_workspace_add(command_name, rest)
+    if subcommand == "adopt":
+        return _handle_workspace_adopt(command_name, rest)
+    if subcommand == "list":
+        return _handle_workspace_list(command_name, rest)
+    if subcommand == "remove":
+        return _handle_workspace_remove(command_name, rest)
+    if subcommand == "prune":
+        return _handle_workspace_prune(command_name, rest)
+
+    raise _workspace_usage(command_name)
+
+
 def handle_ticket_create(command_name: str, arguments: list[str]) -> int:
     if not arguments:
         raise _ticket_create_usage(command_name)
@@ -3940,6 +4812,7 @@ def _resolve_command_handler(handler_key: str):
         "complete": handle_complete,
         "block": handle_block,
         "resume": handle_resume,
+        "workspace": handle_workspace,
         "ticket-create": handle_ticket_create,
         "ticket-show": handle_ticket_show,
         "ticket-query": handle_ticket_query,
