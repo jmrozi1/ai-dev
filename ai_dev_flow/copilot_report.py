@@ -437,31 +437,18 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
     if not analyzers and not executions:
         return {"source": "terminal-diagnostic", "status": "unavailable", "detail": "no bounded plaintext terminal records"}
     requests: list[dict[str, Any]] = []
-    seen: set[tuple[str, ...]] = set()
-    denied_commands = {
-        _normalize_command(command): entry
-        for entry in analyzers
-        if entry.get("denied")
-        for command in entry["commands"]
-    }
+    seen: set[tuple[tuple[str, ...], float, bool, str | None]] = set()
     used_execution_indices: set[int] = set()
     for entry in analyzers:
         commands = entry["commands"]
         if not commands:
             continue
-        key = (tuple(commands), entry["timestamp"])
+        bounded_commands = [command[:MAX_CONTENT] for command in commands[:MAX_ACTIONS]]
+        key = (tuple(bounded_commands), entry["timestamp"], bool(entry.get("denied")), entry.get("reason"))
         if key in seen:
             continue
         seen.add(key)
-        denied = entry.get("denied", False)
-        denied_entry = None
-        if denied:
-            for cmd in commands:
-                if _normalize_command(cmd) in denied_commands:
-                    denied_entry = denied_commands[_normalize_command(cmd)]
-                    break
-        command = commands[0]
-        execution = None
+        denied = bool(entry.get("denied"))
         matching_indices: list[int] = []
         for idx, candidate in enumerate(executions):
             if idx in used_execution_indices:
@@ -474,16 +461,16 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
                     matching_indices.append(idx)
                     break
         disposition = "unresolved"
+        execution = None
         if len(matching_indices) == 1:
             execution = executions[matching_indices[0]]
             used_execution_indices.add(matching_indices[0])
             disposition = "executed"
         elif len(matching_indices) > 1:
-            execution = executions[matching_indices[0]]
-            used_execution_indices.add(matching_indices[0])
             disposition = "ambiguous"
         wait = execution["timestamp"] - entry["timestamp"] if denied and execution else None
-        requests.append({"command": command[:MAX_CONTENT], "terminalApprovalRequest": denied, "denialReason": denied_entry.get("reason") if denied_entry else None, "disposition": disposition, "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "approvalWaitSeconds": wait})
+        command = bounded_commands[0] if len(bounded_commands) == 1 else json.dumps(bounded_commands, ensure_ascii=True, separators=(",", ":"))[:MAX_CONTENT]
+        requests.append({"command": command, "commands": bounded_commands, "terminalApprovalRequest": denied, "denialReason": entry.get("reason"), "disposition": disposition, "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "approvalWaitSeconds": wait})
     if not requests:
         return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": _state({"status": "validated", "value": 0})}
     approvals = [request for request in requests if request["terminalApprovalRequest"]]
@@ -576,9 +563,17 @@ def render_copilot_report(
         elif timing_status == "validated":
             lines.append(f"Approval timing: {timing_value} seconds validated")
         else:
-            lines.append(f"Approval timing: unavailable")
+            lines.append("Approval timing: unavailable")
     if terminal is not None and terminal.get("status") == "validated":
-        lines.append(f"Timing: approval wait {terminal['approvalWaitSeconds']['value']} seconds validated")
+        approval_timing = terminal.get("approvalWaitSeconds", {})
+        timing_status = approval_timing.get("status", "unavailable")
+        timing_value = approval_timing.get("value", "unavailable")
+        if timing_status == "partial":
+            lines.append(f"Timing: approval wait {timing_value} (partial)")
+        elif timing_status == "validated":
+            lines.append(f"Timing: approval wait {timing_value} seconds validated")
+        else:
+            lines.append("Timing: approval wait unavailable")
     else:
         lines.append("Timing: partial - approval timing unavailable")
     if otel.get("status") == "validated":
