@@ -32,12 +32,47 @@ Use the smallest evidence surface that supports the decision:
 - corrections, interventions, repeated approaches, rediscovery, permission
   friction, scope drift, and validation results;
 - tasking, repository, and provider-native execution constraints;
+- the active ticket's `Skill Candidates` and `Skills` entries when the judgment
+  originates from checkpoint or promotion review;
 - behavioral dogfooding of positive activation, negative boundaries, and
   intended composition.
 
 Skill use alone is exposure, not evidence of deficiency. A single isolated agent
 mistake is not enough to change a skill unless it reveals a durable failure
 class or a safety invariant was violated.
+
+## Skill Candidates And Accepted Skills
+
+A `Skill Candidates` entry is a reviewed hypothesis that observed process
+friction may justify reusable skill investment. It is not yet authorization to
+create or modify a skill.
+
+When asked to adjudicate a candidate, return the smallest correct disposition:
+
+- **keep candidate** when the evidence is still materially inconclusive;
+- **no skill** when the evidence is isolated, already covered by sufficient
+  guidance, better explained by tasking/provider/tooling/executor behavior, or
+  not reusable enough to justify a skill change;
+- **refine existing skill** when an existing skill owns the behavior and its
+  activation or guidance is the responsible deficiency;
+- **create skill** when repeated work, durable operational knowledge, recurring
+  friction, or a demonstrated invariant has no correct existing owner and a new
+  reusable capability would materially improve execution.
+
+Do not use mechanical evidence thresholds such as "three observations means a
+skill." Judge recurrence, cost, correctness risk, portability, and reuse value.
+One severe recurring class may justify immediate action; many small annoyances
+may still justify no skill.
+
+When a candidate is accepted for `create skill` or `refine existing skill`, move
+it from `Skill Candidates` into the active ticket's `Skills` section. Preserve
+only enough accounting context to identify the originating checkpoint/friction,
+the accepted action and owner, implementation status, and dogfood result. Do not
+copy the full investigation or canonical skill text into the ticket.
+
+At ticket promotion/closure, every unresolved candidate requires a final
+skill-authoring disposition. A candidate cannot remain merely "reassess later"
+at issue completion.
 
 ## Failure Classification
 
@@ -48,6 +83,7 @@ Distinguish before recommending a change:
 - correct skill activated but guidance was insufficient;
 - guidance was sufficient but the executor failed to follow it;
 - tasking or provider instructions were deficient;
+- tooling or deterministic helper capability was deficient;
 - isolated, non-actionable agent error.
 
 For wrong or missing activation, identify the smallest responsible owner before
@@ -55,11 +91,12 @@ recommending a skill edit. Check, in order as applicable, the canonical skill's
 activation metadata or instructions, derivative discovery surfaces such as
 `skills/index.md`, caller or provider instructions, and composition/discovery
 behavior. Change only the responsible owner: a correct canonical skill should
-not be modified to compensate for a discovery-surface, caller-instruction, or
-composition defect.
+not be modified to compensate for a discovery-surface, caller-instruction,
+tooling, or composition defect.
 
 Only the skill-definition cases justify a skill change. Otherwise recommend no
-action or a tasking, instruction, permission, or execution correction.
+action or the responsible tasking, instruction, permission, tooling, or
+execution correction.
 
 ## When To Create, Refine, Or Leave Unchanged
 
@@ -72,6 +109,24 @@ execution. Keep the guidance proportional to evidence and risk.
 adequately handled by existing guidance, or better explained by non-skill
 failure. Do not preserve obsolete rules or create a skill because an abstraction
 is merely imaginable.
+
+## Work Accepted Skill Investments Immediately
+
+An accepted skill investment discovered at a named product checkpoint is
+checkpoint-review remediation, not backlog decoration. Complete the accepted
+create/refine work before advancing to the next named product checkpoint unless
+a real permission, scope, dependency, or owning-repository blocker requires
+explicit escalation.
+
+Dogfood the resulting skill or refinement against the friction that justified it
+while that evidence is still available. The dogfood need not replay an expensive
+production event when a cheaper faithful reproduction proves the behavior, but
+it must exercise the claimed improvement rather than merely checking syntax.
+
+If the accepted skill is owned in another repository, make the change in its
+canonical owning repository and record the resulting change reference and
+dogfood outcome in the originating ticket's `Skills` entry. Do not create a
+project-local duplicate solely to avoid the repository boundary.
 
 ## Audience And Placement
 
@@ -119,6 +174,11 @@ Decide whether shell/tools are needed, whether permission is broader than one
 skill-local script, and whether a narrower permission is available. Do not add a
 custom AI Dev permission system or expand permissions merely to remove prompts.
 Reasoning-only skills should not request shell access for convenience.
+
+A helper deficiency discovered during candidate review can justify helper work
+owned by an existing or newly accepted skill without implying that helper logic
+belongs in the ticket itself. Record the accepted skill investment in the ticket
+and keep deterministic mechanics with the canonical skill package.
 
 ## Dogfooding And Freshness
 
