@@ -401,6 +401,111 @@ class CopilotReportTests(unittest.TestCase):
         self.assertEqual(bounded["status"], "validated")
         self.assertLessEqual(len(bounded["approvalRequests"]["value"][0]["command"]), 400)
 
+    def test_case_a_simple_denied_and_executed(self) -> None:
+        """Case A: Control - Simple denied command + executed"""
+        log = self._terminal_log([
+            "2026-08-21 12:28:38.409 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"skills/copilot/flow/scripts/ticket-status verbose\"]]",
+            "2026-08-21 12:28:38.410 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 12:28:38.411 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: - Command 'skills/copilot/flow/scripts/ticket-status verbose' has no matching auto approve entries",
+            "2026-08-21 12:28:46.535 [info] RunInTerminalTool: Using `rich` execute strategy for command `skills/copilot/flow/scripts/ticket-status verbose` []",
+            "2026-08-21 12:28:46.636 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `8126`, error `undefined` []",
+        ])
+        result = parse_terminal_diagnostics(log, start=datetime_timestamp("2026-08-21 12:28:00"), end=datetime_timestamp("2026-08-21 12:29:00"))
+        self.assertEqual(result["status"], "validated")
+        requests = result["approvalRequests"]["value"]
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request["command"], "skills/copilot/flow/scripts/ticket-status verbose")
+        self.assertEqual(request["disposition"], "executed")
+        self.assertAlmostEqual(request["approvalWaitSeconds"], 8.126, places=2)
+        self.assertEqual(result["approvalWaitSeconds"]["status"], "validated")
+        self.assertAlmostEqual(result["approvalWaitSeconds"]["value"], 8.126, places=2)
+
+    def test_case_b_compound_command_with_first_executed(self) -> None:
+        """Case B: Compound command array ['unittest', 'git diff --check'] with only first executed"""
+        log = self._terminal_log([
+            "2026-08-21 19:42:51.365 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"python3 -m unittest tests.test_copilot_report\", \"git diff --check\"]]",
+            "2026-08-21 19:42:51.366 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 19:42:51.367 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: - Command 'python3 -m unittest tests.test_copilot_report' has no matching auto approve entries",
+            "2026-08-21 19:45:48.991 [info] RunInTerminalTool: Using `rich` execute strategy for command `python3 -m unittest tests.test_copilot_report` []",
+            "2026-08-21 19:45:54.123 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `42`, error `undefined` []",
+        ])
+        result = parse_terminal_diagnostics(log, start=datetime_timestamp("2026-08-21 19:40:00"), end=datetime_timestamp("2026-08-21 19:50:00"))
+        self.assertEqual(result["status"], "validated")
+        requests = result["approvalRequests"]["value"]
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request["command"], "python3 -m unittest tests.test_copilot_report")
+        self.assertEqual(request["disposition"], "executed")
+        self.assertAlmostEqual(request["approvalWaitSeconds"], 177.626, places=2)
+
+    def test_case_c_denied_no_execution(self) -> None:
+        """Case C: Denied request with no matching execution"""
+        log = self._terminal_log([
+            "2026-08-21 12:53:59.968 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"custom-script --flag\"]]",
+            "2026-08-21 12:53:59.969 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 12:53:59.970 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: - Command 'custom-script --flag' has no matching auto approve entries",
+        ])
+        result = parse_terminal_diagnostics(log, start=datetime_timestamp("2026-08-21 12:53:00"), end=datetime_timestamp("2026-08-21 12:55:00"))
+        self.assertEqual(result["status"], "validated")
+        requests = result["approvalRequests"]["value"]
+        self.assertEqual(len(requests), 1)
+        request = requests[0]
+        self.assertEqual(request["command"], "custom-script --flag")
+        self.assertEqual(request["disposition"], "unresolved")
+        self.assertIsNone(request["approvalWaitSeconds"])
+        self.assertEqual(result["approvalWaitSeconds"]["status"], "partial")
+        self.assertIn("0/1 approval requests correlated", str(result["approvalWaitSeconds"]["value"]))
+
+    def test_case_d_duplicate_analyzer_same_timestamp_deduplicated(self) -> None:
+        """Case D: Duplicate analyzer records with same command array and timestamp (deduplicated)"""
+        log = self._terminal_log([
+            "2026-08-21 20:07:52.704 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"./skills/copilot/auto-review/scripts/review-evidence --mode checkpoint\"]]",
+            "2026-08-21 20:07:52.705 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 20:07:52.704 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"./skills/copilot/auto-review/scripts/review-evidence --mode checkpoint\"]]",
+            "2026-08-21 20:07:52.705 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 20:07:57.200 [info] RunInTerminalTool: Using `rich` execute strategy for command `./skills/copilot/auto-review/scripts/review-evidence --mode checkpoint` []",
+        ])
+        result = parse_terminal_diagnostics(log, start=datetime_timestamp("2026-08-21 20:07:00"), end=datetime_timestamp("2026-08-21 20:08:00"))
+        self.assertEqual(result["status"], "validated")
+        requests = result["approvalRequests"]["value"]
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0]["disposition"], "executed")
+
+    def test_case_d_duplicate_different_timestamps_preserved(self) -> None:
+        """Case D: Same command analyzed at different times (different occurrences, not duplicates)"""
+        log = self._terminal_log([
+            "2026-08-21 20:07:52.704 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"review-cmd\"]]",
+            "2026-08-21 20:07:52.705 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 20:29:38.293 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"review-cmd\"]]",
+            "2026-08-21 20:29:38.294 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 20:07:57.200 [info] RunInTerminalTool: Using `rich` execute strategy for command `review-cmd` []",
+            "2026-08-21 20:29:43.100 [info] RunInTerminalTool: Using `rich` execute strategy for command `review-cmd` []",
+        ])
+        result = parse_terminal_diagnostics(log, start=datetime_timestamp("2026-08-21 20:07:00"), end=datetime_timestamp("2026-08-21 20:30:00"))
+        self.assertEqual(result["status"], "validated")
+        requests = result["approvalRequests"]["value"]
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0]["disposition"], "ambiguous")
+        self.assertEqual(requests[1]["disposition"], "executed")
+        self.assertEqual(result["approvalWaitSeconds"]["status"], "partial")
+
+    def test_case_e_nonzero_exit_code_captured(self) -> None:
+        """Case E: Executed command with nonzero exit code"""
+        log = self._terminal_log([
+            "2026-08-21 14:24:41.500 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"pytest tests/\"]]",
+            "2026-08-21 14:24:41.501 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: All sub-commands auto-approved",
+            "2026-08-21 14:24:41.600 [info] RunInTerminalTool: Using `rich` execute strategy for command `pytest tests/` []",
+            "2026-08-21 14:24:41.682 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `7`, result.length `128`, error `test failures detected` []",
+        ])
+        result = parse_terminal_diagnostics(log, start=datetime_timestamp("2026-08-21 14:24:00"), end=datetime_timestamp("2026-08-21 14:25:00"))
+        self.assertEqual(result["status"], "validated")
+        requests = result["approvalRequests"]["value"]
+        self.assertEqual(len(requests), 0)
+        self.assertEqual(result["terminalRequestCount"]["value"], 1)
+        executions = result.get("executions", [])
+
+
 
 def datetime_timestamp(value: str) -> float:
     from datetime import datetime

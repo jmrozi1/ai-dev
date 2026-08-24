@@ -444,25 +444,66 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
         if entry.get("denied")
         for command in entry["commands"]
     }
+    used_execution_indices: set[int] = set()
     for entry in analyzers:
         commands = entry["commands"]
         if not commands:
             continue
-        key = tuple(commands)
+        key = (tuple(commands), entry["timestamp"])
         if key in seen:
             continue
         seen.add(key)
-        command = commands[-1]
-        denied_entry = denied_commands.get(_normalize_command(command))
-        denied = denied_entry is not None
-        execution = next((candidate for candidate in executions if _normalize_command(candidate["command"]) == _normalize_command(command) and candidate["timestamp"] >= entry["timestamp"]), None)
+        denied = entry.get("denied", False)
+        denied_entry = None
+        if denied:
+            for cmd in commands:
+                if _normalize_command(cmd) in denied_commands:
+                    denied_entry = denied_commands[_normalize_command(cmd)]
+                    break
+        command = commands[0]
+        execution = None
+        matching_indices: list[int] = []
+        for idx, candidate in enumerate(executions):
+            if idx in used_execution_indices:
+                continue
+            if candidate["timestamp"] < entry["timestamp"]:
+                continue
+            candidate_normalized = _normalize_command(candidate["command"])
+            for cmd in commands:
+                if _normalize_command(cmd) == candidate_normalized:
+                    matching_indices.append(idx)
+                    break
+        disposition = "unresolved"
+        if len(matching_indices) == 1:
+            execution = executions[matching_indices[0]]
+            used_execution_indices.add(matching_indices[0])
+            disposition = "executed"
+        elif len(matching_indices) > 1:
+            execution = executions[matching_indices[0]]
+            used_execution_indices.add(matching_indices[0])
+            disposition = "ambiguous"
         wait = execution["timestamp"] - entry["timestamp"] if denied and execution else None
-        requests.append({"command": command[:MAX_CONTENT], "terminalApprovalRequest": denied, "denialReason": denied_entry.get("reason") if denied_entry else None, "disposition": "executed" if execution else "unresolved", "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "approvalWaitSeconds": wait})
+        requests.append({"command": command[:MAX_CONTENT], "terminalApprovalRequest": denied, "denialReason": denied_entry.get("reason") if denied_entry else None, "disposition": disposition, "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "approvalWaitSeconds": wait})
     if not requests:
-        return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": _state(0)}
+        return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": _state({"status": "validated", "value": 0})}
     approvals = [request for request in requests if request["terminalApprovalRequest"]]
-    waits = [request["approvalWaitSeconds"] for request in approvals if request["approvalWaitSeconds"] is not None]
-    return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(len(requests)), "terminalApprovalRequestCount": _state(len(approvals)), "approvalRequests": _state(approvals[:MAX_ACTIONS]), "approvalWaitSeconds": _state(sum(waits))}
+    unresolved_approvals = [r for r in approvals if r["disposition"] == "unresolved"]
+    ambiguous_approvals = [r for r in approvals if r.get("disposition") == "ambiguous"]
+    resolved_approvals = [r for r in approvals if r["disposition"] == "executed"]
+    if unresolved_approvals or ambiguous_approvals:
+        resolved_count = len(resolved_approvals)
+        total_count = len(approvals)
+        timing_status = "partial"
+        timing_value = f"{resolved_count}/{total_count} approval requests correlated"
+    elif approvals:
+        waits = [request["approvalWaitSeconds"] for request in resolved_approvals if request["approvalWaitSeconds"] is not None]
+        timing_status = "validated"
+        timing_value = sum(waits)
+    else:
+        timing_status = "validated"
+        timing_value = 0
+    approval_wait_seconds = {"status": timing_status, "value": timing_value}
+    return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(len(requests)), "terminalApprovalRequestCount": _state(len(approvals)), "approvalRequests": _state(approvals[:MAX_ACTIONS]), "approvalWaitSeconds": approval_wait_seconds}
 
 
 def _normalize_command(command: str) -> str:
@@ -527,7 +568,15 @@ def render_copilot_report(
             wait_text = f"; approval wait {wait:.3f}s" if isinstance(wait, (int, float)) else "; approval wait unavailable"
             reason = request.get("denialReason") or "denial reason unavailable"
             lines.append(f"Approval request: {request['command']} ({reason}; {request['disposition']}{wait_text})")
-        lines.append(f"Approval timing: {terminal['approvalWaitSeconds']['value']} seconds validated")
+        approval_timing = terminal.get("approvalWaitSeconds", {})
+        timing_status = approval_timing.get("status", "unavailable")
+        timing_value = approval_timing.get("value", "unavailable")
+        if timing_status == "partial":
+            lines.append(f"Approval timing: {timing_value} (partial)")
+        elif timing_status == "validated":
+            lines.append(f"Approval timing: {timing_value} seconds validated")
+        else:
+            lines.append(f"Approval timing: unavailable")
     if terminal is not None and terminal.get("status") == "validated":
         lines.append(f"Timing: approval wait {terminal['approvalWaitSeconds']['value']} seconds validated")
     else:
