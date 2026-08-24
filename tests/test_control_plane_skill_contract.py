@@ -162,6 +162,12 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.assertIn("the human is the dispatcher", self.orchestrator)
         self.assertIn("never spawn, poll, or manage agents", self.orchestrator)
 
+    def test_orchestrator_marks_recommended_rails_running_and_clears_them_later(self) -> None:
+        self.assertIn("when you recommend launching or continuing a rail, mark that rail `running`", self.orchestrator)
+        self.assertIn("so shared-resource contention stays visible while an executor holds it", self.orchestrator)
+        self.assertIn("after you reconcile its handoff, return it to an orchestrator-owned terminal status", self.orchestrator)
+        self.assertIn("rather than leaving it `running`", self.orchestrator)
+
     def test_orchestrator_optimizes_attention_not_agent_count(self) -> None:
         self.assertIn("optimize useful progress and human attention rather than agent count", self.orchestrator)
         self.assertIn("holding a runnable rail is often right", self.orchestrator)

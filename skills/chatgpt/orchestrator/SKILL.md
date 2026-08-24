@@ -209,6 +209,11 @@ For each rail that matters right now, recommend exactly one of:
 
 The human is the dispatcher. Recommend work; never spawn, poll, or manage agents.
 
+When you recommend launching or continuing a rail, mark that rail `running` in
+the same publication so shared-resource contention stays visible while an
+executor holds it. After you reconcile its handoff, return it to an
+orchestrator-owned terminal status rather than leaving it `running`.
+
 Optimize useful progress and human attention rather than agent count. Holding a
 runnable rail is often right when several rails would reach decision points at
 once, or when the human has no attention to spend on them. A known singleton
