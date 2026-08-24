@@ -472,7 +472,7 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
         command = bounded_commands[0] if len(bounded_commands) == 1 else json.dumps(bounded_commands, ensure_ascii=True, separators=(",", ":"))[:MAX_CONTENT]
         requests.append({"command": command, "commands": bounded_commands, "terminalApprovalRequest": denied, "denialReason": entry.get("reason"), "disposition": disposition, "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "approvalWaitSeconds": wait})
     if not requests:
-        return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": _state({"status": "validated", "value": 0})}
+        return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": {"status": "validated", "value": 0}}
     approvals = [request for request in requests if request["terminalApprovalRequest"]]
     unresolved_approvals = [r for r in approvals if r["disposition"] == "unresolved"]
     ambiguous_approvals = [r for r in approvals if r.get("disposition") == "ambiguous"]

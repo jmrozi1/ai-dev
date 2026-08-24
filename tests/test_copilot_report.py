@@ -364,7 +364,7 @@ class CopilotReportTests(unittest.TestCase):
         result = parse_terminal_diagnostics(log, start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:03"))
         self.assertEqual(result["terminalRequestCount"]["value"], 1)
         self.assertEqual(result["terminalApprovalRequestCount"]["value"], 0)
-        self.assertEqual(result["approvalWaitSeconds"]["value"], 0)
+        self.assertEqual(result["approvalWaitSeconds"], {"status": "validated", "value": 0})
 
     def test_renderer_includes_bounded_approval_and_timing_sections(self) -> None:
         debug = parse_agent_debug(self._debug(), self.repo)
@@ -379,6 +379,28 @@ class CopilotReportTests(unittest.TestCase):
         self.assertIn("Approvals: 1 terminal approval requests", report)
         self.assertIn("Approval timing: 2.5 seconds validated", report)
         self.assertIn("approval wait 2.500s", report)
+
+    def test_renderer_zero_approval_timing_is_scalar_and_exact(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"python --version\"]]",
+            "2026-08-21 14:00:00.010 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: All sub-commands auto-approved",
+            "2026-08-21 14:00:02.500 [info] RunInTerminalTool: Using `rich` execute strategy for command ` python --version` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:03"))
+        self.assertEqual(terminal["approvalWaitSeconds"], {"status": "validated", "value": 0})
+        report = render_copilot_report(agent_debug=debug, otel=otel, terminal=terminal, active_issue="49")
+        self.assertIn("Approval timing: 0 seconds validated", report)
+        self.assertIn("Timing: approval wait 0 seconds validated", report)
+        self.assertNotIn("{'status': 'validated', 'value': 0}", report)
+
+    def test_unresolved_approval_timing_remains_partial(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"custom-script\"]]",
+            "2026-08-21 14:00:00.010 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:03"))
+        self.assertEqual(terminal["approvalWaitSeconds"]["status"], "partial")
+        self.assertNotEqual(terminal["approvalWaitSeconds"]["value"], 0)
 
     def test_multiple_repositories_and_bounded_sensitive_fields(self) -> None:
         other_repo = str(self.root / "other")
