@@ -175,8 +175,9 @@ class OSC52Backend:
     MAX_OSC52_BYTES = 16384
 
     @staticmethod
-    def copy(content: str) -> bool:
+    def copy(content: str, control_stream=None) -> bool:
         """Copy content via OSC 52 control sequence."""
+        close_stream = False
         try:
             content_bytes = content.encode("utf-8")
 
@@ -191,13 +192,18 @@ class OSC52Backend:
             # Where ST is either BEL (\a) or ESC \ (recommended)
             osc52_sequence = f"\x1b]52;c;{encoded}\x1b\\"
 
-            # Write to terminal
-            sys.stdout.buffer.write(osc52_sequence.encode("utf-8"))
-            sys.stdout.buffer.flush()
+            if control_stream is None:
+                control_stream = open("/dev/tty", "wb")
+                close_stream = True
+            control_stream.write(osc52_sequence.encode("utf-8"))
+            control_stream.flush()
 
             return True
         except Exception:
             return False
+        finally:
+            if close_stream:
+                control_stream.close()
 
 
 def _get_ai_dev_root() -> Path | None:
@@ -332,6 +338,7 @@ def copy_report_to_clipboard(
     repo_root: Path | None = None,
     original_cwd: Path | None = None,
     backends: list[Callable[[str], bool]] | None = None,
+    report: str | None = None,
 ) -> tuple[bool, str]:
     """
     Copy the canonical report to the clipboard.
@@ -353,8 +360,8 @@ def copy_report_to_clipboard(
     if original_cwd is None:
         original_cwd = Path.cwd()
 
-    # Get the canonical report (executed from caller's original directory)
-    report = get_canonical_report(repo_root, original_cwd)
+    if report is None:
+        report = get_canonical_report(repo_root, original_cwd)
     if report is None:
         return False, "Error: Could not obtain canonical report. Ensure flow-report is available."
 
@@ -386,7 +393,6 @@ def copy_report_to_clipboard(
         except Exception:
             continue
 
-    # All backends failed: print report to stdout for recovery
     available_backends = get_backend_names()
     system = platform.system()
 
@@ -404,31 +410,24 @@ def copy_report_to_clipboard(
             "Install one of these tools or run in a compatible VS Code integrated terminal."
         )
 
-    return False, f"Error: All clipboard backends failed.\n{guidance}\n\n--- Report (recoverable) ---\n{report}"
+    return False, f"Error: All clipboard backends failed.\n{guidance}"
 
 
 def main() -> int:
     """Main entry point."""
-    success, message = copy_report_to_clipboard()
+    report = get_canonical_report()
+    if report is None:
+        print("Error: Could not obtain canonical report. Ensure flow-report is available.", file=sys.stderr)
+        return 1
+
+    print(report, end="", file=sys.stdout)
+    success, message = copy_report_to_clipboard(report=report)
 
     if success:
-        print(message, file=sys.stdout)
+        print(message, file=sys.stderr)
         return 0
-    else:
-        # On failure: print report to stdout for manual recovery, guidance to stderr
-        if "--- Report (recoverable) ---" in message:
-            # Split recovery message: error guidance + report
-            parts = message.split("\n\n--- Report (recoverable) ---\n", 1)
-            error_guidance = parts[0] if parts else message
-            report = parts[1] if len(parts) > 1 else ""
-
-            print(error_guidance, file=sys.stderr)
-            if report:
-                print(report, file=sys.stdout)
-        else:
-            print(message, file=sys.stderr)
-
-        return 1
+    print(message, file=sys.stderr)
+    return 1
 
 
 if __name__ == "__main__":

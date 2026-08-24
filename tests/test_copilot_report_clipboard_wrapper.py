@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import io
 import os
 import subprocess
 import sys
@@ -281,28 +282,13 @@ class OSC52Tests(unittest.TestCase):
         """OSC 52 encoding must be UTF-8 then Base64."""
         report = "Issue: 49\nTokens: 100\n"
 
-        captured_output = []
-
-        def mock_write(data):
-            captured_output.append(data)
-            return len(data)
-
-        def mock_flush():
-            pass
-
-        mock_buffer = mock.MagicMock()
-        mock_buffer.write.side_effect = mock_write
-        mock_buffer.flush.side_effect = mock_flush
-
-        with mock.patch.object(sys, "stdout") as mock_stdout:
-            mock_stdout.buffer = mock_buffer
-            result = OSC52Backend.copy(report)
+        control_stream = io.BytesIO()
+        result = OSC52Backend.copy(report, control_stream=control_stream)
 
         self.assertTrue(result)
-        self.assertEqual(len(captured_output), 1)
 
         # Verify OSC 52 format: ESC ] 52 ; c ; <base64> ESC \
-        output = captured_output[0].decode("utf-8")
+        output = control_stream.getvalue().decode("utf-8")
         self.assertTrue(output.startswith("\x1b]52;c;"))
         self.assertTrue(output.endswith("\x1b\\"))
 
@@ -319,22 +305,11 @@ class OSC52Tests(unittest.TestCase):
     def test_osc52_at_size_limit(self) -> None:
         """OSC 52 must succeed at exactly the UTF-8 byte limit."""
         report_at_limit = "é" * (OSC52Backend.MAX_OSC52_BYTES // 2)
-        captured_output = []
-
-        def mock_write(data):
-            captured_output.append(data)
-            return len(data)
-
-        mock_buffer = mock.MagicMock()
-        mock_buffer.write.side_effect = mock_write
-        mock_buffer.flush = mock.MagicMock()
-
-        with mock.patch.object(sys, "stdout") as mock_stdout:
-            mock_stdout.buffer = mock_buffer
-            result = OSC52Backend.copy(report_at_limit)
+        control_stream = io.BytesIO()
+        result = OSC52Backend.copy(report_at_limit, control_stream=control_stream)
 
         self.assertTrue(result)
-        output = captured_output[0].decode("utf-8")
+        output = control_stream.getvalue().decode("utf-8")
         self.assertTrue(output.startswith("\x1b]52;c;"))
         self.assertTrue(output.endswith("\x1b\\"))
         self.assertEqual(output[7:-2], base64.b64encode(report_at_limit.encode("utf-8")).decode("ascii"))
@@ -348,28 +323,28 @@ class OSC52Tests(unittest.TestCase):
         """OSC 52 sequence must write to stdout.buffer only, not contaminate copied content."""
         report = "Issue: 49\nTokens: 100\n"
 
-        captured_output = []
-
-        def mock_write(data):
-            captured_output.append(data)
-            return len(data)
-
-        mock_buffer = mock.MagicMock()
-        mock_buffer.write.side_effect = mock_write
-        mock_buffer.flush = mock.MagicMock()
-
-        with mock.patch.object(sys, "stdout") as mock_stdout:
-            mock_stdout.buffer = mock_buffer
-            OSC52Backend.copy(report)
+        control_stream = io.BytesIO()
+        OSC52Backend.copy(report, control_stream=control_stream)
 
         # Verify only OSC 52 sequence was written, no extra content
-        self.assertEqual(len(captured_output), 1)
-        output = captured_output[0].decode("utf-8")
+        output = control_stream.getvalue().decode("utf-8")
         # Sequence should start and end correctly
         self.assertTrue(output.startswith("\x1b]52;c;"))
         self.assertTrue(output.endswith("\x1b\\"))
         # No duplication or extra newlines
         self.assertEqual(output.count("\x1b]52;c;"), 1)
+
+    def test_osc52_never_writes_stdout(self) -> None:
+        report = "Issue: 49\n"
+        control_stream = io.BytesIO()
+        stdout = io.StringIO()
+        with mock.patch.object(sys, "stdout", stdout):
+            self.assertTrue(OSC52Backend.copy(report, control_stream=control_stream))
+        self.assertEqual(stdout.getvalue(), "")
+
+    def test_osc52_without_control_stream_fails_safely(self) -> None:
+        with mock.patch("builtins.open", side_effect=OSError("no tty")):
+            self.assertFalse(OSC52Backend.copy("Issue: 49\n"))
 
 
 class WindowsClipboardTests(unittest.TestCase):
@@ -651,7 +626,7 @@ class WindowsClipboardTests(unittest.TestCase):
                 mock_backends.return_value = [lambda content: WindowsClipboard.copy(content, api=FakeWin32())]
                 success, message = copy_report_to_clipboard(self.repo_root)
                 self.assertFalse(success)
-                self.assertIn("--- Report (recoverable) ---", message)
+                self.assertNotIn("Issue: 49", message)
 
 
 class BackendSelectionTests(unittest.TestCase):
@@ -725,25 +700,34 @@ class FailureRecoveryTests(unittest.TestCase):
         def failing_backend(content):
             return False
 
-        captured_output = {"stdout": [], "stderr": []}
-
-        def mock_print(msg="", **kwargs):
-            if kwargs.get("file") == sys.stderr:
-                captured_output["stderr"].append(msg)
-            else:
-                captured_output["stdout"].append(msg)
-
         with mock.patch.object(clipboard_module, "get_canonical_report") as mock_get:
             mock_get.return_value = canonical_report
-            with mock.patch("builtins.print", side_effect=mock_print):
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
                 with mock.patch.object(clipboard_module, "get_clipboard_backends") as mock_backends:
                     mock_backends.return_value = [failing_backend]
-                    main()
+                    self.assertEqual(main(), 1)
 
-        # Report should be in stdout
-        stdout_text = "\n".join(captured_output["stdout"])
-        self.assertIn("Issue: 49", stdout_text)
-        self.assertIn("Tokens: 100", stdout_text)
+        self.assertEqual(stdout.getvalue(), canonical_report)
+        self.assertEqual(stdout.getvalue().count("Issue: 49"), 1)
+        self.assertIn("All clipboard backends failed", stderr.getvalue())
+        self.assertNotIn("Report copied", stderr.getvalue())
+
+    def test_success_prints_report_once_and_confirmation_only_to_stderr(self) -> None:
+        canonical_report = "Issue: 49\nPrompt: café 中文\n"
+
+        with mock.patch.object(clipboard_module, "get_canonical_report", return_value=canonical_report):
+            with mock.patch.object(clipboard_module, "get_clipboard_backends", return_value=[lambda content: content == canonical_report]):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with mock.patch.object(sys, "stdout", stdout), mock.patch.object(sys, "stderr", stderr):
+                    self.assertEqual(main(), 0)
+
+        self.assertEqual(stdout.getvalue(), canonical_report)
+        self.assertEqual(stdout.getvalue().count("Issue: 49"), 1)
+        self.assertIn("Report copied", stderr.getvalue())
+        self.assertNotIn("Report copied", stdout.getvalue())
 
     def test_failure_does_not_include_report_in_arguments(self) -> None:
         """Failure messages must not include report content in exception/args."""
@@ -834,13 +818,10 @@ class SymlinkResolutionTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertIn("Report copied to OSC 52 (terminal).", completed.stdout)
-            self.assertIn("\x1b]52;c;", completed.stdout)
-
-            payload = completed.stdout.split("\x1b]52;c;", 1)[1].split("\x1b\\", 1)[0]
-            decoded = base64.b64decode(payload).decode("utf-8")
-            self.assertIn("Issue:", decoded)
-            self.assertNotIn("Traceback", completed.stderr)
+            self.assertIn("Issue:", completed.stdout)
+            self.assertEqual(completed.stdout.splitlines().count("Copilot work report"), 1)
+            self.assertNotIn("\x1b]52;c;", completed.stdout)
+            self.assertTrue("report copied" in completed.stderr.lower() or "clipboard" in completed.stderr.lower())
         finally:
             temp_dir.cleanup()
 
