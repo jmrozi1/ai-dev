@@ -59,6 +59,13 @@ cached branch status, and fails closed on stale or diverged publication. On a
 fail-closed refusal, re-read the current state and republish against it. Do not
 force, and do not route around the helper with bespoke Git writes.
 
+When a handoff indicator is in use, publish and push first, then allocate through
+the same helper, which advances the counter by compare-and-swap against fresh
+remote state. Print only the value the allocation returned, and print nothing if
+it fails. If allocation conflicts after a successful publication, retry the
+allocation alone rather than republishing. The number is display-only; the user
+never types it, and it never authorizes work.
+
 ## Task Outcomes and Continuation
 
 Track each bounded task with one explicit outcome:

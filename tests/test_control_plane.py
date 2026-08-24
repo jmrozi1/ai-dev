@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+import io
 import json
 from pathlib import Path
 import subprocess
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
+from ai_dev_flow import control_plane
 from ai_dev_flow.control_plane import (
     ControlPlaneError,
+    allocate_proceed_number,
     collect_rail_states,
+    parse_proceed_sequence,
     publish,
     resolve_control_plane_config,
     resolve_read_source,
@@ -153,6 +159,8 @@ class ControlPlaneTests(unittest.TestCase):
         self._git(self.tmp_path, "clone", "-q", str(self.coordination), str(upstream))
         self._git(upstream, "config", "user.name", "Control Plane Upstream")
         self._git(upstream, "config", "user.email", "control-plane-upstream@example.com")
+        # A real coordination remote is bare; let this non-bare fixture accept pushes to main.
+        self._git(upstream, "config", "receive.denyCurrentBranch", "updateInstead")
         self._git(self.coordination, "remote", "add", "origin", str(upstream))
         self._git(self.coordination, "fetch", "-q", "origin")
         self._git(self.coordination, "branch", "--set-upstream-to", "origin/main", "main")
@@ -486,6 +494,188 @@ class ControlPlaneTests(unittest.TestCase):
             self._git(self.coordination, "rev-parse", "--abbrev-ref", "HEAD"),
         )
         self.assertEqual(before, after)
+
+    # Handoff indicator: optimistic compare-and-swap on one mechanical counter
+
+    def _seed_counter(self, upstream: Path, value: str = "5\n") -> None:
+        target = upstream / "ai-dev" / "issue-51" / "proceed-sequence.txt"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(value, encoding="utf-8")
+        self._git(upstream, "add", "--", "ai-dev/issue-51/proceed-sequence.txt")
+        self._git(upstream, "commit", "-q", "-m", "seed counter")
+        self._git(self.coordination, "fetch", "-q", "origin")
+        self._git(self.coordination, "merge", "--ff-only", "-q", "origin/main")
+
+    def _remote_counter(self, upstream: Path) -> str:
+        return (upstream / "ai-dev" / "issue-51" / "proceed-sequence.txt").read_text(encoding="utf-8")
+
+    def _allocate(self, **kwargs: object) -> int:
+        return allocate_proceed_number(self.coordination, project="ai-dev", ticket="issue-51", **kwargs)  # type: ignore[arg-type]
+
+    def test_counter_parsing_is_strict(self) -> None:
+        self.assertEqual(parse_proceed_sequence("0\n"), 0)
+        self.assertEqual(parse_proceed_sequence("42\n"), 42)
+        for malformed in (None, "", "5", "abc\n", " 5\n", "5\n5\n", "-1\n", "05\n", "5 \n", "\n"):
+            with self.subTest(malformed=malformed), self.assertRaises(ControlPlaneError):
+                parse_proceed_sequence(malformed)
+
+    def test_missing_counter_fails_closed(self) -> None:
+        self._attach_shared_upstream("upstream-no-counter")
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._allocate()
+        self.assertIn("is missing", str(caught.exception))
+
+    def test_malformed_remote_counter_fails_closed(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-bad-counter")
+        self._seed_counter(upstream, "not-a-number\n")
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._allocate()
+        self.assertIn("non-negative decimal integer", str(caught.exception))
+
+    def test_sequential_allocations_are_increasing_and_unique(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-sequential")
+        self._seed_counter(upstream)
+        allocated = [self._allocate() for _ in range(3)]
+        self.assertEqual(allocated, [6, 7, 8])
+        self.assertEqual(len(set(allocated)), 3)
+        self.assertEqual(self._git(self.coordination, "show", "origin/main:ai-dev/issue-51/proceed-sequence.txt"), "8")
+
+    def test_concurrent_allocators_resolve_conflict_with_distinct_values(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-concurrent")
+        self._seed_counter(upstream)
+        rival = self.tmp_path / "rival"
+        self._git(self.tmp_path, "clone", "-q", str(upstream), str(rival))
+        self._git(rival, "config", "user.name", "Rival")
+        self._git(rival, "config", "user.email", "rival@example.com")
+
+        original = control_plane._build_counter_commit
+        raced: list[int] = []
+        armed = [True]
+
+        def race_once(repo_root: Path, **kwargs: object) -> str:
+            commit = original(repo_root, **kwargs)  # type: ignore[arg-type]
+            if armed[0]:
+                # A rival allocator wins the counter between our build and our push.
+                armed[0] = False
+                raced.append(allocate_proceed_number(rival, project="ai-dev", ticket="issue-51"))
+            return commit
+
+        with patch.object(control_plane, "_build_counter_commit", side_effect=race_once):
+            allocated = self._allocate()
+
+        self.assertEqual(raced, [6], "the rival must have taken the first value")
+        self.assertEqual(allocated, 7, "the loser must retry and take a distinct higher value")
+        self.assertGreater(allocated, raced[0])
+
+    def test_retry_exhaustion_fails_closed_without_claiming_a_number(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-exhausted")
+        self._seed_counter(upstream)
+        rival = self.tmp_path / "rival-always"
+        self._git(self.tmp_path, "clone", "-q", str(upstream), str(rival))
+        self._git(rival, "config", "user.name", "Rival")
+        self._git(rival, "config", "user.email", "rival@example.com")
+
+        original = control_plane._build_counter_commit
+        racing = [False]
+
+        def always_race(repo_root: Path, **kwargs: object) -> str:
+            commit = original(repo_root, **kwargs)  # type: ignore[arg-type]
+            if not racing[0]:
+                racing[0] = True
+                try:
+                    allocate_proceed_number(rival, project="ai-dev", ticket="issue-51")
+                finally:
+                    racing[0] = False
+            return commit
+
+        with patch.object(control_plane, "_build_counter_commit", side_effect=always_race):
+            with self.assertRaises(ControlPlaneError) as caught:
+                self._allocate(attempts=2)
+        self.assertIn("No number was allocated", str(caught.exception))
+
+    def test_allocation_retry_does_not_republish_the_handoff(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-no-republish")
+        self._seed_counter(upstream)
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\npublished once\n")
+        self._git(self.coordination, "push", "-q", "origin", "main")
+        handoff_path = "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
+        revisions_before = self._git(self.coordination, "rev-list", "--count", "origin/main", "--", handoff_path)
+
+        rival = self.tmp_path / "rival-republish"
+        self._git(self.tmp_path, "clone", "-q", str(upstream), str(rival))
+        self._git(rival, "config", "user.name", "Rival")
+        self._git(rival, "config", "user.email", "rival@example.com")
+        original = control_plane._build_counter_commit
+        raced: list[int] = []
+        armed = [True]
+
+        def race_once(repo_root: Path, **kwargs: object) -> str:
+            commit = original(repo_root, **kwargs)  # type: ignore[arg-type]
+            if armed[0]:
+                armed[0] = False
+                raced.append(allocate_proceed_number(rival, project="ai-dev", ticket="issue-51"))
+            return commit
+
+        with patch.object(control_plane, "_build_counter_commit", side_effect=race_once):
+            self._allocate()
+
+        self._git(self.coordination, "fetch", "-q", "origin")
+        revisions_after = self._git(self.coordination, "rev-list", "--count", "origin/main", "--", handoff_path)
+        self.assertEqual(revisions_before, revisions_after)
+        self.assertEqual(
+            self._git(self.coordination, "show", f"origin/main:{handoff_path}").strip().splitlines()[-1],
+            "published once",
+        )
+
+    def test_no_indicator_is_printed_when_allocation_fails(self) -> None:
+        self._attach_shared_upstream("upstream-print-guard")
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(ControlPlaneError):
+                control_plane.main(
+                    ["proceed", "--repo", str(self.coordination), "--project", "ai-dev", "--ticket", "issue-51"]
+                )
+        self.assertNotIn("proceed ", stdout.getvalue())
+
+    def test_successful_allocation_prints_only_the_allocated_indicator(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-print-success")
+        self._seed_counter(upstream)
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            control_plane.main(
+                ["proceed", "--repo", str(self.coordination), "--project", "ai-dev", "--ticket", "issue-51"]
+            )
+        self.assertEqual(stdout.getvalue().strip(), "proceed 6")
+
+    def test_allocation_does_not_move_or_dirty_the_local_repository(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-no-local-move")
+        self._seed_counter(upstream)
+        before = (
+            resolve_current_head(self.coordination),
+            self._git(self.coordination, "status", "--porcelain"),
+            self._git(self.coordination, "rev-parse", "--abbrev-ref", "HEAD"),
+        )
+        self._allocate()
+        after = (
+            resolve_current_head(self.coordination),
+            self._git(self.coordination, "status", "--porcelain"),
+            self._git(self.coordination, "rev-parse", "--abbrev-ref", "HEAD"),
+        )
+        self.assertEqual(before, after)
+        self.assertEqual(self._remote_counter(upstream), "6\n")
+
+    def test_allocation_without_upstream_fails_closed(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._allocate()
+        self.assertIn("no tracked upstream", str(caught.exception))
+
+    def test_unpushed_local_commits_block_allocation(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-unpushed")
+        self._seed_counter(upstream)
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nunpushed\n")
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._allocate()
+        self.assertIn("not on", str(caught.exception))
 
     # Configuration discovery: a fresh agent must find its coordination repository
 

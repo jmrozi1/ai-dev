@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
+import tempfile
 from typing import Any, Iterable
 
 from .json_files import JsonFileError, load_json_object, write_text_atomic
@@ -300,6 +302,137 @@ def validate_evidence_projection(payload: Any) -> dict[str, Any]:
             if isinstance(observation.get(numeric), bool):
                 raise ControlPlaneError(f"Provider evidence observation {index} {numeric} must be numeric.")
     return payload
+
+
+PROCEED_SEQUENCE_FILENAME = "proceed-sequence.txt"
+MAX_ALLOCATION_ATTEMPTS = 5
+_SEQUENCE_VALUE = re.compile(r"^(0|[1-9][0-9]*)\n$")
+
+
+def proceed_sequence_relative(project: str, ticket: str) -> str:
+    return f"{scope_relative(project, ticket)}/{PROCEED_SEQUENCE_FILENAME}"
+
+
+def parse_proceed_sequence(text: str | None) -> int:
+    """Exactly one non-negative decimal integer and a final newline."""
+    if text is None:
+        raise ControlPlaneError(
+            f"Cannot allocate a handoff indicator: {PROCEED_SEQUENCE_FILENAME} is missing. "
+            "The orchestrator initializes the counter."
+        )
+    match = _SEQUENCE_VALUE.match(text)
+    if match is None:
+        raise ControlPlaneError(
+            f"Cannot allocate a handoff indicator: {PROCEED_SEQUENCE_FILENAME} must hold exactly "
+            "one non-negative decimal integer and a final newline."
+        )
+    return int(match.group(1))
+
+
+def _git_capture(
+    repo_root: Path, arguments: list[str], *, stdin: str | None = None, env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
+    merged = None
+    if env is not None:
+        merged = {**os.environ, **env}
+    return subprocess.run(
+        ["git", "-C", str(repo_root), *arguments],
+        input=stdin,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+        env=merged,
+    )
+
+
+def _build_counter_commit(repo_root: Path, *, base: str, relative: str, value: int) -> str:
+    """Build the successor commit with plumbing so no local ref, index, or worktree moves."""
+    blob = _git_capture(repo_root, ["hash-object", "-w", "--stdin"], stdin=f"{value}\n")
+    if blob.returncode != 0:
+        raise ControlPlaneError(f"Cannot allocate a handoff indicator: {blob.stderr.strip()}")
+    blob_id = blob.stdout.strip()
+
+    with tempfile.TemporaryDirectory(prefix="control-plane-index-") as temporary:
+        env = {"GIT_INDEX_FILE": str(Path(temporary) / "index")}
+        for arguments in (
+            ["read-tree", base],
+            ["update-index", "--add", "--cacheinfo", f"100644,{blob_id},{relative}"],
+        ):
+            completed = _git_capture(repo_root, arguments, env=env)
+            if completed.returncode != 0:
+                raise ControlPlaneError(f"Cannot allocate a handoff indicator: {completed.stderr.strip()}")
+        tree = _git_capture(repo_root, ["write-tree"], env=env)
+        if tree.returncode != 0:
+            raise ControlPlaneError(f"Cannot allocate a handoff indicator: {tree.stderr.strip()}")
+
+    commit = _git_capture(
+        repo_root,
+        ["commit-tree", tree.stdout.strip(), "-p", base, "-m", f"Allocate handoff indicator {value}"],
+    )
+    if commit.returncode != 0:
+        raise ControlPlaneError(f"Cannot allocate a handoff indicator: {commit.stderr.strip()}")
+    return commit.stdout.strip()
+
+
+def allocate_proceed_number(
+    repo_root: Path, *, project: str, ticket: str, attempts: int = MAX_ALLOCATION_ATTEMPTS
+) -> int:
+    """Compare-and-swap the ticket counter against fresh remote state.
+
+    Mechanical current state only: not a queue, lease, heartbeat, worker
+    identity, history, or authorization source. Allocation happens after durable
+    publication, never before.
+    """
+    relative = proceed_sequence_relative(project, ticket)
+    branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    upstream = _tracked_upstream(repo_root, branch) if branch and branch != "HEAD" else None
+    if upstream is None:
+        raise ControlPlaneError(
+            "Cannot allocate a handoff indicator: the coordination repository has no tracked "
+            "upstream, so no compare-and-swap is possible."
+        )
+    remote_name, _, remote_branch = upstream.partition("/")
+
+    for _ in range(max(1, attempts)):
+        try:
+            _git(repo_root, ["fetch", "--quiet", remote_name])
+        except ControlPlaneError as exc:
+            raise ControlPlaneError(
+                f"Cannot allocate a handoff indicator: coordination remote '{remote_name}' "
+                f"could not be fetched. {exc}"
+            ) from exc
+
+        base = _git(repo_root, ["rev-parse", upstream])
+        local = _git(repo_root, ["rev-parse", branch], check=False)
+        if local and not branch_contains(repo_root, ancestor=local, descendant=upstream):
+            raise ControlPlaneError(
+                f"Cannot allocate a handoff indicator: '{branch}' holds commits that are not on "
+                f"{upstream}. Publish and push them first so the shared counter advances from "
+                "the authoritative state."
+            )
+
+        source = ReadSource(repo_root, base, base)
+        allocated = parse_proceed_sequence(source.read(relative)) + 1
+        candidate = _build_counter_commit(repo_root, base=base, relative=relative, value=allocated)
+        pushed = _git_capture(repo_root, ["push", remote_name, f"{candidate}:refs/heads/{remote_branch}"])
+        if pushed.returncode == 0:
+            return allocated
+        stderr = pushed.stderr.lower()
+        if "rejected" not in stderr and "non-fast-forward" not in stderr and "fetch first" not in stderr:
+            raise ControlPlaneError(f"Cannot allocate a handoff indicator: {pushed.stderr.strip()}")
+
+    raise ControlPlaneError(
+        f"Cannot allocate a handoff indicator: {attempts} compare-and-swap attempts were all "
+        "rejected by a concurrent allocator. No number was allocated."
+    )
+
+
+def branch_contains(repo_root: Path, *, ancestor: str, descendant: str) -> bool:
+    completed = _git_capture(repo_root, ["merge-base", "--is-ancestor", ancestor, descendant])
+    return completed.returncode == 0
 
 
 def _tracked_upstream(repo_root: Path, branch: str) -> str | None:
@@ -713,6 +846,11 @@ def _build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--rail", help="Stable semantic rail identifier for rail-scoped artifacts.")
     publish_parser.add_argument("--expected-head", help="Head the caller last read; publication fails closed if stale.")
 
+    proceed_parser = subparsers.add_parser(
+        "proceed", help="Allocate the next handoff indicator after durable publication."
+    )
+    add_scope(proceed_parser)
+
     config_parser = subparsers.add_parser("config", help="Report whether a control plane is configured here.")
     config_parser.add_argument("--repo", help=argparse.SUPPRESS)
     config_parser.add_argument("--project", help=argparse.SUPPRESS)
@@ -766,6 +904,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if arguments.command == "rail":
         print(render_rail(repo_root, project=project, ticket=ticket, rail=arguments.rail))
+        return 0
+    if arguments.command == "proceed":
+        # Allocation must already have succeeded before anything is printed.
+        allocated = allocate_proceed_number(repo_root, project=project, ticket=ticket)
+        print(f"proceed {allocated}")
         return 0
 
     source = Path(arguments.file).expanduser()

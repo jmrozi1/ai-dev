@@ -180,6 +180,33 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.assertIn("do not assume you authored it", self.executor)
         self.assertIn("work only the rail you were given, even when other rails are running", self.executor)
 
+    # Handoff indicator
+
+    def test_orchestrator_allocates_only_after_publication(self) -> None:
+        self.assertIn("allocate a number only after your durable publication has succeeded", self.orchestrator)
+        self.assertIn("never in advance and never when authoring a rail", self.orchestrator)
+
+    def test_orchestrator_allocates_by_compare_and_swap_and_prints_only_the_result(self) -> None:
+        self.assertIn("compare-and-swap against freshly resolved remote state", self.orchestrator)
+        self.assertIn("print only the value a successful allocation returned", self.orchestrator)
+        self.assertIn("print no number rather than guessing one", self.orchestrator)
+
+    def test_orchestrator_retries_allocation_without_republishing(self) -> None:
+        self.assertIn("retry the allocation alone; do not republish the artifact", self.orchestrator)
+
+    def test_counter_is_not_a_queue_or_authorization_source(self) -> None:
+        self.assertIn("not a queue, lease, heartbeat, worker identity, history, or authorization source", self.orchestrator)
+        self.assertIn("it never authorizes work", self.executor)
+
+    def test_executor_publishes_and_pushes_before_allocating(self) -> None:
+        self.assertIn("publish and push first, then allocate through the same helper", self.executor)
+        self.assertIn("print nothing if it fails", self.executor)
+        self.assertIn("retry the allocation alone rather than republishing", self.executor)
+
+    def test_user_never_types_the_indicator(self) -> None:
+        self.assertIn("the human always types bare `proceed`", self.orchestrator)
+        self.assertIn("the user never types it", self.executor)
+
     # Negative boundaries
 
     def test_no_separate_shared_control_plane_skill_was_created(self) -> None:
@@ -188,7 +215,9 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.assertNotIn("`control-plane`", catalog)
 
     def test_neither_skill_introduces_forbidden_machinery(self) -> None:
-        for forbidden in ("message bus", "inbox", "outbox", "polling loop", "worker queue", "heartbeat", "agent database", "worker registry"):
+        # Terms the skills only prohibit by name, such as heartbeat and lease, are
+        # covered by test_counter_is_not_a_queue_or_authorization_source instead.
+        for forbidden in ("message bus", "inbox", "outbox", "polling loop", "worker queue", "agent database", "worker registry"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, self.orchestrator)
                 self.assertNotIn(forbidden, self.executor)

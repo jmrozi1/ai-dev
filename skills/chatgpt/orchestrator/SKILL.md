@@ -220,6 +220,24 @@ whether those dependencies are satisfied, and shared-resource contention. Those
 are facts. Deciding what to launch, continue, or hold is your judgment and stays
 out of the helper.
 
+### Handoff Indicator
+
+The human always types bare `proceed`. A displayed `proceed N` is only a
+human-visible indicator of which agent acted most recently; it is never input,
+and never a source of authorization.
+
+Allocate a number only after your durable publication has succeeded, never in
+advance and never when authoring a rail. Advance the ticket's counter by
+compare-and-swap against freshly resolved remote state, using a conditional
+GitHub write, and print only the value a successful allocation returned. On a
+conflict, refetch and retry within a small bound; on exhaustion or malformed
+state, report the failure and print no number rather than guessing one. If
+publication succeeded but allocation conflicts, retry the allocation alone; do
+not republish the artifact.
+
+The counter is current mechanical state. It is not a queue, lease, heartbeat,
+worker identity, history, or authorization source.
+
 ### Executive Summary
 
 The normal human-facing response is a compact executive summary covering material
