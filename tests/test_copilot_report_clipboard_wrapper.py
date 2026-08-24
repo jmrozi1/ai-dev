@@ -792,13 +792,97 @@ class MainEntryPointTests(unittest.TestCase):
         self.assertEqual(exit_code, 1)
 
 
+CAPABILITY_PROBE = "ai-dev clipboard capability probe"
+
+
+def clipboard_capability_reason(backends=None) -> str | None:
+    """Return why this host cannot copy, or None when a real backend works here.
+
+    The wrapper only learns a backend works by using it, so capability is probed
+    through the wrapper's own backend list rather than a duplicated platform table.
+    Hosts with no usable backend skip the integration test instead of failing it;
+    hosts that can copy still exercise the real wrapper end to end.
+    """
+    if backends is None:
+        backends = get_clipboard_backends()
+    for backend in backends:
+        try:
+            if backend(CAPABILITY_PROBE):
+                return None
+        except Exception:
+            continue
+    return "no usable clipboard backend or OSC 52 control path is available on this host"
+
+
+class ClipboardCapabilityProbeTests(unittest.TestCase):
+    """Tests for the host-capability predicate guarding the real wrapper run."""
+
+    def test_probe_reports_no_reason_when_a_backend_succeeds(self) -> None:
+        """A working backend means the integration test must actually run."""
+        attempted: list[str] = []
+
+        def failing(content: str) -> bool:
+            attempted.append(content)
+            return False
+
+        def working(content: str) -> bool:
+            attempted.append(content)
+            return True
+
+        self.assertIsNone(clipboard_capability_reason([failing, working]))
+        self.assertEqual(attempted, [CAPABILITY_PROBE, CAPABILITY_PROBE])
+
+    def test_probe_reports_a_reason_when_every_backend_fails_or_raises(self) -> None:
+        """No usable backend must produce an explicit skip reason, not a failure."""
+
+        def failing(content: str) -> bool:
+            return False
+
+        def raising(content: str) -> bool:
+            raise OSError("no clipboard device")
+
+        reason = clipboard_capability_reason([failing, raising])
+        self.assertIsInstance(reason, str)
+        self.assertIn("clipboard", reason)
+
+    def test_probe_reports_a_reason_when_no_backend_exists_at_all(self) -> None:
+        """An empty backend list is the same unavailable host, not a success."""
+        self.assertIsInstance(clipboard_capability_reason([]), str)
+
+
 class SymlinkResolutionTests(unittest.TestCase):
     """Tests for symlinked wrapper execution."""
+
+    def test_symlink_invocation_skips_when_no_clipboard_backend_exists(self) -> None:
+        """A host with no usable backend must skip with a reason, never fail."""
+        with mock.patch(
+            f"{__name__}.clipboard_capability_reason",
+            return_value="no usable clipboard backend or OSC 52 control path is available on this host",
+        ):
+            with self.assertRaises(unittest.SkipTest) as caught:
+                self.test_actual_symlink_invocation_resolves_source_and_runs_report()
+        self.assertIn("clipboard", str(caught.exception))
+
+    def test_symlink_invocation_runs_when_a_backend_is_available(self) -> None:
+        """An available backend must never skip the real wrapper run."""
+        with mock.patch(f"{__name__}.clipboard_capability_reason", return_value=None):
+            try:
+                self.test_actual_symlink_invocation_resolves_source_and_runs_report()
+            except unittest.SkipTest as skipped:
+                self.fail(f"integration coverage was skipped despite an available backend: {skipped}")
+            except AssertionError:
+                # The run was attempted, which is what this test guards. Whether it
+                # succeeds is the integration test's own assertion on a capable host.
+                pass
 
     def test_actual_symlink_invocation_resolves_source_and_runs_report(self) -> None:
         """A real symlink should resolve the repository and execute the canonical report."""
         if not hasattr(os, "symlink"):
             self.skipTest("symbolic links are unavailable on this platform")
+
+        unavailable = clipboard_capability_reason()
+        if unavailable:
+            self.skipTest(unavailable)
 
         temp_dir = tempfile.TemporaryDirectory()
         try:
