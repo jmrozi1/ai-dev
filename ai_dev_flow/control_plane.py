@@ -1,0 +1,441 @@
+"""Git-backed current-state collaboration surface for orchestrator/executor rails."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+from typing import Any, Iterable
+
+from .json_files import JsonFileError, write_text_atomic
+
+
+class ControlPlaneError(Exception):
+    """Raised for user-facing control-plane failures."""
+
+
+# The control plane stores only current state; Git history preserves prior versions,
+# so artifacts never become transcripts or append-only logs. One owning role per
+# artifact means ordinary collaboration cannot produce an ambiguous shared mutation.
+# The executor proposes; the orchestrator accepts.
+ARTIFACT_OWNERS: dict[str, str] = {
+    "state": "orchestrator",
+    "rail": "orchestrator",
+    "handoff": "executor",
+    "evidence": "evidence",
+}
+
+ARTIFACT_FILENAMES: dict[str, str] = {
+    "state": "state.md",
+    "rail": "rail.md",
+    "handoff": "handoff.md",
+    "evidence": "evidence.json",
+}
+
+RAIL_SCOPED_ARTIFACTS = frozenset({"rail", "handoff", "evidence"})
+
+_SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
+_HEX_ONLY = re.compile(r"^[0-9a-f-]+$")
+
+MAX_EVIDENCE_STRING = 240
+MAX_EVIDENCE_OBSERVATIONS = 50
+
+# Only these keys may enter Git. Anything else is refused rather than trimmed.
+EVIDENCE_ALLOWED_KEYS = frozenset({"schemaVersion", "provenance", "sourceHealth", "observations"})
+PROVENANCE_ALLOWED_KEYS = frozenset({"source", "sessionId", "turnId", "collectedAt"})
+SOURCE_HEALTH_ALLOWED_KEYS = frozenset({"status", "detail"})
+OBSERVATION_ALLOWED_KEYS = frozenset({"kind", "status", "count", "durationSeconds", "detail"})
+SOURCE_HEALTH_STATUSES = frozenset({"validated", "partial", "unavailable", "error"})
+
+# Named for actionable errors; the allowlist above is what actually enforces.
+EVIDENCE_DENIED_KEYS = frozenset({
+    "prompt", "prompts", "response", "responses", "command", "commands",
+    "output", "stdout", "stderr", "transcript", "transcripts", "log", "logs",
+    "telemetry", "toolResult", "toolResults", "diagnostics", "content",
+})
+
+
+def _git(repo_root: Path, arguments: list[str], *, check: bool = True) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(repo_root), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=False,
+    )
+    if check and completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+        raise ControlPlaneError(f"git {' '.join(arguments)} failed: {detail}")
+    return completed.stdout.strip()
+
+
+def resolve_coordination_repo(path: Path) -> Path:
+    """Resolve an explicitly supplied coordination repository path."""
+    if not path.is_dir():
+        raise ControlPlaneError(f"Coordination repository does not exist: {path}")
+    inside = _git(path, ["rev-parse", "--is-inside-work-tree"], check=False)
+    if inside != "true":
+        raise ControlPlaneError(f"Coordination path is not a Git repository: {path}")
+    return Path(_git(path, ["rev-parse", "--show-toplevel"]))
+
+
+def validate_identifier(value: str, *, label: str) -> str:
+    """Accept stable semantic identifiers; refuse session/agent/process shapes."""
+    candidate = value.strip()
+    if not _SLUG.match(candidate):
+        raise ControlPlaneError(
+            f"Invalid {label} '{value}': use a stable semantic slug of 3-64 "
+            "lowercase letters, digits, or hyphens."
+        )
+    if not any(character.isalpha() for character in candidate):
+        raise ControlPlaneError(f"Invalid {label} '{value}': must contain letters.")
+    compact = candidate.replace("-", "")
+    if len(compact) >= 24 and _HEX_ONLY.match(candidate):
+        raise ControlPlaneError(
+            f"Invalid {label} '{value}': looks like a session, agent, or process "
+            "identifier. Use a stable semantic work identifier."
+        )
+    return candidate
+
+
+def scope_directory(repo_root: Path, *, project: str, ticket: str) -> Path:
+    return repo_root / validate_identifier(project, label="project") / validate_identifier(ticket, label="ticket")
+
+
+def artifact_path(
+    repo_root: Path, *, project: str, ticket: str, artifact: str, rail: str | None
+) -> Path:
+    if artifact not in ARTIFACT_FILENAMES:
+        raise ControlPlaneError(
+            f"Unknown artifact '{artifact}': expected one of {', '.join(sorted(ARTIFACT_FILENAMES))}."
+        )
+    scope = scope_directory(repo_root, project=project, ticket=ticket)
+    if artifact in RAIL_SCOPED_ARTIFACTS:
+        if rail is None:
+            raise ControlPlaneError(f"Artifact '{artifact}' requires a rail identifier.")
+        return scope / "rails" / validate_identifier(rail, label="rail identifier") / ARTIFACT_FILENAMES[artifact]
+    if rail is not None:
+        raise ControlPlaneError(f"Artifact '{artifact}' is scope-level and takes no rail identifier.")
+    return scope / ARTIFACT_FILENAMES[artifact]
+
+
+def require_owner(artifact: str, role: str) -> None:
+    owner = ARTIFACT_OWNERS.get(artifact)
+    if owner is None:
+        raise ControlPlaneError(f"Unknown artifact '{artifact}'.")
+    if role != owner:
+        raise ControlPlaneError(
+            f"Role '{role}' cannot publish '{artifact}': it is owned by '{owner}'. "
+            "The executor proposes; the orchestrator accepts."
+        )
+
+
+def _bounded_string(value: Any, *, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ControlPlaneError(f"Provider evidence field '{field}' must be a non-empty string.")
+    if len(value) > MAX_EVIDENCE_STRING:
+        raise ControlPlaneError(
+            f"Provider evidence field '{field}' exceeds {MAX_EVIDENCE_STRING} characters; "
+            "publish a bounded projection, not raw content."
+        )
+    return value
+
+
+def _reject_unknown(payload: dict[str, Any], allowed: Iterable[str], *, where: str) -> None:
+    allowed_set = set(allowed)
+    denied = sorted(set(payload) & EVIDENCE_DENIED_KEYS)
+    if denied:
+        raise ControlPlaneError(
+            f"Provider evidence {where} contains excluded raw content key(s): {', '.join(denied)}. "
+            "Raw prompts, responses, commands, tool results, transcripts, logs, and telemetry "
+            "never enter the control plane."
+        )
+    unknown = sorted(set(payload) - allowed_set)
+    if unknown:
+        raise ControlPlaneError(
+            f"Provider evidence {where} contains non-allowlisted key(s): {', '.join(unknown)}."
+        )
+
+
+def validate_evidence_projection(payload: Any) -> dict[str, Any]:
+    """Validate a provider-neutral bounded projection with provenance and health.
+
+    This intake owns no provider parsing or correlation. It only proves that a
+    projection is bounded, attributed, and free of raw diagnostic content.
+    """
+    if not isinstance(payload, dict):
+        raise ControlPlaneError("Provider evidence must be a JSON object.")
+    _reject_unknown(payload, EVIDENCE_ALLOWED_KEYS, where="root")
+
+    provenance = payload.get("provenance")
+    if not isinstance(provenance, dict):
+        raise ControlPlaneError("Provider evidence requires a provenance object.")
+    _reject_unknown(provenance, PROVENANCE_ALLOWED_KEYS, where="provenance")
+    _bounded_string(provenance.get("source"), field="provenance.source")
+    _bounded_string(provenance.get("collectedAt"), field="provenance.collectedAt")
+    for optional in ("sessionId", "turnId"):
+        if optional in provenance:
+            _bounded_string(provenance[optional], field=f"provenance.{optional}")
+
+    health = payload.get("sourceHealth")
+    if not isinstance(health, dict):
+        raise ControlPlaneError("Provider evidence requires a sourceHealth object.")
+    _reject_unknown(health, SOURCE_HEALTH_ALLOWED_KEYS, where="sourceHealth")
+    status = health.get("status")
+    if status not in SOURCE_HEALTH_STATUSES:
+        raise ControlPlaneError(
+            f"Provider evidence sourceHealth.status must be one of {', '.join(sorted(SOURCE_HEALTH_STATUSES))}."
+        )
+    if "detail" in health:
+        _bounded_string(health["detail"], field="sourceHealth.detail")
+
+    observations = payload.get("observations", [])
+    if not isinstance(observations, list):
+        raise ControlPlaneError("Provider evidence observations must be a list.")
+    if len(observations) > MAX_EVIDENCE_OBSERVATIONS:
+        raise ControlPlaneError(
+            f"Provider evidence carries {len(observations)} observations; "
+            f"the bounded intake accepts at most {MAX_EVIDENCE_OBSERVATIONS}."
+        )
+    for index, observation in enumerate(observations):
+        if not isinstance(observation, dict):
+            raise ControlPlaneError(f"Provider evidence observation {index} must be an object.")
+        _reject_unknown(observation, OBSERVATION_ALLOWED_KEYS, where=f"observation {index}")
+        _bounded_string(observation.get("kind"), field=f"observation {index} kind")
+        for optional in ("status", "detail"):
+            if optional in observation:
+                _bounded_string(observation[optional], field=f"observation {index} {optional}")
+        for numeric in ("count", "durationSeconds"):
+            if numeric in observation and not isinstance(observation[numeric], (int, float)):
+                raise ControlPlaneError(f"Provider evidence observation {index} {numeric} must be numeric.")
+            if isinstance(observation.get(numeric), bool):
+                raise ControlPlaneError(f"Provider evidence observation {index} {numeric} must be numeric.")
+    return payload
+
+
+def _tracked_upstream(repo_root: Path, branch: str) -> str | None:
+    upstream = _git(
+        repo_root,
+        ["rev-parse", "--abbrev-ref", "--symbolic-full-name", f"{branch}@{{upstream}}"],
+        check=False,
+    )
+    return upstream or None
+
+
+def resolve_current_head(repo_root: Path) -> str:
+    """Resolve the head fresh from the repository on every call; never cached."""
+    return _git(repo_root, ["rev-parse", "HEAD"], check=False) or ""
+
+
+def ensure_publishable(repo_root: Path) -> str:
+    """Freshly resolve remote state and refuse to publish onto stale history."""
+    branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    upstream = _tracked_upstream(repo_root, branch) if branch and branch != "HEAD" else None
+    if upstream is not None:
+        remote = upstream.split("/", 1)[0]
+        try:
+            _git(repo_root, ["fetch", "--quiet", remote])
+        except ControlPlaneError as exc:
+            raise ControlPlaneError(
+                f"Cannot publish: coordination remote '{remote}' could not be fetched. {exc}"
+            ) from exc
+        local_head = _git(repo_root, ["rev-parse", branch])
+        remote_head = _git(repo_root, ["rev-parse", upstream])
+        if local_head != remote_head:
+            base = _git(repo_root, ["merge-base", branch, upstream], check=False)
+            if base == local_head:
+                raise ControlPlaneError(
+                    f"Cannot publish: coordination upstream {upstream} is ahead of {branch}. "
+                    "Re-read the current state and reconcile before republishing."
+                )
+            if base != remote_head:
+                raise ControlPlaneError(
+                    f"Cannot publish: {branch} and {upstream} have diverged. "
+                    "Re-read the current state and reconcile before republishing."
+                )
+    return resolve_current_head(repo_root)
+
+
+def publish(
+    repo_root: Path,
+    *,
+    project: str,
+    ticket: str,
+    artifact: str,
+    role: str,
+    content: str,
+    rail: str | None = None,
+    expected_head: str | None = None,
+) -> tuple[Path, str]:
+    """Replace one owned artifact with current state and commit only that path."""
+    require_owner(artifact, role)
+    target = artifact_path(repo_root, project=project, ticket=ticket, artifact=artifact, rail=rail)
+
+    if artifact == "evidence":
+        try:
+            payload = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ControlPlaneError(f"Provider evidence is not valid JSON: {exc.msg}") from exc
+        validate_evidence_projection(payload)
+        content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+
+    current_head = ensure_publishable(repo_root)
+    if expected_head is not None and expected_head.strip() and expected_head.strip() != current_head:
+        raise ControlPlaneError(
+            f"Cannot publish: expected head {expected_head.strip()} but the coordination "
+            f"repository is at {current_head or 'an empty history'}. Re-read the current "
+            "state and republish against it."
+        )
+
+    try:
+        write_text_atomic(target, content if content.endswith("\n") else content + "\n")
+    except JsonFileError as exc:
+        raise ControlPlaneError(str(exc)) from exc
+
+    relative = target.relative_to(repo_root).as_posix()
+    _git(repo_root, ["add", "--", relative])
+    if not _git(repo_root, ["diff", "--cached", "--name-only", "--", relative], check=False):
+        return target, current_head
+    scope = f"{project}/{ticket}"
+    subject = f"{role}: {artifact}" + (f" {rail}" if rail else "") + f" ({scope})"
+    _git(repo_root, ["commit", "--quiet", "-m", subject, "--", relative])
+    return target, resolve_current_head(repo_root)
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ControlPlaneError(f"Cannot read {path}: {exc}") from exc
+
+
+def render_status(repo_root: Path, *, project: str, ticket: str) -> str:
+    """Bounded orchestrator read: accepted state plus the rails that exist."""
+    scope = scope_directory(repo_root, project=project, ticket=ticket)
+    lines = [
+        "# Control Plane State",
+        "",
+        f"scope: {project}/{ticket}",
+        f"head: {resolve_current_head(repo_root) or 'empty history'}",
+        "",
+        "## Accepted State",
+        "",
+    ]
+    state = _read_text(scope / ARTIFACT_FILENAMES["state"])
+    lines.append(state.rstrip("\n") if state else "no accepted state published")
+    lines.extend(["", "## Rails Present", ""])
+    rails_root = scope / "rails"
+    rail_dirs = sorted(path for path in rails_root.glob("*") if path.is_dir()) if rails_root.is_dir() else []
+    if not rail_dirs:
+        lines.append("none")
+    for rail_dir in rail_dirs:
+        present = [name for name in ("rail", "handoff", "evidence") if (rail_dir / ARTIFACT_FILENAMES[name]).is_file()]
+        lines.append(f"- {rail_dir.name}: {', '.join(present) if present else 'empty'}")
+    return "\n".join(lines)
+
+
+def render_rail(repo_root: Path, *, project: str, ticket: str, rail: str) -> str:
+    """Bounded executor read: one rail only, never siblings or accepted state."""
+    rail_id = validate_identifier(rail, label="rail identifier")
+    rail_dir = scope_directory(repo_root, project=project, ticket=ticket) / "rails" / rail_id
+    authorization = _read_text(rail_dir / ARTIFACT_FILENAMES["rail"])
+    if authorization is None:
+        raise ControlPlaneError(f"No authorized rail '{rail_id}' in {project}/{ticket}.")
+    handoff = _read_text(rail_dir / ARTIFACT_FILENAMES["handoff"])
+    lines = [
+        "# Control Plane Rail",
+        "",
+        f"scope: {project}/{ticket}",
+        f"rail: {rail_id}",
+        f"head: {resolve_current_head(repo_root) or 'empty history'}",
+        f"provider evidence: {'present' if (rail_dir / ARTIFACT_FILENAMES['evidence']).is_file() else 'absent'}",
+        "",
+        "## Authorization",
+        "",
+        authorization.rstrip("\n"),
+        "",
+        "## Current Handoff",
+        "",
+        handoff.rstrip("\n") if handoff else "no handoff published",
+    ]
+    return "\n".join(lines)
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m ai_dev_flow.control_plane",
+        description="Read and publish current collaboration state in an explicitly supplied coordination repository.",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    def add_scope(subparser: argparse.ArgumentParser) -> None:
+        subparser.add_argument("--repo", required=True, help="Path to the coordination repository.")
+        subparser.add_argument("--project", required=True, help="Stable project identifier.")
+        subparser.add_argument("--ticket", required=True, help="Stable ticket identifier.")
+
+    status_parser = subparsers.add_parser("status", help="Print accepted state and the rail index.")
+    add_scope(status_parser)
+
+    rail_parser = subparsers.add_parser("rail", help="Print one rail's authorization and current handoff.")
+    add_scope(rail_parser)
+    rail_parser.add_argument("--rail", required=True, help="Stable semantic rail identifier.")
+
+    publish_parser = subparsers.add_parser("publish", help="Replace one owned artifact with current state.")
+    add_scope(publish_parser)
+    publish_parser.add_argument("--artifact", required=True, choices=sorted(ARTIFACT_FILENAMES))
+    publish_parser.add_argument("--role", required=True, choices=sorted(set(ARTIFACT_OWNERS.values())))
+    publish_parser.add_argument("--file", required=True, help="File holding the current content to publish.")
+    publish_parser.add_argument("--rail", help="Stable semantic rail identifier for rail-scoped artifacts.")
+    publish_parser.add_argument("--expected-head", help="Head the caller last read; publication fails closed if stale.")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
+    repo_root = resolve_coordination_repo(Path(arguments.repo).expanduser())
+
+    if arguments.command == "status":
+        print(render_status(repo_root, project=arguments.project, ticket=arguments.ticket))
+        return 0
+    if arguments.command == "rail":
+        print(render_rail(repo_root, project=arguments.project, ticket=arguments.ticket, rail=arguments.rail))
+        return 0
+
+    source = Path(arguments.file).expanduser()
+    try:
+        content = source.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ControlPlaneError(f"Cannot read {source}: {exc}") from exc
+    target, head = publish(
+        repo_root,
+        project=arguments.project,
+        ticket=arguments.ticket,
+        artifact=arguments.artifact,
+        role=arguments.role,
+        content=content,
+        rail=arguments.rail,
+        expected_head=arguments.expected_head,
+    )
+    print(f"published: {target.relative_to(repo_root).as_posix()}")
+    print(f"head: {head or 'empty history'}")
+    return 0
+
+
+def run() -> None:
+    try:
+        status = main()
+    except ControlPlaneError as exc:
+        print(f"control-plane: {exc}", file=sys.stderr)
+        status = 1
+    raise SystemExit(status)
+
+
+if __name__ == "__main__":
+    run()
