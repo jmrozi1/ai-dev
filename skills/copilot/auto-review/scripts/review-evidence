@@ -223,6 +223,65 @@ else
   printf 'no tasking rail at %s\n\n' "$tasking_file"
 fi
 
+printf '## Ticket Skill State\n\n'
+if [[ -z "$active_issue_number" ]]; then
+  printf 'not applicable: no active issue workflow\n\n'
+elif [[ ! -f "$workflow_file" ]]; then
+  printf 'unavailable: workflow state is missing\n\n'
+else
+  ticket_skill_state="$(python3 - "$repo_root" "$workflow_file" <<'PY'
+from __future__ import annotations
+
+from pathlib import Path
+import re
+import sys
+
+from ai_dev_flow.ticket_providers import TicketProviderError, resolve_ticket_provider_for_reference
+from ai_dev_flow.workflow_state import WorkflowStateError, load_state
+
+repo_root = Path(sys.argv[1])
+workflow_file = Path(sys.argv[2])
+section_heading = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
+
+
+def section(body: str, name: str) -> str | None:
+    matches = list(section_heading.finditer(body))
+    for index, match in enumerate(matches):
+        if match.group(1).strip().casefold() != name.casefold():
+            continue
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        return body[match.end():end].strip()
+    return None
+
+try:
+    state = load_state(workflow_file)
+    if state.ticket_reference is None:
+        print("unavailable: active workflow has no ticket reference")
+        raise SystemExit(0)
+    ticket = resolve_ticket_provider_for_reference(
+        repo_root=repo_root,
+        reference=state.ticket_reference,
+    ).get(state.ticket_reference.ticket_id)
+except (WorkflowStateError, TicketProviderError, OSError) as exc:
+    print(f"unavailable: {exc}")
+    raise SystemExit(0)
+
+body = ticket.body or ""
+for name in ("Skill Candidates", "Skills"):
+    print(f"### {name}")
+    value = section(body, name)
+    if value is None:
+        print(f"missing: ## {name}")
+    elif value:
+        print(value)
+    else:
+        print("empty")
+    print()
+PY
+)"
+  printf '%s\n' "$ticket_skill_state"
+fi
+
 # Attempt automatic telemetry sampling if an active issue is present.
 # Capture status to display visibility of availability/failure.
 telemetry_status=""
@@ -304,8 +363,7 @@ for skill_file in skills/*/SKILL.md; do
       if [[ "$changed_path" == $trigger ]]; then
         skills_to_review+="$skill_name: review trigger $trigger matched ($changed_path)"$'\n'
       fi
-    done <<<"$changed_paths"
-  done <<<"$triggers"
+    done <<<"$triggers"
 done
 
 if [[ -n "${skills_to_review//[[:space:]]/}" ]]; then
