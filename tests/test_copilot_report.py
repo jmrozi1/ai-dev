@@ -402,32 +402,138 @@ class CopilotReportTests(unittest.TestCase):
         self.assertEqual(terminal["approvalWaitSeconds"]["status"], "partial")
         self.assertNotEqual(terminal["approvalWaitSeconds"]["value"], 0)
 
-    def test_terminal_action_unique_exit_zero_is_successful(self) -> None:
+    def test_terminal_action_unique_exit_zero_is_completed(self) -> None:
         terminal = parse_terminal_diagnostics(self._terminal_log([
             "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `ok-cmd` []",
             "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
         ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
         self.assertEqual(terminal["actions"]["status"], "validated")
-        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "successful")
+        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "completed")
+        self.assertEqual(terminal["actions"]["value"][0]["exitOutcome"], "zero")
         self.assertEqual(terminal["actions"]["value"][0]["exitCode"], "0")
+
+    def test_known_zero_exit_with_no_failure_renders_zero_validated(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `ok-cmd` []",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
+        self.assertEqual(terminal["errors"], {"status": "validated", "value": [], "unknownExitCount": 0})
+        report = render_copilot_report(agent_debug=debug, otel=otel, terminal=terminal, active_issue="49")
+        self.assertIn("Terminal errors: 0 validated", report)
+        self.assertIn("Action: +0.000s ok-cmd (executed/completed; exit 0)", report)
 
     def test_terminal_action_nonzero_exit_is_visible(self) -> None:
         terminal = parse_terminal_diagnostics(self._terminal_log([
             "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `bad-cmd` []",
             "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `7`, result.length `2`, error `failed` []",
         ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
-        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "failed")
+        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "completed")
+        self.assertEqual(terminal["actions"]["value"][0]["exitOutcome"], "nonzero")
         self.assertEqual(terminal["errors"]["value"][0]["category"], "nonzero_exit")
         self.assertEqual(terminal["errors"]["value"][0]["outcome"], "unresolved_failure")
 
-    def test_terminal_action_undefined_exit_is_unknown(self) -> None:
+    def test_undefined_exit_is_completed_with_unknown_exit_and_no_error(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
         terminal = parse_terminal_diagnostics(self._terminal_log([
             "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `unknown-cmd` []",
             "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `undefined`, result.length `2`, error `undefined` []",
         ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
-        self.assertEqual(terminal["actions"]["status"], "partial")
-        self.assertEqual(terminal["actions"]["value"][0]["executionStatus"], "unknown")
-        self.assertEqual(terminal["errors"]["value"][0]["category"], "unknown_outcome")
+        action = terminal["actions"]["value"][0]
+        self.assertEqual(action["executionStatus"], "completed")
+        self.assertEqual(action["exitOutcome"], "unknown")
+        self.assertEqual(terminal["errors"]["value"], [])
+        self.assertEqual(terminal["errors"]["status"], "partial")
+        self.assertEqual(terminal["errors"]["unknownExitCount"], 1)
+        report = render_copilot_report(agent_debug=debug, otel=otel, terminal=terminal, active_issue="49")
+        self.assertIn("Action: +0.000s unknown-cmd (executed/completed; exit unknown)", report)
+        self.assertIn("Terminal errors: partial - 1 completed action has unknown exit outcome", report)
+        self.assertNotIn("Terminal errors: 1 shown", report)
+
+    def test_live_shaped_seventeen_undefined_exits_use_one_aggregate_limitation(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        lines = []
+        for index in range(17):
+            lines.append(f"2026-08-21 14:00:{index:02d}.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `live-cmd-{index}` []")
+            lines.append(f"2026-08-21 14:00:{index:02d}.500 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `undefined`, result.length `2`, error `undefined` []")
+        terminal = parse_terminal_diagnostics(self._terminal_log(lines), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:01:00"))
+        self.assertEqual(len(terminal["actions"]["value"]), 17)
+        self.assertTrue(all(action["executionStatus"] == "completed" for action in terminal["actions"]["value"]))
+        self.assertEqual(terminal["errors"]["value"], [])
+        report = render_copilot_report(agent_debug=debug, otel=otel, terminal=terminal, active_issue="49")
+        self.assertIn("Terminal actions: 17 shown", report)
+        self.assertNotIn("Terminal errors: 17 shown", report)
+        self.assertEqual(report.count("Terminal errors:"), 1)
+        self.assertIn("Terminal errors: partial - 17 completed actions have unknown exit outcomes", report)
+
+    def test_mixed_proven_failure_and_unknown_exits_render_entries_plus_limitation(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `bad-cmd` []",
+            "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `7`, result.length `2`, error `boom` []",
+            "2026-08-21 14:00:01.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `unknown-cmd` []",
+            "2026-08-21 14:00:01.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `undefined`, result.length `2`, error `undefined` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:02"))
+        self.assertEqual([error["category"] for error in terminal["errors"]["value"]], ["nonzero_exit"])
+        self.assertEqual(terminal["errors"]["status"], "partial")
+        self.assertEqual(terminal["errors"]["unknownExitCount"], 1)
+        report = render_copilot_report(agent_debug=debug, otel=otel, terminal=terminal, active_issue="49")
+        self.assertIn("Terminal errors: 1 shown", report)
+        self.assertIn("Error: +0.100s bad-cmd (nonzero_exit; unresolved_failure; boom)", report)
+        self.assertIn("Terminal errors: partial - 1 completed action has unknown exit outcome", report)
+
+    def test_finish_correlation_ignores_executions_after_the_finish(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:00.500 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
+            "2026-08-21 14:00:01.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `later-cmd` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:02"))
+        statuses = [action["executionStatus"] for action in terminal["actions"]["value"]]
+        self.assertEqual(statuses, ["unassociated", "started"])
+        self.assertEqual(terminal["errors"]["value"], [])
+
+    def test_relative_timestamps_are_deterministic(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:12.341 [info] RunInTerminalTool: Using `rich` execute strategy for command `timed-cmd` []",
+            "2026-08-21 14:00:12.900 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `3`, result.length `2`, error `boom` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:20"))
+        self.assertAlmostEqual(terminal["actions"]["value"][0]["relativeSeconds"], 12.341, places=3)
+        self.assertAlmostEqual(terminal["actions"]["value"][0]["timestamp"], datetime_timestamp("2026-08-21 14:00:12") + 0.341, places=3)
+        report = render_copilot_report(agent_debug=debug, otel=otel, terminal=terminal, active_issue="49")
+        self.assertIn("Action: +12.341s timed-cmd (executed/completed; exit 3)", report)
+        self.assertIn("Error: +12.900s timed-cmd (nonzero_exit; unresolved_failure; boom)", report)
+
+    def test_unresolved_permission_interruption_remains_visible(self) -> None:
+        debug = parse_agent_debug(self._debug(), self.repo)
+        otel = parse_otel(self._otel(), session="session-1", start=1.0, end=1.5)
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:01.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"blocked-cmd\"]]",
+            "2026-08-21 14:00:01.001 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 14:00:01.002 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: - Command 'blocked-cmd' has no matching auto approve entries",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:05"))
+        error = terminal["errors"]["value"][0]
+        self.assertEqual(error["category"], "permission_interruption")
+        self.assertEqual(error["outcome"], "unresolved_permission")
+        report = render_copilot_report(agent_debug=debug, otel=otel, terminal=terminal, active_issue="49")
+        self.assertIn("permission_interruption; unresolved_permission", report)
+
+    def test_request_only_unresolved_and_ambiguous_actions_remain_visible(self) -> None:
+        terminal = parse_terminal_diagnostics(self._terminal_log([
+            "2026-08-21 14:00:01.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"never-run\"]]",
+            "2026-08-21 14:00:01.001 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 14:00:02.000 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Parsed sub-commands via bash grammar [[\"twice-cmd\"]]",
+            "2026-08-21 14:00:02.001 [info] RunInTerminalTool#CommandLineAutoApproveAnalyzer: Sub-command DENIED auto approval",
+            "2026-08-21 14:00:03.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `twice-cmd` []",
+            "2026-08-21 14:00:04.000 [info] RunInTerminalTool: Using `rich` execute strategy for command `twice-cmd` []",
+        ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:10"))
+        request_actions = [action for action in terminal["actions"]["value"] if action["actionType"] == "request"]
+        self.assertEqual([action["executionStatus"] for action in request_actions], ["unresolved", "ambiguous"])
+        self.assertEqual([error["category"] for error in terminal["errors"]["value"]], ["permission_interruption"])
 
     def test_unassociated_finish_is_preserved_as_unknown(self) -> None:
         terminal = parse_terminal_diagnostics(self._terminal_log([
@@ -444,8 +550,8 @@ class CopilotReportTests(unittest.TestCase):
             "2026-08-21 14:00:00.100 [info] RunInTerminalTool: Finished `rich` execute strategy with exitCode `0`, result.length `2`, error `undefined` []",
         ]), start=datetime_timestamp("2026-08-21 14:00:00"), end=datetime_timestamp("2026-08-21 14:00:01"))
         self.assertEqual(terminal["actions"]["status"], "partial")
-        self.assertEqual(terminal["actions"]["value"][-1]["executionStatus"], "ambiguous")
-        self.assertEqual(sum(action["executionStatus"] == "unknown" for action in terminal["actions"]["value"]), 2)
+        self.assertEqual([action["executionStatus"] for action in terminal["actions"]["value"]], ["started", "started", "ambiguous"])
+        self.assertEqual(terminal["errors"]["value"], [])
 
     def test_unique_approval_attaches_to_one_action(self) -> None:
         terminal = parse_terminal_diagnostics(self._terminal_log([

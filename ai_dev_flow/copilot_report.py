@@ -29,6 +29,27 @@ def _bounded_state(items: list[dict[str, Any]], status: str = "validated") -> di
     return result
 
 
+def _numeric_exit(exit_code: Any) -> int | None:
+    """Return the exit code only when it is objectively numeric."""
+    if not isinstance(exit_code, str):
+        return None
+    try:
+        return int(exit_code.strip())
+    except ValueError:
+        return None
+
+
+def _relative(value: Any) -> str:
+    return f"+{value:.3f}s" if isinstance(value, (int, float)) else "+unknown"
+
+
+def _unknown_exit_limitation(count: int) -> str:
+    noun = "action" if count == 1 else "actions"
+    verb = "has" if count == 1 else "have"
+    outcome = "outcome" if count == 1 else "outcomes"
+    return f"Terminal errors: partial - {count} completed {noun} {verb} unknown exit {outcome}"
+
+
 def _unavailable(detail: str) -> dict[str, Any]:
     result = _state(None, "unavailable")
     result["detail"] = detail[:240]
@@ -438,13 +459,15 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
                 finished = _FINISHED.search(body)
                 if finished:
                     completion = {"timestamp": timestamp, "exitCode": finished.group("code") or None, "resultLength": int(finished.group("length")), "error": finished.group("error")}
-                    candidates = [execution for execution in executions if execution["completion"] is None]
+                    candidates = [
+                        execution for execution in executions
+                        if execution["command"] is not None and execution["completion"] is None and execution["timestamp"] <= timestamp
+                    ]
                     if len(candidates) == 1:
                         candidates[0]["completion"] = completion
-                    elif len(candidates) == 0:
-                        executions.append({"timestamp": timestamp, "command": None, "completion": completion, "completionStatus": "unassociated"})
                     else:
-                        executions.append({"timestamp": timestamp, "command": None, "completion": completion, "completionStatus": "ambiguous"})
+                        completion_status = "ambiguous" if candidates else "unassociated"
+                        executions.append({"timestamp": timestamp, "command": None, "completion": completion, "completionStatus": completion_status})
     except OSError as exc:
         return {"source": "terminal-diagnostic", "status": "unavailable", "detail": str(exc)}
     if not analyzers and not executions:
@@ -464,7 +487,7 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
         denied = bool(entry.get("denied"))
         matching_indices: list[int] = []
         for idx, candidate in enumerate(executions):
-            if idx in used_execution_indices:
+            if idx in used_execution_indices or candidate["command"] is None:
                 continue
             if candidate["timestamp"] < entry["timestamp"]:
                 continue
@@ -484,42 +507,56 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
         wait = execution["timestamp"] - entry["timestamp"] if denied and execution else None
         command = bounded_commands[0] if len(bounded_commands) == 1 else json.dumps(bounded_commands, ensure_ascii=True, separators=(",", ":"))[:MAX_CONTENT]
         requests.append({"command": command, "commands": bounded_commands, "terminalApprovalRequest": denied, "denialReason": entry.get("reason"), "disposition": disposition, "requestTimestamp": entry["timestamp"], "executionTimestamp": execution["timestamp"] if execution else None, "approvalWaitSeconds": wait, "executionIndex": matching_indices[0] if disposition == "executed" else None})
+    def relative(timestamp: float) -> float | None:
+        return timestamp - start if start is not None else None
+
     actions: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
-    action_unknown = False
+    unknown_exit_count = 0
+    uncorrelated = False
     for index, execution in enumerate(executions):
         completion = execution.get("completion")
-        if execution.get("command") is None:
-            action = {"timestamp": execution["timestamp"], "command": None, "executionStatus": execution.get("completionStatus", "unknown"), "completionTimestamp": completion["timestamp"] if completion else execution["timestamp"], "exitCode": completion["exitCode"] if completion else None}
-            action_unknown = True
+        if execution["command"] is None:
+            # A finish record that no single started execution can safely own.
+            uncorrelated = True
+            actions.append({"actionType": "execution", "timestamp": execution["timestamp"], "relativeSeconds": relative(execution["timestamp"]), "command": None, "executionStatus": execution.get("completionStatus", "unassociated"), "completionTimestamp": completion["timestamp"] if completion else None, "exitCode": completion.get("exitCode") if completion else None, "exitOutcome": None})
+            continue
+        exit_code = completion.get("exitCode") if completion else None
+        numeric_exit = _numeric_exit(exit_code)
+        if completion is None:
+            # Execution started; no completion record was observed for it.
+            execution_status, exit_outcome = "started", None
+            uncorrelated = True
         else:
-            exit_code = completion.get("exitCode") if completion else None
-            try:
-                numeric_exit = int(exit_code) if exit_code is not None and exit_code.lower() != "undefined" else None
-            except (AttributeError, ValueError):
-                numeric_exit = None
-            execution_status = "successful" if numeric_exit == 0 else "failed" if numeric_exit is not None else "unknown"
-            action = {"timestamp": execution["timestamp"], "command": execution["command"], "executionStatus": execution_status, "completionTimestamp": completion["timestamp"] if completion else None, "exitCode": exit_code}
-            if execution_status == "unknown":
-                action_unknown = True
-                errors.append({"timestamp": completion["timestamp"] if completion else execution["timestamp"], "command": execution["command"], "category": "unknown_outcome", "outcome": "unknown_outcome", "evidence": completion.get("error") if completion else None})
-            request = next((item for item in requests if item.get("executionIndex") == index and item.get("terminalApprovalRequest")), None)
-            if request:
-                action.update({"approvalRequest": True, "denialReason": request.get("denialReason"), "approvalDisposition": request.get("disposition"), "approvalWaitSeconds": request.get("approvalWaitSeconds")})
-            if numeric_exit is not None and numeric_exit != 0:
-                recovered = any(other.get("command") and _normalize_command(other["command"]) == _normalize_command(execution["command"]) and other.get("completion") and str(other["completion"].get("exitCode")) == "0" for other in executions[index + 1:])
-                errors.append({"timestamp": completion["timestamp"] if completion else execution["timestamp"], "command": execution["command"], "category": "nonzero_exit", "outcome": "recovered_failure" if recovered else "unresolved_failure", "exitCode": exit_code, "evidence": completion.get("error") if completion else None})
+            execution_status = "completed"
+            exit_outcome = "zero" if numeric_exit == 0 else "nonzero" if numeric_exit is not None else "unknown"
+            if exit_outcome == "unknown":
+                unknown_exit_count += 1
+        action = {"actionType": "execution", "timestamp": execution["timestamp"], "relativeSeconds": relative(execution["timestamp"]), "command": execution["command"], "executionStatus": execution_status, "completionTimestamp": completion["timestamp"] if completion else None, "exitCode": exit_code, "exitOutcome": exit_outcome}
+        request = next((item for item in requests if item.get("executionIndex") == index and item.get("terminalApprovalRequest")), None)
+        if request:
+            action.update({"approvalRequest": True, "denialReason": request.get("denialReason"), "approvalDisposition": request.get("disposition"), "approvalWaitSeconds": request.get("approvalWaitSeconds")})
         actions.append(action)
+        if exit_outcome == "nonzero":
+            recovered = any(other.get("command") and _normalize_command(other["command"]) == _normalize_command(execution["command"]) and other.get("completion") and _numeric_exit(other["completion"].get("exitCode")) == 0 for other in executions[index + 1:])
+            errors.append({"timestamp": completion["timestamp"], "relativeSeconds": relative(completion["timestamp"]), "command": execution["command"], "category": "nonzero_exit", "outcome": "recovered_failure" if recovered else "unresolved_failure", "exitCode": exit_code, "evidence": completion.get("error")})
     for request in requests:
-        if request["disposition"] in {"unresolved", "ambiguous"}:
-            errors.append({"timestamp": request["requestTimestamp"], "command": request["command"], "category": "permission_interruption" if request["disposition"] == "unresolved" and request["terminalApprovalRequest"] else "unknown_outcome", "outcome": "unknown_outcome", "evidence": request.get("denialReason")})
-            action_unknown = True
+        if request["disposition"] not in {"unresolved", "ambiguous"}:
+            continue
+        uncorrelated = True
+        actions.append({"actionType": "request", "timestamp": request["requestTimestamp"], "relativeSeconds": relative(request["requestTimestamp"]), "command": request["command"], "executionStatus": request["disposition"], "completionTimestamp": None, "exitCode": None, "exitOutcome": None, "approvalRequest": request["terminalApprovalRequest"], "denialReason": request.get("denialReason"), "approvalDisposition": request["disposition"], "approvalWaitSeconds": request.get("approvalWaitSeconds")})
+        if request["disposition"] == "unresolved" and request["terminalApprovalRequest"]:
+            errors.append({"timestamp": request["requestTimestamp"], "relativeSeconds": relative(request["requestTimestamp"]), "command": request["command"], "category": "permission_interruption", "outcome": "unresolved_permission", "exitCode": None, "evidence": request.get("denialReason")})
     actions.sort(key=lambda action: (action["timestamp"], action.get("completionTimestamp") or action["timestamp"], action.get("command") or ""))
     errors.sort(key=lambda error: (error["timestamp"], error.get("command") or ""))
-    action_state = "partial" if action_unknown or any(action.get("executionStatus") == "ambiguous" for action in actions) else "validated"
-    error_state = "partial" if action_state == "partial" else "validated"
+    status = "partial" if unknown_exit_count or uncorrelated else "validated"
+    action_state = _bounded_state(actions, status)
+    error_state = _bounded_state(errors, status)
+    error_state["unknownExitCount"] = unknown_exit_count
+    if unknown_exit_count:
+        error_state["limitation"] = _unknown_exit_limitation(unknown_exit_count)
     if not requests:
-        return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": {"status": "validated", "value": 0}, "actions": _bounded_state(actions, action_state), "errors": _bounded_state(errors, error_state)}
+        return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(0), "terminalApprovalRequestCount": _state(0), "approvalRequests": _state([]), "approvalWaitSeconds": {"status": "validated", "value": 0}, "actions": action_state, "errors": error_state}
     approvals = [request for request in requests if request["terminalApprovalRequest"]]
     unresolved_approvals = [r for r in approvals if r["disposition"] == "unresolved"]
     ambiguous_approvals = [r for r in approvals if r.get("disposition") == "ambiguous"]
@@ -537,7 +574,7 @@ def _parse_terminal_plaintext(path: Path, *, start: float | None, end: float | N
         timing_status = "validated"
         timing_value = 0
     approval_wait_seconds = {"status": timing_status, "value": timing_value}
-    return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(len(requests)), "terminalApprovalRequestCount": _state(len(approvals)), "approvalRequests": _state(approvals[:MAX_ACTIONS]), "approvalWaitSeconds": approval_wait_seconds, "actions": _bounded_state(actions, action_state), "errors": _bounded_state(errors, error_state)}
+    return {"source": "terminal-diagnostic", "status": "validated", "terminalRequestCount": _state(len(requests)), "terminalApprovalRequestCount": _state(len(approvals)), "approvalRequests": _state(approvals[:MAX_ACTIONS]), "approvalWaitSeconds": approval_wait_seconds, "actions": action_state, "errors": error_state}
 
 
 def _normalize_command(command: str) -> str:
@@ -558,6 +595,36 @@ def merge_intervals(intervals: Iterable[tuple[float, float]]) -> dict[str, Any]:
             current_start, current_end = start, end
     total += current_end - current_start
     return _state(total)
+
+
+_EXECUTION_STATUS_TEXT = {
+    "completed": "executed/completed",
+    "started": "executed/incomplete",
+    "unassociated": "unassociated completion",
+    "ambiguous": "ambiguous completion",
+}
+
+
+def _action_status_text(action: dict[str, Any]) -> str:
+    status = action.get("executionStatus", "unknown")
+    if action.get("actionType") == "request":
+        return f"requested/{status}"
+    return _EXECUTION_STATUS_TEXT.get(status, "unknown")
+
+
+def _exit_text(action: dict[str, Any]) -> str:
+    """Unknown exit evidence never becomes a claimed exit result."""
+    if action.get("exitOutcome") in {"zero", "nonzero"} and action.get("exitCode") is not None:
+        return f"exit {action['exitCode']}"
+    return "exit unknown"
+
+
+def _error_evidence(error: dict[str, Any]) -> str:
+    evidence = error.get("evidence")
+    if isinstance(evidence, str) and evidence.strip() and evidence != "undefined":
+        return evidence
+    exit_code = error.get("exitCode")
+    return f"exit {exit_code}" if exit_code is not None else "evidence unavailable"
 
 
 def _source_line(source: dict[str, Any]) -> str:
@@ -623,26 +690,32 @@ def render_copilot_report(
             lines.append("Timing: approval wait unavailable")
     else:
         lines.append("Timing: partial - approval timing unavailable")
-    actions = terminal.get("actions", {}).get("value", []) if terminal else []
-    errors = terminal.get("errors", {}).get("value", []) if terminal else []
     if terminal and terminal.get("actions", {}).get("status") in {"validated", "partial"}:
+        action_state = terminal["actions"]
+        actions = action_state.get("value", [])
         lines.append(f"Terminal actions: {len(actions)} shown")
         for action in actions[:MAX_ACTIONS]:
             command = action.get("command") or "command unavailable"
-            status = action.get("executionStatus", "unknown")
-            exit_code = action.get("exitCode")
-            evidence = f"exit {exit_code}" if exit_code not in (None, "undefined") else "exit unknown"
-            lines.append(f"Action: {action.get('timestamp')} {command} ({status}; {evidence})")
-        if terminal["actions"].get("truncated"):
-            lines.append(f"Terminal actions: {terminal['actions'].get('length', len(actions))} total, {terminal['actions'].get('length', len(actions)) - len(actions)} omitted")
+            lines.append(f"Action: {_relative(action.get('relativeSeconds'))} {command} ({_action_status_text(action)}; {_exit_text(action)})")
+        if action_state.get("truncated"):
+            total = action_state.get("length", len(actions))
+            lines.append(f"Terminal actions: {total} total, {total - len(actions)} omitted")
     if terminal and terminal.get("errors", {}).get("status") in {"validated", "partial"}:
-        lines.append(f"Terminal errors: {len(errors)} shown")
-        for error in errors[:MAX_ACTIONS]:
-            command = error.get("command") or "command unavailable"
-            evidence = error.get("evidence") or "evidence unavailable"
-            lines.append(f"Error: {error.get('timestamp')} {command} ({error.get('category', 'unknown_outcome')}; {evidence})")
-        if terminal["errors"].get("truncated"):
-            lines.append(f"Terminal errors: {terminal['errors'].get('length', len(errors))} total, {terminal['errors'].get('length', len(errors)) - len(errors)} omitted")
+        error_state = terminal["errors"]
+        errors = error_state.get("value", [])
+        limitation = error_state.get("limitation")
+        if errors:
+            lines.append(f"Terminal errors: {len(errors)} shown")
+            for error in errors[:MAX_ACTIONS]:
+                command = error.get("command") or "command unavailable"
+                lines.append(f"Error: {_relative(error.get('relativeSeconds'))} {command} ({error.get('category', 'unknown')}; {error.get('outcome', 'unknown')}; {_error_evidence(error)})")
+            if error_state.get("truncated"):
+                total = error_state.get("length", len(errors))
+                lines.append(f"Terminal errors: {total} total, {total - len(errors)} omitted")
+        if limitation:
+            lines.append(limitation)
+        elif not errors:
+            lines.append("Terminal errors: 0 shown (partial)" if error_state.get("status") == "partial" else "Terminal errors: 0 validated")
     if otel.get("status") == "validated":
         lines.append(f"Tokens: {otel['inputTokens']['value']} input, {otel['outputTokens']['value']} output")
         usage = {"inputTokens": otel["inputTokens"]["value"], "outputTokens": otel["outputTokens"]["value"], "models": [{"requestModel": model, "calls": calls} for model, calls in otel.get("modelCalls", {}).get("value", {}).items()]}
