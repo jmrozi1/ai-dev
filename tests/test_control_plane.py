@@ -10,6 +10,7 @@ from ai_dev_flow.control_plane import (
     ControlPlaneError,
     publish,
     resolve_control_plane_config,
+    resolve_read_source,
     render_rail,
     render_status,
     resolve_coordination_repo,
@@ -275,6 +276,102 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(resolve_current_head(product), product_head)
         self.assertEqual(self._git(product, "status", "--porcelain"), "")
         self.assertEqual(self._git(product, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+
+    # Fresh reads: a stale clone must never serve stale authorization
+
+    def _publish_from_upstream(self, upstream: Path, **overrides: object) -> None:
+        """Publish into the upstream clone so the shared surface moves ahead."""
+        arguments: dict[str, object] = {
+            "project": "ai-dev", "ticket": "issue-51",
+            "artifact": "rail", "role": "orchestrator",
+            "content": "# Rail\n\npublished remotely\n", "rail": "remote-only-rail",
+        }
+        arguments.update(overrides)
+        publish(upstream, **arguments)  # type: ignore[arg-type]
+
+    def test_status_reads_new_remote_state_without_moving_local_head(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-fresh-status")
+        self._publish_from_upstream(upstream, artifact="state", role="orchestrator", rail=None,
+                                    content="# Accepted\n\npublished-after-clone\n")
+        local_head_before = resolve_current_head(self.coordination)
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("published-after-clone", rendered)
+        self.assertEqual(resolve_current_head(self.coordination), local_head_before)
+        self.assertEqual(self._git(self.coordination, "status", "--porcelain"), "")
+
+    def test_rail_discovers_a_rail_absent_from_the_stale_local_tree(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-fresh-rail")
+        self._publish_from_upstream(upstream)
+        self.assertFalse(
+            (self.coordination / "ai-dev" / "issue-51" / "rails" / "remote-only-rail").exists(),
+            "the local tree must still be stale for this test to mean anything",
+        )
+        local_head_before = resolve_current_head(self.coordination)
+        rendered = render_rail(self.coordination, project="ai-dev", ticket="issue-51", rail="remote-only-rail")
+        self.assertIn("published remotely", rendered)
+        self.assertEqual(resolve_current_head(self.coordination), local_head_before)
+
+    def test_reported_head_is_the_commit_actually_read(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-head-report")
+        self._publish_from_upstream(upstream, artifact="state", role="orchestrator", rail=None, content="# Accepted\n")
+        self._git(self.coordination, "fetch", "-q", "origin")
+        upstream_head = self._git(self.coordination, "rev-parse", "origin/main")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn(f"head: {upstream_head}", rendered)
+        self.assertNotEqual(upstream_head, resolve_current_head(self.coordination))
+
+    def test_local_ahead_read_fails_closed_without_serving_stale_content(self) -> None:
+        self._attach_shared_upstream("upstream-local-ahead")
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nunpublished\n")
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("unpublished local commits", str(caught.exception))
+
+    def test_diverged_read_fails_closed(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-diverged-read")
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nlocal\n")
+        self._advance_upstream(upstream)
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("diverged", str(caught.exception))
+
+    def test_fetch_failure_fails_closed(self) -> None:
+        self._attach_shared_upstream("upstream-unreachable")
+        self._git(self.coordination, "remote", "set-url", "origin", str(self.tmp_path / "does-not-exist"))
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("freshness is unproven", str(caught.exception))
+
+    def test_remote_without_tracked_upstream_fails_closed(self) -> None:
+        self._attach_shared_upstream("upstream-untracked")
+        self._git(self.coordination, "branch", "--unset-upstream", "main")
+        with self.assertRaises(ControlPlaneError) as caught:
+            render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("no tracked upstream", str(caught.exception))
+
+    def test_repository_without_a_remote_reads_locally(self) -> None:
+        self._publish(artifact="state", role="orchestrator", rail=None, content="# Accepted\n\nlocal-only\n")
+        source = resolve_read_source(self.coordination)
+        self.assertIsNone(source.revision)
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("local-only", rendered)
+
+    def test_reads_do_not_mutate_branch_index_or_worktree(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-no-mutation")
+        self._publish_from_upstream(upstream)
+        before = (
+            resolve_current_head(self.coordination),
+            self._git(self.coordination, "status", "--porcelain"),
+            self._git(self.coordination, "rev-parse", "--abbrev-ref", "HEAD"),
+        )
+        render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        render_rail(self.coordination, project="ai-dev", ticket="issue-51", rail="remote-only-rail")
+        after = (
+            resolve_current_head(self.coordination),
+            self._git(self.coordination, "status", "--porcelain"),
+            self._git(self.coordination, "rev-parse", "--abbrev-ref", "HEAD"),
+        )
+        self.assertEqual(before, after)
 
     # Configuration discovery: a fresh agent must find its coordination repository
 

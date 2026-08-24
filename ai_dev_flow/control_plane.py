@@ -179,21 +179,33 @@ def scope_directory(repo_root: Path, *, project: str, ticket: str) -> Path:
     return repo_root / validate_identifier(project, label="project") / validate_identifier(ticket, label="ticket")
 
 
-def artifact_path(
-    repo_root: Path, *, project: str, ticket: str, artifact: str, rail: str | None
-) -> Path:
+def scope_relative(project: str, ticket: str) -> str:
+    return (
+        f"{validate_identifier(project, label='project')}/"
+        f"{validate_identifier(ticket, label='ticket')}"
+    )
+
+
+def artifact_relative(*, project: str, ticket: str, artifact: str, rail: str | None) -> str:
     if artifact not in ARTIFACT_FILENAMES:
         raise ControlPlaneError(
             f"Unknown artifact '{artifact}': expected one of {', '.join(sorted(ARTIFACT_FILENAMES))}."
         )
-    scope = scope_directory(repo_root, project=project, ticket=ticket)
+    scope = scope_relative(project, ticket)
     if artifact in RAIL_SCOPED_ARTIFACTS:
         if rail is None:
             raise ControlPlaneError(f"Artifact '{artifact}' requires a rail identifier.")
-        return scope / "rails" / validate_identifier(rail, label="rail identifier") / ARTIFACT_FILENAMES[artifact]
+        rail_id = validate_identifier(rail, label="rail identifier")
+        return f"{scope}/rails/{rail_id}/{ARTIFACT_FILENAMES[artifact]}"
     if rail is not None:
         raise ControlPlaneError(f"Artifact '{artifact}' is scope-level and takes no rail identifier.")
-    return scope / ARTIFACT_FILENAMES[artifact]
+    return f"{scope}/{ARTIFACT_FILENAMES[artifact]}"
+
+
+def artifact_path(
+    repo_root: Path, *, project: str, ticket: str, artifact: str, rail: str | None
+) -> Path:
+    return repo_root / artifact_relative(project=project, ticket=ticket, artifact=artifact, rail=rail)
 
 
 def require_owner(artifact: str, role: str) -> None:
@@ -379,55 +391,149 @@ def publish(
     return target, resolve_current_head(repo_root)
 
 
-def _read_text(path: Path) -> str | None:
+class ReadSource:
+    """What a read actually returns: a fetched revision, or the local worktree.
+
+    Guidance requires a fresh durable read, so a clone behind its upstream must
+    serve the fetched upstream content. Reads never move the branch, index, or
+    worktree; only remote-tracking refs advance.
+    """
+
+    def __init__(self, repo_root: Path, revision: str | None, head: str) -> None:
+        self.repo_root = repo_root
+        self.revision = revision
+        self.head = head
+
+    def read(self, relative: str) -> str | None:
+        if self.revision is None:
+            try:
+                return (self.repo_root / relative).read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return None
+            except OSError as exc:
+                raise ControlPlaneError(f"Cannot read {relative}: {exc}") from exc
+        completed = subprocess.run(
+            ["git", "-C", str(self.repo_root), "show", f"{self.revision}:{relative}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding="utf-8", errors="replace", check=False,
+        )
+        return completed.stdout if completed.returncode == 0 else None
+
+    def exists(self, relative: str) -> bool:
+        if self.revision is None:
+            return (self.repo_root / relative).is_file()
+        completed = subprocess.run(
+            ["git", "-C", str(self.repo_root), "cat-file", "-e", f"{self.revision}:{relative}"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
+        )
+        return completed.returncode == 0
+
+    def rails(self, scope: str) -> list[str]:
+        if self.revision is None:
+            rails_root = self.repo_root / scope / "rails"
+            if not rails_root.is_dir():
+                return []
+            return sorted(path.name for path in rails_root.glob("*") if path.is_dir())
+        listing = _git(
+            self.repo_root,
+            ["ls-tree", "-d", "--name-only", f"{self.revision}:{scope}/rails"],
+            check=False,
+        )
+        return sorted(line.strip().rstrip("/") for line in listing.splitlines() if line.strip())
+
+
+def resolve_read_source(repo_root: Path) -> ReadSource:
+    """Resolve tracked remote state freshly, or fail closed on ambiguity."""
+    local_head = resolve_current_head(repo_root)
+    remotes = [name for name in _git(repo_root, ["remote"], check=False).splitlines() if name.strip()]
+    if not remotes:
+        return ReadSource(repo_root, None, local_head)
+
+    branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    upstream = _tracked_upstream(repo_root, branch) if branch and branch != "HEAD" else None
+    if upstream is None:
+        raise ControlPlaneError(
+            f"Cannot read control-plane state: '{branch or 'HEAD'}' has no tracked upstream "
+            f"although remote(s) {', '.join(remotes)} are configured. A read cannot prove "
+            "freshness against an unknown upstream."
+        )
+
+    remote_name = upstream.split("/", 1)[0]
     try:
-        return path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return None
-    except OSError as exc:
-        raise ControlPlaneError(f"Cannot read {path}: {exc}") from exc
+        _git(repo_root, ["fetch", "--quiet", remote_name])
+    except ControlPlaneError as exc:
+        raise ControlPlaneError(
+            f"Cannot read control-plane state: coordination remote '{remote_name}' could not be "
+            f"fetched, so freshness is unproven. {exc}"
+        ) from exc
+
+    local = _git(repo_root, ["rev-parse", branch])
+    remote = _git(repo_root, ["rev-parse", upstream])
+    if local == remote:
+        return ReadSource(repo_root, remote, remote)
+    base = _git(repo_root, ["merge-base", branch, upstream], check=False)
+    if base == local:
+        # Behind upstream: serve the fetched state without moving anything local.
+        return ReadSource(repo_root, remote, remote)
+    if base == remote:
+        raise ControlPlaneError(
+            f"Cannot read control-plane state: '{branch}' has unpublished local commits ahead of "
+            f"{upstream}. Push them so the shared surface is authoritative, then read again."
+        )
+    raise ControlPlaneError(
+        f"Cannot read control-plane state: '{branch}' and {upstream} have diverged. "
+        "Reconcile the coordination repository before reading."
+    )
 
 
 def render_status(repo_root: Path, *, project: str, ticket: str) -> str:
     """Bounded orchestrator read: accepted state plus the rails that exist."""
-    scope = scope_directory(repo_root, project=project, ticket=ticket)
+    source = resolve_read_source(repo_root)
+    scope = scope_relative(project, ticket)
     lines = [
         "# Control Plane State",
         "",
-        f"scope: {project}/{ticket}",
-        f"head: {resolve_current_head(repo_root) or 'empty history'}",
+        f"scope: {scope}",
+        f"head: {source.head or 'empty history'}",
         "",
         "## Accepted State",
         "",
     ]
-    state = _read_text(scope / ARTIFACT_FILENAMES["state"])
+    state = source.read(artifact_relative(project=project, ticket=ticket, artifact="state", rail=None))
     lines.append(state.rstrip("\n") if state else "no accepted state published")
     lines.extend(["", "## Rails Present", ""])
-    rails_root = scope / "rails"
-    rail_dirs = sorted(path for path in rails_root.glob("*") if path.is_dir()) if rails_root.is_dir() else []
-    if not rail_dirs:
+    rail_ids = source.rails(scope)
+    if not rail_ids:
         lines.append("none")
-    for rail_dir in rail_dirs:
-        present = [name for name in ("rail", "handoff", "evidence") if (rail_dir / ARTIFACT_FILENAMES[name]).is_file()]
-        lines.append(f"- {rail_dir.name}: {', '.join(present) if present else 'empty'}")
+    for rail_id in rail_ids:
+        present = [
+            name
+            for name in ("rail", "handoff", "evidence")
+            if source.exists(artifact_relative(project=project, ticket=ticket, artifact=name, rail=rail_id))
+        ]
+        lines.append(f"- {rail_id}: {', '.join(present) if present else 'empty'}")
     return "\n".join(lines)
 
 
 def render_rail(repo_root: Path, *, project: str, ticket: str, rail: str) -> str:
     """Bounded executor read: one rail only, never siblings or accepted state."""
+    source = resolve_read_source(repo_root)
     rail_id = validate_identifier(rail, label="rail identifier")
-    rail_dir = scope_directory(repo_root, project=project, ticket=ticket) / "rails" / rail_id
-    authorization = _read_text(rail_dir / ARTIFACT_FILENAMES["rail"])
+
+    def relative(artifact: str) -> str:
+        return artifact_relative(project=project, ticket=ticket, artifact=artifact, rail=rail_id)
+
+    authorization = source.read(relative("rail"))
     if authorization is None:
-        raise ControlPlaneError(f"No authorized rail '{rail_id}' in {project}/{ticket}.")
-    handoff = _read_text(rail_dir / ARTIFACT_FILENAMES["handoff"])
+        raise ControlPlaneError(f"No authorized rail '{rail_id}' in {scope_relative(project, ticket)}.")
+    handoff = source.read(relative("handoff"))
     lines = [
         "# Control Plane Rail",
         "",
-        f"scope: {project}/{ticket}",
+        f"scope: {scope_relative(project, ticket)}",
         f"rail: {rail_id}",
-        f"head: {resolve_current_head(repo_root) or 'empty history'}",
-        f"provider evidence: {'present' if (rail_dir / ARTIFACT_FILENAMES['evidence']).is_file() else 'absent'}",
+        f"head: {source.head or 'empty history'}",
+        f"provider evidence: {'present' if source.exists(relative('evidence')) else 'absent'}",
         "",
         "## Authorization",
         "",
