@@ -28,8 +28,10 @@ path is Claude-specific.
 Read the orchestrator recommendation that `status` prints. If it identifies
 exactly one rail for this session, execute only that rail. If no rail is
 assigned, or the assignment is materially ambiguous — several rails recommended
-for launch with nothing distinguishing this session, or a status the helper
-flagged as unreconciled — stop and report what you read rather than guessing.
+for launch with nothing distinguishing this session, or durable state
+contradicting the recommendation in a way it does not explain — stop and report
+what you read rather than guessing. An unreconciled status the recommendation
+explains is normal on takeover, not a stop condition.
 
 ## Tasking Precedence
 

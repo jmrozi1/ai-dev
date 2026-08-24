@@ -74,6 +74,21 @@ class ClaudeActivationPointerTests(unittest.TestCase):
         self.assertIn("if no rail is assigned, or the assignment is materially ambiguous", self.pointer)
         self.assertIn("stop and report what you read rather than guessing", self.pointer)
 
+    def test_an_explained_unreconciled_status_is_not_a_stop_condition(self) -> None:
+        """Taking over a rail normally means reading an unaccepted proposed status."""
+        self.assertIn(
+            "an unreconciled status the recommendation explains is normal "
+            "on takeover, not a stop condition",
+            self.pointer,
+        )
+
+    def test_only_an_unexplained_contradiction_is_materially_ambiguous(self) -> None:
+        self.assertIn(
+            "durable state contradicting the recommendation in a way it "
+            "does not explain",
+            self.pointer,
+        )
+
     # Tasking precedence
 
     def test_configured_rail_outranks_local_tasking_file(self) -> None:
