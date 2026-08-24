@@ -363,7 +363,8 @@ for skill_file in skills/*/SKILL.md; do
       if [[ "$changed_path" == $trigger ]]; then
         skills_to_review+="$skill_name: review trigger $trigger matched ($changed_path)"$'\n'
       fi
-    done <<<"$triggers"
+    done <<<"$changed_paths"
+  done <<<"$triggers"
 done
 
 if [[ -n "${skills_to_review//[[:space:]]/}" ]]; then
