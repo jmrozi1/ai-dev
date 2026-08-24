@@ -207,6 +207,25 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.assertIn("the human always types bare `proceed`", self.orchestrator)
         self.assertIn("the user never types it", self.executor)
 
+    # Status reconciliation
+
+    def test_orchestrator_reconciles_flagged_rails_before_recommending(self) -> None:
+        self.assertIn("marks any rail where the two disagree as unreconciled", self.orchestrator)
+        self.assertIn("reconcile every unreconciled rail before you rely on its status", self.orchestrator)
+        self.assertIn(
+            "never recommend continuing, launching, or holding work on the strength of a status the helper has flagged",
+            self.orchestrator,
+        )
+
+    def test_orchestrator_accepts_by_updating_the_rail_not_by_inference(self) -> None:
+        self.assertIn("accepting an executor's proposal means updating the rail yourself", self.orchestrator)
+        self.assertIn("the helper will not promote it, and neither should you infer it from the handoff", self.orchestrator)
+
+    def test_executor_states_a_proposed_status_it_cannot_accept(self) -> None:
+        self.assertIn("state your rail's proposed status in your handoff", self.executor)
+        self.assertIn("that status is a proposal", self.executor)
+        self.assertIn("you never update the rail yourself", self.executor)
+
     # Negative boundaries
 
     def test_no_separate_shared_control_plane_skill_was_created(self) -> None:

@@ -399,6 +399,71 @@ class ControlPlaneTests(unittest.TestCase):
             render_status(self.coordination, project="ai-dev", ticket="issue-51")
         self.assertIn("contradictory", str(caught.exception))
 
+    # Rail authorization versus executor-proposed status
+
+    def _handoff(self, rail: str, status: str) -> None:
+        self._publish(
+            artifact="handoff", role="executor", rail=rail,
+            content=f"# Handoff: {rail}\n\nStatus: {status}\nOwner: executor\n\n## Evidence\n\nbounded\n",
+        )
+
+    def test_agreeing_rail_and_handoff_are_not_flagged(self) -> None:
+        self._authorize("rail-agreed", "completed")
+        self._handoff("rail-agreed", "completed")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("unreconciled rails: 0", rendered)
+        self.assertNotIn("UNRECONCILED", rendered)
+
+    def test_handoff_proposing_completion_is_conspicuously_unreconciled(self) -> None:
+        self._authorize("rail-drifted", "ready")
+        self._handoff("rail-drifted", "completed")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("unreconciled rails: 1 (rail-drifted)", rendered)
+        self.assertIn(
+            "UNRECONCILED: rail authorizes 'ready' but the handoff proposes 'completed'", rendered
+        )
+
+    def test_accepted_completion_contradicted_by_a_handoff_is_flagged(self) -> None:
+        self._authorize("rail-contradicted", "completed")
+        self._handoff("rail-contradicted", "blocked")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("unreconciled rails: 1 (rail-contradicted)", rendered)
+        self.assertIn("rail authorizes 'completed' but the handoff proposes 'blocked'", rendered)
+
+    def test_handoff_status_is_never_promoted_into_rail_status(self) -> None:
+        self._authorize("rail-drifted", "ready")
+        self._handoff("rail-drifted", "completed")
+        state = self._states()["rail-drifted"]
+        self.assertEqual(state.status, "ready")  # type: ignore[attr-defined]
+        self.assertEqual(state.proposed_status, "completed")  # type: ignore[attr-defined]
+        self.assertTrue(state.unreconciled)  # type: ignore[attr-defined]
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("- rail-drifted: ready; artifacts: rail, handoff", rendered)
+
+    def test_rail_without_a_handoff_is_not_flagged(self) -> None:
+        self._authorize("rail-running", "running")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("unreconciled rails: 0", rendered)
+
+    def test_malformed_handoff_status_is_flagged_without_breaking_other_rails(self) -> None:
+        self._authorize("rail-broken", "running")
+        self._publish(artifact="handoff", role="executor", rail="rail-broken",
+                      content="# Handoff\n\nStatus: mostly-done\n\n## Evidence\n\nbounded\n")
+        self._authorize("rail-healthy", "ready")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("the handoff proposes 'unrecognized'", rendered)
+        self.assertIn("- rail-healthy: ready; artifacts: rail", rendered)
+
+    def test_one_unreconciled_rail_does_not_hide_the_others(self) -> None:
+        self._authorize("rail-drifted", "ready")
+        self._handoff("rail-drifted", "completed")
+        self._authorize("rail-clean", "running")
+        self._authorize("rail-waiting", "blocked")
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn("unreconciled rails: 1 (rail-drifted)", rendered)
+        self.assertIn("- rail-clean: running; artifacts: rail", rendered)
+        self.assertIn("- rail-waiting: blocked; artifacts: rail", rendered)
+
     # Fresh reads: a stale clone must never serve stale authorization
 
     def _publish_from_upstream(self, upstream: Path, **overrides: object) -> None:

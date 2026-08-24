@@ -48,6 +48,11 @@ authorization. Propose the change and let the orchestrator decide.
 A published handoff is bounded current state. Replace it. Never append to it, and
 never let it become a transcript, message log, or execution diary.
 
+State your rail's proposed status in your handoff so any disagreement with the
+authorized status is visible rather than silent. That status is a proposal; the
+orchestrator accepts it by updating the rail, and you never update the rail
+yourself.
+
 Executor identity is disposable; the rail is durable. You may be taking over a
 rail a previous executor started. Treat any published handoff as current state to
 continue from rather than as your own memory, and do not assume you authored it.

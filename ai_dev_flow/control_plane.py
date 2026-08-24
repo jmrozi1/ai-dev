@@ -633,12 +633,19 @@ class RailState:
         artifacts: list[str],
         depends_on: list[str],
         shared_resource: str | None,
+        proposed_status: str | None = None,
     ) -> None:
         self.identifier = identifier
         self.status = status
         self.artifacts = artifacts
         self.depends_on = depends_on
         self.shared_resource = shared_resource
+        # What the executor's handoff claims. Evidence, never acceptance.
+        self.proposed_status = proposed_status
+
+    @property
+    def unreconciled(self) -> bool:
+        return self.proposed_status is not None and self.proposed_status != self.status
 
 
 def _parse_rail_header(text: str, *, rail_id: str) -> tuple[str, list[str], str | None]:
@@ -681,6 +688,26 @@ def _parse_rail_header(text: str, *, rail_id: str) -> tuple[str, list[str], str 
     return status, depends_on, resource
 
 
+def _parse_handoff_status(text: str | None) -> str | None:
+    """Read the status a handoff proposes, without letting it break the read.
+
+    A handoff is executor-authored evidence. Malformed or absent status is
+    reported as unrecognized rather than raising, so one executor cannot block
+    the orchestrator from reading every other rail.
+    """
+    if text is None:
+        return None
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            break
+        key, separator, value = stripped.partition(":")
+        if separator and key.strip().lower() == "status":
+            candidate = value.strip().lower()
+            return candidate if candidate in RAIL_STATUSES else "unrecognized"
+    return None
+
+
 def collect_rail_states(source: ReadSource, *, project: str, ticket: str) -> list[RailState]:
     """Surface every rail's current status, dependencies, and shared resource.
 
@@ -703,7 +730,8 @@ def collect_rail_states(source: ReadSource, *, project: str, ticket: str) -> lis
             )
         status, depends_on, resource = _parse_rail_header(authorization, rail_id=rail_id)
         artifacts = [name for name in ("rail", "handoff", "evidence") if source.exists(relative(name))]
-        states.append(RailState(rail_id, status, artifacts, depends_on, resource))
+        proposed = _parse_handoff_status(source.read(relative("handoff")))
+        states.append(RailState(rail_id, status, artifacts, depends_on, resource, proposed))
 
     known = {state.identifier for state in states}
     for state in states:
@@ -743,6 +771,11 @@ def _render_rail_index(states: list[RailState]) -> list[str]:
     for state in states:
         artifacts = ", ".join(state.artifacts) if state.artifacts else "none"
         lines.append(f"- {state.identifier}: {state.status}; artifacts: {artifacts}")
+        if state.unreconciled:
+            lines.append(
+                f"    UNRECONCILED: rail authorizes '{state.status}' but the handoff proposes "
+                f"'{state.proposed_status}'; the orchestrator must reconcile before relying on this status"
+            )
         if state.depends_on:
             rendered = ", ".join(
                 f"{name} ({by_identifier[name].status})" for name in state.depends_on
@@ -781,6 +814,10 @@ def render_status(repo_root: Path, *, project: str, ticket: str) -> str:
     lines.append(state.rstrip("\n") if state else "no accepted state published")
     lines.extend(["", "## Rails Present", ""])
     states = collect_rail_states(source, project=project, ticket=ticket)
+    unreconciled = [state.identifier for state in states if state.unreconciled]
+    lines.insert(4, f"unreconciled rails: {len(unreconciled)}" + (
+        f" ({', '.join(unreconciled)})" if unreconciled else ""
+    ))
     if not states:
         lines.append("none")
     else:

@@ -220,6 +220,14 @@ whether those dependencies are satisfied, and shared-resource contention. Those
 are facts. Deciding what to launch, continue, or hold is your judgment and stays
 out of the helper.
 
+A rail's authorized status is what you wrote. A handoff's status is what the
+executor proposes, and the helper marks any rail where the two disagree as
+unreconciled. Reconcile every unreconciled rail before you rely on its status:
+never recommend continuing, launching, or holding work on the strength of a
+status the helper has flagged. Accepting an executor's proposal means updating
+the rail yourself; the helper will not promote it, and neither should you infer
+it from the handoff.
+
 ### Handoff Indicator
 
 The human always types bare `proceed`. A displayed `proceed N` is only a
