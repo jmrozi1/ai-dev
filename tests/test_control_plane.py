@@ -171,13 +171,103 @@ class ControlPlaneTests(unittest.TestCase):
         self._git(upstream, "add", "remote-change.txt")
         self._git(upstream, "commit", "-q", "-m", "remote advance")
 
-    def test_upstream_ahead_fails_closed_using_freshly_fetched_state(self) -> None:
-        upstream = self._attach_shared_upstream("upstream-ahead")
+    def test_clean_strictly_behind_clone_reconciles_itself_and_publishes(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind")
         # The remote moves after the local repository last observed it.
         self._advance_upstream(upstream)
+        remote_head = self._git(upstream, "rev-parse", "HEAD")
+
+        target, head = self._publish(artifact="handoff", role="executor", content="# Handoff\n\nbehind\n")
+
+        self.assertEqual(target.read_text(encoding="utf-8"), "# Handoff\n\nbehind\n")
+        self.assertEqual(head, resolve_current_head(self.coordination))
+        # Publication landed on the freshly resolved upstream state, by fast-forward only.
+        self.assertEqual(self._git(self.coordination, "rev-parse", "HEAD~1"), remote_head)
+        self.assertTrue((self.coordination / "remote-change.txt").exists())
+
+    def test_behind_publication_reads_the_state_the_remote_actually_holds(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-content")
+        self._publish_from_upstream(upstream)
+        remote_head = self._git(upstream, "rev-parse", "HEAD")
+
+        # The read reports the remote head, and publication against it now succeeds
+        # without a human fast-forwarding in between.
+        rendered = render_status(self.coordination, project="ai-dev", ticket="issue-51")
+        self.assertIn(f"head: {remote_head}", rendered)
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n", expected_head=remote_head)
+        self.assertEqual(self._git(self.coordination, "rev-parse", "HEAD~1"), remote_head)
+
+    def test_dirty_behind_clone_fails_closed_without_reconciling(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-dirty")
+        self._advance_upstream(upstream)
+        (self.coordination / "README.md").write_text("locally edited\n", encoding="utf-8")
+        local_head = resolve_current_head(self.coordination)
+
         with self.assertRaises(ControlPlaneError) as caught:
             self._publish(artifact="handoff", role="executor", content="# Handoff\n")
-        self.assertIn("is ahead of main", str(caught.exception))
+        self.assertIn("uncommitted or untracked changes", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), local_head)
+        self.assertFalse((self.coordination / "remote-change.txt").exists())
+
+    def test_untracked_file_blocks_automatic_reconciliation(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-untracked")
+        self._advance_upstream(upstream)
+        (self.coordination / "stray.txt").write_text("stray\n", encoding="utf-8")
+        local_head = resolve_current_head(self.coordination)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+        self.assertIn("uncommitted or untracked changes", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), local_head)
+
+    def test_active_git_operation_blocks_automatic_reconciliation(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-mid-operation")
+        self._advance_upstream(upstream)
+        git_dir = Path(self._git(self.coordination, "rev-parse", "--absolute-git-dir"))
+        (git_dir / "MERGE_HEAD").write_text(f"{resolve_current_head(self.coordination)}\n", encoding="utf-8")
+        local_head = resolve_current_head(self.coordination)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+        self.assertIn("MERGE_HEAD", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), local_head)
+        self.assertFalse((self.coordination / "remote-change.txt").exists())
+
+    def test_failed_fast_forward_fails_closed_without_publishing(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-non-ff")
+        self._advance_upstream(upstream)
+        local_head = resolve_current_head(self.coordination)
+        real_capture = control_plane._git_capture
+
+        def refuse_merge(repo_root, arguments, **kwargs):  # type: ignore[no-untyped-def]
+            if arguments and arguments[0] == "merge":
+                return subprocess.CompletedProcess(arguments, 1, "", "fatal: Not possible to fast-forward")
+            return real_capture(repo_root, arguments, **kwargs)
+
+        with patch.object(control_plane, "_git_capture", side_effect=refuse_merge):
+            with self.assertRaises(ControlPlaneError) as caught:
+                self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+        self.assertIn("could not be fast-forwarded", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), local_head)
+        self.assertEqual(self._git(self.coordination, "status", "--porcelain"), "")
+
+    def test_behind_publication_fails_closed_when_the_remote_cannot_be_fetched(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-unreachable")
+        self._advance_upstream(upstream)
+        self._git(self.coordination, "remote", "set-url", "origin", str(self.tmp_path / "does-not-exist"))
+        local_head = resolve_current_head(self.coordination)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+        self.assertIn("could not be fetched", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), local_head)
+
+    def test_local_ahead_publication_still_builds_on_local_history(self) -> None:
+        self._attach_shared_upstream("upstream-behind-local-ahead")
+        _, first = self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+        _, second = self._publish(artifact="handoff", role="executor", content="# Handoff\n\nsecond\n")
+        self.assertEqual(self._git(self.coordination, "rev-parse", "HEAD~1"), first)
+        self.assertEqual(resolve_current_head(self.coordination), second)
 
     def test_diverged_upstream_fails_closed(self) -> None:
         upstream = self._attach_shared_upstream("upstream-diverged")

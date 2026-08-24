@@ -449,8 +449,80 @@ def resolve_current_head(repo_root: Path) -> str:
     return _git(repo_root, ["rev-parse", "HEAD"], check=False) or ""
 
 
+# A Git operation in progress means the checkout is mid-edit, so no state it reports
+# is a settled answer about what publication would land on.
+ACTIVE_OPERATION_MARKERS = (
+    "MERGE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "BISECT_LOG",
+    "rebase-merge",
+    "rebase-apply",
+    "sequencer",
+)
+
+
+def active_git_operation(repo_root: Path) -> str | None:
+    """Name the in-progress Git operation, if any, so publication can refuse to guess."""
+    git_dir = _git(repo_root, ["rev-parse", "--git-dir"], check=False)
+    if not git_dir:
+        return None
+    root = Path(git_dir)
+    if not root.is_absolute():
+        root = repo_root / root
+    for marker in ACTIVE_OPERATION_MARKERS:
+        if (root / marker).exists():
+            return marker
+    return None
+
+
+def worktree_is_clean(repo_root: Path) -> bool:
+    """Report whether the checkout carries no staged, unstaged, or untracked change."""
+    completed = _git_capture(repo_root, ["status", "--porcelain", "--untracked-files=all"])
+    if completed.returncode != 0:
+        raise ControlPlaneError(f"Cannot inspect the coordination checkout: {completed.stderr.strip()}")
+    return not completed.stdout.strip()
+
+
+def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, remote_head: str) -> None:
+    """Fast-forward a clean, strictly behind branch onto freshly fetched upstream state.
+
+    This is the one unambiguous case: nothing local is at stake, so requiring a human
+    to type the same fast-forward adds no judgment. Every other shape still fails
+    closed, and the advance itself is fast-forward only, never a rebase, merge, or reset.
+    """
+    operation = active_git_operation(repo_root)
+    if operation is not None:
+        raise ControlPlaneError(
+            f"Cannot publish: coordination upstream {upstream} is ahead of {branch}, but a Git "
+            f"operation ({operation}) is in progress. Finish or abort it, then republish."
+        )
+    if not worktree_is_clean(repo_root):
+        raise ControlPlaneError(
+            f"Cannot publish: coordination upstream {upstream} is ahead of {branch}, but the "
+            "coordination checkout has uncommitted or untracked changes. Clear them, then "
+            "republish."
+        )
+
+    advanced = _git_capture(repo_root, ["merge", "--ff-only", "--quiet", upstream])
+    if advanced.returncode != 0:
+        raise ControlPlaneError(
+            f"Cannot publish: {branch} could not be fast-forwarded to {upstream}. "
+            f"{advanced.stderr.strip() or advanced.stdout.strip()}"
+        )
+    if _git(repo_root, ["rev-parse", branch]) != remote_head:
+        raise ControlPlaneError(
+            f"Cannot publish: {branch} did not land on {upstream} after fast-forwarding. "
+            "Re-read the current state and republish against it."
+        )
+
+
 def ensure_publishable(repo_root: Path) -> str:
-    """Freshly resolve remote state and refuse to publish onto stale history."""
+    """Freshly resolve remote state and refuse to publish onto stale history.
+
+    A clean, strictly behind branch is reconciled by fast-forward first, so publication
+    lands on the freshly resolved upstream state rather than on stale history.
+    """
     branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
     upstream = _tracked_upstream(repo_root, branch) if branch and branch != "HEAD" else None
     if upstream is not None:
@@ -466,11 +538,10 @@ def ensure_publishable(repo_root: Path) -> str:
         if local_head != remote_head:
             base = _git(repo_root, ["merge-base", branch, upstream], check=False)
             if base == local_head:
-                raise ControlPlaneError(
-                    f"Cannot publish: coordination upstream {upstream} is ahead of {branch}. "
-                    "Re-read the current state and reconcile before republishing."
+                _reconcile_strictly_behind(
+                    repo_root, branch=branch, upstream=upstream, remote_head=remote_head
                 )
-            if base != remote_head:
+            elif base != remote_head:
                 raise ControlPlaneError(
                     f"Cannot publish: {branch} and {upstream} have diverged. "
                     "Re-read the current state and reconcile before republishing."
