@@ -9,6 +9,7 @@ import unittest
 from ai_dev_flow.control_plane import (
     ControlPlaneError,
     publish,
+    resolve_control_plane_config,
     render_rail,
     render_status,
     resolve_coordination_repo,
@@ -274,6 +275,65 @@ class ControlPlaneTests(unittest.TestCase):
         self.assertEqual(resolve_current_head(product), product_head)
         self.assertEqual(self._git(product, "status", "--porcelain"), "")
         self.assertEqual(self._git(product, "rev-parse", "--abbrev-ref", "HEAD"), "main")
+
+    # Configuration discovery: a fresh agent must find its coordination repository
+
+    def _product_repo(self, control_plane: dict[str, object] | None, *, active_issue: int | None = 51) -> Path:
+        self._product_repo_count = getattr(self, "_product_repo_count", 0) + 1
+        product = self._init_repo(f"configured-product-{self._product_repo_count}")
+        config: dict[str, object] = {"tickets": {"provider": "github", "repository": "owner/name"}}
+        if control_plane is not None:
+            config["controlPlane"] = control_plane
+        (product / ".ai-dev").mkdir(parents=True, exist_ok=True)
+        (product / ".ai-dev" / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        state: dict[str, object] = {"mainBranch": "main", "scratchBranch": "scratch", "checkpoint": 0}
+        if active_issue is not None:
+            state["activeIssueNumber"] = active_issue
+        (product / ".ai-dev" / "workflow.json").write_text(json.dumps(state), encoding="utf-8")
+        return product
+
+    def test_unconfigured_repository_reports_no_control_plane(self) -> None:
+        product = self._product_repo(None)
+        self.assertIsNone(resolve_control_plane_config(product))
+
+    def test_configured_repository_resolves_scope_without_conversation(self) -> None:
+        product = self._product_repo({"repository": str(self.coordination), "project": "ai-dev"})
+        configured = resolve_control_plane_config(product)
+        self.assertIsNotNone(configured)
+        assert configured is not None
+        self.assertEqual(configured.repository, self.coordination)
+        self.assertEqual(configured.project, "ai-dev")
+        self.assertEqual(configured.ticket, "issue-51")
+
+    def test_explicit_ticket_overrides_the_active_issue(self) -> None:
+        product = self._product_repo(
+            {"repository": str(self.coordination), "project": "ai-dev", "ticket": "issue-77"}
+        )
+        configured = resolve_control_plane_config(product)
+        assert configured is not None
+        self.assertEqual(configured.ticket, "issue-77")
+
+    def test_relative_coordination_path_resolves_against_the_product_repository(self) -> None:
+        product = self._product_repo({"repository": "../coordination", "project": "ai-dev"})
+        configured = resolve_control_plane_config(product)
+        assert configured is not None
+        self.assertEqual(configured.repository, self.coordination)
+
+    def test_incomplete_or_unknown_configuration_fails_closed(self) -> None:
+        for block in (
+            {"project": "ai-dev"},
+            {"repository": str(self.coordination)},
+            {"repository": str(self.coordination), "project": "ai-dev", "extra": "value"},
+            {"repository": "", "project": "ai-dev"},
+        ):
+            with self.subTest(block=block), self.assertRaises(ControlPlaneError):
+                resolve_control_plane_config(self._product_repo(block))
+
+    def test_missing_ticket_without_active_issue_fails_closed(self) -> None:
+        product = self._product_repo({"repository": str(self.coordination), "project": "ai-dev"}, active_issue=None)
+        with self.assertRaises(ControlPlaneError) as caught:
+            resolve_control_plane_config(product)
+        self.assertIn("ticket is required", str(caught.exception))
 
     def test_non_repository_path_is_refused(self) -> None:
         plain = self.tmp_path / "plain"

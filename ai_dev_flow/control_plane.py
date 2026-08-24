@@ -10,7 +10,13 @@ import subprocess
 import sys
 from typing import Any, Iterable
 
-from .json_files import JsonFileError, write_text_atomic
+from .json_files import JsonFileError, load_json_object, write_text_atomic
+from .repository import (
+    RepositoryError,
+    config_file_for_repo_root,
+    resolve_repo_root,
+    workflow_state_file_for_repo_root,
+)
 
 
 class ControlPlaneError(Exception):
@@ -56,6 +62,72 @@ EVIDENCE_DENIED_KEYS = frozenset({
     "output", "stdout", "stderr", "transcript", "transcripts", "log", "logs",
     "telemetry", "toolResult", "toolResults", "diagnostics", "content",
 })
+
+
+CONTROL_PLANE_CONFIG_KEY = "controlPlane"
+CONFIG_ALLOWED_KEYS = frozenset({"repository", "project", "ticket"})
+
+
+class ControlPlaneConfig:
+    """Where this product repository's coordination state lives."""
+
+    def __init__(self, repository: Path, project: str, ticket: str) -> None:
+        self.repository = repository
+        self.project = project
+        self.ticket = ticket
+
+
+def _derive_ticket(product_repo_root: Path) -> str | None:
+    try:
+        state = load_json_object(workflow_state_file_for_repo_root(product_repo_root), missing_default={})
+    except JsonFileError:
+        return None
+    issue_number = state.get("activeIssueNumber")
+    if isinstance(issue_number, int) and not isinstance(issue_number, bool) and issue_number > 0:
+        return f"issue-{issue_number}"
+    return None
+
+
+def resolve_control_plane_config(product_repo_root: Path) -> ControlPlaneConfig | None:
+    """Return the configured control plane, or None when none is configured.
+
+    A fresh agent must be able to find its coordination repository without being
+    told in conversation. No configuration means the repository-local tasking
+    rail remains the assignment; that is a supported outcome, not an error.
+    """
+    config_path = config_file_for_repo_root(product_repo_root)
+    try:
+        payload = load_json_object(config_path, missing_default={})
+    except JsonFileError as exc:
+        raise ControlPlaneError(str(exc)) from exc
+    block = payload.get(CONTROL_PLANE_CONFIG_KEY)
+    if block is None:
+        return None
+    if not isinstance(block, dict):
+        raise ControlPlaneError(f"Invalid {CONTROL_PLANE_CONFIG_KEY} in {config_path}: expected an object.")
+    unknown = sorted(set(block) - CONFIG_ALLOWED_KEYS)
+    if unknown:
+        raise ControlPlaneError(
+            f"Invalid {CONTROL_PLANE_CONFIG_KEY} in {config_path}: unknown key(s): {', '.join(unknown)}."
+        )
+    repository = block.get("repository")
+    if not isinstance(repository, str) or not repository.strip():
+        raise ControlPlaneError(f"Invalid {CONTROL_PLANE_CONFIG_KEY} in {config_path}: repository is required.")
+    project = block.get("project")
+    if not isinstance(project, str) or not project.strip():
+        raise ControlPlaneError(f"Invalid {CONTROL_PLANE_CONFIG_KEY} in {config_path}: project is required.")
+    ticket = block.get("ticket")
+    if ticket is None:
+        ticket = _derive_ticket(product_repo_root)
+    if not isinstance(ticket, str) or not ticket.strip():
+        raise ControlPlaneError(
+            f"Invalid {CONTROL_PLANE_CONFIG_KEY} in {config_path}: ticket is required when no "
+            "active issue workflow can supply it."
+        )
+    resolved = Path(repository.strip()).expanduser()
+    if not resolved.is_absolute():
+        resolved = (product_repo_root / resolved).resolve()
+    return ControlPlaneConfig(resolved, validate_identifier(project, label="project"), validate_identifier(ticket, label="ticket"))
 
 
 def _git(repo_root: Path, arguments: list[str], *, check: bool = True) -> str:
@@ -376,9 +448,9 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     def add_scope(subparser: argparse.ArgumentParser) -> None:
-        subparser.add_argument("--repo", required=True, help="Path to the coordination repository.")
-        subparser.add_argument("--project", required=True, help="Stable project identifier.")
-        subparser.add_argument("--ticket", required=True, help="Stable ticket identifier.")
+        subparser.add_argument("--repo", help="Coordination repository path; defaults to the configured control plane.")
+        subparser.add_argument("--project", help="Stable project identifier; defaults to the configured control plane.")
+        subparser.add_argument("--ticket", help="Stable ticket identifier; defaults to the configured control plane.")
 
     status_parser = subparsers.add_parser("status", help="Print accepted state and the rail index.")
     add_scope(status_parser)
@@ -394,18 +466,60 @@ def _build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--file", required=True, help="File holding the current content to publish.")
     publish_parser.add_argument("--rail", help="Stable semantic rail identifier for rail-scoped artifacts.")
     publish_parser.add_argument("--expected-head", help="Head the caller last read; publication fails closed if stale.")
+
+    config_parser = subparsers.add_parser("config", help="Report whether a control plane is configured here.")
+    config_parser.add_argument("--repo", help=argparse.SUPPRESS)
+    config_parser.add_argument("--project", help=argparse.SUPPRESS)
+    config_parser.add_argument("--ticket", help=argparse.SUPPRESS)
     return parser
+
+
+def _resolve_scope(arguments: argparse.Namespace) -> tuple[Path, str, str]:
+    """Prefer explicit arguments; otherwise discover the configured control plane."""
+    repo, project, ticket = arguments.repo, arguments.project, arguments.ticket
+    if not (repo and project and ticket):
+        try:
+            product_root = resolve_repo_root()
+        except RepositoryError as exc:
+            raise ControlPlaneError(
+                "No control-plane scope was supplied and the current directory is not "
+                f"inside a repository. {exc}"
+            ) from exc
+        configured = resolve_control_plane_config(product_root)
+        if configured is None:
+            raise ControlPlaneError(
+                f"No control plane is configured in {config_file_for_repo_root(product_root)}. "
+                "Use the repository-local tasking rail, or supply --repo, --project, and --ticket."
+            )
+        repo = repo or str(configured.repository)
+        project = project or configured.project
+        ticket = ticket or configured.ticket
+    return resolve_coordination_repo(Path(repo).expanduser()), project, ticket
 
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
-    repo_root = resolve_coordination_repo(Path(arguments.repo).expanduser())
+
+    if arguments.command == "config":
+        product_root = resolve_repo_root()
+        configured = resolve_control_plane_config(product_root)
+        if configured is None:
+            print("control plane: not configured")
+            print(f"rail: {product_root / '.ai-dev' / 'tasking.md'}")
+            return 0
+        print("control plane: configured")
+        print(f"repository: {configured.repository}")
+        print(f"project: {configured.project}")
+        print(f"ticket: {configured.ticket}")
+        return 0
+
+    repo_root, project, ticket = _resolve_scope(arguments)
 
     if arguments.command == "status":
-        print(render_status(repo_root, project=arguments.project, ticket=arguments.ticket))
+        print(render_status(repo_root, project=project, ticket=ticket))
         return 0
     if arguments.command == "rail":
-        print(render_rail(repo_root, project=arguments.project, ticket=arguments.ticket, rail=arguments.rail))
+        print(render_rail(repo_root, project=project, ticket=ticket, rail=arguments.rail))
         return 0
 
     source = Path(arguments.file).expanduser()
@@ -415,8 +529,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ControlPlaneError(f"Cannot read {source}: {exc}") from exc
     target, head = publish(
         repo_root,
-        project=arguments.project,
-        ticket=arguments.ticket,
+        project=project,
+        ticket=ticket,
         artifact=arguments.artifact,
         role=arguments.role,
         content=content,
@@ -431,7 +545,7 @@ def main(argv: list[str] | None = None) -> int:
 def run() -> None:
     try:
         status = main()
-    except ControlPlaneError as exc:
+    except (ControlPlaneError, RepositoryError) as exc:
         print(f"control-plane: {exc}", file=sys.stderr)
         status = 1
     raise SystemExit(status)
