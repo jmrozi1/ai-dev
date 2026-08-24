@@ -1,6 +1,6 @@
 ---
 name: auto-review
-description: Execute approved AI Dev review evidence gathering and recording mechanics.
+description: Execute approved AI Dev review evidence gathering and recording mechanics, including active-ticket skill candidate and accepted skill state.
 ---
 
 # Copilot Auto-Review
@@ -16,11 +16,11 @@ owner.
   review stage before acting.
 - Run the deterministic evidence helper before review work:
   `skills/copilot/auto-review/scripts/review-evidence --mode checkpoint|promotion`.
-- Inspect the changed files, tests, workflow state, and command output named by
-  the active review contract.
+- Inspect the changed files, tests, workflow state, ticket skill state, and
+  command output named by the active review contract.
 - Load or invoke the review skills that the approved task says are applicable.
-  Report concrete evidence, test results, and findings without silently
-  broadening applicability.
+  Report concrete evidence, test results, candidate/skill section contents, and
+  findings without silently broadening applicability.
 - Preserve the distinction between observed evidence and review judgment.
 - Execute the approved recording mechanics only when the task explicitly
   authorizes recording a pass and the required SHA/workflow identity checks
@@ -29,12 +29,35 @@ owner.
 ## Review Composition
 
 For checkpoint review, gather the evidence required by `review-process` and
-return the concrete process observations to the review owner.
+return the concrete process observations to the review owner. Include the active
+ticket's `Skill Candidates` and `Skills` sections when an issue workflow provides
+them. When a legacy ticket lacks either section, report the missing section
+explicitly; do not convert absence into `None` or infer that no skill work exists.
 
-For promotion review, gather cumulative evidence first. Execute only the
-candidate reviews the task has authorized after applicability is decided. Do not
-load `frontend-design-review` merely because it is configured; the issue
-surface must show relevant GUI or front-end design work.
+For promotion review, gather cumulative evidence first, including the current
+skill-candidate and accepted-skill ticket state. Execute only the candidate
+reviews the task has authorized after applicability is decided. Do not load
+`frontend-design-review` merely because it is configured; the issue surface must
+show relevant GUI or front-end design work.
+
+Copilot does not decide whether a candidate stays, is rejected, is promoted into
+`Skills`, or whether accepted skill work is sufficient. Those judgments belong
+to `review-process` / `skill-authoring` under the ChatGPT review owner. Copilot
+may edit ticket sections only when the active task provides the exact approved
+disposition or updated content.
+
+## Ticket Skill-State Evidence
+
+`review-evidence` should provide one compact `Ticket Skill State` section for
+active issue workflows. It should surface, without interpretation:
+
+- the current `Skill Candidates` section body;
+- the current `Skills` section body;
+- an explicit missing-section diagnostic for legacy tickets;
+- an explicit unavailable diagnostic when the active ticket cannot be read.
+
+Do not emit the entire ticket body merely to expose these sections. Do not turn
+the evidence helper into a ticket mutator or skill-disposition engine.
 
 ## Copilot Token Telemetry Evidence
 
@@ -143,10 +166,11 @@ match the current state. This checkpoint does not alter that requirement.
 ### Recording Authorization
 
 Do not record a promotion pass based only on successful commands. The active
-task must authorize that decision, every applicable review must have passed, and
+task must authorize that decision, every applicable review must have passed,
+ticket skill state must have been judged closure-ready by the review owner, and
 the recorder must bind the result to the current scratch SHA and workflow
-identity. Do not invent review policy, add candidates, or convert a failed or
-ambiguous result into a pass.
+identity. Do not invent review policy, add candidate dispositions, or convert a
+failed or ambiguous result into a pass.
 
 ## Shared Mechanics
 

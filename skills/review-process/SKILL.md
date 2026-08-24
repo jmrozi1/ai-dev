@@ -1,6 +1,6 @@
 ---
 name: review-process
-description: Review how an in-progress issue is being worked; decide whether approach, decomposition, and evidence strategy need adjustment. Atomic process-review judgment independent of lifecycle automation.
+description: Review how an in-progress issue is being worked; decide whether approach, decomposition, evidence strategy, and reusable skill investment need adjustment. Atomic process-review judgment independent of lifecycle automation.
 ---
 
 # Process Review Skill
@@ -31,8 +31,9 @@ should be worked differently. Look for these failure modes:
 - **Wasted effort:** avoidable rediscovery, repeated searching, re-reading known
   state, or repeated failed approaches that reveal a process problem rather than
   a bug.
-- **Skill opportunity:** a new skill would materially reduce recurring friction,
-  or observed behavior no longer matches an existing skill.
+- **Skill opportunity:** a new or refined skill could materially reduce recurring
+  friction, preserve reusable operational knowledge, or make observed behavior
+  match the intended process.
 
 As a cheap part of each checkpoint review, record only what is observable and
 useful about materially used skills, missing or irrelevant activation,
@@ -40,11 +41,56 @@ interventions, repeated approaches, rediscovery, permission friction, scope
 drift, and similar process friction. Skill use alone is not evidence of a
 deficiency; do not deep-review every loaded skill.
 
-If that evidence suggests a substantive skill-definition problem rather than
-executor noncompliance, ambiguous tasking, provider permission, or an isolated
-failure, recommend or escalate a focused `skill-authoring` review. Otherwise
-return no skill action. Do not duplicate the `skill-authoring` judgment model
-here.
+### Skill Candidates
+
+The active ticket's `Skill Candidates` section is the durable hypothesis surface
+for reusable skill investment discovered while working that ticket.
+
+At every named checkpoint review:
+
+- read the current `Skill Candidates` and `Skills` sections when an active ticket
+  exists;
+- use current process evidence and tasking process notes to add a new candidate
+  only when the observation may plausibly deserve reusable skill work;
+- reassess every unresolved candidate against the new checkpoint evidence;
+- keep a candidate when evidence is still insufficient for a final disposition;
+- retire it with a concise `no skill` disposition when evidence shows the issue
+  is isolated, adequately handled elsewhere, or not a skill-definition problem;
+- escalate to `skill-authoring` when the evidence supports a substantive
+  create/refine/no-action decision rather than a merely provisional candidate.
+
+Do not use a numeric threshold such as a required observation count. Candidate
+maturity is a judgment about recurrence, cost, risk, and reusability. One severe
+failure can be sufficient evidence; many tiny annoyances may still warrant no
+skill.
+
+Keep candidates compact. Preserve the originating checkpoint or observation,
+the material evidence, and current assessment only far enough to support later
+reassessment. Do not turn the ticket into an investigation transcript.
+
+### Accepted Skills
+
+When `skill-authoring` accepts a candidate for skill creation or refinement, move
+that investment into the ticket's `Skills` section. Record the skill or capability
+being changed, the originating candidate/checkpoint, the accepted action, and its
+current implementation/dogfood result.
+
+Accepted skill work is checkpoint-review remediation. Complete and dogfood it
+against the friction that justified the investment before advancing to the next
+named product checkpoint. The skill work may create additional Flow checkpoint
+commits without advancing the ticket's named roadmap. If the work cannot be
+completed because of a real permission, scope, dependency, or repository-boundary
+blocker, escalate it rather than silently moving on.
+
+If the accepted skill is owned by another repository, keep the originating ticket
+as the durable accounting surface and record the owning repository/change
+reference and dogfood result there. Do not duplicate the canonical skill into the
+product repository merely to keep the work local.
+
+If evidence suggests a substantive skill-definition problem rather than executor
+noncompliance, ambiguous tasking, provider permission, or an isolated failure,
+recommend or escalate a focused `skill-authoring` review. Otherwise return no
+skill action. Do not duplicate the `skill-authoring` judgment model here.
 
 Do not turn checkpoint review into an implementation or code review. Inspect
 changed code only far enough to judge process, and stop there.
@@ -70,6 +116,19 @@ Assess:
 - skills and reusable knowledge discovered;
 - explicit `no process change warranted` when the process went well.
 
+Before promotion review can pass, perform a final skill-candidate disposition:
+
+- every remaining `Skill Candidates` entry must either have an explicit final
+  `no skill` disposition or be promoted through `skill-authoring` into `Skills`;
+- no accepted `Skills` entry may remain pending or in progress;
+- accepted skill work must include sufficient implementation and dogfood evidence
+  to show the originating friction was actually addressed.
+
+Missing `Skill Candidates` or `Skills` sections on a legacy active ticket are a
+normalization finding, not evidence that no candidates or skills exist. Add the
+smallest correct sections before promotion instead of treating absence as empty
+state.
+
 ## Evidence
 
 Prefer the smallest evidence surface that supports the judgment. Useful evidence
@@ -80,10 +139,11 @@ includes:
 - changed file paths;
 - current tasking state;
 - the concise executor or orchestrator handoff;
-- compact current-state process notes.
+- compact current-state process notes;
+- the active ticket's `Skill Candidates` and `Skills` sections;
 - the compact AI usage report when an issue usage summary is available. Treat
   usage as a process signal, not a verdict: high usage alone does not prove
-  inefficiency, and low usage alone does not prove good execution.
+  inefficiency, and low usage alone does not prove good execution;
 - unavailable or unattributable usage is not zero. Usage variance matters only
   when actual and expected values use compatible provider-native units and
   scope. Process conclusions about complexity, rediscovery, decomposition,
@@ -101,7 +161,14 @@ feel thorough.
 Process review depends on process evidence that code and Git state do not carry.
 Read the compact current-state process notes on the tasking rail; they exist so
 a reviewer who did not do the work can still see avoidable interventions, repeated
-approaches, and friction. Treat them as current state, not history.
+approaches, and friction. Treat them as unclassified current observations, not
+history or the canonical skill-candidate ledger.
+
+Once checkpoint review classifies an observation into the ticket's `Skill
+Candidates` or `Skills` section, remove the duplicate classified observation from
+tasking process notes on the next rail rewrite. The ticket owns reviewed skill
+investment state; the tasking file carries only current execution observations
+needed for the next review.
 
 If no process notes exist, review from the evidence that is available and say
 plainly what was unobservable, so the next rail can carry it.
@@ -114,9 +181,15 @@ Return one of:
 - explicit acknowledgment that no process change is warranted;
 - process issues that should be escalated or deferred.
 
+A checkpoint review may pass with unresolved `Skill Candidates` when each has
+been explicitly reassessed and evidence is still insufficient for a final
+skill-authoring disposition. It must not pass while newly accepted `Skills` work
+that blocks advancement remains unresolved.
+
 Completing a named ticket checkpoint is the normal boundary for creating a Flow
-checkpoint commit and running checkpoint review. Review fixes or retries may
-create additional Flow checkpoint commits without advancing the named roadmap.
+checkpoint commit and running checkpoint review. Review fixes or skill
+remediation may create additional Flow checkpoint commits without advancing the
+named roadmap.
 
 ## ChatGPT Interaction
 
