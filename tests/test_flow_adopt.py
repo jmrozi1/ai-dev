@@ -14,12 +14,11 @@ from ai_dev_flow import cli
 
 
 class FlowAdoptInterfaceTests(unittest.TestCase):
-    """Checkpoint adoption-interface-and-validation.
+    """Checkpoints adoption-interface-and-validation and adoption-state-transition.
 
-    Covers the bounded ``--adopt`` interface, commit-ish resolution, and the
-    idle/repository/ancestry preconditions. The state transition itself lands in
-    the adoption-state-transition checkpoint, so the successful path here is
-    asserted up to its explicit boundary and proven non-mutating.
+    Covers the bounded ``--adopt`` interface, commit-ish resolution, the
+    idle/repository/ancestry preconditions, and the adoption state transition
+    that places scratch at the exact adopted SHA and binds the issue workflow.
     """
 
     def setUp(self) -> None:
@@ -137,38 +136,122 @@ class FlowAdoptInterfaceTests(unittest.TestCase):
 
     # Successful validation path -------------------------------------------------
 
-    def test_valid_adoption_passes_every_precondition_without_mutating(self) -> None:
+    def test_adoption_places_scratch_at_the_exact_adopted_sha(self) -> None:
         repo = self._repo("valid")
-        snapshot = self._snapshot(repo)
+        main_before = self._git(repo, "rev-parse", "main")
         recovered = self._git(repo, "rev-parse", "recovered")
+
+        code, out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Adopted issue 57", out)
+        self.assertIn("adoptedCommit: " + recovered, out)
+        # Exact SHA preservation, not an equivalent replay.
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
+        self.assertEqual(self._git(repo, "rev-parse", "HEAD"), recovered)
+        self.assertEqual(self._git(repo, "rev-parse", "--abbrev-ref", "HEAD"), "scratch")
+        # main is untouched.
+        self.assertEqual(self._git(repo, "rev-parse", "main"), main_before)
+
+    def test_adoption_binds_a_normal_issue_workflow(self) -> None:
+        repo = self._repo("bound")
 
         code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
 
-        # Validation succeeded end to end and stopped at the declared boundary.
-        self.assertEqual(code, 1)
-        self.assertIn("the adoption state transition is not implemented yet", err)
-        self.assertIn(recovered, err)
-        self._assert_unmutated(repo, snapshot)
+        self.assertEqual((code, err), (0, ""))
+        state = self._state(repo)
+        self.assertEqual(state["activeIssueNumber"], 57)
+        self.assertEqual(state["activeIssueTitle"], "Adoptable issue")
+        self.assertEqual(state["ticket"]["ticketId"], "57")
+        self.assertEqual(state["mainBranch"], "main")
+        self.assertEqual(state["scratchBranch"], "scratch")
+        self.assertNotIn("patchDescription", state)
+        self.assertEqual(
+            json.loads((repo / ".ai-dev/tickets/57.json").read_text(encoding="utf-8"))["workflowState"],
+            "active",
+        )
+
+    def test_adopted_checkpoint_uses_max_numbered_checkpoint_semantics(self) -> None:
+        repo = self._repo("checkpoint")
+        # Restarted numbering: 1,2,3 then 1,2. Max wins, not the visible tip.
+        self._git(repo, "checkout", "-q", "recovered")
+        for subject in ("1", "2"):
+            (repo / ("restarted-" + subject + ".txt")).write_text(subject, encoding="utf-8")
+            self._git(repo, "add", "restarted-" + subject + ".txt")
+            self._git(repo, "commit", "-q", "-m", subject)
+        self._git(repo, "checkout", "-q", "main")
+        recovered = self._git(repo, "rev-parse", "recovered")
+
+        code, out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("checkpoint: 3", out)
+        self.assertEqual(self._state(repo)["checkpoint"], 3)
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
+
+        # The next checkpoint continues past the maximum instead of colliding.
+        (repo / "next.txt").write_text("next\n", encoding="utf-8")
+        self._git(repo, "add", "next.txt")
+        code, out, err = self._invoke_command(repo, "commit")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Created checkpoint 4", out)
+
+    def test_adoption_derives_zero_when_no_numbered_subjects_exist(self) -> None:
+        repo = self._repo("unnumbered")
+        self._git(repo, "checkout", "-q", "-b", "prose", "main")
+        (repo / "prose.txt").write_text("prose\n", encoding="utf-8")
+        self._git(repo, "add", "prose.txt")
+        self._git(repo, "commit", "-q", "-m", "descriptive subject")
+        self._git(repo, "checkout", "-q", "main")
+
+        code, out, err = self._invoke(repo, "57", "--adopt", "prose")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("checkpoint: 0", out)
+        self.assertEqual(self._state(repo)["checkpoint"], 0)
+
+    def test_adoption_leaves_no_passing_promotion_review_record(self) -> None:
+        repo = self._repo("review-gate")
+        (repo / ".ai-dev/promotion-review.json").write_text(
+            json.dumps({"status": "pass", "issueNumber": 57, "scratchCommit": "stale"}),
+            encoding="utf-8",
+        )
+
+        code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertFalse((repo / ".ai-dev/promotion-review.json").exists())
 
     def test_adoption_accepts_a_bare_commit_sha(self) -> None:
         repo = self._repo("sha")
         recovered = self._git(repo, "rev-parse", "recovered")
 
-        code, _out, err = self._invoke(repo, "57", "--adopt", recovered)
+        code, out, err = self._invoke(repo, "57", "--adopt", recovered)
 
-        self.assertEqual(code, 1)
-        self.assertIn("the adoption state transition is not implemented yet", err)
-        self.assertIn(recovered, err)
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("adoptedCommit: " + recovered, out)
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
 
     def test_adoption_accepts_a_tag(self) -> None:
         repo = self._repo("tag")
         self._git(repo, "tag", "recovery-point", "recovered")
         recovered = self._git(repo, "rev-parse", "recovered")
 
-        code, _out, err = self._invoke(repo, "57", "--adopt", "recovery-point")
+        code, out, err = self._invoke(repo, "57", "--adopt", "recovery-point")
 
-        self.assertEqual(code, 1)
-        self.assertIn(recovered, err)
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
+
+    def test_adoption_from_scratch_checkout_moves_the_branch(self) -> None:
+        """Scratch cannot be force-updated while checked out; Flow must handle it."""
+        repo = self._repo("on-scratch")
+        self._git(repo, "checkout", "-q", "scratch")
+        recovered = self._git(repo, "rev-parse", "recovered")
+
+        code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
 
     # Interface rejections -------------------------------------------------------
 

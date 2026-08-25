@@ -826,21 +826,26 @@ def scratch_commit_count_relative_to_main(
     return int(count_text)
 
 
-def max_numbered_checkpoint_relative_to_main(
+def max_numbered_checkpoint_between(
     repo_root: Path,
     *,
-    main_branch: str,
-    scratch_branch: str,
+    base_revision: str,
+    head_revision: str,
 ) -> int:
-    if _resolve_branch_head(repo_root, main_branch) is None:
+    """Highest numbered checkpoint subject reachable from head but not base.
+
+    Revision-based form of :func:`max_numbered_checkpoint_relative_to_main`, so
+    callers can derive a checkpoint before moving any branch.
+    """
+    if _resolve_branch_head(repo_root, base_revision) is None:
         return 0
 
-    if _resolve_branch_head(repo_root, scratch_branch) is None:
+    if _resolve_branch_head(repo_root, head_revision) is None:
         return 0
 
     completed = _run_git(
         repo_root,
-        ["log", "--format=%s", f"{main_branch}..{scratch_branch}"],
+        ["log", "--format=%s", f"{base_revision}..{head_revision}"],
         check=True,
     )
 
@@ -853,6 +858,19 @@ def max_numbered_checkpoint_relative_to_main(
                 max_checkpoint = value
 
     return max_checkpoint
+
+
+def max_numbered_checkpoint_relative_to_main(
+    repo_root: Path,
+    *,
+    main_branch: str,
+    scratch_branch: str,
+) -> int:
+    return max_numbered_checkpoint_between(
+        repo_root,
+        base_revision=main_branch,
+        head_revision=scratch_branch,
+    )
 
 
 def commit_count_between(

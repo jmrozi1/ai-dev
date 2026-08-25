@@ -42,6 +42,7 @@ from .repository import (
     resolve_tree_hash,
     restore_branch_to_revision,
     clear_diff_baseline_for_repo_root,
+    max_numbered_checkpoint_between,
     max_numbered_checkpoint_relative_to_main,
     fetch_tracked_upstream,
     push_main_to_tracked_upstream,
@@ -1036,7 +1037,7 @@ def _handle_adopt_start(
     issue_number: int,
     revision: str,
 ) -> int:
-    repo_root, _state_path, state = _resolve_repo_state_context()
+    repo_root, state_path, state = _resolve_repo_state_context()
 
     _validate_adoption_prerequisites(command_name, repo_root, state, issue_number)
 
@@ -1057,10 +1058,83 @@ def _handle_adopt_start(
             f"Cannot adopt workflow: ticket {issue_number} is {ticket.lifecycle_state}."
         )
 
-    raise FlowError(
-        "Cannot adopt workflow: the adoption state transition is not implemented yet. "
-        f"Validated issue {issue_number} against adopted commit {target.commit}."
+    # Derived before any mutation so an invalid prospective state cannot leave
+    # the repository half-adopted.
+    adopted_checkpoint = max_numbered_checkpoint_between(
+        repo_root,
+        base_revision=state.main_branch,
+        head_revision=target.commit,
     )
+
+    adopted_state = WorkflowState(
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        checkpoint=adopted_checkpoint,
+        active_issue_number=issue_number,
+        active_issue_title=ticket.title,
+        active_issue_url=ticket.reference.url,
+        ticket_reference=ticket.reference,
+    )
+    normalize_and_validate(
+        adopted_state.to_dict(),
+        context="start --adopt command",
+    )
+
+    checkout_branch(repo_root, state.main_branch)
+    create_or_reset_branch_from_source(
+        repo_root,
+        branch_name=state.scratch_branch,
+        source_branch=target.commit,
+    )
+    checkout_branch(repo_root, state.scratch_branch)
+
+    placed_commit = resolve_commit_hash(repo_root, state.scratch_branch)
+    if placed_commit != target.commit:
+        raise FlowError(
+            f"Cannot adopt workflow: {state.scratch_branch} resolved to {placed_commit} "
+            f"instead of the adopted commit {target.commit}."
+        )
+
+    try:
+        active_ticket = provider.mark_active(ticket.reference)
+    except TicketProviderError as exc:
+        raise FlowError(
+            f"Cannot adopt workflow: failed to mark ticket {issue_number} active. {exc}"
+        ) from exc
+
+    _clear_promotion_review_record(repo_root)
+
+    adopted_state = WorkflowState(
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        checkpoint=adopted_checkpoint,
+        active_issue_number=issue_number,
+        active_issue_title=active_ticket.title,
+        active_issue_url=active_ticket.reference.url,
+        ticket_reference=active_ticket.reference,
+    )
+    adopted_state = normalize_and_validate(
+        adopted_state.to_dict(),
+        context="start --adopt command",
+    )
+
+    ensure_local_state_excluded(repo_root)
+    save_state(state_path, adopted_state)
+    try:
+        clear_promotion_sync_record(repo_root)
+    except PromotionSyncError as exc:
+        raise FlowError(
+            f"Adopted workflow but could not clear stale promotion synchronization state. {exc}"
+        ) from exc
+    _clear_diff_baseline_after_success(repo_root, operation="start --adopt")
+
+    print(f"Adopted issue {issue_number}")
+    print(f"mainBranch: {state.main_branch}")
+    print(f"scratchBranch: {state.scratch_branch}")
+    print(f"checkpoint: {adopted_checkpoint}")
+    print(f"adoptedCommit: {target.commit}")
+
+    return 0
 
 
 def _resolve_issue_details_with_labels(issue_number: int) -> tuple[str, str, list[str]]:
