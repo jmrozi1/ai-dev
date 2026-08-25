@@ -171,7 +171,10 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
             "the claim registry, not workflow state, is the authority",
             normalized_content,
         )
-        self.assertIn("stop and name the owning workspace", normalized_content)
+        self.assertIn(
+            "every flow ticket command stops and names the owning workspace",
+            normalized_content,
+        )
         self.assertIn(
             "only registers the claim that workflow already implies",
             normalized_content,

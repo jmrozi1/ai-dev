@@ -101,10 +101,9 @@ exactly as before.
 - Claim ownership is the Git worktree identity. Reading another workspace's
   claim record never authorizes releasing it.
 - The claim registry, not workflow state, is the authority on which ticket a
-  worktree owns. When the two disagree, every ticket command and the
-  control-plane rail lookup stop and name the owning workspace instead of
-  choosing a side. Listing, pruning, unlocking, and removal keep working so the
-  association can be repaired.
+  worktree owns. When the two disagree, every Flow ticket command stops and
+  names the owning workspace instead of choosing a side. Listing, pruning,
+  unlocking, and removal keep working so the association can be repaired.
 - A workspace never inherits a pinned control-plane ticket from the workspace
   that created it; it resolves the rail of the ticket it actually owns.
 - The ticket catalogue is repository-level state, not workspace state. A `local`

@@ -981,6 +981,22 @@ def merge_revision_no_fast_forward(
         )
 
 
+def set_pending_merge_message(repo_root: Path, *, message: str) -> None:
+    """Replace the message Git prepared for an in-progress merge.
+
+    A conflicted merge leaves Git's own draft, which appends a commented
+    conflict list. Whether those comments survive depends on how the merge is
+    finished: an editor strips them, `git commit --no-edit` keeps them. Writing
+    the intended message here makes the resulting commit subject the same
+    either way.
+    """
+    message_path = _git_path_for_repo_root(repo_root, "MERGE_MSG")
+    try:
+        message_path.write_text(message.rstrip("\n") + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise RepositoryError(f"Cannot write the pending merge message: {exc}") from exc
+
+
 def merge_revision_fast_forward_only(repo_root: Path, *, revision: str) -> None:
     """Advance the current branch along its own ancestry, recording nothing new.
 

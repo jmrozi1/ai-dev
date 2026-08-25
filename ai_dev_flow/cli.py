@@ -55,6 +55,7 @@ from .repository import (
     resolve_managed_ref,
     add_worktree,
     merge_revision_fast_forward_only,
+    set_pending_merge_message,
     merge_revision_no_fast_forward,
     unmerged_paths,
     merge_in_progress,
@@ -5221,7 +5222,16 @@ def _refresh_under_lock(
     except RepositoryError as exc:
         conflicted = unmerged_paths(repo_root)
         if conflicted or merge_in_progress(repo_root):
-            # The ordinary Git merge state is left exactly as Git produced it.
+            # The merge itself is left exactly as Git produced it. Only the
+            # prepared message is replaced, so finishing the merge records the
+            # intended non-numeric subject however the user runs git commit.
+            try:
+                set_pending_merge_message(repo_root, message=merge_subject)
+            except RepositoryError as message_exc:
+                print(
+                    f"Warning: could not prepare the merge message: {message_exc}",
+                    file=sys.stderr,
+                )
             print(
                 f"Cannot refresh workspace: merging {state.main_branch} "
                 f"({observed_main_commit}) into {state.scratch_branch} conflicted.",

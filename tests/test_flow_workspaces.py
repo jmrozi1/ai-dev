@@ -2352,6 +2352,47 @@ class WorkspaceRefreshTests(RefreshTestBase):
         # The lock was released despite the conflict.
         self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
 
+    def test_a_conflicted_refresh_prepares_a_clean_merge_message(self) -> None:
+        """Finishing the merge records the same subject either way.
+
+        Git's own draft appends a commented conflict list, which `git commit`
+        strips through an editor but `git commit --no-edit` commits verbatim.
+        """
+        repo_root = self._conflicting_workspace("repo-refresh-message")
+
+        code, _, _ = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 1)
+
+        message_path = Path(
+            self._run_git(repo_root, "rev-parse", "--git-path", "MERGE_MSG")
+        )
+        if not message_path.is_absolute():
+            message_path = repo_root / message_path
+        prepared = message_path.read_text(encoding="utf-8")
+        self.assertNotIn("#", prepared)
+        self.assertTrue(prepared.startswith(cli.REFRESH_MERGE_SUBJECT_PREFIX))
+
+        self._run_git(repo_root, "checkout", "--theirs", "--", "shared.txt")
+        self._run_git(repo_root, "add", "shared.txt")
+        self._run_git(repo_root, "commit", "-q", "--no-edit")
+
+        subject = self._run_git(repo_root, "log", "-1", "--format=%B")
+        self.assertNotIn("# Conflicts:", subject)
+        self.assertTrue(subject.startswith(cli.REFRESH_MERGE_SUBJECT_PREFIX))
+
+    def _conflicting_workspace(self, name: str):
+        repo_root = self._init_repo(name)
+        self._write_ticket(repo_root, "331")
+        code, _, stderr = self._invoke(repo_root, "start", "331")
+        self.assertEqual(code, 0, msg=stderr)
+
+        (repo_root / "shared.txt").write_text("scratch side\n", encoding="utf-8")
+        code, _, stderr = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+
+        self._advance_main(repo_root, "conflict", path="shared.txt")
+        return repo_root
+
     def test_refresh_invalidates_review_and_baseline_evidence(self) -> None:
         repo_root = self._workspace_with_work("repo-refresh-evidence", "309")
         self._record_review_pass(repo_root, "309")

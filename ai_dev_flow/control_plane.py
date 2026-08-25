@@ -19,8 +19,6 @@ from .repository import (
     resolve_repo_root,
     workflow_state_file_for_repo_root,
 )
-from .workflow_state import WorkflowStateError, load_state
-from .workspaces import WorkspaceError, verify_workspace_ticket_identity
 
 
 class ControlPlaneError(Exception):
@@ -92,35 +90,6 @@ def _derive_ticket(product_repo_root: Path) -> str | None:
     return None
 
 
-def _require_proven_workspace_ticket(product_repo_root: Path) -> None:
-    """Refuse to name a rail this worktree cannot prove it owns.
-
-    One repository may host several concurrent ticket workspaces, and a session
-    reads this before it reads anything else. Resolving the rail of a ticket
-    another workspace owns would send that session to the wrong work, so a
-    contradictory workspace-to-ticket association stops here.
-    """
-    try:
-        state = load_state(workflow_state_file_for_repo_root(product_repo_root))
-    except WorkflowStateError:
-        # Unreadable workflow state supplies no ticket, so there is nothing to prove.
-        return
-
-    try:
-        problem = verify_workspace_ticket_identity(
-            product_repo_root,
-            reference=state.ticket_reference,
-        )
-    except WorkspaceError as exc:
-        raise ControlPlaneError(f"Cannot resolve the workspace ticket identity: {exc}") from exc
-
-    if problem is not None:
-        raise ControlPlaneError(
-            f"Ambiguous workspace ticket identity: {problem.detail} Repair the "
-            "workspace-to-ticket association before reading or publishing any rail."
-        )
-
-
 def resolve_control_plane_config(product_repo_root: Path) -> ControlPlaneConfig | None:
     """Return the configured control plane, or None when none is configured.
 
@@ -149,7 +118,6 @@ def resolve_control_plane_config(product_repo_root: Path) -> ControlPlaneConfig 
     project = block.get("project")
     if not isinstance(project, str) or not project.strip():
         raise ControlPlaneError(f"Invalid {CONTROL_PLANE_CONFIG_KEY} in {config_path}: project is required.")
-    _require_proven_workspace_ticket(product_repo_root)
     ticket = block.get("ticket")
     if ticket is None:
         ticket = _derive_ticket(product_repo_root)
