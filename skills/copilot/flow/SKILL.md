@@ -127,6 +127,7 @@ exactly as before.
   lock. Removal is automatic only for a same-host process proven absent;
   `--force` is required whenever liveness cannot be established.
 
+
 ### Prerequisite Handoff
 
 - Use `scripts/flow-start <issue>` for independent work that starts from `main`.
@@ -189,6 +190,11 @@ worktree, and any durable synchronization evidence. Preserve a pending
 promotion as recoverable state and retry only through the shared Flow command.
 
 ## Diagnostic Status
+
+`scripts/flow-report` prints the canonical read-only renderer output. It selects
+the immediately preceding eligible completed Copilot turn and excludes its own
+in-progress request; it does not create a second synthesized response or mutate
+local state.
 
 `scripts/flow-status` remains a Copilot-only diagnostic and lifecycle-evidence
 helper. Do not present its repository details as normal project progress.

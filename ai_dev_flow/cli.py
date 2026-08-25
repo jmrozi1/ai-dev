@@ -98,6 +98,7 @@ from .promotion_sync import (
     clear_promotion_sync_record,
     save_promotion_sync_record,
 )
+from .copilot_report import render_latest_copilot_report
 from .tickets import TicketReference
 from .workspaces import (
     ClaimOccupiedError,
@@ -194,6 +195,15 @@ COMMAND_SPECS: tuple[CommandSpec, ...] = (
         canonical_namespace="flow",
         order=30,
         handler_key="status",
+        fixed_prefixed_executable=True,
+    ),
+    CommandSpec(
+        name="report",
+        description="Render the latest completed read-only Copilot work report.",
+        canonical_namespace="flow",
+        order=35,
+        handler_key="report",
+        lifecycle_command=False,
         fixed_prefixed_executable=True,
     ),
     CommandSpec(
@@ -344,6 +354,15 @@ Show the active issue, current branch, and repository deviations.
 Options:
   -v, --verbose  Show complete workflow and Git details.
   -h, --help     Show this help.
+""",
+        "report": """\
+Usage: {command_name} report
+
+Render the latest completed repository-scoped Copilot work turn without
+modifying Flow state, logs, settings, approvals, or repository content.
+
+Options:
+    -h, --help  Show this help.
 """,
     "diff": """\
 Usage: {command_name} [--git|--all]
@@ -5193,6 +5212,13 @@ def handle_workspace(command_name: str, arguments: list[str]) -> int:
     raise _workspace_usage(command_name)
 
 
+def handle_report(command_name: str, arguments: list[str]) -> int:
+    if arguments:
+        raise FlowError(f"Usage: {command_name} report")
+    print(render_latest_copilot_report(resolve_repo_root()))
+    return 0
+
+
 def handle_ticket_create(command_name: str, arguments: list[str]) -> int:
     if not arguments:
         raise _ticket_create_usage(command_name)
@@ -5399,6 +5425,7 @@ def _resolve_command_handler(handler_key: str):
         "start": handle_start,
         "patch": handle_patch,
         "status": handle_status,
+        "report": handle_report,
         "diff": handle_diff,
         "commit": handle_commit,
         "reset": handle_reset,
