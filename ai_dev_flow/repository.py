@@ -513,6 +513,114 @@ def resolve_short_commit_hash(repo_root: Path, revision: str = "HEAD") -> str:
     return commit_hash
 
 
+_REVISION_REF_CANDIDATE_TEMPLATES: tuple[str, ...] = (
+    "{revision}",
+    "refs/{revision}",
+    "refs/tags/{revision}",
+    "refs/heads/{revision}",
+    "refs/remotes/{revision}",
+    "refs/remotes/{revision}/HEAD",
+)
+
+
+class RevisionResolutionError(RepositoryError):
+    """A caller-supplied commit-ish does not name exactly one commit."""
+
+    def __init__(self, message: str, *, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def matching_ref_names(repo_root: Path, revision: str) -> list[str]:
+    matches: list[str] = []
+    for template in _REVISION_REF_CANDIDATE_TEMPLATES:
+        ref_name = template.format(revision=revision)
+        if ref_name in matches:
+            continue
+        if resolve_managed_ref(repo_root, ref_name) is not None:
+            matches.append(ref_name)
+
+    return matches
+
+
+def resolve_commit_ish(repo_root: Path, revision: str) -> str:
+    candidate = revision.strip()
+    if not candidate:
+        raise RevisionResolutionError(
+            "the commit-ish is empty.",
+            reason="empty",
+        )
+
+    matches = matching_ref_names(repo_root, candidate)
+    if len(matches) > 1:
+        joined = ", ".join(matches)
+        raise RevisionResolutionError(
+            f"{candidate} is ambiguous; it matches {joined}.",
+            reason="ambiguous",
+        )
+
+    resolved = _run_git(repo_root, ["rev-parse", "--verify", candidate], check=False)
+    resolved_stderr = resolved.stderr.strip()
+    object_id = resolved.stdout.strip()
+    if resolved.returncode != 0 or not object_id:
+        if "ambiguous" in resolved_stderr:
+            raise RevisionResolutionError(
+                f"{candidate} is ambiguous.",
+                reason="ambiguous",
+            )
+        raise RevisionResolutionError(
+            f"{candidate} does not resolve to an object in this repository.",
+            reason="unresolvable",
+        )
+
+    if "ambiguous" in resolved_stderr:
+        raise RevisionResolutionError(
+            f"{candidate} is ambiguous.",
+            reason="ambiguous",
+        )
+
+    peeled = _run_git(
+        repo_root,
+        ["rev-parse", "--verify", f"{object_id}^{{commit}}"],
+        check=False,
+    )
+    commit = peeled.stdout.strip()
+    if peeled.returncode != 0 or not commit:
+        raise RevisionResolutionError(
+            f"{candidate} resolves to {object_id}, which is not a commit.",
+            reason="not-a-commit",
+        )
+
+    return commit
+
+
+def revisions_share_history(
+    repo_root: Path,
+    *,
+    left_revision: str,
+    right_revision: str,
+) -> bool:
+    completed = _run_git(
+        repo_root,
+        ["merge-base", left_revision, right_revision],
+        check=False,
+    )
+
+    if completed.returncode == 0:
+        return bool(completed.stdout.strip())
+
+    if completed.returncode == 1:
+        return False
+
+    stderr = completed.stderr.strip()
+    if stderr:
+        raise RepositoryError(stderr)
+
+    raise RepositoryError(
+        "Cannot determine whether two revisions share history."
+    )
+
+
 def resolve_tree_hash(repo_root: Path, revision: str = "HEAD") -> str:
     completed = _run_git(
         repo_root,

@@ -37,6 +37,9 @@ from .repository import (
     hard_reset_branch_to_revision,
     resolve_repo_root,
     resolve_commit_hash,
+    resolve_commit_ish,
+    revisions_share_history,
+    RevisionResolutionError,
     resolve_short_commit_hash,
     resolve_tree_hash,
     restore_branch_to_revision,
@@ -911,6 +914,28 @@ def _parse_issue_number(command_name: str, arguments: list[str]) -> int:
     return issue_number
 
 
+def _adopt_usage(command_name: str) -> FlowError:
+    return _usage_error(command_name, "start", "<issue-number> --adopt <commit-ish>")
+
+
+def _parse_adopt_start(command_name: str, arguments: list[str]) -> tuple[int, str] | None:
+    if "--adopt" not in arguments:
+        return None
+    if "--prerequisite-for" in arguments:
+        raise FlowError(
+            "Cannot start workflow: --adopt and --prerequisite-for cannot be combined."
+        )
+    if len(arguments) != 3 or arguments[1] != "--adopt":
+        raise _adopt_usage(command_name)
+
+    issue_number = _parse_issue_number(command_name, [arguments[0]])
+    target = arguments[2].strip()
+    if not target:
+        raise FlowError("adopt target must be a non-empty commit-ish.")
+
+    return issue_number, target
+
+
 def _parse_prerequisite_start(command_name: str, arguments: list[str]) -> tuple[int, int] | None:
     if "--prerequisite-for" not in arguments:
         return None
@@ -1036,38 +1061,42 @@ def _validate_patch_prerequisites(
         )
 
 
-def handle_start(command_name: str, arguments: list[str]) -> int:
-    prerequisite_arguments = _parse_prerequisite_start(command_name, arguments)
-    if prerequisite_arguments is not None:
-        return _handle_prerequisite_start(command_name, *prerequisite_arguments)
+def _require_idle_workflow_for_start(state: WorkflowState) -> None:
+    if _active_workflow_type(state) is None:
+        return
 
-    issue_number = _parse_issue_number(command_name, arguments)
-
-    repo_root, state_path, state = _resolve_repo_state_context()
-    active_workflow_type = _active_workflow_type(state)
-    if active_workflow_type is not None:
-        if state.active_issue_number is not None:
-            raise FlowError(
-                f"Cannot start workflow: active issue {state.active_issue_number} is already set."
-            )
-        assert state.patch_description is not None
+    if state.active_issue_number is not None:
         raise FlowError(
-            f"Cannot start workflow: active patch {state.patch_description} is already set."
+            f"Cannot start workflow: active issue {state.active_issue_number} is already set."
         )
+    assert state.patch_description is not None
+    raise FlowError(
+        f"Cannot start workflow: active patch {state.patch_description} is already set."
+    )
 
+
+def _require_unblocked_issue_for_start(
+    repo_root: Path,
+    command_name: str,
+    issue_number: int,
+) -> None:
     blocked_file = blocked_workflows_file_for_repo_root(repo_root)
     blocked_record = get_blocked_workflow(blocked_file, issue_number)
-    if blocked_record is not None:
-        if "-" in command_name:
-            prefix, _, _ = command_name.rpartition("-")
-            resume_command = f"{prefix}-resume"
-        else:
-            resume_command = "flow-resume"
-        raise FlowError(
-            f"Cannot start workflow: issue {issue_number} is blocked. "
-            f"Use {resume_command} {issue_number}."
-        )
+    if blocked_record is None:
+        return
 
+    if "-" in command_name:
+        prefix, _, _ = command_name.rpartition("-")
+        resume_command = f"{prefix}-resume"
+    else:
+        resume_command = "flow-resume"
+    raise FlowError(
+        f"Cannot start workflow: issue {issue_number} is blocked. "
+        f"Use {resume_command} {issue_number}."
+    )
+
+
+def _require_clean_repository_for_start(repo_root: Path, state: WorkflowState) -> None:
     _ensure_main_and_scratch_branches_differ(state)
 
     if not branch_exists(repo_root, state.main_branch):
@@ -1079,6 +1108,23 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
         )
 
     ensure_no_active_git_operations(repo_root)
+
+
+def handle_start(command_name: str, arguments: list[str]) -> int:
+    adopt_arguments = _parse_adopt_start(command_name, arguments)
+    if adopt_arguments is not None:
+        return _handle_adopt_start(command_name, *adopt_arguments)
+
+    prerequisite_arguments = _parse_prerequisite_start(command_name, arguments)
+    if prerequisite_arguments is not None:
+        return _handle_prerequisite_start(command_name, *prerequisite_arguments)
+
+    issue_number = _parse_issue_number(command_name, arguments)
+
+    repo_root, state_path, state = _resolve_repo_state_context()
+    _require_idle_workflow_for_start(state)
+    _require_unblocked_issue_for_start(repo_root, command_name, issue_number)
+    _require_clean_repository_for_start(repo_root, state)
 
     provider = _resolve_ticket_provider_for_repo_root(repo_root)
     try:
@@ -1156,6 +1202,103 @@ def handle_start(command_name: str, arguments: list[str]) -> int:
     print("checkpoint: 0")
 
     return 0
+
+
+@dataclass(frozen=True)
+class AdoptionTarget:
+    """A validated adoption target resolved through Flow-owned repository behavior."""
+
+    requested: str
+    commit: str
+    main_branch: str
+    main_commit: str
+
+
+def _adoption_ancestry_relationship(
+    repo_root: Path,
+    *,
+    main_commit: str,
+    target_commit: str,
+) -> str:
+    if branch_is_ancestor(
+        repo_root,
+        ancestor_revision=target_commit,
+        descendant_revision=main_commit,
+    ):
+        return "behind"
+
+    if revisions_share_history(
+        repo_root,
+        left_revision=main_commit,
+        right_revision=target_commit,
+    ):
+        return "diverged from"
+
+    return "unrelated to"
+
+
+def resolve_adoption_target(
+    repo_root: Path,
+    state: WorkflowState,
+    requested_target: str,
+) -> AdoptionTarget:
+    try:
+        commit = resolve_commit_ish(repo_root, requested_target)
+    except RevisionResolutionError as exc:
+        raise FlowError(f"Cannot adopt commit: {exc}") from exc
+
+    main_commit = resolve_commit_hash(repo_root, state.main_branch)
+
+    if commit == main_commit:
+        raise FlowError(
+            f"Cannot adopt commit: {requested_target} already equals "
+            f"{state.main_branch} ({main_commit}). Adoption requires a commit ahead of "
+            f"{state.main_branch}."
+        )
+
+    if not branch_is_ancestor(
+        repo_root,
+        ancestor_revision=main_commit,
+        descendant_revision=commit,
+    ):
+        relationship = _adoption_ancestry_relationship(
+            repo_root,
+            main_commit=main_commit,
+            target_commit=commit,
+        )
+        raise FlowError(
+            f"Cannot adopt commit: {requested_target} resolves to {commit}, which is "
+            f"{relationship} {state.main_branch} ({main_commit}). Adoption requires "
+            f"{state.main_branch} to be an ancestor of the target and never fetches, "
+            "merges, rebases, cherry-picks, or otherwise reconciles."
+        )
+
+    return AdoptionTarget(
+        requested=requested_target,
+        commit=commit,
+        main_branch=state.main_branch,
+        main_commit=main_commit,
+    )
+
+
+def _handle_adopt_start(
+    command_name: str,
+    issue_number: int,
+    requested_target: str,
+) -> int:
+    repo_root, _state_path, state = _resolve_repo_state_context()
+    _require_idle_workflow_for_start(state)
+    _require_unblocked_issue_for_start(repo_root, command_name, issue_number)
+    _require_clean_repository_for_start(repo_root, state)
+
+    target = resolve_adoption_target(repo_root, state, requested_target)
+
+    raise FlowError(
+        "Cannot adopt commit: adopting a validated target is not implemented yet. "
+        f"{target.requested} resolves to {target.commit} and satisfies every adoption "
+        f"precondition for issue {issue_number}, but binding the workflow to it is not "
+        "available. No repository, workflow, or ticket state was changed."
+    )
 
 
 def _handle_prerequisite_start(
