@@ -9,16 +9,21 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from unittest.mock import patch
 
 from ai_dev_flow import cli
+from ai_dev_flow.repository import RepositoryError
+from ai_dev_flow.ticket_providers import LocalTicketProvider, TicketProviderError
+from ai_dev_flow.workflow_state import WorkflowStateError
 
 
-class FlowAdoptInterfaceTests(unittest.TestCase):
+class _FlowAdoptFixture(unittest.TestCase):
     """Checkpoints adoption-interface-and-validation and adoption-state-transition.
 
     Covers the bounded ``--adopt`` interface, commit-ish resolution, the
     idle/repository/ancestry preconditions, and the adoption state transition
     that places scratch at the exact adopted SHA and binds the issue workflow.
+    Failure atomicity lives in :class:`FlowAdoptFailureSafetyTests`.
     """
 
     def setUp(self) -> None:
@@ -134,6 +139,9 @@ class FlowAdoptInterfaceTests(unittest.TestCase):
             )["workflowState"],
         }
 
+
+
+class FlowAdoptInterfaceTests(_FlowAdoptFixture):
     # Successful validation path -------------------------------------------------
 
     def test_adoption_places_scratch_at_the_exact_adopted_sha(self) -> None:
@@ -514,6 +522,258 @@ class FlowAdoptInterfaceTests(unittest.TestCase):
 
         self.assertEqual((code, err), (0, ""))
         self.assertIn("--adopt <commit-ish>", out)
+
+
+class FlowAdoptFailureSafetyTests(_FlowAdoptFixture):
+    """Checkpoint adoption-failure-safety.
+
+    Adoption is all-or-nothing. For every covered failure the externally
+    visible state afterwards must equal the state before the attempt, across
+    Git, Flow, review/promotion artifacts, and the ticket provider.
+    """
+
+    # Full externally visible state -------------------------------------------
+
+    def _visible_state(self, repo: Path) -> dict:
+        def read(relative: str):
+            path = repo / relative
+            return path.read_bytes() if path.is_file() else None
+
+        return {
+            "branch": self._git(repo, "rev-parse", "--abbrev-ref", "HEAD"),
+            "head": self._git(repo, "rev-parse", "HEAD"),
+            "main": self._git(repo, "rev-parse", "main"),
+            "scratch": (
+                self._git(repo, "rev-parse", "scratch")
+                if self._branch_exists(repo, "scratch")
+                else None
+            ),
+            "workflow": read(".ai-dev/workflow.json"),
+            "promotion_review": read(".ai-dev/promotion-review.json"),
+            "promotion_sync": read(".ai-dev/promotion-sync.json"),
+            "diff_baseline": read(".ai-dev/diff-baseline/baseline.json"),
+            # Provider records cannot be byte-restored: deactivate() stamps a
+            # fresh updatedAt. The invariant is that lifecycle/label state is
+            # not left contradicting local Flow state, so compare that.
+            "ticket_57_state": self._ticket_state(repo, 57),
+            "git_operations": sorted(
+                marker
+                for marker in (
+                    "MERGE_HEAD",
+                    "CHERRY_PICK_HEAD",
+                    "REVERT_HEAD",
+                    "BISECT_LOG",
+                    "rebase-apply",
+                    "rebase-merge",
+                )
+                if (repo / ".git" / marker).exists()
+            ),
+        }
+
+    def _ticket_state(self, repo: Path, number: int) -> tuple:
+        payload = json.loads(
+            (repo / f".ai-dev/tickets/{number}.json").read_text(encoding="utf-8")
+        )
+        return (
+            payload["lifecycleState"],
+            payload["workflowState"],
+            tuple(payload.get("labels", ())),
+        )
+
+    def _branch_exists(self, repo: Path, branch: str) -> bool:
+        result = subprocess.run(
+            ["git", "-C", str(repo), "rev-parse", "--verify", "refs/heads/" + branch],
+            capture_output=True,
+            text=True,
+        )
+        return result.returncode == 0
+
+    def _seed_review_and_sync_artifacts(self, repo: Path) -> None:
+        """Pre-existing artifacts prove restoration, not merely absence."""
+        (repo / ".ai-dev/promotion-review.json").write_text(
+            json.dumps({"status": "pass", "issueNumber": 99, "scratchCommit": "prior"}),
+            encoding="utf-8",
+        )
+        (repo / ".ai-dev/promotion-sync.json").write_text(
+            json.dumps({"status": "pending", "issueNumber": 99}), encoding="utf-8"
+        )
+        baseline = repo / ".ai-dev/diff-baseline"
+        baseline.mkdir(parents=True, exist_ok=True)
+        (baseline / "baseline.json").write_text(
+            json.dumps({"baseline": "prior"}), encoding="utf-8"
+        )
+
+    def _assert_failed_adoption_preserved_everything(
+        self, repo: Path, before: dict, code: int, err: str
+    ) -> None:
+        self.assertEqual(code, 1)
+        self.assertNotEqual(err.strip(), "")
+        self.assertEqual(self._visible_state(repo), before)
+
+    # Provider activation failure ----------------------------------------------
+
+    def test_provider_activation_failure_restores_exact_pre_adoption_state(self) -> None:
+        repo = self._repo("activation-failure")
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+        recovered = self._git(repo, "rev-parse", "recovered")
+        self.assertNotEqual(before["scratch"], recovered)
+
+        with patch.object(
+            LocalTicketProvider,
+            "mark_active",
+            side_effect=TicketProviderError("simulated activation outage"),
+        ):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertIn("failed to mark ticket 57 active", err)
+        self.assertIn("simulated activation outage", err)
+        self.assertNotIn("Rollback failures", err)
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+        # The adopted commit was never left on scratch.
+        self.assertNotEqual(self._git(repo, "rev-parse", "scratch"), recovered)
+
+    def test_provider_activation_failure_leaves_ticket_inactive(self) -> None:
+        repo = self._repo("activation-provider-state")
+
+        with patch.object(
+            LocalTicketProvider,
+            "mark_active",
+            side_effect=TicketProviderError("simulated activation outage"),
+        ):
+            code, _out, _err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual(code, 1)
+        ticket = json.loads((repo / ".ai-dev/tickets/57.json").read_text(encoding="utf-8"))
+        # Provider must not claim an active workflow Flow does not own.
+        self.assertEqual(ticket["workflowState"], "inactive")
+        self.assertNotIn("activeIssueNumber", self._state(repo))
+
+    def test_provider_activation_failure_restores_state_when_scratch_checked_out(self) -> None:
+        repo = self._repo("activation-on-scratch")
+        self._git(repo, "checkout", "-q", "scratch")
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+        self.assertEqual(before["branch"], "scratch")
+
+        with patch.object(
+            LocalTicketProvider,
+            "mark_active",
+            side_effect=TicketProviderError("simulated activation outage"),
+        ):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+        # Still on scratch, still at its original commit.
+        self.assertEqual(self._git(repo, "rev-parse", "--abbrev-ref", "HEAD"), "scratch")
+
+    def test_rollback_deletes_a_scratch_branch_it_created(self) -> None:
+        repo = self._repo("activation-no-scratch")
+        self._git(repo, "branch", "-D", "scratch")
+        before = self._visible_state(repo)
+        self.assertIsNone(before["scratch"])
+
+        with patch.object(
+            LocalTicketProvider,
+            "mark_active",
+            side_effect=TicketProviderError("simulated activation outage"),
+        ):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+        self.assertFalse(self._branch_exists(repo, "scratch"))
+
+    # Other transactional seams ------------------------------------------------
+
+    def test_workflow_state_write_failure_rolls_back_git_and_provider(self) -> None:
+        repo = self._repo("state-write-failure")
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+
+        with patch.object(
+            cli, "save_state", side_effect=WorkflowStateError("simulated state write failure")
+        ):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertIn("simulated state write failure", err)
+        self.assertNotIn("Rollback failures", err)
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+        # Activation happened before the failure and must have been undone.
+        ticket = json.loads((repo / ".ai-dev/tickets/57.json").read_text(encoding="utf-8"))
+        self.assertEqual(ticket["workflowState"], "inactive")
+
+    def test_diff_baseline_failure_rolls_back(self) -> None:
+        repo = self._repo("baseline-failure")
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+
+        with patch.object(
+            cli,
+            "clear_diff_baseline_for_repo_root",
+            side_effect=RepositoryError("simulated baseline failure"),
+        ):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertIn("simulated baseline failure", err)
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+
+    def test_scratch_move_failure_rolls_back(self) -> None:
+        repo = self._repo("branch-move-failure")
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+
+        real = cli.create_or_reset_branch_from_source
+        calls = {"n": 0}
+
+        def fail_first(*args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RepositoryError("simulated branch move failure")
+            return real(*args, **kwargs)
+
+        with patch.object(cli, "create_or_reset_branch_from_source", side_effect=fail_first):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertIn("simulated branch move failure", err)
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+
+    def test_promotion_review_clear_failure_rolls_back(self) -> None:
+        repo = self._repo("review-clear-failure")
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+
+        with patch.object(
+            cli,
+            "_clear_promotion_review_record",
+            side_effect=OSError("simulated review record failure"),
+        ):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertIn("simulated review record failure", err)
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+        # The pre-existing passing record was restored, not silently consumed.
+        self.assertEqual(
+            json.loads((repo / ".ai-dev/promotion-review.json").read_text(encoding="utf-8"))[
+                "issueNumber"
+            ],
+            99,
+        )
+
+    # Success path is unaffected by the transaction ----------------------------
+
+    def test_successful_adoption_still_clears_prior_artifacts(self) -> None:
+        repo = self._repo("success-through-transaction")
+        self._seed_review_and_sync_artifacts(repo)
+        recovered = self._git(repo, "rev-parse", "recovered")
+
+        code, out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("adoptedCommit: " + recovered, out)
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
+        self.assertFalse((repo / ".ai-dev/promotion-review.json").exists())
+        self.assertFalse((repo / ".ai-dev/diff-baseline/baseline.json").exists())
+        self.assertEqual(self._state(repo)["activeIssueNumber"], 57)
 
 
 if __name__ == "__main__":

@@ -402,6 +402,15 @@ def create_or_reset_branch_from_source(
     _run_git(repo_root, ["branch", branch_name, source_branch], check=True)
 
 
+def delete_branch(repo_root: Path, branch_name: str) -> None:
+    """Delete a local branch regardless of its merge state.
+
+    Used to undo a branch this process created; callers must not invoke it on a
+    branch they did not create in the same operation.
+    """
+    _run_git(repo_root, ["branch", "-D", branch_name], check=True)
+
+
 def ensure_branches_point_to_same_commit(
     repo_root: Path,
     *,
