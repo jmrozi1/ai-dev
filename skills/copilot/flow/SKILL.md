@@ -84,6 +84,9 @@ exactly as before.
   the checkpoint from existing numbered commits.
 - One ticket may be active as only one writable workspace. A second attempt is
   refused and names the owning workspace.
+- A prerequisite handoff claims its own ticket in the workspace that starts it,
+  and the suspended issue keeps its claim there, so neither ticket can be
+  activated a second time elsewhere.
 - `scripts/flow-workspace remove` refuses unless that workspace's workflow is
   inactive, its tree is clean, and its branch is not ahead of `main`.
 - `scripts/flow-workspace prune` removes only claims whose worktree is gone or
@@ -92,6 +95,10 @@ exactly as before.
   appropriate lifecycle command.
 - Claim ownership is the Git worktree identity. Reading another workspace's
   claim record never authorizes releasing it.
+- The ticket catalogue is repository-level state, not workspace state. A `local`
+  ticket store is read from the workspace that holds one, and otherwise from the
+  primary worktree, so every concurrent workspace resolves its own ticket from
+  one shared catalogue instead of a private copy.
 
 ### Promotion Serialization And Stale Bases
 
@@ -108,6 +115,9 @@ exactly as before.
   current `main` into this workspace's scratch branch under the promotion lock
   and records a non-numeric merge commit, so checkpoint numbering is unchanged.
   It never rebases, force-updates, resets, or modifies `main`.
+- A workspace that is only behind `main` has nothing of its own to reconcile, so
+  refresh fast-forwards it and records no commit. That keeps it completable; a
+  merge there would leave it permanently ahead of `main` by an empty commit.
 - Refresh clears promotion-review and review-baseline evidence bound to the old
   base. Review must be earned again before promoting.
 - A conflicting refresh leaves the ordinary Git merge in progress for explicit

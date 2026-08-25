@@ -12,7 +12,14 @@ from contextlib import redirect_stderr, redirect_stdout
 
 from ai_dev_flow import cli
 from ai_dev_flow import workspaces
+from ai_dev_flow.ticket_config import load_ticket_configuration_for_repo_root
+from ai_dev_flow.ticket_providers import instantiate_ticket_provider
+from ai_dev_flow.ticket_status import render_active_ticket_status
 from ai_dev_flow.tickets import TicketReference
+
+
+# The local ticket catalogue is repository-level state shared by every worktree.
+TICKET_STORE = ".ai-dev/tickets"
 
 
 class WorkspaceTestBase(unittest.TestCase):
@@ -52,7 +59,7 @@ class WorkspaceTestBase(unittest.TestCase):
         lifecycle_state: str = "open",
         workflow_state: str = "inactive",
     ) -> None:
-        path = repo_root / ".ai-dev" / "tickets" / f"{ticket_id}.json"
+        path = repo_root / TICKET_STORE / f"{ticket_id}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(
             json.dumps(
@@ -60,11 +67,18 @@ class WorkspaceTestBase(unittest.TestCase):
                     "reference": {
                         "provider": "local",
                         "ticketId": ticket_id,
-                        "path": ".ai-dev/tickets",
+                        "path": TICKET_STORE,
                     },
                     "title": title,
                     "lifecycleState": lifecycle_state,
                     "workflowState": workflow_state,
+                    "body": (
+                        "## Checkpoints\n\n"
+                        "- [ ] **Define the work**\n  The first named checkpoint.\n\n"
+                        "- [ ] **Finish the work**\n  The second named checkpoint.\n\n"
+                        "## Full Description\n\n"
+                        f"Ticket {ticket_id} description.\n"
+                    ),
                 },
                 indent=2,
             )
@@ -74,7 +88,7 @@ class WorkspaceTestBase(unittest.TestCase):
 
     def _write_config(self, repo_root: Path, *, out: str | None = None) -> None:
         payload: dict = {
-            "tickets": {"provider": "local", "path": ".ai-dev/tickets"},
+            "tickets": {"provider": "local", "path": TICKET_STORE},
         }
         if out is not None:
             payload["out"] = out
@@ -610,6 +624,112 @@ class WorkspaceLifecycleTests(WorkspaceTestBase):
         self.assertIn("(current)", stdout)
 
 
+class SharedTicketCatalogueTests(WorkspaceTestBase):
+    """A concurrent workspace reads the same ticket catalogue as every other."""
+
+    def _status(self, repo_root: Path) -> str:
+        return render_active_ticket_status(repo_root)
+
+    def test_added_workspace_reports_only_its_own_ticket(self) -> None:
+        repo_root = self._init_repo("repo-shared-status")
+        self._write_ticket(repo_root, "401", title="Ticket A")
+        self._write_ticket(repo_root, "402", title="Ticket B")
+        code, _, stderr = self._invoke(repo_root, "start", "401")
+        self.assertEqual(code, 0, msg=stderr)
+
+        workspace = self.tmp_path / "workspace-402"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "402", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+
+        primary_status = self._status(repo_root)
+        self.assertIn("#401 Ticket A", primary_status)
+        self.assertNotIn("402", primary_status)
+
+        workspace_status = self._status(workspace)
+        self.assertIn("#402 Ticket B", workspace_status)
+        self.assertNotIn("401", workspace_status)
+        self.assertIn("Current checkpoint: Define the work", workspace_status)
+
+    def test_the_catalogue_is_not_duplicated_into_the_new_workspace(self) -> None:
+        repo_root = self._init_repo("repo-shared-single-store")
+        self._write_ticket(repo_root, "411")
+        self._write_ticket(repo_root, "412")
+        code, _, stderr = self._invoke(repo_root, "start", "411")
+        self.assertEqual(code, 0, msg=stderr)
+
+        workspace = self.tmp_path / "workspace-412"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "412", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+
+        self.assertFalse((workspace / TICKET_STORE).exists())
+        activated = json.loads(
+            (repo_root / TICKET_STORE / "412.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(activated["workflowState"], "active")
+
+    def test_activation_never_dirties_another_workspace(self) -> None:
+        repo_root = self._init_repo("repo-shared-clean")
+        self._write_ticket(repo_root, "421")
+        self._write_ticket(repo_root, "422")
+        code, _, stderr = self._invoke(repo_root, "start", "421")
+        self.assertEqual(code, 0, msg=stderr)
+
+        workspace = self.tmp_path / "workspace-422"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "422", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+
+        self.assertEqual(self._run_git(repo_root, "status", "--porcelain"), "")
+        self.assertEqual(self._run_git(workspace, "status", "--porcelain"), "")
+
+    def _ticket_title(self, repo_root: Path, ticket_id: str) -> str:
+        configuration = load_ticket_configuration_for_repo_root(repo_root)
+        provider = instantiate_ticket_provider(repo_root=repo_root, config=configuration)
+        return provider.get(ticket_id).title
+
+    def test_a_workspace_local_catalogue_stays_authoritative(self) -> None:
+        """A worktree that holds its own store keeps reading that store."""
+        repo_root = self._init_repo("repo-shared-override")
+        self._write_ticket(repo_root, "431", title="Shared")
+
+        workspace = self.tmp_path / "workspace-local-store"
+        self._run_git(repo_root, "worktree", "add", "-q", "-b", "linked", str(workspace), "main")
+        self._write_config(workspace)
+        self._write_state(workspace, scratch_branch="linked")
+
+        self.assertEqual(self._ticket_title(workspace, "431"), "Shared")
+
+        self._write_ticket(workspace, "431", title="Workspace copy")
+        self.assertEqual(self._ticket_title(workspace, "431"), "Workspace copy")
+        self.assertEqual(self._ticket_title(repo_root, "431"), "Shared")
+
+    def test_a_shared_catalogue_completes_from_the_added_workspace(self) -> None:
+        repo_root = self._init_repo("repo-shared-complete")
+        self._write_ticket(repo_root, "441")
+        self._write_ticket(repo_root, "442")
+        code, _, stderr = self._invoke(repo_root, "start", "441")
+        self.assertEqual(code, 0, msg=stderr)
+
+        workspace = self.tmp_path / "workspace-442"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "442", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+
+        code, _, stderr = self._invoke(workspace, "complete")
+        self.assertEqual(code, 0, msg=stderr)
+
+        completed = json.loads(
+            (repo_root / TICKET_STORE / "442.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(completed["lifecycleState"], "closed")
+        self.assertEqual(completed["workflowState"], "inactive")
+
+        untouched = json.loads(
+            (repo_root / TICKET_STORE / "441.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(untouched["lifecycleState"], "open")
+        self.assertEqual(untouched["workflowState"], "active")
+        self.assertEqual(self._read_state(repo_root)["activeIssueNumber"], 441)
+
+
 class SingleWorkspaceRegressionTests(WorkspaceTestBase):
     def test_ordinary_single_workspace_lifecycle_is_unchanged(self) -> None:
         repo_root = self._init_repo("repo-single")
@@ -746,6 +866,97 @@ class BlockedClaimTests(WorkspaceTestBase):
         code, _, stderr = self._invoke(linked, "start", "103")
         self.assertEqual(code, 1)
         self.assertIn("already active in workspace", stderr)
+
+
+class StackedHandoffClaimTests(WorkspaceTestBase):
+    """A prerequisite handoff stays valid inside one concurrent workspace."""
+
+    def _workspace_with_prerequisite(self, name: str):
+        repo_root = self._init_repo(name)
+        for ticket_id in ("501", "502", "503"):
+            self._write_ticket(repo_root, ticket_id)
+        code, _, stderr = self._invoke(repo_root, "start", "501")
+        self.assertEqual(code, 0, msg=stderr)
+
+        workspace = self.tmp_path / f"{name}-502"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "502", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+
+        (workspace / "b.txt").write_text("b\n", encoding="utf-8")
+        code, _, stderr = self._invoke(workspace, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+
+        code, _, stderr = self._invoke(workspace, "start", "503", "--prerequisite-for", "502")
+        self.assertEqual(code, 0, msg=stderr)
+        return repo_root, workspace
+
+    def test_a_prerequisite_claims_its_own_ticket_in_this_workspace(self) -> None:
+        repo_root, workspace = self._workspace_with_prerequisite("repo-stacked-claim")
+
+        suspended = workspaces.read_claim(
+            repo_root, workspaces.canonical_ticket_key(self._local_reference("502"))
+        )
+        prerequisite = workspaces.read_claim(
+            repo_root, workspaces.canonical_ticket_key(self._local_reference("503"))
+        )
+        self.assertIsNotNone(suspended)
+        self.assertIsNotNone(prerequisite)
+        self.assertEqual(prerequisite.status, "active")
+        self.assertEqual(prerequisite.worktree_id, suspended.worktree_id)
+        self.assertEqual(self._read_state(workspace)["activeIssueNumber"], 503)
+
+    def test_another_workspace_cannot_activate_a_prerequisite_ticket(self) -> None:
+        repo_root, workspace = self._workspace_with_prerequisite("repo-stacked-duplicate")
+
+        code, _, stderr = self._invoke(
+            repo_root, "workspace", "add", "503", str(self.tmp_path / "third")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("already active in workspace", stderr)
+        self.assertIn(str(workspace), stderr)
+        self.assertFalse((self.tmp_path / "third").exists())
+
+    def test_completing_a_prerequisite_releases_only_its_own_claim(self) -> None:
+        repo_root, workspace = self._workspace_with_prerequisite("repo-stacked-complete")
+
+        (workspace / "c.txt").write_text("c\n", encoding="utf-8")
+        code, _, stderr = self._invoke(workspace, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+        self._record_prerequisite_review(workspace, 503)
+
+        code, _, stderr = self._invoke(workspace, "promote", "promote the prerequisite")
+        self.assertEqual(code, 0, msg=stderr)
+        code, _, stderr = self._invoke(workspace, "complete")
+        self.assertEqual(code, 0, msg=stderr)
+
+        self.assertIsNone(
+            workspaces.read_claim(
+                repo_root, workspaces.canonical_ticket_key(self._local_reference("503"))
+            )
+        )
+        self.assertIsNotNone(
+            workspaces.read_claim(
+                repo_root, workspaces.canonical_ticket_key(self._local_reference("502"))
+            )
+        )
+
+        code, _, stderr = self._invoke(workspace, "resume", "502")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertEqual(self._read_state(workspace)["activeIssueNumber"], 502)
+        self.assertEqual(self._read_state(repo_root)["activeIssueNumber"], 501)
+
+    def _record_prerequisite_review(self, workspace: Path, issue_number: int) -> None:
+        record = {
+            "version": 1,
+            "result": "pass",
+            "scratchCommit": self._run_git(workspace, "rev-parse", "HEAD"),
+            "mainBranch": "main",
+            "scratchBranch": self._run_git(workspace, "rev-parse", "--abbrev-ref", "HEAD"),
+            "activeIssueNumber": issue_number,
+        }
+        path = workspace / ".ai-dev" / "promotion-review.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
 
 class ClaimAuthorizationTests(WorkspaceTestBase):
@@ -1082,6 +1293,19 @@ class PromotionSetupMixin(WorkspaceTestBase):
         self._record_review_pass(repo_root, ticket_id)
         return repo_root
 
+    def _advance_main(self, repo_root: Path, marker: str, *, path: str | None = None) -> str:
+        """Move main forward from a detached worktree, leaving this one alone."""
+        advancer = self.tmp_path / f"advance-{marker}"
+        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(advancer), "main")
+        target = path or f"{marker}.txt"
+        (advancer / target).write_text(f"{marker}\n", encoding="utf-8")
+        self._run_git(advancer, "add", target)
+        self._run_git(advancer, "commit", "-q", "-m", f"advance {marker}")
+        new_commit = self._run_git(advancer, "rev-parse", "HEAD")
+        self._run_git(repo_root, "branch", "-f", "main", new_commit)
+        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
+        return new_commit
+
     def _record_review_pass(self, repo_root: Path, ticket_id: str) -> None:
         scratch_commit = self._run_git(repo_root, "rev-parse", "scratch")
         record = {
@@ -1319,17 +1543,6 @@ class PromotionLockRecoveryTests(PromotionSetupMixin):
 
 
 class StaleBaseRefusalTests(PromotionSetupMixin):
-    def _advance_main(self, repo_root: Path, marker: str) -> str:
-        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(self.tmp_path / f"adv-{marker}"), "main")
-        advancer = self.tmp_path / f"adv-{marker}"
-        (advancer / f"{marker}.txt").write_text(marker + "\n", encoding="utf-8")
-        self._run_git(advancer, "add", f"{marker}.txt")
-        self._run_git(advancer, "commit", "-q", "-m", f"advance {marker}")
-        new_commit = self._run_git(advancer, "rev-parse", "HEAD")
-        self._run_git(repo_root, "branch", "-f", "main", new_commit)
-        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
-        return new_commit
-
     def test_stale_base_refuses_without_touching_anything(self) -> None:
         repo_root = self._ready_to_promote("repo-stale-base", "211")
         new_main = self._advance_main(repo_root, "one")
@@ -1489,17 +1702,6 @@ class PromotionBreadcrumbTests(PromotionSetupMixin):
             "a failed promotion must not touch the breadcrumb",
         )
 
-    def _advance_main(self, repo_root: Path, marker: str) -> str:
-        advancer = self.tmp_path / f"adv-{marker}"
-        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(advancer), "main")
-        (advancer / f"{marker}.txt").write_text(marker + "\n", encoding="utf-8")
-        self._run_git(advancer, "add", f"{marker}.txt")
-        self._run_git(advancer, "commit", "-q", "-m", f"advance {marker}")
-        new_commit = self._run_git(advancer, "rev-parse", "HEAD")
-        self._run_git(repo_root, "branch", "-f", "main", new_commit)
-        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
-        return new_commit
-
 
 class SingleWorkspacePromotionRegressionTests(PromotionSetupMixin):
     def test_ordinary_promotion_is_unchanged_and_leaves_no_lock(self) -> None:
@@ -1534,6 +1736,55 @@ class SingleWorkspacePromotionRegressionTests(PromotionSetupMixin):
         self.assertIn("promotion review gate", stderr)
         self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
 
+    def test_claimless_workflow_behind_main_keeps_the_ordinary_refusal(self) -> None:
+        """A workflow that owns no claim is never pointed at refresh.
+
+        `flow-workspace refresh` refuses without an owned active claim, so a
+        patch workflow behind main must keep the plain branch-relationship
+        refusal rather than naming a recovery that cannot run.
+        """
+        repo_root = self._init_repo("repo-claimless-behind")
+        code, _, stderr = self._invoke(repo_root, "patch", "a bounded patch")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertEqual(workspaces.list_claim_files(repo_root), [])
+
+        self._advance_main(repo_root, "claimless")
+        before = self._run_git(repo_root, "rev-parse", "HEAD")
+
+        code, stdout, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertEqual(stdout, "")
+        self.assertIn("is behind main", stderr)
+        self.assertNotIn("workspace", stderr)
+        self.assertNotIn("stale", stderr)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "HEAD"), before)
+        self.assertFalse(workspaces.promotion_lock_path(repo_root).exists())
+
+    def test_claimless_workflow_diverged_from_main_keeps_the_ordinary_refusal(self) -> None:
+        repo_root = self._init_repo("repo-claimless-diverged")
+        code, _, stderr = self._invoke(repo_root, "patch", "a bounded patch")
+        self.assertEqual(code, 0, msg=stderr)
+
+        (repo_root / "scratch-work.txt").write_text("scratch\n", encoding="utf-8")
+        code, _, stderr = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+        self._advance_main(repo_root, "diverged")
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("have diverged", stderr)
+        self.assertNotIn("workspace", stderr)
+
+    def test_a_claimed_workflow_still_gets_the_refresh_recovery(self) -> None:
+        """The stale-base explanation stays where refresh can actually run."""
+        repo_root = self._ready_to_promote("repo-claimed-behind", "233")
+        self._advance_main(repo_root, "claimed")
+
+        code, _, stderr = self._invoke(repo_root, "promote", "should not run")
+        self.assertEqual(code, 1)
+        self.assertIn("base is stale", stderr)
+        self.assertIn("flow-workspace refresh", stderr)
+
 
 class RefreshTestBase(PromotionSetupMixin):
     def _workspace_with_work(self, name: str, ticket_id: str = "301"):
@@ -1545,18 +1796,6 @@ class RefreshTestBase(PromotionSetupMixin):
         code, _, stderr = self._invoke(repo_root, "commit")
         self.assertEqual(code, 0, msg=stderr)
         return repo_root
-
-    def _advance_main(self, repo_root: Path, marker: str, *, path: str = None) -> str:
-        advancer = self.tmp_path / f"advance-{marker}"
-        self._run_git(repo_root, "worktree", "add", "-q", "--detach", str(advancer), "main")
-        target = path or f"{marker}.txt"
-        (advancer / target).write_text(f"{marker}\n", encoding="utf-8")
-        self._run_git(advancer, "add", target)
-        self._run_git(advancer, "commit", "-q", "-m", f"advance {marker}")
-        new_commit = self._run_git(advancer, "rev-parse", "HEAD")
-        self._run_git(repo_root, "branch", "-f", "main", new_commit)
-        self._run_git(repo_root, "worktree", "remove", "--force", str(advancer))
-        return new_commit
 
     def _checkpoint_inference(self, repo_root: Path, scratch_branch: str) -> int:
         from ai_dev_flow.repository import max_numbered_checkpoint_relative_to_main
@@ -1610,6 +1849,45 @@ class WorkspaceRefreshTests(RefreshTestBase):
             "a refresh merge must not change numbered-checkpoint inference",
         )
         self.assertEqual(self._read_state(repo_root)["checkpoint"], before)
+
+    def test_a_workspace_that_is_only_behind_is_fast_forwarded(self) -> None:
+        """Nothing of its own means nothing to merge, so no commit is recorded.
+
+        Recording a merge here would leave the workspace permanently ahead of
+        main with an empty commit, which neither promotion nor completion can
+        resolve.
+        """
+        repo_root = self._init_repo("repo-refresh-behind")
+        self._write_ticket(repo_root, "321")
+        code, _, stderr = self._invoke(repo_root, "start", "321")
+        self.assertEqual(code, 0, msg=stderr)
+
+        new_main = self._advance_main(repo_root, "behind")
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("fast-forwarded: no merge commit was needed", stdout)
+
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "scratch"), new_main)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "main"), new_main)
+        self.assertEqual(self._run_git(repo_root, "status", "--porcelain"), "")
+
+    def test_a_fast_forwarded_workspace_can_still_complete(self) -> None:
+        repo_root = self._init_repo("repo-refresh-behind-complete")
+        self._write_ticket(repo_root, "322")
+        code, _, stderr = self._invoke(repo_root, "start", "322")
+        self.assertEqual(code, 0, msg=stderr)
+        self._advance_main(repo_root, "elsewhere")
+
+        code, _, stderr = self._invoke(repo_root, "complete")
+        self.assertEqual(code, 1)
+        self.assertIn("is behind main", stderr)
+
+        code, _, stderr = self._invoke(repo_root, "workspace", "refresh")
+        self.assertEqual(code, 0, msg=stderr)
+
+        code, _, stderr = self._invoke(repo_root, "complete")
+        self.assertEqual(code, 0, msg=stderr)
 
     def test_already_current_workspace_is_a_no_op(self) -> None:
         repo_root = self._workspace_with_work("repo-refresh-current", "303")

@@ -142,6 +142,15 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         self.assertIn("flow never resolves or aborts it", normalized_content)
         self.assertIn("same-host process proven absent", normalized_content)
 
+    def test_skill_body_documents_the_shared_ticket_catalogue(self) -> None:
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+
+        self.assertIn("ticket catalogue is repository-level state", normalized_content)
+        self.assertIn("otherwise from the primary worktree", normalized_content)
+        self.assertIn("only behind `main` has nothing of its own", normalized_content)
+        self.assertIn("refresh fast-forwards it and records no commit", normalized_content)
+
     def test_skill_body_documents_claim_ownership_and_blocked_claims(self) -> None:
         content = self.flow_skill.read_text(encoding="utf-8").lower()
         normalized_content = " ".join(content.split())
@@ -153,6 +162,10 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         )
         self.assertIn("blocked workflow is live and is never pruned", normalized_content)
         self.assertIn("one ticket may be active as only one writable workspace", normalized_content)
+        self.assertIn(
+            "a prerequisite handoff claims its own ticket in the workspace that starts it",
+            normalized_content,
+        )
 
     def test_skill_body_omits_unimplemented_workspace_behavior(self) -> None:
         """Documentation is limited to behavior that exists today."""

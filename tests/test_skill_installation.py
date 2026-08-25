@@ -131,6 +131,7 @@ class SkillInstallationTests(unittest.TestCase):
             "complete",
             "block",
             "resume",
+            "workspace",
         ):
             ps1_text = (scripts_dir / f"flow-{command}.ps1").read_text(encoding="utf-8")
             self.assertIn("invoke-flow.ps1", ps1_text)

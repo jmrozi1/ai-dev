@@ -54,6 +54,7 @@ from .repository import (
     delete_managed_ref,
     resolve_managed_ref,
     add_worktree,
+    merge_revision_fast_forward_only,
     merge_revision_no_fast_forward,
     unmerged_paths,
     merge_in_progress,
@@ -1413,6 +1414,25 @@ def _handle_prerequisite_start(
             f"Cannot start prerequisite workflow: issue {prerequisite_number} is already {prerequisite_ticket.workflow_state}."
         )
 
+    # A prerequisite becomes the active ticket of this workspace, so it takes a
+    # claim of its own. Without one it would look unclaimed to every other
+    # workspace, which could then activate the same ticket a second time. The
+    # suspended issue keeps its own claim: this workspace still owns it.
+    prerequisite_key = canonical_ticket_key(prerequisite_ticket.reference)
+    try:
+        requesting_worktree = effective_worktree_id(repo_root)
+        occupancy = describe_occupancy(
+            repo_root,
+            prerequisite_key,
+            requesting_worktree_id=requesting_worktree,
+        )
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+    if occupancy is not None:
+        raise FlowError(
+            f"Cannot start prerequisite workflow for ticket {prerequisite_number}: {occupancy}"
+        )
+
     try:
         inherited_commit = resolve_commit_hash(repo_root, state.scratch_branch)
         inherited_tree = resolve_tree_hash(repo_root, state.scratch_branch)
@@ -1458,6 +1478,21 @@ def _handle_prerequisite_start(
         ticket_reference=active_ticket.reference,
     )
 
+    try:
+        prerequisite_claim = acquire_active_claim(
+            repo_root,
+            reference=prerequisite_ticket.reference,
+            worktree_id=worktree_id_for_repo_root(repo_root),
+            workspace_path=repo_root,
+            branch=state.scratch_branch,
+        )
+    except ClaimOccupiedError as exc:
+        raise FlowError(
+            f"Cannot start prerequisite workflow for ticket {prerequisite_number}: {exc}"
+        ) from exc
+    except WorkspaceError as exc:
+        raise FlowError(str(exc)) from exc
+
     ref_created = False
     provider_changed = False
     try:
@@ -1473,6 +1508,7 @@ def _handle_prerequisite_start(
         save_state(state_path, next_state)
     except (RepositoryError, TicketProviderError, BlockedWorkflowsError, WorkflowStateError) as exc:
         rollback_errors: list[str] = []
+        _release_claim_quietly(repo_root, prerequisite_claim)
         try:
             save_state(state_path, state)
         except WorkflowStateError as rollback_exc:
@@ -2059,6 +2095,20 @@ def _workspace_command_name(command_name: str) -> str:
     return "flow-workspace"
 
 
+def _workspace_refresh_is_available(repo_root: Path, state: WorkflowState) -> bool:
+    """Whether the workspace refresh recovery could actually run here.
+
+    Refresh recovers a stale base only for a workflow that owns an active claim
+    in this worktree. A claim-less workflow -- a patch, or workflow state seeded
+    without a bound ticket -- must not be pointed at a command that would refuse.
+    """
+    try:
+        _owned_active_claim_for_state(repo_root, state)
+    except FlowError:
+        return False
+    return True
+
+
 def _promote_stale_base_message(
     repo_root: Path,
     state: WorkflowState,
@@ -2124,6 +2174,36 @@ def _promote_stale_base_message(
     return "\n".join(lines)
 
 
+def _promote_stale_base_error(
+    repo_root: Path,
+    state: WorkflowState,
+    comparison: BranchComparison,
+    *,
+    command_name: str,
+    observed_main_commit: str,
+    preflight_main_commit: str | None = None,
+) -> str:
+    """The refusal for a base that is no longer current.
+
+    Concurrent workspaces get the stale-base explanation and the refresh
+    recovery. A repository without a claim for this workflow keeps the ordinary
+    branch-relationship refusal, so ordinary single-workflow promotion behaves
+    exactly as it did before concurrent workspaces existed.
+    """
+    if not _workspace_refresh_is_available(repo_root, state):
+        relationship_error = _promote_branch_relationship_error(comparison)
+        if relationship_error:
+            return relationship_error
+    return _promote_stale_base_message(
+        repo_root,
+        state,
+        comparison,
+        command_name=command_name,
+        observed_main_commit=observed_main_commit,
+        preflight_main_commit=preflight_main_commit,
+    )
+
+
 def _promote_locked_revalidation(
     repo_root: Path,
     state: WorkflowState,
@@ -2169,7 +2249,7 @@ def _promote_locked_revalidation(
         descendant_revision=state.scratch_branch,
     ):
         raise FlowError(
-            _promote_stale_base_message(
+            _promote_stale_base_error(
                 repo_root,
                 state,
                 comparison,
@@ -2181,7 +2261,7 @@ def _promote_locked_revalidation(
 
     if comparison.scratch_behind_main:
         raise FlowError(
-            _promote_stale_base_message(
+            _promote_stale_base_error(
                 repo_root,
                 state,
                 comparison,
@@ -4428,8 +4508,13 @@ def _handle_workspace_add(command_name: str, arguments: list[str]) -> int:
             scratch_branch=branch_name,
         )
 
+        # Activation belongs to the new workspace, so it is written through that
+        # workspace's provider. A repository-local ticket store would otherwise
+        # be modified inside this worktree's working tree, leaking one ticket's
+        # activation into the other ticket's uncommitted work.
+        workspace_provider = _resolve_ticket_provider_for_repo_root(workspace_path)
         try:
-            active_ticket = provider.mark_active(reference)
+            active_ticket = workspace_provider.mark_active(reference)
         except TicketProviderError as exc:
             raise FlowError(
                 f"failed to mark ticket {issue_number} active. {exc}"
@@ -4958,6 +5043,16 @@ def _refresh_under_lock(
             file=sys.stderr,
         )
 
+    # A workspace that is only behind has nothing of its own to reconcile.
+    # Recording a merge there would leave it ahead of main with an empty commit,
+    # which no lifecycle command can then resolve, so it is moved forward
+    # instead. Nothing is rewritten: the branch follows its own ancestry.
+    scratch_is_contained_in_main = branch_is_ancestor(
+        repo_root,
+        ancestor_revision=state.scratch_branch,
+        descendant_revision=observed_main_commit,
+    )
+
     short_main = resolve_short_commit_hash(repo_root, observed_main_commit)
     # A non-numeric subject keeps numbered-checkpoint inference unchanged.
     merge_subject = (
@@ -4974,11 +5069,14 @@ def _refresh_under_lock(
         ) from exc
 
     try:
-        merge_revision_no_fast_forward(
-            repo_root,
-            revision=observed_main_commit,
-            message=merge_subject,
-        )
+        if scratch_is_contained_in_main:
+            merge_revision_fast_forward_only(repo_root, revision=observed_main_commit)
+        else:
+            merge_revision_no_fast_forward(
+                repo_root,
+                revision=observed_main_commit,
+                message=merge_subject,
+            )
     except RepositoryError as exc:
         conflicted = unmerged_paths(repo_root)
         if conflicted or merge_in_progress(repo_root):
@@ -5018,10 +5116,12 @@ def _refresh_under_lock(
             f"{state.main_branch} is still not an ancestor of {state.scratch_branch}."
         )
 
-    merge_commit = resolve_commit_hash(repo_root, "HEAD")
     print(f"Refreshed {state.scratch_branch} from {state.main_branch}")
     print(f"{state.main_branch}: {observed_main_commit}")
-    print(f"merge commit: {merge_commit}")
+    if scratch_is_contained_in_main:
+        print("fast-forwarded: no merge commit was needed")
+    else:
+        print(f"merge commit: {resolve_commit_hash(repo_root, 'HEAD')}")
     print(f"checkpoint: {state.checkpoint}")
     print(
         "Review evidence tied to the previous base was cleared; re-run review before "
