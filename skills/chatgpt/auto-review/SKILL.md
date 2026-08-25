@@ -1,6 +1,6 @@
 ---
 name: auto-review
-description: Decide and govern checkpoint or promotion review composition for AI Dev work, including ticket skill-candidate disposition and accepted skill remediation.
+description: Decide and govern checkpoint, promotion, or in-flight review composition for AI Dev work, including in-flight process review at a natural orchestrator handoff while a named checkpoint is still in progress, ticket skill-candidate disposition, and accepted skill remediation.
 ---
 
 # ChatGPT Auto-Review
@@ -80,6 +80,91 @@ Request or consume evidence gathered by Copilot's
 before making applicability decisions. The helper gathers evidence, including
 active ticket skill state when available; it does not make candidate or skill
 judgments.
+
+## In-Flight Composition
+
+In-flight process review is a third composition stage, distinct from checkpoint
+and promotion review. It is bound to a handoff rather than a lifecycle boundary,
+and it carries none of their recording, gating, or skill-disposition authority.
+
+### Applicability
+
+Consider in-flight review only when all of the following hold:
+
+- the active named ticket checkpoint is still in progress;
+- you are at a natural handoff, meaning the previous executor rail has ended in
+  a published handoff, block, or failure and no executor is currently executing
+  an authorized rail;
+- you are about to issue the next rail for that same named checkpoint.
+
+It never interrupts, pauses, or preempts an executor mid-rail, and never requires
+a running executor to stop and self-review. It is additive: it never replaces,
+defers, or satisfies checkpoint review or promotion review, never records a
+review pass, and never advances the named roadmap or a Flow checkpoint.
+
+### Evidence Basis
+
+Decide from observable current process evidence only: the authorized rail,
+published handoffs, current-state process notes, and lifecycle or repository
+state. Material signals include repeated invalid controls or baselines; repeated
+provenance or evidence invalidation; repeated reconstruction or repair of probes,
+harnesses, fixtures, or measurement tooling; the evidence apparatus having become
+the dominant work instead of advancing the named checkpoint; and successive
+materially equivalent rails ending in the same class of unresolved obligation for
+the same route reason. Weigh recurrence, cost, and whether the route or
+measurement strategy itself is churning. This is a judgment, never a count.
+
+Persistence of one proof obligation across several rails is not sufficient by
+itself. It becomes a signal only when paired with observable churn or failure of
+the route or measurement strategy. Correctly retiring invalid evidence and
+correctly honoring stop conditions are good local discipline, not churn; the
+signal is that the strategy for obtaining valid evidence keeps failing.
+
+Never activate on elapsed time, wall-clock duration, prompt, turn, or exchange
+count, token or credit usage, retry count, number of Flow checkpoint commits, any
+score or dashboard metric, or the mere length or difficulty of work that is
+steadily converging. A long checkpoint that keeps resolving real obligations,
+narrowing the problem, or producing valid new evidence continues without review.
+If a proposed rule could be evaluated by counting alone, it is outside this
+stage.
+
+### Action And Result
+
+When it applies, compose `review-process` before issuing another materially
+equivalent rail and ask one narrow question: on current process evidence, should
+the approach, decomposition, executor rail, or evidence strategy change in order
+to reach this checkpoint? Supply the smallest sufficient evidence surface, such
+as the current rail authorization, recent handoffs, process notes, changed paths,
+and lifecycle state. Build no report, monitor, or store.
+
+`review-process` alone decides process quality here; this skill owns
+applicability, timing, composition, evidence surface, and escalation, and does
+not pre-judge, override, or substitute for that judgment. The review returns
+concrete justified process changes, an explicit `no process change warranted`, or
+process issues to escalate or defer. `no process change warranted` is a complete,
+preferred result and permits reissuing the intended rail.
+
+Carry material findings into the current tasking surface: orchestrator-owned
+accepted state and authorized rail under a control plane, otherwise
+`.ai-dev/tasking.md`. Do not immediately reissue a materially equivalent rejected
+strategy unchanged; revisit it only with a stated reason grounded in new
+evidence.
+
+In-flight review may add a `Skill Candidates` entry when evidence warrants, but
+it does not perform and does not satisfy the named-checkpoint or promotion
+skill-candidate disposition gate.
+
+### Violations
+
+Each of the following breaches this stage: firing on long but steadily
+converging work; relying on any fixed threshold; interrupting or preempting an
+executor mid-rail; deciding process quality here or skipping `review-process`;
+immediately reissuing a materially equivalent rejected strategy without carrying
+findings forward; treating in-flight review as, or in place of, checkpoint or
+promotion review, or recording a pass from it; firing on a single persistent
+proof obligation with no route or measurement churn; and introducing a monitoring
+service, timer, counter, scoring system, dashboard, transcript store, retry
+framework, or new skill in order to implement it.
 
 ## Recording Boundary
 
