@@ -637,13 +637,16 @@ def resolve_repo_root_if_available() -> Path | None:
         return None
 
 
-def _resolve_repo_state_context() -> tuple[Path, Path, WorkflowState]:
+def _resolve_repo_state_context(
+    *, validate_identity: bool = True
+) -> tuple[Path, Path, WorkflowState]:
     repo_root = resolve_repo_root()
     state_path = workflow_state_file_for_repo_root(repo_root)
     state = load_state(state_path)
     if state.stacked_handoff is not None:
         _validate_stacked_scope(repo_root, state)
-    _validate_workspace_ticket_identity(repo_root, state)
+    if validate_identity:
+        _validate_workspace_ticket_identity(repo_root, state)
     return repo_root, state_path, state
 
 
@@ -4620,16 +4623,98 @@ def _workspace_path_conflicts(candidate: Path, existing: Path) -> bool:
     return candidate_text.startswith(existing_text.rstrip(os.sep) + os.sep)
 
 
+def _register_claims_for_active_workflow(
+    *,
+    repo_root: Path,
+    state: WorkflowState,
+    issue_number: int,
+) -> int:
+    """Record the claim a workspace's existing active workflow already implies.
+
+    A workflow started before this repository had a claim registry owns its
+    ticket in every way except the record, which leaves that ticket free for a
+    second workspace to activate. Registering it changes no branch, index,
+    working tree, workflow state, or ticket provider state.
+    """
+    if state.active_issue_number != issue_number or state.ticket_reference is None:
+        raise FlowError(
+            "Cannot adopt workspace: this workspace already has an active workflow."
+        )
+
+    references = [state.ticket_reference]
+    handoff = state.stacked_handoff
+    if handoff is not None and handoff.suspended_ticket_reference is not None:
+        # The suspended issue is owned here too, and is just as exposed.
+        references.append(handoff.suspended_ticket_reference)
+
+    registered: list[str] = []
+    already_owned: list[str] = []
+    for reference in references:
+        key = canonical_ticket_key(reference)
+        try:
+            requesting_worktree = effective_worktree_id(repo_root)
+            occupancy = describe_occupancy(
+                repo_root,
+                key,
+                requesting_worktree_id=requesting_worktree,
+            )
+        except WorkspaceError as exc:
+            raise FlowError(str(exc)) from exc
+        if occupancy is not None:
+            raise FlowError(f"Cannot adopt workspace for ticket {key}: {occupancy}")
+
+        existing = read_claim(repo_root, key)
+        if (
+            existing is not None
+            and not isinstance(existing, MalformedClaim)
+            and existing.status == "active"
+        ):
+            already_owned.append(key)
+            continue
+
+        try:
+            acquire_active_claim(
+                repo_root,
+                reference=reference,
+                worktree_id=worktree_id_for_repo_root(repo_root),
+                workspace_path=repo_root,
+                branch=state.scratch_branch,
+            )
+        except ClaimOccupiedError as exc:
+            raise FlowError(f"Cannot adopt workspace for ticket {key}: {exc}") from exc
+        except WorkspaceError as exc:
+            raise FlowError(str(exc)) from exc
+        registered.append(key)
+
+    if not registered:
+        print(f"Workspace already owns the claim for issue {issue_number}")
+        for key in already_owned:
+            print(f"claim: {key}")
+        print("No changes were made.")
+        return 0
+
+    print(f"Registered workspace ownership for issue {issue_number}")
+    for key in registered:
+        print(f"claim: {key}")
+    for key in already_owned:
+        print(f"already claimed: {key}")
+    print(f"branch: {state.scratch_branch}")
+    print(f"checkpoint: {state.checkpoint}")
+    return 0
+
+
 def _handle_workspace_adopt(command_name: str, arguments: list[str]) -> int:
     if len(arguments) != 1:
         raise _workspace_usage(command_name)
 
     issue_number = _parse_issue_number(command_name, arguments)
-    repo_root, state_path, state = _resolve_repo_state_context()
+    # Adoption is how an unproven association is repaired, so it reads state
+    # without demanding the identity it is about to establish.
+    repo_root, state_path, state = _resolve_repo_state_context(validate_identity=False)
 
     if _active_workflow_type(state) is not None:
-        raise FlowError(
-            "Cannot adopt workspace: this workspace already has an active workflow."
+        return _register_claims_for_active_workflow(
+            repo_root=repo_root, state=state, issue_number=issue_number
         )
 
     _ensure_main_and_scratch_branches_differ(state)

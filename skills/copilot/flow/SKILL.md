@@ -82,6 +82,11 @@ exactly as before.
 - `scripts/flow-workspace adopt <id>` claims and activates a worktree that
   already exists. It never resets the branch, index, or working tree, and infers
   the checkpoint from existing numbered commits.
+  Run against a workspace whose workflow is already active on that same ticket,
+  it only registers the claim that workflow already implies -- including a
+  stacked handoff's suspended issue -- and changes nothing else. That is the
+  supported repair for a workflow started before this repository had a registry,
+  and for a workspace whose claim went missing.
 - One ticket may be active as only one writable workspace. A second attempt is
   refused and names the owning workspace.
 - A prerequisite handoff claims its own ticket in the workspace that starts it,

@@ -388,6 +388,114 @@ class AdoptionTests(WorkspaceTestBase):
         self.assertIn("already has an active workflow", stderr)
 
 
+class LegacyClaimRegistrationTests(WorkspaceTestBase):
+    """An active workflow that predates the registry can register its claim."""
+
+    def _active_without_claims(self, name: str, ticket_id: str = "21"):
+        repo_root = self._init_repo(name)
+        self._write_ticket(repo_root, ticket_id)
+        self._write_ticket(repo_root, "29")
+        code, _, stderr = self._invoke(repo_root, "start", ticket_id)
+        self.assertEqual(code, 0, msg=stderr)
+        for claim_file in workspaces.list_claim_files(repo_root):
+            claim_file.unlink()
+        return repo_root
+
+    def test_adopt_registers_the_claim_an_active_workflow_implies(self) -> None:
+        repo_root = self._active_without_claims("repo-legacy-adopt")
+        before = self._read_state(repo_root)
+        head_before = self._run_git(repo_root, "rev-parse", "HEAD")
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "adopt", "21")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("Registered workspace ownership for issue 21", stdout)
+
+        claim = workspaces.read_claim(
+            repo_root, workspaces.canonical_ticket_key(self._local_reference("21"))
+        )
+        self.assertIsNotNone(claim)
+        self.assertEqual(claim.status, "active")
+        self.assertEqual(self._read_state(repo_root), before)
+        self.assertEqual(self._run_git(repo_root, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(self._run_git(repo_root, "status", "--porcelain"), "")
+
+    def test_registering_the_claim_is_idempotent(self) -> None:
+        repo_root = self._active_without_claims("repo-legacy-idempotent")
+        self.assertEqual(self._invoke(repo_root, "workspace", "adopt", "21")[0], 0)
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "adopt", "21")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("already owns the claim", stdout)
+        self.assertIn("No changes were made", stdout)
+
+    def test_adopting_a_different_ticket_than_the_active_one_is_refused(self) -> None:
+        repo_root = self._active_without_claims("repo-legacy-mismatch")
+
+        code, _, stderr = self._invoke(repo_root, "workspace", "adopt", "29")
+        self.assertEqual(code, 1)
+        self.assertIn("already has an active workflow", stderr)
+        self.assertEqual(workspaces.list_claim_files(repo_root), [])
+
+    def test_a_registered_claim_blocks_a_second_workspace(self) -> None:
+        repo_root = self._active_without_claims("repo-legacy-protects")
+        self.assertEqual(self._invoke(repo_root, "workspace", "adopt", "21")[0], 0)
+
+        code, _, stderr = self._invoke(
+            repo_root, "workspace", "add", "21", str(self.tmp_path / "second")
+        )
+        self.assertEqual(code, 1)
+        self.assertIn("already active in workspace", stderr)
+
+    def test_a_stacked_workspace_registers_its_suspended_issue_too(self) -> None:
+        repo_root = self._init_repo("repo-legacy-stacked")
+        for ticket_id in ("21", "22"):
+            self._write_ticket(repo_root, ticket_id)
+        code, _, stderr = self._invoke(repo_root, "start", "21")
+        self.assertEqual(code, 0, msg=stderr)
+        (repo_root / "work.txt").write_text("work\n", encoding="utf-8")
+        code, _, stderr = self._invoke(repo_root, "commit")
+        self.assertEqual(code, 0, msg=stderr)
+        code, _, stderr = self._invoke(repo_root, "start", "22", "--prerequisite-for", "21")
+        self.assertEqual(code, 0, msg=stderr)
+        for claim_file in workspaces.list_claim_files(repo_root):
+            claim_file.unlink()
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "adopt", "22")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("local:22", stdout)
+        self.assertIn("local:21", stdout)
+        for ticket_id in ("21", "22"):
+            with self.subTest(ticket_id=ticket_id):
+                self.assertIsNotNone(
+                    workspaces.read_claim(
+                        repo_root,
+                        workspaces.canonical_ticket_key(self._local_reference(ticket_id)),
+                    )
+                )
+
+    def test_a_linked_workspace_repairs_its_own_unproven_identity(self) -> None:
+        repo_root = self._init_repo("repo-legacy-linked")
+        self._write_ticket(repo_root, "21")
+        self._write_ticket(repo_root, "22")
+        code, _, stderr = self._invoke(repo_root, "start", "21")
+        self.assertEqual(code, 0, msg=stderr)
+        workspace = self.tmp_path / "linked-22"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "22", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+        self._claim_path(repo_root, "22").unlink()
+
+        code, _, stderr = self._invoke(workspace, "status", "-v")
+        self.assertEqual(code, 1)
+        self.assertIn("holds no active claim", stderr)
+
+        code, _, stderr = self._invoke(workspace, "workspace", "adopt", "22")
+        self.assertEqual(code, 0, msg=stderr)
+
+        code, stdout, stderr = self._invoke(workspace, "status", "-v")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("issue number: 22", stdout)
+
+
 class StaleClaimTests(WorkspaceTestBase):
     def test_prune_removes_claims_whose_worktree_is_gone(self) -> None:
         repo_root = self._init_repo("repo-stale")

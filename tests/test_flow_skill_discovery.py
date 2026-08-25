@@ -173,6 +173,10 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         )
         self.assertIn("stop and name the owning workspace", normalized_content)
         self.assertIn(
+            "only registers the claim that workflow already implies",
+            normalized_content,
+        )
+        self.assertIn(
             "never inherits a pinned control-plane ticket",
             normalized_content,
         )
