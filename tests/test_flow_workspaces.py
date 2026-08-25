@@ -12,6 +12,7 @@ from contextlib import redirect_stderr, redirect_stdout
 
 from ai_dev_flow import cli
 from ai_dev_flow import workspaces
+from ai_dev_flow.repository import diff_baseline_file_for_repo_root
 from ai_dev_flow.ticket_config import load_ticket_configuration_for_repo_root
 from ai_dev_flow.ticket_providers import instantiate_ticket_provider
 from ai_dev_flow.ticket_status import render_active_ticket_status
@@ -757,6 +758,90 @@ class WorkspaceLifecycleTests(WorkspaceTestBase):
         self.assertIn("local:81", stdout)
         self.assertIn("local:82", stdout)
         self.assertIn("(current)", stdout)
+
+
+class WorkspaceArtifactIsolationTests(WorkspaceTestBase):
+    """Per-workspace review and task artifacts never cross workspaces."""
+
+    def _record_review_pass(self, repo_root: Path, ticket_id: str) -> None:
+        record = {
+            "version": 1,
+            "result": "pass",
+            "scratchCommit": self._run_git(repo_root, "rev-parse", "scratch"),
+            "mainBranch": "main",
+            "scratchBranch": "scratch",
+            "activeIssueNumber": int(ticket_id),
+        }
+        path = repo_root / ".ai-dev" / "promotion-review.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+
+    def _two_workspaces(self, name: str):
+        repo_root = self._init_repo(name)
+        self._write_ticket(repo_root, "451")
+        self._write_ticket(repo_root, "452")
+        code, _, stderr = self._invoke(repo_root, "start", "451")
+        self.assertEqual(code, 0, msg=stderr)
+
+        workspace = self.tmp_path / f"{name}-452"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "452", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+        return repo_root, workspace
+
+    def test_review_and_task_artifacts_stay_in_their_own_workspace(self) -> None:
+        repo_root, workspace = self._two_workspaces("repo-artifacts")
+
+        for root, marker in ((repo_root, "451"), (workspace, "452")):
+            (root / ".ai-dev" / "review").mkdir(parents=True, exist_ok=True)
+            (root / ".ai-dev" / "review" / "notes.md").write_text(
+                f"review for {marker}\n", encoding="utf-8"
+            )
+            (root / ".ai-dev" / "tasks").mkdir(parents=True, exist_ok=True)
+            (root / ".ai-dev" / "tasks" / f"review-{marker}-task.md").write_text(
+                f"task for {marker}\n", encoding="utf-8"
+            )
+
+        self.assertEqual(
+            (repo_root / ".ai-dev" / "review" / "notes.md").read_text(encoding="utf-8"),
+            "review for 451\n",
+        )
+        self.assertEqual(
+            (workspace / ".ai-dev" / "review" / "notes.md").read_text(encoding="utf-8"),
+            "review for 452\n",
+        )
+        self.assertFalse((repo_root / ".ai-dev" / "tasks" / "review-452-task.md").exists())
+        self.assertFalse((workspace / ".ai-dev" / "tasks" / "review-451-task.md").exists())
+
+    def test_promotion_review_evidence_is_never_shared(self) -> None:
+        repo_root, workspace = self._two_workspaces("repo-review-evidence")
+
+        (repo_root / "a.txt").write_text("a\n", encoding="utf-8")
+        self.assertEqual(self._invoke(repo_root, "commit")[0], 0)
+        self._record_review_pass(repo_root, "451")
+
+        self.assertFalse((workspace / ".ai-dev" / "promotion-review.json").exists())
+
+        (workspace / "b.txt").write_text("b\n", encoding="utf-8")
+        self.assertEqual(self._invoke(workspace, "commit")[0], 0)
+
+        # The other workspace's pass never satisfies this workspace's gate.
+        code, _, stderr = self._invoke(workspace, "promote", "no review here")
+        self.assertEqual(code, 1)
+        self.assertIn("promotion review gate", stderr)
+        self.assertTrue((repo_root / ".ai-dev" / "promotion-review.json").exists())
+
+    def test_diff_baselines_are_per_workspace(self) -> None:
+        repo_root, workspace = self._two_workspaces("repo-baselines")
+
+        baseline = diff_baseline_file_for_repo_root(repo_root)
+        baseline.parent.mkdir(parents=True, exist_ok=True)
+        baseline.write_text(json.dumps({"marker": "451"}), encoding="utf-8")
+
+        self.assertFalse(diff_baseline_file_for_repo_root(workspace).exists())
+        self.assertNotEqual(
+            diff_baseline_file_for_repo_root(workspace),
+            diff_baseline_file_for_repo_root(repo_root),
+        )
 
 
 class SharedTicketCatalogueTests(WorkspaceTestBase):
