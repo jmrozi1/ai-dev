@@ -502,6 +502,33 @@ class ConfigurationRelocationTests(WorkspaceTestBase):
         seeded = json.loads((workspace / ".ai-dev" / "config.json").read_text(encoding="utf-8"))
         self.assertEqual(seeded["out"], str(external))
 
+    def test_a_pinned_control_plane_ticket_is_not_inherited(self) -> None:
+        """A pin names the source workspace's rail, not the new workspace's."""
+        relocation = workspaces.relocate_config_for_workspace(
+            {
+                "controlPlane": {
+                    "repository": "../coordination",
+                    "project": "demo",
+                    "ticket": "issue-11",
+                }
+            },
+            source_root=self.tmp_path / "source",
+            target_root=self.tmp_path / "target",
+        )
+        self.assertEqual(
+            relocation.config["controlPlane"],
+            {"repository": "../coordination", "project": "demo"},
+        )
+
+    def test_an_unpinned_control_plane_block_is_untouched(self) -> None:
+        block = {"repository": "../coordination", "project": "demo"}
+        relocation = workspaces.relocate_config_for_workspace(
+            {"controlPlane": dict(block)},
+            source_root=self.tmp_path / "source",
+            target_root=self.tmp_path / "target",
+        )
+        self.assertEqual(relocation.config["controlPlane"], block)
+
     def test_relocation_helper_preserves_nested_relative_layout(self) -> None:
         source = Path("/srv/project")
         target = Path("/srv/project-issue-9")
@@ -866,6 +893,94 @@ class BlockedClaimTests(WorkspaceTestBase):
         code, _, stderr = self._invoke(linked, "start", "103")
         self.assertEqual(code, 1)
         self.assertIn("already active in workspace", stderr)
+
+
+class WorkspaceIdentityFailsClosedTests(WorkspaceTestBase):
+    """A session must not act on a ticket its worktree cannot prove it owns."""
+
+    def _two_workspaces(self, name: str):
+        repo_root = self._init_repo(name)
+        self._write_ticket(repo_root, "11", title="Ticket eleven")
+        self._write_ticket(repo_root, "12", title="Ticket twelve")
+        code, _, stderr = self._invoke(repo_root, "start", "11")
+        self.assertEqual(code, 0, msg=stderr)
+
+        workspace = self.tmp_path / f"{name}-12"
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "12", str(workspace))
+        self.assertEqual(code, 0, msg=stderr)
+        return repo_root, workspace
+
+    def _retarget_state(self, workspace: Path, issue_number: int) -> None:
+        """Rewrite workflow state to name a ticket this worktree does not own."""
+        path = workspace / ".ai-dev" / "workflow.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["activeIssueNumber"] = issue_number
+        payload["ticket"]["ticketId"] = str(issue_number)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+
+    def test_each_workspace_resolves_only_its_own_ticket(self) -> None:
+        repo_root, workspace = self._two_workspaces("repo-identity-scope")
+
+        code, stdout, stderr = self._invoke(repo_root, "status", "-v")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("issue number: 11", stdout)
+        self.assertNotIn("issue number: 12", stdout)
+
+        code, stdout, stderr = self._invoke(workspace, "status", "-v")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("issue number: 12", stdout)
+        self.assertNotIn("issue number: 11", stdout)
+
+    def test_a_ticket_owned_elsewhere_stops_every_lifecycle_command(self) -> None:
+        repo_root, workspace = self._two_workspaces("repo-identity-conflict")
+        self._retarget_state(workspace, 11)
+        head_before = self._run_git(workspace, "rev-parse", "HEAD")
+
+        for command in ("status", "commit", "diff", "promote"):
+            with self.subTest(command=command):
+                arguments = ("message",) if command == "promote" else ()
+                code, stdout, stderr = self._invoke(workspace, command, *arguments)
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn("Ambiguous workspace ticket identity", stderr)
+                self.assertIn(str(repo_root), stderr)
+                self.assertIn("Nothing was changed", stderr)
+
+        self.assertEqual(self._run_git(workspace, "rev-parse", "HEAD"), head_before)
+        self.assertEqual(self._read_state(repo_root)["activeIssueNumber"], 11)
+
+    def test_the_registry_commands_stay_available_for_repair(self) -> None:
+        repo_root, workspace = self._two_workspaces("repo-identity-repair")
+        self._retarget_state(workspace, 11)
+
+        code, stdout, stderr = self._invoke(workspace, "workspace", "list")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("local:11", stdout)
+        self.assertIn("local:12", stdout)
+
+        code, _, stderr = self._invoke(workspace, "workspace", "prune")
+        self.assertEqual(code, 0, msg=stderr)
+
+    def test_a_linked_workspace_without_a_claim_is_unproven(self) -> None:
+        repo_root, workspace = self._two_workspaces("repo-identity-missing")
+        self._claim_path(repo_root, "12").unlink()
+
+        code, _, stderr = self._invoke(workspace, "status", "-v")
+        self.assertEqual(code, 1)
+        self.assertIn("holds no active claim", stderr)
+
+    def test_a_repository_that_never_used_workspaces_is_unaffected(self) -> None:
+        repo_root = self._init_repo("repo-identity-legacy")
+        self._write_ticket(repo_root, "13")
+        code, _, stderr = self._invoke(repo_root, "start", "13")
+        self.assertEqual(code, 0, msg=stderr)
+
+        for claim_file in workspaces.list_claim_files(repo_root):
+            claim_file.unlink()
+
+        code, stdout, stderr = self._invoke(repo_root, "status", "-v")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("issue number: 13", stdout)
 
 
 class StackedHandoffClaimTests(WorkspaceTestBase):

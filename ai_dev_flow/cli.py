@@ -116,6 +116,7 @@ from .workspaces import (
     create_active_claim,
     default_workspace_path,
     describe_occupancy,
+    verify_workspace_ticket_identity,
     effective_worktree_id,
     evaluate_claim,
     find_foreign_out_path,
@@ -642,7 +643,43 @@ def _resolve_repo_state_context() -> tuple[Path, Path, WorkflowState]:
     state = load_state(state_path)
     if state.stacked_handoff is not None:
         _validate_stacked_scope(repo_root, state)
+    _validate_workspace_ticket_identity(repo_root, state)
     return repo_root, state_path, state
+
+
+def _validate_workspace_ticket_identity(repo_root: Path, state: WorkflowState) -> None:
+    """Stop before acting on a ticket this worktree cannot prove it owns.
+
+    Two workspaces acting on one ticket is the failure this ticket exists to
+    prevent, and a session that reads contradictory identity must stop rather
+    than pick a side. The registry-level workspace commands do not resolve
+    state through here, so listing, pruning, unlocking, and removal remain
+    available to repair whatever produced the contradiction.
+    """
+    permitted_keys = []
+    handoff = state.stacked_handoff
+    if handoff is not None and handoff.suspended_ticket_reference is not None:
+        # A prerequisite handoff legitimately owns its suspended issue's claim.
+        permitted_keys.append(canonical_ticket_key(handoff.suspended_ticket_reference))
+
+    try:
+        problem = verify_workspace_ticket_identity(
+            repo_root,
+            reference=state.ticket_reference,
+            permitted_keys=permitted_keys,
+        )
+    except WorkspaceError as exc:
+        raise FlowError(f"Cannot resolve workspace ticket identity: {exc}") from exc
+
+    if problem is None:
+        return
+
+    workspace_command = _workspace_command_name(resolve_command_name())
+    raise FlowError(
+        f"Ambiguous workspace ticket identity: {problem.detail} "
+        f"Nothing was changed. Inspect the workspaces with '{workspace_command} list' "
+        "and repair the workspace-to-ticket association before running any ticket work."
+    )
 
 
 def _validate_stacked_scope(repo_root: Path, state: WorkflowState) -> None:

@@ -167,6 +167,15 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
             normalized_content,
         )
         self.assertIn("blocked workflow is live and is never pruned", normalized_content)
+        self.assertIn(
+            "the claim registry, not workflow state, is the authority",
+            normalized_content,
+        )
+        self.assertIn("stop and name the owning workspace", normalized_content)
+        self.assertIn(
+            "never inherits a pinned control-plane ticket",
+            normalized_content,
+        )
         self.assertIn("one ticket may be active as only one writable workspace", normalized_content)
         self.assertIn(
             "a prerequisite handoff claims its own ticket in the workspace that starts it",

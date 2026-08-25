@@ -10,6 +10,8 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from ai_dev_flow import control_plane
+from ai_dev_flow import workspaces
+from ai_dev_flow.tickets import TicketReference
 from ai_dev_flow.control_plane import (
     ControlPlaneError,
     allocate_proceed_number,
@@ -890,6 +892,90 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(ControlPlaneError) as caught:
             resolve_control_plane_config(product)
         self.assertIn("ticket is required", str(caught.exception))
+
+    def test_each_concurrent_workspace_resolves_only_its_own_rail(self) -> None:
+        """One repository, two ticket workspaces, two distinct rails."""
+        product = self._workspace_product_repo(active_issue=50, claimed_issue=50)
+        workspace = self._linked_workspace(product, active_issue=51, claimed_issue=51)
+
+        primary = resolve_control_plane_config(product)
+        linked = resolve_control_plane_config(workspace)
+        assert primary is not None and linked is not None
+        self.assertEqual(primary.ticket, "issue-50")
+        self.assertEqual(linked.ticket, "issue-51")
+
+    def test_a_workspace_that_names_another_workspaces_ticket_fails_closed(self) -> None:
+        product = self._workspace_product_repo(active_issue=50, claimed_issue=50)
+        workspace = self._linked_workspace(product, active_issue=50, claimed_issue=51)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            resolve_control_plane_config(workspace)
+        message = str(caught.exception)
+        self.assertIn("Ambiguous workspace ticket identity", message)
+        self.assertIn("Repair the workspace-to-ticket association", message)
+
+    def test_a_workspace_without_a_claim_cannot_name_a_rail(self) -> None:
+        product = self._workspace_product_repo(active_issue=50, claimed_issue=50)
+        workspace = self._linked_workspace(product, active_issue=51, claimed_issue=None)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            resolve_control_plane_config(workspace)
+        self.assertIn("holds no active claim", str(caught.exception))
+
+    def _workspace_product_repo(self, *, active_issue: int, claimed_issue: int | None) -> Path:
+        product = self._product_repo(
+            {"repository": str(self.coordination), "project": "ai-dev"},
+            active_issue=active_issue,
+        )
+        self._write_workflow_ticket(product, active_issue)
+        if claimed_issue is not None:
+            self._claim(product, product, claimed_issue)
+        return product
+
+    def _linked_workspace(self, product: Path, *, active_issue: int, claimed_issue: int | None) -> Path:
+        workspace = self.tmp_path / f"workspace-{active_issue}"
+        self._git(product, "worktree", "add", "-q", "-b", f"flow-{active_issue}", str(workspace), "main")
+        (workspace / ".ai-dev").mkdir(parents=True, exist_ok=True)
+        (workspace / ".ai-dev" / "config.json").write_text(
+            (product / ".ai-dev" / "config.json").read_text(encoding="utf-8"), encoding="utf-8"
+        )
+        (workspace / ".ai-dev" / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "mainBranch": "main",
+                    "scratchBranch": f"flow-{active_issue}",
+                    "checkpoint": 0,
+                    "activeIssueNumber": active_issue,
+                }
+            ),
+            encoding="utf-8",
+        )
+        self._write_workflow_ticket(workspace, active_issue)
+        if claimed_issue is not None:
+            self._claim(product, workspace, claimed_issue)
+        return workspace
+
+    def _write_workflow_ticket(self, repo_root: Path, issue_number: int) -> None:
+        path = repo_root / ".ai-dev" / "workflow.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["ticket"] = {
+            "provider": "github",
+            "ticketId": str(issue_number),
+            "repository": "owner/name",
+        }
+        path.write_text(json.dumps(payload), encoding="utf-8")
+
+    def _claim(self, product: Path, owner_root: Path, issue_number: int) -> None:
+        reference = TicketReference(
+            provider="github", ticket_id=str(issue_number), repository="owner/name"
+        )
+        workspaces.create_active_claim(
+            product,
+            reference=reference,
+            worktree_id=workspaces.effective_worktree_id(owner_root),
+            workspace_path=owner_root,
+            branch=self._git(owner_root, "rev-parse", "--abbrev-ref", "HEAD"),
+        )
 
     def test_non_repository_path_is_refused(self) -> None:
         plain = self.tmp_path / "plain"

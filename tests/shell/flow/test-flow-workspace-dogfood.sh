@@ -167,6 +167,42 @@ assert_contains "$listing" "$PRIMARY" 'workspace list'
 assert_contains "$listing" "$SECOND" 'workspace list'
 assert_contains "$listing" '(current)' 'workspace list'
 
+# A contradictory workspace-to-ticket association stops without executing
+# either ticket, and the registry stays readable so it can be repaired.
+python3 - "$SECOND/.ai-dev/workflow.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+payload["activeIssueNumber"] = 601
+payload["ticket"]["ticketId"] = "601"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2)
+PY
+identity_output="$TMP_DIR/identity-output"
+flow_expect_failure "$SECOND" "$identity_output" status -v
+identity_text="$(cat "$identity_output")"
+assert_contains "$identity_text" 'Ambiguous workspace ticket identity' 'contradictory identity'
+assert_contains "$identity_text" "$PRIMARY" 'contradictory identity names the owner'
+assert_contains "$identity_text" 'Nothing was changed' 'contradictory identity'
+assert_contains "$(flow "$SECOND" workspace list)" 'local:602' 'registry stays readable for repair'
+git -C "$SECOND" checkout -q -- . 2>/dev/null || true
+python3 - "$SECOND/.ai-dev/workflow.json" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as handle:
+    payload = json.load(handle)
+payload["activeIssueNumber"] = 602
+payload["ticket"]["ticketId"] = "602"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, indent=2)
+PY
+assert_contains "$(flow "$SECOND" status -v)" 'issue number: 602' 'repaired identity resolves again'
+
 # ---------------------------------------------------------------------------
 # Independent checkpoints, and no leakage of either work surface.
 # ---------------------------------------------------------------------------

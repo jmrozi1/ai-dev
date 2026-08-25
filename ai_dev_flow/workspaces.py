@@ -754,6 +754,76 @@ def evaluate_claim(repo_root: Path, record: ClaimRecord, path: Path) -> ClaimSta
     )
 
 
+@dataclass(frozen=True)
+class IdentityProblem:
+    """Why this worktree's active ticket cannot be trusted."""
+
+    detail: str
+
+
+def verify_workspace_ticket_identity(
+    repo_root: Path,
+    *,
+    reference: Optional[TicketReference],
+    permitted_keys: Iterable = (),
+):
+    """Prove that this worktree really owns the ticket its workflow names.
+
+    The claim registry is the ownership authority; workflow state is only what
+    a command acts on. When the two disagree, a session would otherwise execute
+    the ticket another workspace owns, so the disagreement is reported rather
+    than resolved. A repository that never created a workspace has no claims at
+    all, which is the ordinary single-worktree case and not a disagreement.
+    """
+    if reference is None:
+        return None
+
+    key = canonical_ticket_key(reference)
+    allowed = {key, *permitted_keys}
+    owner = effective_worktree_id(repo_root)
+
+    record = read_claim(repo_root, key)
+    if isinstance(record, MalformedClaim):
+        return IdentityProblem(
+            f"the workspace claim for {key} at {record.path} is unreadable "
+            f"({record.detail})."
+        )
+
+    if record is not None and record.status == "active":
+        if record.worktree_id != owner:
+            return IdentityProblem(
+                f"the active ticket {key} is owned by workspace "
+                f"{record.intended_path or record.worktree_id}, not this one."
+            )
+        return None
+
+    # No active claim for the named ticket. That is only acceptable where no
+    # workspace ownership was ever established for this worktree.
+    conflicting = []
+    for path in list_claim_files(repo_root):
+        other = read_claim_file(path)
+        if isinstance(other, MalformedClaim) or other is None:
+            continue
+        if other.status != "active" or other.worktree_id != owner:
+            continue
+        if other.key not in allowed:
+            conflicting.append(other.key)
+
+    if conflicting:
+        return IdentityProblem(
+            f"this workspace holds the active claim for {', '.join(sorted(conflicting))} "
+            f"but its workflow names {key}."
+        )
+
+    if worktree_id_for_repo_root(repo_root) is not None:
+        return IdentityProblem(
+            f"this workspace holds no active claim for {key}, so its ticket ownership "
+            "is unproven."
+        )
+
+    return None
+
+
 def describe_occupancy(
     repo_root: Path,
     key: str,
@@ -796,6 +866,10 @@ def describe_occupancy(
 # ---------------------------------------------------------------------------
 
 
+# Mirrors ai_dev_flow.control_plane; naming it here avoids an import cycle.
+CONTROL_PLANE_CONFIG_KEY = "controlPlane"
+
+
 @dataclass(frozen=True)
 class ConfigRelocation:
     config: dict
@@ -811,11 +885,18 @@ def relocate_config_for_workspace(
 ) -> ConfigRelocation:
     """Move repository-local output into the new workspace; leave external paths.
 
-    Only `out` is workspace-relative today. A value inside the source workspace
-    is rewritten to the equivalent path inside the target so two workspaces
-    never share one output artifact; anything outside is deliberate and kept.
+    A value inside the source workspace is rewritten to the equivalent path
+    inside the target so two workspaces never share one output artifact;
+    anything outside is deliberate and kept. A pinned control-plane ticket names
+    the source workspace's own rail, so it is dropped rather than inherited: the
+    new workspace derives its rail from the ticket it actually owns.
     """
     updated = dict(config)
+    control_plane = updated.get(CONTROL_PLANE_CONFIG_KEY)
+    if isinstance(control_plane, dict) and "ticket" in control_plane:
+        pruned = {key: value for key, value in control_plane.items() if key != "ticket"}
+        updated[CONTROL_PLANE_CONFIG_KEY] = pruned
+
     out_value = config.get("out")
     if not isinstance(out_value, str) or not out_value.strip():
         return ConfigRelocation(config=updated, relocated=False, detail="no out path configured")
