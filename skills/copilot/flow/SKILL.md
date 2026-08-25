@@ -58,6 +58,7 @@ Map natural-language lifecycle requests to this package's local helpers:
 | `/status` or `what's my status?` | `scripts/ticket-status` |
 | `/status verbose` | `scripts/ticket-status verbose` |
 
+
 ### Prerequisite Handoff
 
 - Use `scripts/flow-start <issue>` for independent work that starts from `main`.
@@ -120,6 +121,11 @@ worktree, and any durable synchronization evidence. Preserve a pending
 promotion as recoverable state and retry only through the shared Flow command.
 
 ## Diagnostic Status
+
+`scripts/flow-report` prints the canonical read-only renderer output. It selects
+the immediately preceding eligible completed Copilot turn and excludes its own
+in-progress request; it does not create a second synthesized response or mutate
+local state.
 
 `scripts/flow-status` remains a Copilot-only diagnostic and lifecycle-evidence
 helper. Do not present its repository details as normal project progress.

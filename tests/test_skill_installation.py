@@ -112,6 +112,25 @@ class SkillInstallationTests(unittest.TestCase):
             [package.name for package in discover_skill_packages(source_repo, audience="copilot")],
         )
 
+    def test_copilot_report_skill_is_not_discoverable(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        names = [package.name for package in discover_skill_packages(source_repo, audience="copilot")]
+        self.assertNotIn("report", names)
+
+    def test_installed_copilot_package_does_not_include_report_skill(self) -> None:
+        source_repo = Path(__file__).resolve().parents[1]
+        destination = self.tmp_path / "installed-skills"
+        home = self.tmp_path / "home"
+        result = install_skill_packages(
+            repo_root=source_repo,
+            destination_root=destination,
+            home=home,
+            audience="copilot",
+        )
+        self.assertNotIn("report", [package.name for package in discover_skill_packages(source_repo, audience="copilot")])
+        self.assertFalse((destination / "report").exists())
+        self.assertNotIn("report", [status.name for status in result.statuses])
+
     def test_copilot_flow_skill_has_single_windows_local_invocation_mechanism(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
         scripts_dir = source_repo / "skills" / "copilot" / "flow" / "scripts"
@@ -131,6 +150,7 @@ class SkillInstallationTests(unittest.TestCase):
             "complete",
             "block",
             "resume",
+            "report",
         ):
             ps1_text = (scripts_dir / f"flow-{command}.ps1").read_text(encoding="utf-8")
             self.assertIn("invoke-flow.ps1", ps1_text)
@@ -181,7 +201,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self.assertEqual(names.count("auto-review"), 2)
         self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 13)
+        self.assertEqual(len(names), 14)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -208,6 +228,7 @@ class SkillInstallationTests(unittest.TestCase):
         shared_names = {
             "feedback-loop-design",
             "frontend-design-review",
+            "investigation-synthesis",
             "requirements-driven-development",
             "review-process",
         }
@@ -265,6 +286,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "flow",
                 "flow",
                 "frontend-design-review",
+                "investigation-synthesis",
                 "orchestrator",
                 "requirements-driven-development",
                 "review-process",
@@ -301,6 +323,7 @@ class SkillInstallationTests(unittest.TestCase):
                 "flow",
                 "flow",
                 "frontend-design-review",
+                "investigation-synthesis",
                 "orchestrator",
                 "requirements-driven-development",
                 "review-process",
