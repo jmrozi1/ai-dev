@@ -19,7 +19,7 @@ from pathlib import Path
 import platform
 import socket
 import subprocess
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from .json_files import JsonFileError, write_json_object_atomic
 from .tickets import TicketReference
@@ -546,6 +546,78 @@ def acquire_active_claim(
         workspace_path=workspace_path,
         branch=branch,
     )
+
+
+def reclaim_stale_active_claim(
+    repo_root: Path,
+    *,
+    reference: TicketReference,
+    worktree_id: Optional[str],
+    workspace_path: Path,
+    branch: str,
+) -> ClaimRecord:
+    """Re-register a stale claim for this workspace. Used by adopt.
+
+    Adopt is the documented recovery command, so a claim left behind by a
+    worktree that is gone or prunable must be repaired rather than reported as
+    ownership this workspace already has. Only staleness authorizes the
+    replacement: a live claim -- including one a blocked workflow keeps on
+    purpose -- and an unreadable one are still refused. The generation token
+    observed before the decision is re-proved at write time, so a claim that is
+    recreated concurrently is never overwritten by a stale in-memory copy.
+    """
+    key = canonical_ticket_key(reference)
+    owner = worktree_id if worktree_id else _PRIMARY_WORKTREE_ID
+    path = claim_path(repo_root, key)
+    existing = read_claim_file(path)
+
+    if existing is None:
+        return create_active_claim(
+            repo_root,
+            reference=reference,
+            worktree_id=worktree_id,
+            workspace_path=workspace_path,
+            branch=branch,
+        )
+    if isinstance(existing, MalformedClaim):
+        raise WorkspaceError(
+            "ticket claim at {0} is unreadable ({1}); it is treated as occupied "
+            "until explicit recovery".format(existing.path, existing.detail)
+        )
+    if existing.worktree_id == owner:
+        return existing
+
+    status = evaluate_claim(repo_root, existing, path)
+    if status.state != "stale":
+        raise ClaimOccupiedError(
+            "ticket is already claimed by workspace {0}.".format(
+                status.live_path or existing.intended_path or existing.worktree_id or "unknown"
+            )
+        )
+
+    repaired = replace(
+        existing,
+        status=CLAIM_STATUS_ACTIVE,
+        token=_generate_token(),
+        created_at=_now_utc_iso(),
+        worktree_id=owner,
+        intended_path=str(Path(os.path.abspath(str(workspace_path)))),
+        intended_branch=branch,
+        hostname=_current_hostname(),
+        pid=os.getpid(),
+    )
+
+    current = read_claim_file(path)
+    if isinstance(current, MalformedClaim) or current is None or current.token != existing.token:
+        raise WorkspaceError(
+            "Cannot repair claim {0}: it changed while it was being repaired.".format(path)
+        )
+
+    try:
+        write_json_object_atomic(path, repaired.to_dict())
+    except JsonFileError as exc:
+        raise WorkspaceError("Cannot repair claim {0}: {1}".format(path, exc)) from exc
+    return repaired
 
 
 def promote_claim(

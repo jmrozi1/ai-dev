@@ -114,6 +114,7 @@ from .workspaces import (
     acquire_promotion_lock,
     claim_is_live,
     claim_path,
+    claims_directory,
     create_active_claim,
     default_workspace_path,
     describe_occupancy,
@@ -127,6 +128,7 @@ from .workspaces import (
     promote_claim,
     read_claim,
     read_claim_file,
+    reclaim_stale_active_claim,
     registry_directory,
     relocate_config_for_workspace,
     release_claim,
@@ -2340,6 +2342,23 @@ def _promote_locked_revalidation(
     return comparison, upstream, observed_main_commit
 
 
+# The lock is repository-wide, so more than promotion takes it. Contention has
+# to name the operation the caller actually asked for; telling someone running
+# workspace refresh that the workflow cannot be promoted sends them to the wrong
+# command.
+_PROMOTION_LOCK_FAILURE_SUMMARIES = {
+    "promote": "Cannot promote workflow",
+    "promote-sync-retry": "Cannot promote workflow",
+    "refresh": "Cannot refresh workspace",
+}
+
+
+def _promotion_lock_failure_summary(operation: str) -> str:
+    return _PROMOTION_LOCK_FAILURE_SUMMARIES.get(
+        operation, f"Cannot complete {operation}"
+    )
+
+
 @contextmanager
 def _held_promotion_lock(repo_root: Path, state: WorkflowState, *, operation: str):
     """Hold the repository-wide promotion lock for one canonical-main mutation.
@@ -2348,6 +2367,7 @@ def _held_promotion_lock(repo_root: Path, state: WorkflowState, *, operation: st
     silently queueing behind one another is exactly the ambiguity this ticket
     exists to remove.
     """
+    summary = _promotion_lock_failure_summary(operation)
     ticket_key = None
     if state.ticket_reference is not None:
         ticket_key = canonical_ticket_key(state.ticket_reference)
@@ -2362,12 +2382,12 @@ def _held_promotion_lock(repo_root: Path, state: WorkflowState, *, operation: st
         )
     except PromotionLockHeldError as exc:
         raise FlowError(
-            f"Cannot promote workflow: {exc} Promotion is serialized across workspaces; "
+            f"{summary}: {exc} The promotion lock is serialized across workspaces; "
             "retry once that workspace finishes, or recover an abandoned lock with the "
             "workspace unlock command."
         ) from exc
     except PromotionLockError as exc:
-        raise FlowError(f"Cannot promote workflow: {exc}") from exc
+        raise FlowError(f"{summary}: {exc}") from exc
 
     try:
         yield record
@@ -4669,12 +4689,16 @@ def _register_claims_for_active_workflow(
             existing is not None
             and not isinstance(existing, MalformedClaim)
             and existing.status == "active"
+            and existing.worktree_id == requesting_worktree
         ):
             already_owned.append(key)
             continue
 
+        # A claim naming a worktree that is gone or prunable is stale, and
+        # leaving it in place keeps this workspace's ownership unprovable.
+        # Adopt is the documented repair, so it re-registers that record here.
         try:
-            acquire_active_claim(
+            reclaim_stale_active_claim(
                 repo_root,
                 reference=reference,
                 worktree_id=worktree_id_for_repo_root(repo_root),
@@ -4777,7 +4801,7 @@ def _handle_workspace_adopt(command_name: str, arguments: list[str]) -> int:
         raise FlowError(f"Cannot adopt workspace for ticket {issue_number}: {occupancy}")
 
     try:
-        record = acquire_active_claim(
+        record = reclaim_stale_active_claim(
             repo_root,
             reference=reference,
             worktree_id=worktree_id_for_repo_root(repo_root),
@@ -4986,6 +5010,32 @@ def _handle_workspace_remove(command_name: str, arguments: list[str]) -> int:
     return 0
 
 
+def _ensure_bare_claim_selector(selector: str) -> None:
+    """Refuse anything that could name a path outside the claims directory.
+
+    The selector is joined onto the claims directory, where an absolute path
+    replaces that directory outright and a traversal component escapes it. Prune
+    then deletes whatever the join produced, so the shape is proved here, before
+    any join, and the selector is required to be a bare filename or identifier.
+    """
+    separators = [character for character in (os.sep, os.altsep, "/") if character]
+    if any(separator in selector for separator in separators):
+        raise FlowError(
+            "Cannot prune claim: the claim selector must be a bare claim filename or "
+            f"ticket identifier, not a path. Got {selector!r}."
+        )
+    if selector in {os.curdir, os.pardir} or selector.startswith("~"):
+        raise FlowError(
+            "Cannot prune claim: the claim selector must be a bare claim filename or "
+            f"ticket identifier. Got {selector!r}."
+        )
+    if Path(selector).is_absolute() or len(Path(selector).parts) != 1:
+        raise FlowError(
+            "Cannot prune claim: the claim selector must be a bare claim filename or "
+            f"ticket identifier, not a path. Got {selector!r}."
+        )
+
+
 def _handle_workspace_prune(command_name: str, arguments: list[str]) -> int:
     claim_selector = ""
     if arguments:
@@ -4998,12 +5048,13 @@ def _handle_workspace_prune(command_name: str, arguments: list[str]) -> int:
     repo_root = resolve_repo_root()
 
     if claim_selector:
+        _ensure_bare_claim_selector(claim_selector)
         if claim_selector.endswith(".json") or (
             len(claim_selector) == 64
             and all(character in "0123456789abcdef" for character in claim_selector)
         ):
             filename = claim_selector if claim_selector.endswith(".json") else f"{claim_selector}.json"
-            target_path = registry_directory(repo_root) / "claims" / filename
+            target_path = claims_directory(repo_root) / filename
         else:
             reference = _workspace_reference_for_ticket_id(repo_root, claim_selector)
             target_path = claim_path(repo_root, canonical_ticket_key(reference))

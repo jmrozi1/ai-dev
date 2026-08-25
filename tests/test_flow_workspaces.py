@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import io
 import json
 import os
@@ -7,6 +8,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import typing
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 
@@ -474,6 +476,103 @@ class LegacyClaimRegistrationTests(WorkspaceTestBase):
                     )
                 )
 
+    def test_adopt_repairs_a_claim_left_behind_by_a_dead_worktree(self) -> None:
+        repo_root = self._active_without_claims("repo-legacy-stale-claim")
+        claim_file = self._claim_path(repo_root, "21")
+
+        # The claim an earlier, now-removed workspace left behind: active, but
+        # naming a worktree Git no longer registers.
+        claim_file.parent.mkdir(parents=True, exist_ok=True)
+        stale = workspaces.ClaimRecord(
+            status="active",
+            token="0" * 32,
+            key=workspaces.canonical_ticket_key(self._local_reference("21")),
+            provider="local",
+            ticket_id="21",
+            created_at="2024-01-01T00:00:00Z",
+            intended_path=str(self.tmp_path / "worktree-that-is-gone"),
+            intended_branch="scratch",
+            worktree_id="worktree-that-is-gone",
+        )
+        claim_file.write_text(
+            json.dumps(stale.to_dict(), indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        code, _, stderr = self._invoke(repo_root, "status", "-v")
+        self.assertEqual(code, 1)
+        self.assertIn("not this one", stderr)
+
+        code, stdout, stderr = self._invoke(repo_root, "workspace", "adopt", "21")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("Registered workspace ownership for issue 21", stdout)
+        self.assertNotIn("already owns the claim", stdout)
+
+        repaired = workspaces.read_claim(repo_root, stale.key)
+        self.assertNotIsInstance(repaired, workspaces.MalformedClaim)
+        self.assertEqual(repaired.status, "active")
+        self.assertEqual(
+            repaired.worktree_id, workspaces.effective_worktree_id(repo_root)
+        )
+        self.assertEqual(
+            Path(os.path.abspath(str(repaired.intended_path))),
+            Path(os.path.abspath(str(repo_root))),
+        )
+        self.assertNotEqual(repaired.token, stale.token)
+
+        code, stdout, stderr = self._invoke(repo_root, "status", "-v")
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("issue number: 21", stdout)
+
+    def test_reclaiming_refuses_a_claim_a_live_workspace_holds(self) -> None:
+        repo_root = self._init_repo("repo-legacy-live-claim")
+        self._write_ticket(repo_root, "23")
+        self._write_ticket(repo_root, "24")
+        code, _, stderr = self._invoke(repo_root, "start", "23")
+        self.assertEqual(code, 0, msg=stderr)
+
+        # A second, genuinely registered workspace: its worktree id resolves, so
+        # a claim naming it is live and never repairable from here.
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "24")
+        self.assertEqual(code, 0, msg=stderr)
+        live_claim = json.loads(
+            self._claim_path(repo_root, "24").read_text(encoding="utf-8")
+        )
+
+        claim_file = self._claim_path(repo_root, "23")
+        payload = json.loads(claim_file.read_text(encoding="utf-8"))
+        payload["worktreeId"] = live_claim["worktreeId"]
+        payload["intendedPath"] = live_claim["intendedPath"]
+        claim_file.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+
+        with self.assertRaises(workspaces.ClaimOccupiedError):
+            workspaces.reclaim_stale_active_claim(
+                repo_root,
+                reference=self._local_reference("23"),
+                worktree_id=None,
+                workspace_path=repo_root,
+                branch="scratch",
+            )
+        self.assertEqual(json.loads(claim_file.read_text(encoding="utf-8")), payload)
+
+    def test_reclaiming_refuses_an_unreadable_claim(self) -> None:
+        repo_root = self._init_repo("repo-legacy-unreadable-claim")
+        claim_file = self._claim_path(repo_root, "25")
+        claim_file.parent.mkdir(parents=True, exist_ok=True)
+        claim_file.write_text("{ not json", encoding="utf-8")
+
+        with self.assertRaises(workspaces.WorkspaceError) as caught:
+            workspaces.reclaim_stale_active_claim(
+                repo_root,
+                reference=self._local_reference("25"),
+                worktree_id=None,
+                workspace_path=repo_root,
+                branch="scratch",
+            )
+        self.assertIn("treated as occupied", str(caught.exception))
+        self.assertEqual(claim_file.read_text(encoding="utf-8"), "{ not json")
+
     def test_a_linked_workspace_repairs_its_own_unproven_identity(self) -> None:
         repo_root = self._init_repo("repo-legacy-linked")
         self._write_ticket(repo_root, "21")
@@ -571,6 +670,57 @@ class StaleClaimTests(WorkspaceTestBase):
         self.assertIn("Removed claim record", stdout)
         self.assertFalse(claim_file.exists())
 
+    def test_prune_claim_refuses_a_selector_that_names_a_path(self) -> None:
+        repo_root = self._init_repo("repo-prune-traversal")
+        outside = self.tmp_path / "outside.json"
+        outside.write_text("keep me\n", encoding="utf-8")
+
+        claims = workspaces.claims_directory(repo_root)
+        selectors = [
+            "../" + outside.name,
+            "../../" + outside.name,
+            str(outside),
+            "/etc/passwd.json",
+            "sub/claim.json",
+            "..",
+        ]
+        for selector in selectors:
+            with self.subTest(selector=selector):
+                code, stdout, stderr = self._invoke(
+                    repo_root, "workspace", "prune", "--claim", selector
+                )
+                self.assertEqual(code, 1)
+                self.assertEqual(stdout, "")
+                self.assertIn("must be a bare claim filename", stderr)
+
+        self.assertTrue(outside.exists(), "prune must not reach outside the registry")
+        self.assertFalse(claims.exists() and any(claims.iterdir()))
+
+    def test_prune_claim_still_accepts_a_bare_selector(self) -> None:
+        repo_root = self._init_repo("repo-prune-bare")
+        self._write_ticket(repo_root, "34")
+
+        code, _, stderr = self._invoke(repo_root, "workspace", "add", "34")
+        self.assertEqual(code, 0, msg=stderr)
+        claim_file = self._claim_path(repo_root, "34")
+        self.assertTrue(claim_file.exists())
+
+        workspace = self.tmp_path / "repo-prune-bare-issue-34"
+        subprocess.run(
+            ["rm", "-rf", str(workspace)],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        self._run_git(repo_root, "worktree", "prune")
+
+        code, stdout, stderr = self._invoke(
+            repo_root, "workspace", "prune", "--claim", claim_file.stem
+        )
+        self.assertEqual(code, 0, msg=stderr)
+        self.assertIn("Removed claim record", stdout)
+        self.assertFalse(claim_file.exists())
+
     def test_liveness_refuses_automated_recovery_for_foreign_hosts(self) -> None:
         self.assertIsNone(workspaces.process_is_absent(1234, "some-other-host"))
         self.assertIsNone(workspaces.process_is_absent(None, None))
@@ -581,6 +731,30 @@ class StaleClaimTests(WorkspaceTestBase):
             self.assertIs(
                 workspaces.process_is_absent(os.getpid(), socket.gethostname()), False
             )
+
+
+class ModuleAnnotationTests(unittest.TestCase):
+    """`from __future__ import annotations` defers name errors to whoever resolves them.
+
+    A missing typing import therefore compiles, imports, and runs until some
+    tool asks for the real hints. Resolving them here is that ask, and it needs
+    no lint framework.
+    """
+
+    def test_every_workspace_annotation_resolves(self) -> None:
+        unresolved = []
+        for name, value in vars(workspaces).items():
+            if name.startswith("__"):
+                continue
+            if getattr(value, "__module__", None) != workspaces.__name__:
+                continue
+            if not (inspect.isfunction(value) or inspect.isclass(value)):
+                continue
+            try:
+                typing.get_type_hints(value)
+            except Exception as exc:  # NameError in practice; report any failure
+                unresolved.append(f"{name}: {exc}")
+        self.assertEqual(unresolved, [])
 
 
 class ConfigurationRelocationTests(WorkspaceTestBase):
@@ -2272,6 +2446,11 @@ class WorkspaceRefreshTests(RefreshTestBase):
         self.assertEqual(stdout, "")
         self.assertIn("promotion lock is held by", stderr)
         self.assertIn("local:888", stderr)
+        # The lock is shared, but the diagnostic must name the operation the
+        # caller actually ran; "Cannot promote workflow" here sends them to the
+        # wrong command.
+        self.assertIn("Cannot refresh workspace", stderr)
+        self.assertNotIn("Cannot promote workflow", stderr)
         self.assertEqual(self._run_git(repo_root, "rev-parse", "scratch"), scratch_before)
 
     def test_main_advancing_between_preflight_and_locked_reread_uses_the_newer_commit(
