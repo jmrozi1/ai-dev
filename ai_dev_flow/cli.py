@@ -37,6 +37,7 @@ from .repository import (
     hard_reset_branch_to_revision,
     resolve_repo_root,
     resolve_commit_hash,
+    resolve_revision_commit,
     resolve_short_commit_hash,
     resolve_tree_hash,
     restore_branch_to_revision,
@@ -261,13 +262,18 @@ COMMAND_HELP: dict[str, str] = {
     "start": """\
 Usage: {command_name} start <issue-number>
     {command_name} start <issue-number> --prerequisite-for <active-issue>
+    {command_name} start <issue-number> --adopt <commit-ish>
 
 Begin independent work on an unblocked issue from main. The prerequisite form
 is only for active issue A handing off to prerequisite B; it keeps A's current
 scratch tree, starts B at checkpoint 0, and preserves A's checkpoint ownership.
+The adopt form binds an existing commit that already contains main to the issue
+from an idle workflow; it publishes nothing and does not reconcile the target.
 
 Options:
-  -h, --help  Show this help.
+  --prerequisite-for <active-issue>  Hand off from the named active issue.
+  --adopt <commit-ish>               Adopt an existing commit as this issue's work.
+  -h, --help                         Show this help.
 """,
     "patch": """\
 Usage: {command_name} patch "<description>"
@@ -908,6 +914,155 @@ def _parse_prerequisite_start(command_name: str, arguments: list[str]) -> tuple[
     return prerequisite_number, active_number
 
 
+def _adopt_usage(command_name: str) -> FlowError:
+    return _usage_error(command_name, "start", "<issue-number> --adopt <commit-ish>")
+
+
+def _parse_adopt_start(command_name: str, arguments: list[str]) -> tuple[int, str] | None:
+    if "--adopt" not in arguments:
+        return None
+
+    if "--prerequisite-for" in arguments:
+        raise FlowError(
+            "Cannot adopt workflow: --adopt and --prerequisite-for cannot be combined."
+        )
+
+    if len(arguments) != 3 or arguments[1] != "--adopt":
+        raise _adopt_usage(command_name)
+
+    issue_number = _parse_issue_number(command_name, [arguments[0]])
+
+    revision = arguments[2].strip()
+    if not revision:
+        raise FlowError("Cannot adopt workflow: adopted revision cannot be empty.")
+
+    return issue_number, revision
+
+
+@dataclass(frozen=True)
+class _AdoptionTarget:
+    revision: str
+    commit: str
+
+
+def _resolve_adoption_target(
+    repo_root: Path,
+    *,
+    main_branch: str,
+    revision: str,
+) -> _AdoptionTarget:
+    """Resolve and validate an adoption target without mutating anything.
+
+    Refuses anything Flow would otherwise have to reconcile. Adoption never
+    fetches, merges, rebases, or cherry-picks to make a target usable.
+    """
+    try:
+        adopted_commit = resolve_revision_commit(repo_root, revision)
+    except RepositoryError as exc:
+        raise FlowError(f"Cannot adopt workflow: {exc}") from exc
+
+    try:
+        main_commit = resolve_commit_hash(repo_root, main_branch)
+    except RepositoryError as exc:
+        raise FlowError(
+            f"Cannot adopt workflow: cannot resolve {main_branch}. {exc}"
+        ) from exc
+
+    if adopted_commit == main_commit:
+        raise FlowError(
+            f"Cannot adopt workflow: adopted revision {revision} already equals "
+            f"{main_branch}; there is no work to adopt."
+        )
+
+    if not branch_is_ancestor(
+        repo_root,
+        ancestor_revision=main_commit,
+        descendant_revision=adopted_commit,
+    ):
+        raise FlowError(
+            f"Cannot adopt workflow: {main_branch} is not an ancestor of adopted "
+            f"revision {revision}. Adoption does not fetch, merge, rebase, or "
+            f"otherwise reconcile the target."
+        )
+
+    return _AdoptionTarget(revision=revision, commit=adopted_commit)
+
+
+def _validate_adoption_prerequisites(
+    command_name: str,
+    repo_root: Path,
+    state: WorkflowState,
+    issue_number: int,
+) -> None:
+    active_workflow_type = _active_workflow_type(state)
+    if active_workflow_type is not None:
+        if state.active_issue_number is not None:
+            raise FlowError(
+                f"Cannot adopt workflow: active issue {state.active_issue_number} is already set."
+            )
+        assert state.patch_description is not None
+        raise FlowError(
+            f"Cannot adopt workflow: active patch {state.patch_description} is already set."
+        )
+
+    blocked_file = blocked_workflows_file_for_repo_root(repo_root)
+    if get_blocked_workflow(blocked_file, issue_number) is not None:
+        if "-" in command_name:
+            prefix, _, _ = command_name.rpartition("-")
+            resume_command = f"{prefix}-resume"
+        else:
+            resume_command = "flow-resume"
+        raise FlowError(
+            f"Cannot adopt workflow: issue {issue_number} is blocked. "
+            f"Use {resume_command} {issue_number}."
+        )
+
+    _ensure_main_and_scratch_branches_differ(state)
+
+    if not branch_exists(repo_root, state.main_branch):
+        raise FlowError(f"Main branch does not exist locally: {state.main_branch}")
+
+    if git_status_short(repo_root):
+        raise FlowError(
+            "Cannot adopt workflow: working tree is not clean. Commit, stash, or "
+            "remove changes before adopting."
+        )
+
+    ensure_no_active_git_operations(repo_root)
+
+
+def _handle_adopt_start(
+    command_name: str,
+    issue_number: int,
+    revision: str,
+) -> int:
+    repo_root, _state_path, state = _resolve_repo_state_context()
+
+    _validate_adoption_prerequisites(command_name, repo_root, state, issue_number)
+
+    target = _resolve_adoption_target(
+        repo_root,
+        main_branch=state.main_branch,
+        revision=revision,
+    )
+
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+    try:
+        ticket = provider.get(str(issue_number))
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    if ticket.lifecycle_state != "open":
+        raise FlowError(
+            f"Cannot adopt workflow: ticket {issue_number} is {ticket.lifecycle_state}."
+        )
+
+    raise FlowError(
+        "Cannot adopt workflow: the adoption state transition is not implemented yet. "
+        f"Validated issue {issue_number} against adopted commit {target.commit}."
+    )
+
+
 def _resolve_issue_details_with_labels(issue_number: int) -> tuple[str, str, list[str]]:
     completed = subprocess.run(
         ["gh", "issue", "view", str(issue_number), "--json", "title,url,labels"],
@@ -1018,6 +1173,10 @@ def _validate_patch_prerequisites(
 
 
 def handle_start(command_name: str, arguments: list[str]) -> int:
+    adopt_arguments = _parse_adopt_start(command_name, arguments)
+    if adopt_arguments is not None:
+        return _handle_adopt_start(command_name, *adopt_arguments)
+
     prerequisite_arguments = _parse_prerequisite_start(command_name, arguments)
     if prerequisite_arguments is not None:
         return _handle_prerequisite_start(command_name, *prerequisite_arguments)

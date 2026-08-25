@@ -497,6 +497,39 @@ def resolve_commit_hash(repo_root: Path, revision: str = "HEAD") -> str:
     return commit_hash
 
 
+def resolve_revision_commit(repo_root: Path, revision: str) -> str:
+    """Resolve a caller-supplied commit-ish to its full commit hash.
+
+    Fails closed for empty, option-like, unresolvable, and non-commit
+    revisions, plus the ambiguous abbreviated hashes ``--verify`` rejects,
+    instead of letting Git interpret them loosely.
+    """
+    normalized = revision.strip()
+    if not normalized:
+        raise RepositoryError("Revision cannot be empty.")
+
+    if normalized.startswith("-"):
+        raise RepositoryError(f"Revision cannot start with '-': {normalized}")
+
+    completed = _run_git(
+        repo_root,
+        ["rev-parse", "--verify", f"{normalized}^{{commit}}"],
+        check=False,
+    )
+
+    commit_hash = completed.stdout.strip()
+    if completed.returncode != 0 or not commit_hash:
+        detail = completed.stderr.strip()
+        message = f"Cannot resolve revision to a commit: {normalized}"
+        if detail:
+            message = f"{message}. {detail}"
+        else:
+            message = f"{message}."
+        raise RepositoryError(message)
+
+    return commit_hash
+
+
 def resolve_short_commit_hash(repo_root: Path, revision: str = "HEAD") -> str:
     completed = _run_git(
         repo_root,
