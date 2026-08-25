@@ -12,7 +12,44 @@ should be worked differently.
 
 Review is independent and atomic: you can invoke it alone without lifecycle automation
 or load composition. The review machinery in `auto-review` uses this skill in its
-checkpoint and promotion lifecycle stages.
+checkpoint, promotion, and in-flight review stages. That machinery decides when a
+review applies and what it composes with; this skill decides process quality.
+
+## Convergence Judgment
+
+Convergence is a global property of how the work is going. Judge it separately
+from how well each individual piece of evidence was handled.
+
+Correct local evidence discipline does not prove global convergence. Invalid
+evidence may be retired correctly, provenance may be tracked honestly, and stop
+conditions may work exactly as intended while the overall evidence strategy
+still repeatedly fails to advance the underlying proof obligation. A series of
+correctly rejected experiments is still a series of experiments that produced no
+answer. Do not read good local epistemic discipline as evidence that the work is
+converging.
+
+Treat the following as material convergence evidence once the apparatus loop has
+become the dominant work rather than an incidental cost of it:
+
+- repeated invalid controls or baselines;
+- repeated provenance or evidence invalidation;
+- repeated reconstruction or repair of diagnostic, test, probe, harness,
+  fixture, or measurement apparatus;
+- successive materially equivalent attempts ending in the same class of
+  unresolved obligation for the same route reason.
+
+Persistence alone is not the signal. One proof obligation persisting across
+several attempts is not sufficient by itself; it becomes evidence only when
+paired with observable churn or repeated failure of the route or measurement
+strategy itself. Long, slow, or difficult work that keeps resolving real
+obligations, narrowing the problem, or producing valid new evidence is
+converging.
+
+Keep the resulting judgment global and process-oriented: ask whether the
+approach, decomposition, executor rail, or evidence strategy should change in
+order to reach the current objective. Inspect the apparatus only far enough to
+judge that; repairing it is implementation work, not process review. An explicit
+`no process change warranted` remains a complete and preferred answer here.
 
 ## Checkpoint Process Review
 
@@ -24,6 +61,7 @@ should be worked differently. Look for these failure modes:
 
 - **Approach quality:** the work is not converging, or decomposition and the
   evidence/verification strategy no longer match the real shape of the work.
+  Judge convergence globally, per `Convergence Judgment`.
 - **Intervention balance:** unnecessary human confirmations or handoffs, or a
   leash that is too short (needless stops on settled decisions) or too long
   (executor settled product, scope, or architecture questions that should have
@@ -108,7 +146,7 @@ decision.
 
 Assess:
 
-- convergence and approach quality over the issue;
+- convergence and approach quality over the issue, per `Convergence Judgment`;
 - human intervention and executor leash balance;
 - avoidable rediscovery, repetition, and context waste;
 - failed or repeated approaches worth remembering;
