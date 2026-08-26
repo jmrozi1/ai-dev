@@ -648,5 +648,175 @@ class CheckpointTwoFailureSafetyTests(_TempHome):
         self.assertEqual(activation.sync_claude_activation(home=self.home), "unchanged")
 
 
+class OwnershipHomeIsolationTests(_TempHome):
+    """An install aimed at an alternate home must not touch the real user's ledger.
+
+    The skills destination already honors `home`. Before this fix the ownership
+    ledger did not, so reconciliation ran against the machine-global manifest and
+    could remove packages belonging to a different home entirely.
+    """
+
+    def _resolve(self, **kwargs):
+        return installation.resolve_skill_installation_ownership_path(**kwargs)
+
+    # Precedence --------------------------------------------------------------
+
+    def test_windows_explicit_home_ignores_ambient_appdata(self) -> None:
+        alt = self.tmp_path / "alt-home"
+        with patch.dict(os.environ, {"APPDATA": str(self.tmp_path / "real-appdata")}):
+            resolved = self._resolve(home=alt, os_name="nt")
+
+        self.assertEqual(
+            resolved,
+            alt.resolve() / "AppData" / "Roaming" / "ai-dev" / "skill-installation-ownership.json",
+        )
+        self.assertNotIn("real-appdata", str(resolved))
+
+    def test_posix_explicit_home_ignores_ambient_xdg_config_home(self) -> None:
+        alt = self.tmp_path / "alt-home"
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.tmp_path / "real-xdg")}):
+            resolved = self._resolve(home=alt, os_name="posix")
+
+        self.assertEqual(
+            resolved,
+            alt.resolve() / ".config" / "ai-dev" / "skill-installation-ownership.json",
+        )
+        self.assertNotIn("real-xdg", str(resolved))
+
+    def test_explicit_config_override_still_beats_explicit_home(self) -> None:
+        alt = self.tmp_path / "alt-home"
+        explicit_appdata = self.tmp_path / "explicit-appdata"
+        explicit_xdg = self.tmp_path / "explicit-xdg"
+
+        self.assertEqual(
+            self._resolve(home=alt, os_name="nt", appdata=str(explicit_appdata)),
+            explicit_appdata / "ai-dev" / "skill-installation-ownership.json",
+        )
+        self.assertEqual(
+            self._resolve(home=alt, os_name="posix", xdg_config_home=str(explicit_xdg)),
+            explicit_xdg / "ai-dev" / "skill-installation-ownership.json",
+        )
+
+    def test_default_host_behaviour_still_uses_ambient_config(self) -> None:
+        ambient_appdata = self.tmp_path / "ambient-appdata"
+        with patch.dict(os.environ, {"APPDATA": str(ambient_appdata)}):
+            self.assertEqual(
+                self._resolve(os_name="nt"),
+                ambient_appdata / "ai-dev" / "skill-installation-ownership.json",
+            )
+
+        ambient_xdg = self.tmp_path / "ambient-xdg"
+        with patch.dict(os.environ, {"XDG_CONFIG_HOME": str(ambient_xdg)}):
+            self.assertEqual(
+                self._resolve(os_name="posix"),
+                ambient_xdg / "ai-dev" / "skill-installation-ownership.json",
+            )
+
+    def test_default_host_behaviour_falls_back_to_home_when_config_absent(self) -> None:
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("APPDATA", None)
+            resolved = self._resolve(os_name="nt")
+        self.assertEqual(resolved.name, "skill-installation-ownership.json")
+        self.assertIn("AppData", str(resolved))
+
+    # Destructive cross-home regression ---------------------------------------
+
+    def test_alternate_home_install_cannot_touch_the_real_users_state(self) -> None:
+        """The exact failure that removed real Claude packages during a test run."""
+        repo_root = Path(__file__).resolve().parents[1]
+
+        # A stand-in for the real user: their own config root, their own ledger,
+        # and a real managed link they have installed.
+        real_config = self.tmp_path / "real-config"
+        real_skills = self.tmp_path / "real-skills"
+        real_package = self.tmp_path / "real-package"
+        real_package.mkdir()
+        (real_package / "SKILL.md").write_text("the real user's package", encoding="utf-8")
+        real_link = real_skills / "flow"
+        kind = installation.preferred_link_kind("windows" if WINDOWS else "posix")
+        installation._replace_skill_link(real_link, real_package, kind=kind)
+
+        platform = "windows" if WINDOWS else "posix"
+        real_ledger = installation.resolve_skill_installation_ownership_path(
+            **(
+                {"appdata": str(real_config)}
+                if WINDOWS
+                else {"xdg_config_home": str(real_config)}
+            ),
+            os_name="nt" if WINDOWS else "posix",
+        )
+        real_ledger.parent.mkdir(parents=True, exist_ok=True)
+        real_ledger.write_text(
+            json.dumps(
+                {
+                    "version": installation.SKILL_INSTALLATION_OWNERSHIP_VERSION,
+                    "owned_skills": {
+                        installation._normalized_path_identity_text_for_platform(
+                            real_link, platform=platform
+                        ): installation._symlink_ownership_value(
+                            real_package, platform=platform, kind=kind
+                        )
+                    },
+                },
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+        ledger_before = real_ledger.read_bytes()
+
+        # Now install into a completely separate home, with the real user's config
+        # root still ambient in the environment.
+        alt_home = self.tmp_path / "alt-home"
+        alt_home.mkdir()
+        env = {"APPDATA": str(real_config)} if WINDOWS else {"XDG_CONFIG_HOME": str(real_config)}
+        with patch.dict(os.environ, env):
+            installation.install_skill_packages(
+                repo_root=repo_root,
+                destination_root=installation.resolve_skills_root_for_audience(
+                    audience="claude", home=alt_home
+                ),
+                home=alt_home,
+                audience="claude",
+            )
+
+        # The real user's ledger is byte-for-byte untouched...
+        self.assertEqual(real_ledger.read_bytes(), ledger_before)
+        # ...and their installed package is still linked and still serves content.
+        self.assertTrue(installation.path_is_managed_link(real_link))
+        self.assertEqual(
+            (real_link / "SKILL.md").read_text(encoding="utf-8"), "the real user's package"
+        )
+
+        # The alternate home received its own ledger, and only its own.
+        alt_ledger = installation.resolve_skill_installation_ownership_path(home=alt_home)
+        self.assertTrue(alt_ledger.is_file())
+        self.assertIn(str(alt_home.resolve()), str(alt_ledger))
+        alt_owned = json.loads(alt_ledger.read_text(encoding="utf-8"))["owned_skills"]
+        self.assertTrue(alt_owned)
+        for destination in alt_owned:
+            self.assertIn(str(alt_home.resolve()), destination)
+
+    def test_alternate_home_install_needs_no_environment_isolation(self) -> None:
+        """Correctness must come from the API, not from tests patching the env."""
+        repo_root = Path(__file__).resolve().parents[1]
+        alt_home = self.tmp_path / "api-only-home"
+        alt_home.mkdir()
+
+        # Deliberately no patch.dict here: ambient APPDATA/XDG stay as the host
+        # has them, exactly as an unisolated caller would see.
+        installation.install_skill_packages(
+            repo_root=repo_root,
+            destination_root=installation.resolve_skills_root_for_audience(
+                audience="claude", home=alt_home
+            ),
+            home=alt_home,
+            audience="claude",
+        )
+
+        ledger = installation.resolve_skill_installation_ownership_path(home=alt_home)
+        self.assertTrue(ledger.is_file())
+        self.assertIn(str(alt_home.resolve()), str(ledger))
+
+
 if __name__ == "__main__":
     unittest.main()

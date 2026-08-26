@@ -210,25 +210,38 @@ def resolve_skill_installation_ownership_path(
     appdata: str | None = None,
     xdg_config_home: str | None = None,
 ) -> Path:
+    """Resolve the ownership ledger, keeping it inside whichever home was asked for.
+
+    Precedence, most specific first:
+
+    1. an explicitly supplied ``appdata`` / ``xdg_config_home`` wins;
+    2. otherwise an explicitly supplied ``home`` keeps the ledger under that home
+       and ambient machine config is deliberately ignored;
+    3. otherwise ordinary host behavior applies, using ambient config when set.
+
+    Rule 2 exists because the skills destination already honors ``home``. Without
+    it, an install aimed at an alternate home would reconcile against the real
+    user's machine-global ledger and could remove packages it does not own.
+    """
     resolved_os = os.name if os_name is None else os_name
+    explicit_home = home is not None
     resolved_home = Path.home() if home is None else home
     resolved_home = resolved_home.expanduser().resolve()
 
-    resolved_appdata = appdata if appdata is not None else os.environ.get("APPDATA")
-    resolved_xdg = xdg_config_home if xdg_config_home is not None else os.environ.get("XDG_CONFIG_HOME")
-
     if resolved_os == "nt":
-        appdata_text = (resolved_appdata or "").strip()
-        if appdata_text:
-            base_dir = Path(appdata_text).expanduser() / "ai-dev"
-        else:
-            base_dir = resolved_home / "AppData" / "Roaming" / "ai-dev"
+        explicit_config = appdata
+        ambient_config = None if explicit_home else os.environ.get("APPDATA")
+        home_relative = ("AppData", "Roaming", "ai-dev")
     else:
-        xdg_text = (resolved_xdg or "").strip()
-        if xdg_text:
-            base_dir = Path(xdg_text).expanduser() / "ai-dev"
-        else:
-            base_dir = resolved_home / ".config" / "ai-dev"
+        explicit_config = xdg_config_home
+        ambient_config = None if explicit_home else os.environ.get("XDG_CONFIG_HOME")
+        home_relative = (".config", "ai-dev")
+
+    config_text = (explicit_config if explicit_config is not None else ambient_config or "").strip()
+    if config_text:
+        base_dir = Path(config_text).expanduser() / "ai-dev"
+    else:
+        base_dir = resolved_home.joinpath(*home_relative)
 
     return base_dir / "skill-installation-ownership.json"
 
