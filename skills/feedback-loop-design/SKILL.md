@@ -64,6 +64,43 @@ An unexpected result is not a reason for an automatic retry. Diagnose what the
 result changed, revise the hypothesis or implementation, and perform another
 expensive pass only when it can establish newly useful evidence.
 
+## Prove The Apparatus Before Paying The Cost
+
+A prepared pass can fail without producing any evidence when the harness,
+driver, or command it depends on was never checked against the place it will
+actually run. Before the first materially expensive boundary — a download or
+install, a build or deployment, an authentication step, a provider call, a live
+environment, a rendered or relayed observation, or a human handoff — establish
+that the apparatus can reach that boundary at all:
+
+- prove the target runtime, interpreter, and tool versions the apparatus
+  requires, including the interface features it actually uses;
+- validate the exact options, arguments, and input shapes the target will
+  accept, from authoritative interface documentation or a bounded direct probe;
+- compile, parse, or otherwise construct the driver through the last
+  deterministic boundary before the expensive action, including the state and
+  ordering preconditions that action requires;
+- when host and target differ materially, run the cheapest faithful self-test on
+  the target itself rather than trusting local behavior.
+
+Non-exhaustive help output, a local host's version of a tool, and a neighboring
+interface's behavior are not capability evidence. Absence from an abbreviated
+listing does not establish that an option is unsupported, and working locally
+does not establish that it works on the target.
+
+Dry construction covers ordering as well as syntax. Build the request, command,
+or payload in the exact state the real call will see, so a precondition that can
+only hold earlier in the sequence fails deterministically and cheaply instead of
+after the cost is paid.
+
+Preflight iteration is cheap and repairable. Correct a failed compatibility
+check, an invalid option, or a broken dry construction and continue; that is
+what the preflight is for. Once the expensive attempt begins, that latitude ends
+and the no-automatic-retry rule above governs. Keep the boundary honest in both
+directions: an authoring defect corrected before a declared pass is not a
+failure of that pass, and a declared validation or expensive attempt does not
+become repeatable by describing its failure as a typo.
+
 ## Size The Execution Rail To The Next Branch Point
 
 Build a rail only across work whose route is currently knowable.
