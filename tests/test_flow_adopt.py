@@ -1116,5 +1116,184 @@ class FlowAdoptProviderCompensationTests(_FlowAdoptFailureFixture):
         )
 
 
+class FlowAdoptEndToEndTests(_FlowAdoptFixture):
+    """Checkpoint adoption-validation-and-guidance.
+
+    An adopted workflow must be indistinguishable from one produced by
+    flow-start for every downstream lifecycle command, and must still be
+    stopped by the promotion-review gate.
+    """
+
+    def _gated_repo(self, name: str) -> Path:
+        """Fixture with the promotion-review gate left at its required default."""
+        repo = self._repo(name)
+        (repo / ".ai-dev/config.json").write_text(
+            json.dumps({"tickets": {"provider": "local", "path": ".ai-dev/tickets"}}),
+            encoding="utf-8",
+        )
+        return repo
+
+    def test_adopted_workflow_drives_the_normal_downstream_lifecycle(self) -> None:
+        repo = self._gated_repo("e2e-lifecycle")
+        main_before = self._git(repo, "rev-parse", "main")
+        recovered = self._git(repo, "rev-parse", "recovered")
+
+        # 1. Adopt.
+        code, out, err = self._invoke(repo, "57", "--adopt", "recovered")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("adoptedCommit: " + recovered, out)
+
+        # 2. Status reports a normal issue workflow at the derived checkpoint.
+        code, status, err = self._invoke_command(repo, "status", "-v")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("issue number: 57", status)
+        self.assertIn("checkpoint: 3", status)
+        self.assertIn("current branch: scratch", status)
+        self.assertIn("commits ahead of main", status)
+        self.assertIn("clean", status)
+
+        # 3. Diff works over the adopted scope.
+        code, _diff, err = self._invoke_command(repo, "diff", "--all")
+        self.assertEqual(code, 0, err)
+
+        # 4. Checkpointing continues the adopted numbering.
+        (repo / "followup.txt").write_text("followup\n", encoding="utf-8")
+        self._git(repo, "add", "followup.txt")
+        code, commit_out, err = self._invoke_command(repo, "commit")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("Created checkpoint 4", commit_out)
+
+        # 5. main is still untouched through the whole lifecycle.
+        self.assertEqual(self._git(repo, "rev-parse", "main"), main_before)
+
+    def test_promotion_is_still_blocked_by_the_review_gate_after_adoption(self) -> None:
+        repo = self._gated_repo("e2e-review-gate")
+        main_before = self._git(repo, "rev-parse", "main")
+
+        code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+        self.assertEqual((code, err), (0, ""))
+        self.assertFalse((repo / ".ai-dev/promotion-review.json").exists())
+
+        code, _out, err = self._invoke_command(repo, "promote", "Adopted recovery")
+
+        self.assertEqual(code, 1)
+        self.assertIn("promotion review gate", err)
+        # Nothing was published by the refused promotion.
+        self.assertEqual(self._git(repo, "rev-parse", "main"), main_before)
+
+    def test_adoption_does_not_inherit_a_stale_passing_review_record(self) -> None:
+        repo = self._gated_repo("e2e-stale-review")
+        (repo / ".ai-dev/promotion-review.json").write_text(
+            json.dumps(
+                {
+                    "status": "pass",
+                    "issueNumber": 57,
+                    "scratchCommit": self._git(repo, "rev-parse", "recovered"),
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+        self.assertEqual((code, err), (0, ""))
+
+        # The stale record was cleared by adoption, so promotion stays gated.
+        self.assertFalse((repo / ".ai-dev/promotion-review.json").exists())
+        code, _out, err = self._invoke_command(repo, "promote", "Adopted recovery")
+        self.assertEqual(code, 1)
+        self.assertIn("promotion review gate", err)
+
+    def test_adopted_workflow_can_be_abandoned_and_readopted(self) -> None:
+        """Adoption leaves ordinary lifecycle state, not a special mode."""
+        repo = self._gated_repo("e2e-abandon")
+        recovered = self._git(repo, "rev-parse", "recovered")
+
+        self.assertEqual(self._invoke(repo, "57", "--adopt", "recovered")[0], 0)
+        self.assertEqual(self._state(repo)["activeIssueNumber"], 57)
+
+        # Abandon requires scratch synchronized with main, so reset first.
+        code, _out, err = self._invoke_command(repo, "reset")
+        self.assertEqual((code, err), (0, ""))
+        code, _out, err = self._invoke_command(repo, "abandon")
+        self.assertEqual((code, err), (0, ""))
+        # abandon clears the local workflow record entirely.
+        state_path = repo / ".ai-dev/workflow.json"
+        if state_path.exists():
+            self.assertNotIn("activeIssueNumber", self._state(repo))
+
+        # Idle again, so the same commit can be adopted again.
+        code, out, err = self._invoke(repo, "57", "--adopt", "recovered")
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("adoptedCommit: " + recovered, out)
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
+
+    def test_adoption_is_refused_once_a_workflow_is_active(self) -> None:
+        repo = self._gated_repo("e2e-single-active")
+        self.assertEqual(self._invoke(repo, "57", "--adopt", "recovered")[0], 0)
+
+        code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual(code, 1)
+        self.assertIn("active issue 57 is already set", err)
+
+
+class FlowAdoptGuidanceTests(unittest.TestCase):
+    """The Flow skill must document the supported adoption path."""
+
+    def setUp(self) -> None:
+        self.skill = (
+            Path(__file__).resolve().parents[1]
+            / "skills"
+            / "copilot"
+            / "flow"
+            / "SKILL.md"
+        )
+        self.text = self.skill.read_text(encoding="utf-8")
+        self.normalized = " ".join(self.text.lower().split())
+
+    def test_intent_mapping_routes_adoption_to_the_supported_helper(self) -> None:
+        self.assertIn("scripts/flow-start <id> --adopt <commit-ish>", self.text)
+        self.assertIn("adopt <commit-ish> as ticket <id>", self.normalized)
+
+    def test_guidance_states_the_binding_preconditions(self) -> None:
+        for phrase in (
+            "adoption requires an idle workflow",
+            "clean worktree",
+            "no in-progress git operation",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, self.normalized)
+
+    def test_guidance_states_sha_and_checkpoint_semantics(self) -> None:
+        self.assertIn("its sha is preserved", self.normalized)
+        self.assertIn("highest numbered checkpoint", self.normalized)
+        self.assertIn(
+            "a restarted `1…n` sequence inside the adopted history is not the checkpoint",
+            self.normalized,
+        )
+
+    def test_guidance_states_the_no_reconciliation_rule(self) -> None:
+        self.assertIn("must be an ancestor of the adopted commit", self.normalized)
+        self.assertIn(
+            "never fetches, merges, rebases, or cherry-picks", self.normalized
+        )
+
+    def test_guidance_states_ambiguity_rejection(self) -> None:
+        self.assertIn("must name exactly one commit", self.normalized)
+        self.assertIn("ambiguous abbreviated hashes", self.normalized)
+
+    def test_guidance_preserves_the_review_gate_and_atomicity_claims(self) -> None:
+        self.assertIn("leaves no passing promotion-review record", self.normalized)
+        self.assertIn("adoption is all-or-nothing", self.normalized)
+        self.assertIn("pre-activation labels", self.normalized)
+
+    def test_guidance_separates_adoption_from_adjacent_lifecycle_actions(self) -> None:
+        self.assertIn("remains `flow-patch --adopt`", self.normalized)
+        self.assertIn(
+            "never use flow-start --adopt to redirect an active workflow",
+            self.normalized,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
