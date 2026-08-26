@@ -31,7 +31,9 @@ ACTION_CONTINUE = "continue"
 # Only `running` is dispatched authorization. `ready` is eligible work the
 # orchestrator has not dispatched, and marking it `running` is the orchestrator's
 # act -- so treating `ready` as executable would let the controller dispatch
-# itself. Launch and continuation are distinguished by binding state, not status.
+# itself. Launch and continuation are told apart by binding state, not by status:
+# no live binding means launch, a bound one means continuation, and a reserved one
+# means a launch is already under way and neither is authorized.
 DISPATCHED_RAIL_STATUS = "running"
 
 # Whether the snapshot describes the whole scope or only part of it.
@@ -65,6 +67,8 @@ REASON_WORKSPACE_IDENTITY_AMBIGUOUS = "workspace-identity-ambiguous"
 REASON_BINDING_DUPLICATED = "binding-duplicated"
 REASON_BINDING_MISMATCHED = "binding-mismatched"
 REASON_INVOCATION_IN_FLIGHT = "invocation-in-flight"
+# A launch this controller already started and has not yet attached a process to.
+REASON_BINDING_NOT_READY = "binding-not-ready"
 
 REASON_LAUNCH_AUTHORIZED = "launch-authorized"
 REASON_CONTINUATION_AUTHORIZED = "continuation-authorized"
@@ -307,6 +311,9 @@ def authorize(
             )
         seen.add(record.session_id)
 
+    # Reserved and bound records both occupy the rail. A reservation is a launch
+    # this controller has already committed to, so it must not look like an empty
+    # rail waiting for another one.
     live = [
         record
         for record in records
@@ -337,38 +344,47 @@ def authorize(
             head=observation.head,
         )
 
-    bound = live[0]
+    held = live[0]
     if not _matches_assignment(
-        bound, project=project, ticket=ticket, rail=rail, role=role, iteration=iteration
+        held, project=project, ticket=ticket, rail=rail, role=role, iteration=iteration
     ):
         return refuse(
             REASON_BINDING_MISMATCHED,
-            "session {0} is bound to {1}/{2} rail {3} as {4} at iteration {5}; continuing it "
+            "session {0} is {6} to {1}/{2} rail {3} as {4} at iteration {5}; continuing it "
             "here would be an in-place rebinding.".format(
-                bound.session_id, bound.project, bound.ticket, bound.rail, bound.role,
-                bound.iteration.blob,
+                held.session_id, held.project, held.ticket, held.rail, held.role,
+                held.iteration.blob, held.state,
             ),
         )
-    if workspace.workspace_key != bound.workspace_key or workspace.worktree_id != bound.worktree_id:
+    if workspace.workspace_key != held.workspace_key or workspace.worktree_id != held.worktree_id:
         return refuse(
             REASON_BINDING_MISMATCHED,
-            "session {0} is bound to workspace {1} in worktree {2}, but the observed "
+            "session {0} names workspace {1} in worktree {2}, but the observed "
             "workspace is {3} in {4}.".format(
-                bound.session_id, bound.workspace_key, bound.worktree_id,
+                held.session_id, held.workspace_key, held.worktree_id,
                 workspace.workspace_key, workspace.worktree_id,
             ),
         )
-    if bound.session_id in set(in_flight_session_ids):
+    if held.is_reserved:
+        # The spawn has not reported back yet. Continuation has nothing to resume
+        # and a second launch would duplicate the session this reservation names.
+        return refuse(
+            REASON_BINDING_NOT_READY,
+            "session {0} is reserved for rail '{1}' but has no attached process yet; "
+            "neither a second launch nor a continuation is authorized until it is bound "
+            "or unbound.".format(held.session_id, rail),
+        )
+    if held.session_id in set(in_flight_session_ids):
         return refuse(
             REASON_INVOCATION_IN_FLIGHT,
-            "session {0} already has an invocation in flight.".format(bound.session_id),
+            "session {0} already has an invocation in flight.".format(held.session_id),
         )
 
     return AuthorizationDecision(
         authorized=True,
         reason=REASON_CONTINUATION_AUTHORIZED,
         detail="session {0} is the single live binding for rail '{1}' at iteration {2}.".format(
-            bound.session_id, rail, rail_blob
+            held.session_id, rail, rail_blob
         ),
         project=project,
         ticket=ticket,
@@ -376,6 +392,6 @@ def authorize(
         role=role,
         action=ACTION_CONTINUE,
         iteration=iteration,
-        session_id=bound.session_id,
+        session_id=held.session_id,
         head=observation.head,
     )

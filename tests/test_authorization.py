@@ -22,6 +22,8 @@ from ai_dev_flow.authorization import (
     authorize,
 )
 from ai_dev_flow.session_binding import (
+    BINDING_STATE_BOUND,
+    BINDING_STATE_RESERVED,
     BINDING_STATE_UNBOUND,
     BindingRecord,
     RailIteration,
@@ -77,7 +79,8 @@ def observation(**overrides: object) -> ControlPlaneObservation:
     return ControlPlaneObservation(**arguments)  # type: ignore[arg-type]
 
 
-def binding(**overrides: object) -> BindingRecord:
+def reserved(**overrides: object) -> BindingRecord:
+    """A launch this controller committed to but has not yet attached a process to."""
     arguments: dict = {
         "project": "ai-dev",
         "ticket": "issue-55",
@@ -88,14 +91,25 @@ def binding(**overrides: object) -> BindingRecord:
         "role": "executor",
         "iteration": RailIteration(rail=RAIL, blob=BLOB),
         "session_id": SESSION,
-        "pid": 4242,
-        "pid_domain": "test-host",
-        "started_at": "2026-08-26T12:00:00Z",
         "launched_at_head": HEAD,
-        "bound_at": "2026-08-26T12:00:01Z",
+        "reserved_at": "2026-08-26T12:00:00Z",
+        "state": BINDING_STATE_RESERVED,
     }
     arguments.update(overrides)
     return BindingRecord(**arguments)  # type: ignore[arg-type]
+
+
+def binding(**overrides: object) -> BindingRecord:
+    """A reservation whose spawn succeeded and reported process identity back."""
+    arguments: dict = {
+        "state": BINDING_STATE_BOUND,
+        "pid": 4242,
+        "pid_domain": "test-host",
+        "started_at": "2026-08-26T12:00:02Z",
+        "bound_at": "2026-08-26T12:00:03Z",
+    }
+    arguments.update(overrides)
+    return reserved(**arguments)
 
 
 def decide(observed: ControlPlaneObservation, **overrides: object):
@@ -132,6 +146,70 @@ class AuthorizationDecisionTests(unittest.TestCase):
         self.assertEqual(decision.action, ACTION_CONTINUE)
         self.assertEqual(decision.reason, authorization.REASON_CONTINUATION_AUTHORIZED)
         self.assertEqual(decision.session_id, SESSION)
+
+    def test_a_reserved_binding_authorizes_nothing(self) -> None:
+        # It is neither an empty rail waiting for a launch nor a session that can
+        # be resumed: the spawn it names has not reported back yet.
+        decision = decide(observation(), bindings=(reserved(),))
+        self.assertFalse(decision.authorized)
+        self.assertIsNone(decision.action)
+        self.assertIsNone(decision.session_id)
+        self.assertEqual(decision.reason, authorization.REASON_BINDING_NOT_READY)
+        self.assertIn(SESSION, decision.detail)
+
+    def test_a_reserved_binding_blocks_a_second_launch_with_the_same_reason(self) -> None:
+        # The caller that would launch and the caller that would continue both ask
+        # the same question, so both must get the same stable refusal.
+        launch_attempt = decide(observation(), bindings=(reserved(),))
+        continue_attempt = decide(
+            observation(), bindings=(reserved(),), in_flight_session_ids=(SESSION,)
+        )
+        self.assertEqual(launch_attempt.reason, authorization.REASON_BINDING_NOT_READY)
+        self.assertEqual(continue_attempt.reason, authorization.REASON_BINDING_NOT_READY)
+
+    def test_a_reservation_becomes_continuable_only_once_it_is_bound(self) -> None:
+        self.assertEqual(
+            decide(observation(), bindings=(reserved(),)).reason,
+            authorization.REASON_BINDING_NOT_READY,
+        )
+        promoted = decide(observation(), bindings=(binding(),))
+        self.assertTrue(promoted.authorized)
+        self.assertEqual(promoted.action, ACTION_CONTINUE)
+        self.assertEqual(promoted.session_id, SESSION)
+
+    def test_an_unbound_reservation_frees_the_rail_for_a_new_launch(self) -> None:
+        decision = decide(
+            observation(), bindings=(reserved(state=BINDING_STATE_UNBOUND),)
+        )
+        self.assertTrue(decision.authorized)
+        self.assertEqual(decision.action, ACTION_LAUNCH)
+
+    def test_a_reserved_binding_for_another_rail_does_not_block_this_one(self) -> None:
+        decision = decide(
+            observation(),
+            bindings=(
+                reserved(session_id=OTHER_SESSION, rail=OTHER_RAIL,
+                         iteration=RailIteration(rail=OTHER_RAIL, blob=OTHER_BLOB)),
+            ),
+        )
+        self.assertTrue(decision.authorized)
+        self.assertEqual(decision.action, ACTION_LAUNCH)
+
+    def test_a_reserved_binding_at_another_iteration_is_a_mismatch_not_a_wait(self) -> None:
+        decision = decide(
+            observation(),
+            bindings=(reserved(iteration=RailIteration(rail=RAIL, blob=OTHER_BLOB)),),
+        )
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_BINDING_MISMATCHED)
+
+    def test_a_reserved_and_a_bound_binding_on_one_rail_are_duplicates(self) -> None:
+        decision = decide(
+            observation(),
+            bindings=(reserved(), binding(session_id=OTHER_SESSION)),
+        )
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_BINDING_DUPLICATED)
 
     def test_terminal_bindings_do_not_block_a_relaunch(self) -> None:
         decision = decide(
@@ -384,6 +462,7 @@ class AuthorizationPurityTests(unittest.TestCase):
         cases = (
             {},                                                     # launch
             {"bindings": (binding(),)},                             # continuation
+            {"bindings": (reserved(),)},                            # not-ready refusal
             {"rail": "issue-55-absent-rail"},                       # refusal
             {"expected_head": "d" * 40},                            # refusal
         )
@@ -429,6 +508,7 @@ class AuthorizationPurityTests(unittest.TestCase):
             decide(observation(), bindings=(binding(), binding(session_id=OTHER_SESSION))),
             decide(observation(), bindings=(binding(role="reviewer"),)),
             decide(observation(), bindings=(binding(),), in_flight_session_ids=(SESSION,)),
+            decide(observation(), bindings=(reserved(),)),
         )
         seen = set()
         for decision in refusals:

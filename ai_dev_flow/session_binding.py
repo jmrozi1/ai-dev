@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 # A binding is the durable proof that a specific provider session belongs to a
-# specific project, ticket, Flow workspace, rail, role, and rail iteration. It is
-# written *before* the session exists -- the controller preassigns the session id
-# -- so no managed session is ever observed without a binding to explain it.
+# specific project, ticket, Flow workspace, rail, role, and rail iteration.
+#
+# It has two phases because the facts arrive in two moments. The assignment and the
+# preassigned session id exist *before* any process does, so they are reserved
+# first -- that is what stops a launch from racing ahead of the record explaining
+# it. Process identity (pid, its host, the process start time) cannot exist until
+# a spawn has succeeded, so it is attached afterwards, atomically, to that exact
+# reservation. A reserved record therefore carries no process fields at all rather
+# than placeholder ones: a fabricated pid would be indistinguishable from an
+# observed one, and every later liveness answer would be built on it.
 #
 # Identity is proved, never inferred. Workspace ownership comes from the shared
 # claim registry through `workspaces.verify_workspace_ticket_identity`, and the
@@ -44,19 +51,25 @@ ROLE_REVIEWER = "reviewer"
 ROLE_ORCHESTRATOR = "orchestrator"
 BINDING_ROLES = (ROLE_EXECUTOR, ROLE_REVIEWER, ROLE_ORCHESTRATOR)
 
-# `bound` is the only nonterminal state. Bindings are never deleted: a consumed
-# session id stays consumed, which is what makes "rebinding needs a new
-# preassigned session id" provable rather than merely intended.
+# `reserved` and `bound` are both nonterminal; only `unbound` is terminal.
+# Bindings are never deleted: a consumed session id stays consumed, which is what
+# makes "rebinding needs a new preassigned session id" provable rather than merely
+# intended. An abandoned reservation is terminalized, not removed.
+BINDING_STATE_RESERVED = "reserved"
 BINDING_STATE_BOUND = "bound"
 BINDING_STATE_UNBOUND = "unbound"
-BINDING_STATES = (BINDING_STATE_BOUND, BINDING_STATE_UNBOUND)
-NONTERMINAL_BINDING_STATES = frozenset({BINDING_STATE_BOUND})
+BINDING_STATES = (BINDING_STATE_RESERVED, BINDING_STATE_BOUND, BINDING_STATE_UNBOUND)
+NONTERMINAL_BINDING_STATES = frozenset({BINDING_STATE_RESERVED, BINDING_STATE_BOUND})
+
+# Facts that only a successful spawn can supply. They are absent while reserved,
+# complete once bound, and all-or-nothing in every state.
+PROCESS_FIELD_NAMES = ("pid", "pidDomain", "startedAt", "boundAt")
 
 _OBJECT_NAME = re.compile(r"^[0-9a-f]{40}$")
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 _TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
-_RECORD_KEYS = (
+_ASSIGNMENT_KEYS = (
     "version",
     "state",
     "project",
@@ -68,12 +81,10 @@ _RECORD_KEYS = (
     "role",
     "iteration",
     "sessionId",
-    "pid",
-    "pidDomain",
-    "startedAt",
     "launchedAtHead",
-    "boundAt",
+    "reservedAt",
 )
+_RECORD_KEYS = _ASSIGNMENT_KEYS + PROCESS_FIELD_NAMES
 _ITERATION_KEYS = ("rail", "blob")
 
 
@@ -100,6 +111,8 @@ REASON_UNREADABLE_RECORD = "unreadable-record"
 REASON_STORE_WRITE_FAILED = "store-write-failed"
 REASON_UNKNOWN_SESSION = "unknown-session"
 REASON_ALREADY_UNBOUND = "already-unbound"
+REASON_NOT_RESERVED = "not-reserved"
+REASON_ITERATION_MISMATCH = "iteration-mismatch"
 
 
 def current_pid_domain() -> str:
@@ -128,6 +141,12 @@ class RailIteration:
 
 @dataclass(frozen=True)
 class BindingRecord:
+    """One session's assignment, plus its process identity once one exists.
+
+    The four process fields are `None` for a reservation and complete for a
+    binding. They are never partially populated, in any state.
+    """
+
     project: str
     ticket: str
     workspace_key: str
@@ -137,19 +156,28 @@ class BindingRecord:
     role: str
     iteration: RailIteration
     session_id: str
-    pid: int
-    pid_domain: str
-    started_at: str
     launched_at_head: str
-    bound_at: str
-    state: str = BINDING_STATE_BOUND
+    reserved_at: str
+    state: str = BINDING_STATE_RESERVED
+    pid: Optional[int] = None
+    pid_domain: Optional[str] = None
+    started_at: Optional[str] = None
+    bound_at: Optional[str] = None
 
     @property
     def is_terminal(self) -> bool:
         return self.state not in NONTERMINAL_BINDING_STATES
 
+    @property
+    def is_reserved(self) -> bool:
+        return self.state == BINDING_STATE_RESERVED
+
+    @property
+    def has_process_identity(self) -> bool:
+        return self.pid is not None
+
     def to_dict(self) -> dict:
-        return {
+        payload = {
             "version": 1,
             "state": self.state,
             "project": self.project,
@@ -161,12 +189,16 @@ class BindingRecord:
             "role": self.role,
             "iteration": self.iteration.to_dict(),
             "sessionId": self.session_id,
-            "pid": self.pid,
-            "pidDomain": self.pid_domain,
-            "startedAt": self.started_at,
             "launchedAtHead": self.launched_at_head,
-            "boundAt": self.bound_at,
+            "reservedAt": self.reserved_at,
         }
+        # Absent rather than null: there is no such thing as a half-known process.
+        if self.has_process_identity:
+            payload["pid"] = self.pid
+            payload["pidDomain"] = self.pid_domain
+            payload["startedAt"] = self.started_at
+            payload["boundAt"] = self.bound_at
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -316,15 +348,24 @@ def build_record(
     role: str,
     iteration: Any,
     session_id: str,
-    pid: int,
-    pid_domain: str,
-    started_at: str,
     launched_at_head: str,
-    bound_at: str,
-    state: str = BINDING_STATE_BOUND,
+    reserved_at: str,
+    state: str = BINDING_STATE_RESERVED,
+    pid: Any = None,
+    pid_domain: Any = None,
+    started_at: Any = None,
+    bound_at: Any = None,
 ) -> BindingRecord:
-    """Validate every field of one binding. Missing identity fails closed."""
+    """Validate one record whole. Missing or partial identity fails closed."""
     rail_id = _require_slug(rail, field="rail")
+    resolved_state = _require_state(state)
+    process = _require_process_identity(
+        pid=pid,
+        pid_domain=pid_domain,
+        started_at=started_at,
+        bound_at=bound_at,
+        state=resolved_state,
+    )
     return BindingRecord(
         project=_require_slug(project, field="project"),
         ticket=_require_slug(ticket, field="ticket"),
@@ -335,12 +376,51 @@ def build_record(
         role=_require_role(role),
         iteration=_require_iteration(iteration, rail=rail_id),
         session_id=validate_session_id(session_id),
-        pid=_require_pid(pid),
-        pid_domain=_require_text(pid_domain, field="pidDomain"),
-        started_at=_require_timestamp(started_at, field="startedAt"),
         launched_at_head=_require_object_name(launched_at_head, field="launchedAtHead"),
-        bound_at=_require_timestamp(bound_at, field="boundAt"),
-        state=_require_state(state),
+        reserved_at=_require_timestamp(reserved_at, field="reservedAt"),
+        state=resolved_state,
+        pid=process[0],
+        pid_domain=process[1],
+        started_at=process[2],
+        bound_at=process[3],
+    )
+
+
+def _require_process_identity(*, pid, pid_domain, started_at, bound_at, state):
+    """Process identity is all four fields or none, and `bound` demands all four.
+
+    Half a process identity is worse than none: it would let a caller record a pid
+    with no host to interpret it on, or a bound state with nothing to observe.
+    """
+    supplied = [
+        value is not None for value in (pid, pid_domain, started_at, bound_at)
+    ]
+    if not any(supplied):
+        if state == BINDING_STATE_BOUND:
+            raise SessionBindingError(
+                REASON_INVALID_IDENTITY,
+                "a bound binding requires {0}.".format(", ".join(PROCESS_FIELD_NAMES)),
+            )
+        return (None, None, None, None)
+    if not all(supplied):
+        raise SessionBindingError(
+            REASON_INVALID_IDENTITY,
+            "process identity must supply all of {0} or none of them.".format(
+                ", ".join(PROCESS_FIELD_NAMES)
+            ),
+        )
+    if state == BINDING_STATE_RESERVED:
+        raise SessionBindingError(
+            REASON_INVALID_IDENTITY,
+            "a reserved binding precedes its process and must carry no {0}.".format(
+                ", ".join(PROCESS_FIELD_NAMES)
+            ),
+        )
+    return (
+        _require_pid(pid),
+        _require_text(pid_domain, field="pidDomain"),
+        _require_timestamp(started_at, field="startedAt"),
+        _require_timestamp(bound_at, field="boundAt"),
     )
 
 
@@ -355,7 +435,7 @@ def _record_from_payload(payload: Any, path: Path) -> BindingRecord:
             REASON_MALFORMED_RECORD,
             "binding {0} has unknown key(s): {1}.".format(path, ", ".join(unknown)),
         )
-    missing = sorted(set(_RECORD_KEYS) - set(payload))
+    missing = sorted(set(_ASSIGNMENT_KEYS) - set(payload))
     if missing:
         raise SessionBindingError(
             REASON_MALFORMED_RECORD,
@@ -376,12 +456,13 @@ def _record_from_payload(payload: Any, path: Path) -> BindingRecord:
             role=payload["role"],
             iteration=payload["iteration"],
             session_id=payload["sessionId"],
-            pid=payload["pid"],
-            pid_domain=payload["pidDomain"],
-            started_at=payload["startedAt"],
             launched_at_head=payload["launchedAtHead"],
-            bound_at=payload["boundAt"],
+            reserved_at=payload["reservedAt"],
             state=payload["state"],
+            pid=payload.get("pid"),
+            pid_domain=payload.get("pidDomain"),
+            started_at=payload.get("startedAt"),
+            bound_at=payload.get("boundAt"),
         )
     except SessionBindingError as exc:
         raise SessionBindingError(
@@ -549,7 +630,7 @@ def prove_workspace_identity(
     return canonical_ticket_key(reference)
 
 
-def create_binding(
+def reserve_binding(
     store: BindingStore,
     *,
     project: str,
@@ -561,13 +642,18 @@ def create_binding(
     role: str,
     iteration: Any,
     session_id: str,
-    pid: int,
     launched_at_head: str,
-    started_at: str,
-    bound_at: str,
-    pid_domain: Optional[str] = None,
+    reserved_at: str,
 ) -> BindingRecord:
-    """Bind one preassigned session. Every refusal leaves the store untouched."""
+    """Phase one: claim the assignment and the preassigned session id, before launch.
+
+    Nothing about a process is known yet and nothing about one is recorded. The
+    reservation exists so that a spawn can never get ahead of the durable record
+    that explains it -- if the spawn then fails, what remains is an explicit
+    reserved record, not an unexplained live session.
+
+    Every refusal leaves the store exactly as it was.
+    """
     rail_id = _require_slug(rail, field="rail")
     resolved_iteration = _require_iteration(iteration, rail=rail_id)
     workspace_key = prove_workspace_identity(
@@ -584,18 +670,18 @@ def create_binding(
         role=role,
         iteration=resolved_iteration,
         session_id=session_id,
-        pid=pid,
-        pid_domain=pid_domain if pid_domain is not None else current_pid_domain(),
-        started_at=started_at,
         launched_at_head=launched_at_head,
-        bound_at=bound_at,
+        reserved_at=reserved_at,
+        state=BINDING_STATE_RESERVED,
     )
 
     existing = store.read(record.session_id)
     if existing is not None:
         raise SessionBindingError(
             REASON_DUPLICATE_SESSION_ID,
-            "session {0} is already bound to rail {1}.".format(record.session_id, existing.rail),
+            "session {0} is already {1} on rail {2}.".format(
+                record.session_id, existing.state, existing.rail
+            ),
         )
 
     held = find_binding_for_iteration(
@@ -604,9 +690,9 @@ def create_binding(
     if held:
         raise SessionBindingError(
             REASON_DUPLICATE_RAIL_ITERATION,
-            "rail {0} at iteration {1} is already bound to session {2}; unbind it before "
-            "rebinding with a new session id.".format(
-                record.rail, record.iteration.blob, held[0].session_id
+            "rail {0} at iteration {1} is already held by session {2} ({3}); unbind it "
+            "before rebinding with a new session id.".format(
+                record.rail, record.iteration.blob, held[0].session_id, held[0].state
             ),
         )
 
@@ -614,12 +700,72 @@ def create_binding(
     return record
 
 
+def attach_process(
+    store: BindingStore,
+    session_id: str,
+    *,
+    pid: int,
+    pid_domain: str,
+    started_at: str,
+    bound_at: str,
+    expected_iteration: Optional[RailIteration] = None,
+) -> BindingRecord:
+    """Phase two: attach the identity of the process that a successful spawn produced.
+
+    Only a reserved record may be attached to, and the transition is a single
+    atomic replacement of that record. Supplying `expected_iteration` proves the
+    caller is attaching to the reservation it made, which matters because the
+    orchestrator may rewrite the rail while a spawn is in flight.
+    """
+    record = store.read(session_id)
+    if record is None:
+        raise SessionBindingError(
+            REASON_UNKNOWN_SESSION, "no binding for session {0}.".format(session_id)
+        )
+    if not record.is_reserved:
+        raise SessionBindingError(
+            REASON_NOT_RESERVED,
+            "session {0} is {1}; only a reserved binding may take process "
+            "identity.".format(record.session_id, record.state),
+        )
+    if expected_iteration is not None and record.iteration != expected_iteration:
+        raise SessionBindingError(
+            REASON_ITERATION_MISMATCH,
+            "session {0} is reserved for iteration {1}, not {2}.".format(
+                record.session_id, record.iteration.blob, expected_iteration.blob
+            ),
+        )
+
+    bound = build_record(
+        project=record.project,
+        ticket=record.ticket,
+        workspace_key=record.workspace_key,
+        worktree_id=record.worktree_id,
+        workspace_path=record.workspace_path,
+        rail=record.rail,
+        role=record.role,
+        iteration=record.iteration,
+        session_id=record.session_id,
+        launched_at_head=record.launched_at_head,
+        reserved_at=record.reserved_at,
+        state=BINDING_STATE_BOUND,
+        pid=pid,
+        pid_domain=pid_domain,
+        started_at=started_at,
+        bound_at=bound_at,
+    )
+    store.replace_record(bound)
+    return bound
+
+
 def unbind_session(store: BindingStore, session_id: str) -> BindingRecord:
-    """Move one binding to its terminal state. The session id stays consumed.
+    """Terminalize a reserved or bound binding. The session id stays consumed.
 
     Removing the record instead would make the id reusable, and a reused id is
     exactly the ambiguity this store exists to refuse. Rebinding therefore always
-    means a new preassigned session id and a new record.
+    means a new preassigned session id and a new record. An abandoned reservation
+    -- one whose spawn never succeeded -- ends here too, and stays visible as what
+    it was rather than disappearing.
     """
     record = store.read(session_id)
     if record is None:
