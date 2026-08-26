@@ -57,6 +57,86 @@ Map natural-language lifecycle requests to this package's local helpers:
 | `close this out` | `scripts/flow-promote "<message>"`, then `scripts/flow-complete` when authorized |
 | `/status` or `what's my status?` | `scripts/ticket-status` |
 | `/status verbose` | `scripts/ticket-status verbose` |
+| `work a second ticket at the same time` | `scripts/flow-workspace add <id>` |
+| `adopt this worktree for ticket <id>` | `scripts/flow-workspace adopt <id>` |
+| `what workspaces exist?` | `scripts/flow-workspace list` |
+| `my base is stale` | `scripts/flow-workspace refresh` |
+| `remove this workspace` | `scripts/flow-workspace remove [path]` |
+| `clean up dead workspace claims` | `scripts/flow-workspace prune` |
+| `a promotion lock is stuck` | `scripts/flow-workspace unlock [--force] <holder-path>` |
+
+### Concurrent Workspaces
+
+One repository may host several active tickets at once. Each workspace is a
+linked Git worktree with its own ticket-specific scratch branch and its own
+`.ai-dev` state, so `flow-status`, `flow-diff`, `flow-commit`, `flow-reset`,
+`flow-abandon`, and `flow-complete` act only on the workspace they are run from.
+An ordinary single-workspace repository needs none of these commands and behaves
+exactly as before.
+
+- `scripts/flow-workspace add <id>` reserves the ticket claim before creating
+  anything, then creates a sibling worktree and a deterministic branch, seeds
+  that workspace's `.ai-dev`, and activates the ticket. If any step fails, it
+  removes only what that invocation created; when cleanup itself fails it
+  preserves the artifacts and reports them.
+- `scripts/flow-workspace adopt <id>` claims and activates a worktree that
+  already exists. It never resets the branch, index, or working tree, and infers
+  the checkpoint from existing numbered commits.
+  Run against a workspace whose workflow is already active on that same ticket,
+  it only registers the claim that workflow already implies -- including a
+  stacked handoff's suspended issue -- and changes nothing else. That is the
+  supported repair for a workflow started before this repository had a registry,
+  and for a workspace whose claim went missing.
+- One ticket may be active as only one writable workspace. A second attempt is
+  refused and names the owning workspace.
+- A prerequisite handoff claims its own ticket in the workspace that starts it,
+  and the suspended issue keeps its claim there, so neither ticket can be
+  activated a second time elsewhere.
+- `scripts/flow-workspace remove` refuses unless that workspace's workflow is
+  inactive, its tree is clean, and its branch is not ahead of `main`.
+- `scripts/flow-workspace prune` removes only claims whose worktree is gone or
+  prunable. A claim held by a blocked workflow is live and is never pruned;
+  recover it in its own workspace with `scripts/flow-resume <id>` followed by the
+  appropriate lifecycle command.
+- Claim ownership is the Git worktree identity. Reading another workspace's
+  claim record never authorizes releasing it.
+- The claim registry, not workflow state, is the authority on which ticket a
+  worktree owns. When the two disagree, every Flow ticket command stops and
+  names the owning workspace instead of choosing a side. Listing, pruning,
+  unlocking, and removal keep working so the association can be repaired.
+- A workspace never inherits a pinned control-plane ticket from the workspace
+  that created it; it resolves the rail of the ticket it actually owns.
+- The ticket catalogue is repository-level state, not workspace state. A `local`
+  ticket store is read from the workspace that holds one, and otherwise from the
+  primary worktree, so every concurrent workspace resolves its own ticket from
+  one shared catalogue instead of a private copy.
+
+### Promotion Serialization And Stale Bases
+
+- Promotion is serialized repository-wide by a shared promotion lock. Contention
+  fails closed and names the holding ticket and workspace; it never waits.
+- Every promotion precondition is re-proved while the lock is held, so a `main`
+  that advances after an early check is still caught before any mutation.
+- Staleness is measured only against `main`. Another workspace's scratch branch
+  advancing does not make this workspace stale.
+- A stale base is refused without changing branches, index, working tree,
+  workflow state, review evidence, or synchronization state. The refusal reports
+  the ahead/behind counts and names the promoting workspace when that is known.
+- `scripts/flow-workspace refresh` is the supported recovery. It merges the
+  current `main` into this workspace's scratch branch under the promotion lock
+  and records a non-numeric merge commit, so checkpoint numbering is unchanged.
+  It never rebases, force-updates, resets, or modifies `main`.
+- A workspace that is only behind `main` has nothing of its own to reconcile, so
+  refresh fast-forwards it and records no commit. That keeps it completable; a
+  merge there would leave it permanently ahead of `main` by an empty commit.
+- Refresh clears promotion-review and review-baseline evidence bound to the old
+  base. Review must be earned again before promoting.
+- A conflicting refresh leaves the ordinary Git merge in progress for explicit
+  resolution and keeps the workflow state, claim, and checkpoint intact. Resolve
+  and commit it, or run `git merge --abort`. Flow never resolves or aborts it.
+- `scripts/flow-workspace unlock <holder-path>` releases an abandoned promotion
+  lock. Removal is automatic only for a same-host process proven absent;
+  `--force` is required whenever liveness cannot be established.
 
 
 ### Prerequisite Handoff

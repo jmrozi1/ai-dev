@@ -150,6 +150,7 @@ class SkillInstallationTests(unittest.TestCase):
             "complete",
             "block",
             "resume",
+            "workspace",
             "report",
         ):
             ps1_text = (scripts_dir / f"flow-{command}.ps1").read_text(encoding="utf-8")

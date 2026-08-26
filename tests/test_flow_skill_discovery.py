@@ -112,6 +112,98 @@ class FlowSkillDiscoveryTests(unittest.TestCase):
         self.assertIn("may complete directly", normalized_content)
         self.assertIn("new a work still requires", normalized_content)
 
+    def test_skill_body_documents_the_workspace_command_surface(self) -> None:
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+
+        for subcommand in ("add", "adopt", "list", "refresh", "remove", "prune", "unlock"):
+            with self.subTest(subcommand=subcommand):
+                self.assertIn(
+                    f"scripts/flow-workspace {subcommand}",
+                    normalized_content,
+                    msg=f"Expected the {subcommand} workspace subcommand to be documented",
+                )
+
+        self.assertIn("concurrent workspaces", normalized_content)
+        self.assertIn("linked git worktree", normalized_content)
+        self.assertIn("its own `.ai-dev` state", normalized_content)
+        self.assertIn("single-workspace repository needs none of these commands", normalized_content)
+
+    def test_skill_body_documents_promotion_serialization_and_refresh(self) -> None:
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+
+        self.assertIn("promotion is serialized repository-wide", normalized_content)
+        self.assertIn("fails closed", normalized_content)
+        self.assertIn("re-proved while the lock is held", normalized_content)
+        self.assertIn("staleness is measured only against `main`", normalized_content)
+        self.assertIn(
+            "another workspace's scratch branch advancing does not make this workspace stale",
+            normalized_content,
+        )
+        self.assertIn("non-numeric merge commit", normalized_content)
+        self.assertIn("never rebases, force-updates, resets, or modifies `main`", normalized_content)
+        self.assertIn("clears promotion-review and review-baseline evidence", normalized_content)
+        self.assertIn("leaves the ordinary git merge in progress", normalized_content)
+        self.assertIn("flow never resolves or aborts it", normalized_content)
+        self.assertIn("same-host process proven absent", normalized_content)
+
+    def test_skill_body_documents_the_shared_ticket_catalogue(self) -> None:
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+
+        self.assertIn("ticket catalogue is repository-level state", normalized_content)
+        self.assertIn("otherwise from the primary worktree", normalized_content)
+        self.assertIn("only behind `main` has nothing of its own", normalized_content)
+        self.assertIn("refresh fast-forwards it and records no commit", normalized_content)
+
+    def test_skill_body_documents_claim_ownership_and_blocked_claims(self) -> None:
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+
+        self.assertIn("claim ownership is the git worktree identity", normalized_content)
+        self.assertIn(
+            "reading another workspace's claim record never authorizes releasing it",
+            normalized_content,
+        )
+        self.assertIn("blocked workflow is live and is never pruned", normalized_content)
+        self.assertIn(
+            "the claim registry, not workflow state, is the authority",
+            normalized_content,
+        )
+        self.assertIn(
+            "every flow ticket command stops and names the owning workspace",
+            normalized_content,
+        )
+        self.assertIn(
+            "only registers the claim that workflow already implies",
+            normalized_content,
+        )
+        self.assertIn(
+            "never inherits a pinned control-plane ticket",
+            normalized_content,
+        )
+        self.assertIn("one ticket may be active as only one writable workspace", normalized_content)
+        self.assertIn(
+            "a prerequisite handoff claims its own ticket in the workspace that starts it",
+            normalized_content,
+        )
+
+    def test_skill_body_omits_unimplemented_workspace_behavior(self) -> None:
+        """Documentation is limited to behavior that exists today."""
+        content = self.flow_skill.read_text(encoding="utf-8").lower()
+        normalized_content = " ".join(content.split())
+
+        for absent in (
+            "publication lock",
+            "control-plane lock",
+            "dependency graph",
+            "automatic conflict resolution",
+            "automatically rebase",
+        ):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, normalized_content)
+
     def test_start_ticket_uses_canonical_provider_metadata(self) -> None:
         """Verify start-ticket tasking cannot promote historical catalogs to current intent."""
         content = self.flow_skill.read_text(encoding="utf-8").lower()
