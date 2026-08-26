@@ -390,16 +390,43 @@ def _replace_skill_link(destination: Path, target: Path, *, kind: str) -> None:
             f"refusing to replace {destination}: staged link did not resolve to {target}"
         )
 
+    if not path_is_managed_link(destination) and destination.exists():
+        _remove_link(staging)
+        raise OSError(f"destination is not a managed link: {destination}")
+
+    # The working install is moved aside rather than removed, so a failure in the
+    # final swap itself is still recoverable.
+    backup = destination.parent / f".{destination.name}.ai-dev-backup"
+    if path_is_managed_link(backup):
+        _remove_link(backup)
+    elif backup.exists():
+        _remove_link(staging)
+        raise OSError(f"backup path is occupied by unmanaged content: {backup}")
+
+    had_destination = path_is_managed_link(destination)
+    if had_destination:
+        os.rename(destination, backup)
+
     try:
-        if path_is_managed_link(destination):
-            _remove_link(destination)
-        elif destination.exists():
-            raise OSError(f"destination is not a managed link: {destination}")
         os.rename(staging, destination)
-    except OSError:
+    except OSError as swap_error:
+        if had_destination:
+            try:
+                if not path_is_managed_link(destination) and not destination.exists():
+                    os.rename(backup, destination)
+            except OSError as restore_error:
+                # Never discard the only surviving copy of the working install.
+                raise OSError(
+                    f"failed to install {destination} and could not restore the previous "
+                    f"package automatically ({restore_error}). The previous working link is "
+                    f"preserved at {backup}; move it back to {destination} to recover."
+                ) from swap_error
         if path_is_managed_link(staging):
             _remove_link(staging)
         raise
+
+    if had_destination and path_is_managed_link(backup):
+        _remove_link(backup)
 
 
 def _path_exists_or_symlink(path: Path) -> bool:  # noqa: D401 - historical name
@@ -419,7 +446,7 @@ def _reconcile_obsolete_managed_skills(
     for destination_key in obsolete_keys:
         destination_path = Path(destination_key)
         ownership_value = owned_skills[destination_key]
-        expected_target = ownership_value[len(_SYMLINK_OWNERSHIP_PREFIX) :]
+        expected_target = _ownership_target_text(ownership_value)
 
         if not _path_exists_or_symlink(destination_path):
             updated_owned_skills.pop(destination_key, None)
@@ -441,7 +468,7 @@ def _reconcile_obsolete_managed_skills(
         actual_target = _normalized_symlink_target_text(destination_path, platform=platform)
         if actual_target != expected_target:
             raise SkillInstallationError(
-                "Cannot reconcile obsolete managed skill because symlink target diverged: "
+                "Cannot reconcile obsolete managed skill because link target diverged: "
                 f"{destination_path}"
             )
 

@@ -28,7 +28,7 @@ from .control_plane import (
     resolve_coordination_repo,
     resolve_read_source,
 )
-from .json_files import JsonFileError, load_json_object
+from .json_files import JsonFileError, load_json_object, write_text_atomic
 from .repository import RepositoryError, resolve_repo_root, workflow_state_file_for_repo_root
 from .ticket_providers import (
     GitRemoteGitHubCurrentRepositoryResolver,
@@ -163,10 +163,11 @@ def sync_claude_activation(*, home: Path | None = None) -> str:
     if existing == composed:
         return "unchanged"
 
+    # Atomic replace: a failed write must never partially truncate unrelated
+    # user instructions that this module does not own.
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(composed, encoding="utf-8")
-    except OSError as exc:
+        write_text_atomic(path, composed)
+    except (JsonFileError, OSError) as exc:
         raise ClaudeActivationError(f"Cannot write {path}: {exc}") from exc
 
     return "updated" if had_block else ("installed" if not existing else "inserted")

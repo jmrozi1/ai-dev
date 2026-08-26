@@ -433,5 +433,220 @@ class ClaudeLauncherTests(unittest.TestCase):
         self.assertIn("control-plane", completed.stdout)
 
 
+class CheckpointTwoFailureSafetyTests(_TempHome):
+    """Remediation for the three failure-safety defects found by exact-code review.
+
+    A: obsolete cleanup sliced every ownership value by len("symlink:").
+    B: the final staging-to-destination swap removed the working install first.
+    C: the activation pointer was written non-atomically.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.target = self.tmp_path / "package"
+        self.target.mkdir()
+        (self.target / "SKILL.md").write_text("real", encoding="utf-8")
+        self.other = self.tmp_path / "other"
+        self.other.mkdir()
+        (self.other / "SKILL.md").write_text("other", encoding="utf-8")
+        self.destination = self.home / "link"
+        self.kind = installation.preferred_link_kind("windows" if WINDOWS else "posix")
+
+    # Finding A ---------------------------------------------------------------
+
+    def test_ownership_target_parses_both_prefixes_without_truncation(self) -> None:
+        """`junction:` is one character longer than `symlink:`."""
+        self.assertEqual(
+            installation._ownership_target_text("symlink:C:\\\\pkg"), "C:\\\\pkg"
+        )
+        self.assertEqual(
+            installation._ownership_target_text("junction:C:\\\\pkg"), "C:\\\\pkg"
+        )
+
+    def test_obsolete_junction_ownership_is_recognised_and_removed(self) -> None:
+        installation._replace_skill_link(self.destination, self.target, kind=self.kind)
+        platform = "windows" if WINDOWS else "posix"
+        key = installation._normalized_path_identity_text_for_platform(
+            self.destination, platform=platform
+        )
+        ownership = installation._symlink_ownership_value(
+            self.target, platform=platform, kind=self.kind
+        )
+        # The recorded prefix is the one the current platform actually installs.
+        self.assertTrue(ownership.startswith(f"{self.kind}:"))
+
+        updated, statuses = installation._reconcile_obsolete_managed_skills(
+            desired_destination_keys=set(),
+            owned_skills={key: ownership},
+            platform=platform,
+        )
+
+        self.assertEqual([status.state for status in statuses], ["removed"])
+        self.assertEqual(updated, {})
+        self.assertFalse(installation.path_is_managed_link(self.destination))
+        # Removing the link must never remove the package it pointed at.
+        self.assertEqual((self.target / "SKILL.md").read_text(encoding="utf-8"), "real")
+
+    def test_obsolete_reconcile_fails_closed_on_diverged_target(self) -> None:
+        installation._replace_skill_link(self.destination, self.target, kind=self.kind)
+        platform = "windows" if WINDOWS else "posix"
+        key = installation._normalized_path_identity_text_for_platform(
+            self.destination, platform=platform
+        )
+        diverged = installation._symlink_ownership_value(
+            self.other, platform=platform, kind=self.kind
+        )
+
+        with self.assertRaises(installation.SkillInstallationError):
+            installation._reconcile_obsolete_managed_skills(
+                desired_destination_keys=set(),
+                owned_skills={key: diverged},
+                platform=platform,
+            )
+
+        self.assertTrue(installation.path_is_managed_link(self.destination))
+
+    # Finding B ---------------------------------------------------------------
+
+    def test_final_swap_failure_leaves_the_original_package_installed(self) -> None:
+        installation._replace_skill_link(self.destination, self.target, kind=self.kind)
+        real_rename = os.rename
+        calls = {"n": 0}
+
+        def fail_final_swap(src, dst, *args, **kwargs):
+            # The destination-to-backup move succeeds; the staging-to-destination
+            # swap is the seam under test.
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("simulated final swap failure")
+            return real_rename(src, dst, *args, **kwargs)
+
+        with patch.object(os, "rename", side_effect=fail_final_swap):
+            with self.assertRaises(OSError):
+                installation._replace_skill_link(
+                    self.destination, self.other, kind=self.kind
+                )
+
+        # The working install still resolves to and serves the original package.
+        self.assertTrue(installation.path_is_managed_link(self.destination))
+        self.assertEqual(
+            Path(installation.read_link_target_text(self.destination)).resolve(),
+            self.target.resolve(),
+        )
+        self.assertEqual((self.destination / "SKILL.md").read_text(encoding="utf-8"), "real")
+
+    def test_unrecoverable_swap_preserves_the_backup_and_reports_it(self) -> None:
+        installation._replace_skill_link(self.destination, self.target, kind=self.kind)
+        real_rename = os.rename
+
+        def fail_swap_and_restore(src, dst, *args, **kwargs):
+            if Path(dst) == self.destination:
+                raise OSError("simulated unrecoverable swap")
+            return real_rename(src, dst, *args, **kwargs)
+
+        with patch.object(os, "rename", side_effect=fail_swap_and_restore):
+            with self.assertRaises(OSError) as caught:
+                installation._replace_skill_link(
+                    self.destination, self.other, kind=self.kind
+                )
+
+        message = str(caught.exception)
+        backup = self.destination.parent / f".{self.destination.name}.ai-dev-backup"
+        self.assertIn("preserved at", message)
+        self.assertIn(str(backup), message)
+        # The only surviving copy of the working install was not discarded.
+        self.assertTrue(installation.path_is_managed_link(backup))
+        self.assertEqual((backup / "SKILL.md").read_text(encoding="utf-8"), "real")
+
+    def test_successful_replacement_retargets_and_cleans_artifacts(self) -> None:
+        installation._replace_skill_link(self.destination, self.target, kind=self.kind)
+        installation._replace_skill_link(self.destination, self.other, kind=self.kind)
+
+        self.assertEqual((self.destination / "SKILL.md").read_text(encoding="utf-8"), "other")
+        staging = self.destination.parent / f".{self.destination.name}.ai-dev-staging"
+        backup = self.destination.parent / f".{self.destination.name}.ai-dev-backup"
+        self.assertFalse(staging.exists() or installation.path_is_managed_link(staging))
+        self.assertFalse(backup.exists() or installation.path_is_managed_link(backup))
+
+    def test_recoverable_failure_cleans_staging(self) -> None:
+        installation._replace_skill_link(self.destination, self.target, kind=self.kind)
+        real_rename = os.rename
+        calls = {"n": 0}
+
+        def fail_final_swap(src, dst, *args, **kwargs):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError("simulated final swap failure")
+            return real_rename(src, dst, *args, **kwargs)
+
+        with patch.object(os, "rename", side_effect=fail_final_swap):
+            with self.assertRaises(OSError):
+                installation._replace_skill_link(
+                    self.destination, self.other, kind=self.kind
+                )
+
+        staging = self.destination.parent / f".{self.destination.name}.ai-dev-staging"
+        self.assertFalse(staging.exists() or installation.path_is_managed_link(staging))
+
+    def test_unmanaged_destination_still_fails_closed(self) -> None:
+        self.destination.mkdir(parents=True)
+        (self.destination / "user.txt").write_text("mine", encoding="utf-8")
+
+        with self.assertRaises(OSError):
+            installation._replace_skill_link(self.destination, self.target, kind=self.kind)
+
+        self.assertEqual((self.destination / "user.txt").read_text(encoding="utf-8"), "mine")
+        staging = self.destination.parent / f".{self.destination.name}.ai-dev-staging"
+        self.assertFalse(staging.exists() or installation.path_is_managed_link(staging))
+
+    # Finding C ---------------------------------------------------------------
+
+    def test_activation_write_uses_the_atomic_primitive(self) -> None:
+        with patch.object(activation, "write_text_atomic") as writer:
+            activation.sync_claude_activation(home=self.home)
+        writer.assert_called_once()
+
+    def test_failed_activation_write_leaves_existing_file_byte_identical(self) -> None:
+        path = activation.resolve_claude_instruction_path(home=self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = "# My own notes\n\nKeep every byte of this.\n"
+        path.write_text(original, encoding="utf-8")
+        before = path.read_bytes()
+
+        with patch.object(
+            activation, "write_text_atomic", side_effect=OSError("simulated write failure")
+        ):
+            with self.assertRaises(ClaudeActivationError):
+                activation.sync_claude_activation(home=self.home)
+
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_marker_failures_never_write(self) -> None:
+        path = activation.resolve_claude_instruction_path(home=self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        original = activation.MANAGED_BEGIN + "\nonly a begin marker\n"
+        path.write_text(original, encoding="utf-8")
+        before = path.read_bytes()
+
+        with patch.object(activation, "write_text_atomic") as writer:
+            with self.assertRaises(ClaudeActivationError):
+                activation.sync_claude_activation(home=self.home)
+            writer.assert_not_called()
+
+        self.assertEqual(path.read_bytes(), before)
+
+    def test_success_preserves_unrelated_content_and_rerun_is_unchanged(self) -> None:
+        path = activation.resolve_claude_instruction_path(home=self.home)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# Mine\n\nkeep\n", encoding="utf-8")
+
+        self.assertEqual(activation.sync_claude_activation(home=self.home), "inserted")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn("# Mine", text)
+        self.assertIn("keep", text)
+
+        self.assertEqual(activation.sync_claude_activation(home=self.home), "unchanged")
+
+
 if __name__ == "__main__":
     unittest.main()
