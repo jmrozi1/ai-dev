@@ -632,6 +632,25 @@ class ReadSource:
         )
         return completed.returncode == 0
 
+    def blob_sha(self, relative: str) -> str | None:
+        """Git blob id of one artifact at the revision this read actually serves.
+
+        Rail authorizations are versioned by content, so the controller needs the
+        exact object name of a `rail.md` to pin the iteration it acted on. Text
+        alone cannot supply it, and hashing the text elsewhere would reinvent Git
+        object naming outside the module that owns control-plane reads.
+        """
+        if self.revision is None:
+            path = self.repo_root / relative
+            if not path.is_file():
+                return None
+            return _git(self.repo_root, ["hash-object", "--", str(path)], check=False) or None
+        return _git(
+            self.repo_root,
+            ["rev-parse", "--verify", "--quiet", f"{self.revision}:{relative}"],
+            check=False,
+        ) or None
+
     def rails(self, scope: str) -> list[str]:
         if self.revision is None:
             rails_root = self.repo_root / scope / "rails"
@@ -644,6 +663,13 @@ class ReadSource:
             check=False,
         )
         return sorted(line.strip().rstrip("/") for line in listing.splitlines() if line.strip())
+
+
+def rail_blob_sha(source: ReadSource, *, project: str, ticket: str, rail: str) -> str | None:
+    """The iteration id of one rail: the blob its authorization was read from."""
+    return source.blob_sha(
+        artifact_relative(project=project, ticket=ticket, artifact="rail", rail=rail)
+    )
 
 
 def resolve_read_source(repo_root: Path) -> ReadSource:

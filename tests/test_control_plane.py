@@ -18,6 +18,7 @@ from ai_dev_flow.control_plane import (
     publish,
     resolve_control_plane_config,
     resolve_read_source,
+    rail_blob_sha,
     render_rail,
     render_status,
     resolve_coordination_repo,
@@ -488,6 +489,57 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(ControlPlaneError) as caught:
             render_status(self.coordination, project="ai-dev", ticket="issue-51")
         self.assertIn("contradictory", str(caught.exception))
+
+    # Rail iteration identity
+
+    def test_rail_blob_sha_is_the_object_name_of_that_rails_authorization(self) -> None:
+        self._authorize("rail-iterated", "running")
+        source = resolve_read_source(self.coordination)
+        blob = rail_blob_sha(source, project="ai-dev", ticket="issue-51", rail="rail-iterated")
+        expected = self._git(
+            self.coordination, "rev-parse", "HEAD:ai-dev/issue-51/rails/rail-iterated/rail.md"
+        )
+        self.assertEqual(blob, expected)
+
+    def test_rail_blob_sha_changes_only_when_the_authorization_text_changes(self) -> None:
+        self._authorize("rail-iterated", "running")
+        first = rail_blob_sha(
+            resolve_read_source(self.coordination), project="ai-dev", ticket="issue-51",
+            rail="rail-iterated",
+        )
+        # Publishing an unrelated artifact moves the head but not the iteration.
+        self._handoff("rail-iterated", "running")
+        unchanged = rail_blob_sha(
+            resolve_read_source(self.coordination), project="ai-dev", ticket="issue-51",
+            rail="rail-iterated",
+        )
+        self.assertEqual(unchanged, first)
+
+        self._authorize("rail-iterated", "blocked")
+        changed = rail_blob_sha(
+            resolve_read_source(self.coordination), project="ai-dev", ticket="issue-51",
+            rail="rail-iterated",
+        )
+        self.assertNotEqual(changed, first)
+
+    def test_rail_blob_sha_is_absent_for_an_unauthorized_rail(self) -> None:
+        source = resolve_read_source(self.coordination)
+        self.assertIsNone(
+            rail_blob_sha(source, project="ai-dev", ticket="issue-51", rail="rail-absent")
+        )
+
+    def test_rail_blob_sha_reads_the_revision_the_source_serves(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-iteration")
+        self._authorize("rail-iterated", "running")
+        self._git(self.coordination, "push", "-q", "origin", "main")
+        remote_blob = self._git(
+            upstream, "rev-parse", "HEAD:ai-dev/issue-51/rails/rail-iterated/rail.md"
+        )
+        source = resolve_read_source(self.coordination)
+        self.assertEqual(
+            rail_blob_sha(source, project="ai-dev", ticket="issue-51", rail="rail-iterated"),
+            remote_blob,
+        )
 
     # Rail authorization versus executor-proposed status
 
