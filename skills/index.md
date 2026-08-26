@@ -47,7 +47,7 @@ remain in the applicable canonical `SKILL.md` files.
 
 | Skill | Use when | Canonical path |
 | --- | --- | --- |
-| `auto-review` | Deciding checkpoint/promotion review composition and pass/action-required judgment, including final readiness of ticket skill-candidate and accepted-skill state. | `skills/chatgpt/auto-review/SKILL.md` |
+| `auto-review` | Deciding checkpoint/promotion review composition and pass/action-required judgment, including final readiness of ticket skill-candidate and accepted-skill state; also deciding whether in-flight process review applies at a natural orchestrator handoff while a named checkpoint is still in progress. | `skills/chatgpt/auto-review/SKILL.md` |
 | `flow` | Interpreting Flow lifecycle state, deciding valid transitions, and escalating blocked or unsafe workflow state. | `skills/chatgpt/flow/SKILL.md` |
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, ticket-owned skill investment state, and evidence-based decisions. | `skills/chatgpt/orchestrator/SKILL.md` |
 | `skill-authoring` | Creating/refining AI Dev skills or adjudicating ticket skill candidates as keep/no-skill/refine/create, with immediate dogfood for accepted investments. | `skills/chatgpt/skill-authoring/SKILL.md` |

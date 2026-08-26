@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 import re
 import shutil
 from pathlib import Path
@@ -231,6 +232,30 @@ def sync_local_excludes(
 
 def branch_exists(repo_root: Path, branch_name: str) -> bool:
     return _resolve_branch_head(repo_root, branch_name) is not None
+
+
+def primary_worktree_root(repo_root: Path) -> Path | None:
+    """The repository's primary worktree, or None when there is not one.
+
+    Every linked worktree shares one common Git directory, and that directory
+    sits inside the primary worktree. Repository-level state therefore has one
+    home no matter which worktree asks for it. A bare repository has no primary
+    worktree, so callers keep whatever root they already had.
+    """
+    completed = _run_git(repo_root, ["rev-parse", "--git-common-dir"], check=False)
+    if completed.returncode != 0:
+        return None
+    resolved = completed.stdout.strip()
+    if not resolved:
+        return None
+
+    common_dir = Path(resolved)
+    if not common_dir.is_absolute():
+        common_dir = Path(repo_root) / common_dir
+    common_dir = Path(os.path.abspath(str(common_dir)))
+    if common_dir.name != ".git":
+        return None
+    return common_dir.parent
 
 
 def ensure_branch_exists(repo_root: Path, branch_name: str) -> None:
@@ -1026,3 +1051,119 @@ def _compose_exclude_text(
         return ""
 
     return "\n".join(lines) + "\n"
+
+
+def add_worktree(
+    repo_root: Path,
+    *,
+    workspace_path: Path,
+    branch_name: str,
+    source_branch: str,
+) -> None:
+    _run_git(
+        repo_root,
+        ["worktree", "add", "-b", branch_name, str(workspace_path), source_branch],
+        check=True,
+    )
+
+
+def remove_worktree(repo_root: Path, *, workspace_path: Path) -> None:
+    _run_git(repo_root, ["worktree", "remove", str(workspace_path)], check=True)
+
+
+def prune_worktrees(repo_root: Path) -> None:
+    _run_git(repo_root, ["worktree", "prune"], check=True)
+
+
+def delete_branch_if_at_revision(
+    repo_root: Path,
+    *,
+    branch_name: str,
+    expected_commit: str,
+) -> bool:
+    """Delete a branch only while it still points where this caller left it."""
+    current = _resolve_branch_head(repo_root, branch_name)
+    if current is None:
+        return False
+    if current != expected_commit:
+        raise RepositoryError(
+            f"Refusing to delete branch {branch_name}: it moved to {current}, "
+            f"not {expected_commit}."
+        )
+
+    completed = _run_git(repo_root, ["branch", "-D", branch_name], check=False)
+    if completed.returncode != 0:
+        raise RepositoryError(
+            completed.stderr.strip() or f"Cannot delete branch {branch_name}."
+        )
+    return True
+
+
+def merge_revision_no_fast_forward(
+    repo_root: Path,
+    *,
+    revision: str,
+    message: str,
+) -> None:
+    """Merge one exact revision into the current branch, always recording a merge.
+
+    --no-ff guarantees a real merge commit even when the current branch is only
+    behind, so the resulting subject is always available to carry a non-numeric
+    label.
+    """
+    completed = _run_git(
+        repo_root,
+        ["merge", "--no-ff", "--no-edit", "-m", message, revision],
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RepositoryError(
+            (completed.stderr.strip() or completed.stdout.strip())
+            or f"git merge {revision} failed."
+        )
+
+
+def set_pending_merge_message(repo_root: Path, *, message: str) -> None:
+    """Replace the message Git prepared for an in-progress merge.
+
+    A conflicted merge leaves Git's own draft, which appends a commented
+    conflict list. Whether those comments survive depends on how the merge is
+    finished: an editor strips them, `git commit --no-edit` keeps them. Writing
+    the intended message here makes the resulting commit subject the same
+    either way.
+    """
+    message_path = _git_path_for_repo_root(repo_root, "MERGE_MSG")
+    try:
+        message_path.write_text(message.rstrip("\n") + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise RepositoryError(f"Cannot write the pending merge message: {exc}") from exc
+
+
+def merge_revision_fast_forward_only(repo_root: Path, *, revision: str) -> None:
+    """Advance the current branch along its own ancestry, recording nothing new.
+
+    A branch that is only behind has no work to reconcile, so moving it forward
+    is not a merge, a rebase, or a force update: the resulting commit is the
+    revision itself and no history is rewritten.
+    """
+    completed = _run_git(repo_root, ["merge", "--ff-only", revision], check=False)
+    if completed.returncode != 0:
+        raise RepositoryError(
+            (completed.stderr.strip() or completed.stdout.strip())
+            or f"git merge --ff-only {revision} failed."
+        )
+
+
+def unmerged_paths(repo_root: Path) -> list[str]:
+    completed = _run_git(
+        repo_root,
+        ["diff", "--name-only", "--diff-filter=U"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+    return [line for line in completed.stdout.splitlines() if line]
+
+
+def merge_in_progress(repo_root: Path) -> bool:
+    return _git_operation_sentinel_exists(repo_root, "MERGE_HEAD")

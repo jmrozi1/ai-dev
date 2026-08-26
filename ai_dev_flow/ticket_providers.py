@@ -11,6 +11,7 @@ from typing import Protocol, Union
 from urllib.parse import urlparse
 
 from .json_files import JsonFileError, load_json_object, write_json_object_atomic
+from .repository import primary_worktree_root
 from .ticket_config import (
     GitHubCurrentTicketConfiguration,
     GitHubTicketConfiguration,
@@ -98,7 +99,29 @@ def _now_utc_iso_timestamp() -> str:
 
 
 def _local_tickets_directory_for_repo_root(repo_root: Path, configured_path: str) -> Path:
-    return repo_root / configured_path
+    """Resolve the local ticket catalogue for whichever worktree is asking.
+
+    The catalogue is repository-level state, not per-worktree state, so a
+    concurrent ticket workspace must read the same tickets as every other
+    worktree. A store the asking worktree already holds stays authoritative for
+    it -- that is the ordinary single-worktree case, and a tracked store
+    genuinely does belong to each worktree -- otherwise the primary worktree's
+    store is shared.
+    """
+    local_directory = repo_root / configured_path
+    if local_directory.exists():
+        return local_directory
+
+    primary_root = primary_worktree_root(repo_root)
+    if primary_root is None:
+        return local_directory
+    if Path(os.path.abspath(str(primary_root))) == Path(os.path.abspath(str(repo_root))):
+        return local_directory
+
+    primary_directory = primary_root / configured_path
+    if primary_directory.is_dir():
+        return primary_directory
+    return local_directory
 
 
 def _parse_positive_numeric_ticket_id(value: str, *, context: str) -> int:

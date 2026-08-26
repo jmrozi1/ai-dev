@@ -26,6 +26,51 @@ carrying forward in the handoff so the orchestrator can rewrite it.
 For trivial or single-step work, execute the provided bounded assignment without
 forcing creation of a formal tasking file.
 
+## Authorized Rail And Publication
+
+When a durable authorized rail is configured, that rail is the active assignment
+in place of `.ai-dev/tasking.md`, and every rule for the tasking file applies to
+it. When no control plane is configured, `.ai-dev/tasking.md` remains the rail
+and no external coordination is required.
+
+`proceed` and `continue` mean read the fresh authorized rail before acting. A
+fresh executor continues from that rail, this skill, durable repository state,
+and relevant capability skills, without the previous chat transcript. Read your
+own rail and the shared context it names; do not read sibling rails you were not
+authorized for.
+
+Publish only what you own: your handoff, and any bounded provider-evidence
+projection for your rail. Publish observations, exact evidence, unknowns,
+proposed facts, failures, and recommended next work. You may not promote your own
+proposal into accepted state, and you may not materially rewrite your own
+authorization. Propose the change and let the orchestrator decide.
+
+A published handoff is bounded current state. Replace it. Never append to it, and
+never let it become a transcript, message log, or execution diary.
+
+State your rail's proposed status in your handoff so any disagreement with the
+authorized status is visible rather than silent. That status is a proposal; the
+orchestrator accepts it by updating the rail, and you never update the rail
+yourself.
+
+Executor identity is disposable; the rail is durable. You may be taking over a
+rail a previous executor started. Treat any published handoff as current state to
+continue from rather than as your own memory, and do not assume you authored it.
+Work only the rail you were given, even when other rails are running.
+
+Local executors publish through `python -m ai_dev_flow.control_plane`, which
+enforces artifact ownership, resolves remote state freshly rather than trusting
+cached branch status, and fails closed on stale or diverged publication. On a
+fail-closed refusal, re-read the current state and republish against it. Do not
+force, and do not route around the helper with bespoke Git writes.
+
+When a handoff indicator is in use, publish and push first, then allocate through
+the same helper, which advances the counter by compare-and-swap against fresh
+remote state. Print only the value the allocation returned, and print nothing if
+it fails. If allocation conflicts after a successful publication, retry the
+allocation alone rather than republishing. The number is display-only; the user
+never types it, and it never authorizes work.
+
 ## Task Outcomes and Continuation
 
 Track each bounded task with one explicit outcome:
@@ -48,6 +93,9 @@ Stop only when:
 - remaining useful work has been invalidated;
 - continuing would cross a constraint or explicit scope boundary; or
 - the configured context ceiling prevents safely starting the next unit.
+
+Failure of one task does not stop an authorized rail. Record the reason, block
+only what actually depends on it, and continue the remaining independent work.
 
 ## Context Ceiling
 
@@ -81,11 +129,25 @@ When useful and observable, keep the concise handoff evidence specific by
 reporting materially used skills, notable skill or process friction, repeated
 user corrections or interventions, rediscovered knowledge, unexpected
 permission friction, and obvious cases where a relevant skill did not activate.
-Report observations only. Do not decide or state that a skill is defective;
-ChatGPT owns that judgment. Do not add empty template fields or a history log.
+
+Record process observations so checkpoint review can tell these apart:
+
+- a communication failure durable state should have prevented, such as avoidable
+  relay, missing durable context, repeated explanation, or rediscovery;
+- durable information that was stale or contradictory;
+- a legitimate human decision;
+- a tooling or deterministic-helper failure;
+- a permission or provider limitation;
+- an isolated executor mistake;
+- a possible skill-guidance deficiency.
+
+Report the observation and which of these it resembles. Do not decide or state
+that a skill is defective; ChatGPT owns that judgment. Do not add empty template
+fields or a history log.
 
 ## Fresh Resume
 
 A fresh executor must be able to continue from this skill, the current
-`.ai-dev/tasking.md`, durable repository/project state, and relevant capability
-skills. It must not depend on conversation memory from a prior executor.
+`.ai-dev/tasking.md` or the configured authorized rail, durable
+repository/project state, and relevant capability skills. It must not depend on
+conversation memory from a prior executor.
