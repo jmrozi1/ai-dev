@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -12,8 +13,14 @@ from contextlib import redirect_stderr, redirect_stdout
 from unittest.mock import patch
 
 from ai_dev_flow import cli
-from ai_dev_flow.repository import RepositoryError
+from ai_dev_flow.repository import (
+    RepositoryError,
+    ambiguous_abbreviated_object_names,
+    matching_revision_namespaces,
+    resolve_revision_commit,
+)
 from ai_dev_flow.ticket_providers import LocalTicketProvider, TicketProviderError
+from ai_dev_flow.tickets import Ticket, TicketReference
 from ai_dev_flow.workflow_state import WorkflowStateError
 
 
@@ -524,7 +531,7 @@ class FlowAdoptInterfaceTests(_FlowAdoptFixture):
         self.assertIn("--adopt <commit-ish>", out)
 
 
-class FlowAdoptFailureSafetyTests(_FlowAdoptFixture):
+class _FlowAdoptFailureFixture(_FlowAdoptFixture):
     """Checkpoint adoption-failure-safety.
 
     Adoption is all-or-nothing. For every covered failure the externally
@@ -610,6 +617,9 @@ class FlowAdoptFailureSafetyTests(_FlowAdoptFixture):
         self.assertNotEqual(err.strip(), "")
         self.assertEqual(self._visible_state(repo), before)
 
+
+
+class FlowAdoptFailureSafetyTests(_FlowAdoptFailureFixture):
     # Provider activation failure ----------------------------------------------
 
     def test_provider_activation_failure_restores_exact_pre_adoption_state(self) -> None:
@@ -774,6 +784,336 @@ class FlowAdoptFailureSafetyTests(_FlowAdoptFixture):
         self.assertFalse((repo / ".ai-dev/promotion-review.json").exists())
         self.assertFalse((repo / ".ai-dev/diff-baseline/baseline.json").exists())
         self.assertEqual(self._state(repo)["activeIssueNumber"], 57)
+
+
+class _GitHubStyleProvider:
+    """Provider double modelling GitHub label semantics.
+
+    LocalTicketProvider is insufficient for compensation tests because its
+    mark_active does not add an "active" label, so it cannot expose the bug
+    where post-activation labels are used to restore pre-activation state.
+    """
+
+    def __init__(self, repo: Path, *, fail_after_mutation: bool = False) -> None:
+        self.repo = repo
+        self.fail_after_mutation = fail_after_mutation
+        self.deactivate_calls: list[tuple[str, tuple[str, ...]]] = []
+
+    # storage -----------------------------------------------------------------
+
+    def _path(self) -> Path:
+        return self.repo / ".ai-dev/tickets/57.json"
+
+    def _load(self) -> dict:
+        return json.loads(self._path().read_text(encoding="utf-8"))
+
+    def _save(self, payload: dict) -> None:
+        self._path().write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def _ticket(self, payload: dict) -> Ticket:
+        return Ticket(
+            reference=TicketReference(provider="local", ticket_id="57", path=".ai-dev/tickets"),
+            title=payload["title"],
+            body=None,
+            acceptance_criteria=(),
+            labels=tuple(payload.get("labels", ())),
+            lifecycle_state=payload["lifecycleState"],
+            workflow_state=payload["workflowState"],
+            block_reason=None,
+            created_at=None,
+            updated_at=None,
+            closed_at=None,
+        )
+
+    # provider protocol --------------------------------------------------------
+
+    def get(self, ticket_id: str) -> Ticket:
+        return self._ticket(self._load())
+
+    def mark_active(self, reference: TicketReference) -> Ticket:
+        # GitHub edits labels first, then performs a final read-back.
+        payload = self._load()
+        labels = [label for label in payload.get("labels", []) if label != "backlog"]
+        if "active" not in labels:
+            labels.append("active")
+        payload["labels"] = labels
+        payload["workflowState"] = "active"
+        self._save(payload)
+
+        if self.fail_after_mutation:
+            raise TicketProviderError("simulated read-back failure after label mutation")
+
+        return self._ticket(payload)
+
+    def deactivate(
+        self, reference: TicketReference, previous_labels: tuple[str, ...] = ()
+    ) -> Ticket:
+        self.deactivate_calls.append((reference.ticket_id, tuple(previous_labels)))
+        payload = self._load()
+        payload["labels"] = list(previous_labels)
+        if "active" in previous_labels:
+            payload["workflowState"] = "active"
+        elif "blocked" in previous_labels:
+            payload["workflowState"] = "blocked"
+        else:
+            payload["workflowState"] = "inactive"
+        self._save(payload)
+        return self._ticket(payload)
+
+
+class FlowAdoptRevisionResolverTests(_FlowAdoptFixture):
+    """Remediation A: commit-ish resolution must name exactly one commit."""
+
+    # Accepted forms -----------------------------------------------------------
+
+    def test_accepts_branch_remote_tracking_tags_and_hashes(self) -> None:
+        repo = self._repo("resolver-accepts")
+        recovered = self._git(repo, "rev-parse", "recovered")
+        self._git(repo, "tag", "light-tag", "recovered")
+        self._git(repo, "tag", "-a", "annotated-tag", "-m", "annotated", "recovered")
+        # A remote-tracking ref without needing a real remote.
+        self._git(repo, "update-ref", "refs/remotes/origin/recovered", recovered)
+        short = recovered[:12]
+
+        for revision in (
+            "recovered",
+            "origin/recovered",
+            "light-tag",
+            "annotated-tag",
+            recovered,
+            short,
+        ):
+            with self.subTest(revision=revision):
+                self.assertEqual(resolve_revision_commit(repo, revision), recovered)
+
+    def test_annotated_tag_peels_to_its_commit_not_the_tag_object(self) -> None:
+        repo = self._repo("resolver-annotated")
+        recovered = self._git(repo, "rev-parse", "recovered")
+        self._git(repo, "tag", "-a", "annotated-tag", "-m", "annotated", "recovered")
+        tag_object = self._git(repo, "rev-parse", "annotated-tag")
+
+        self.assertNotEqual(tag_object, recovered)
+        self.assertEqual(resolve_revision_commit(repo, "annotated-tag"), recovered)
+
+    # Rejected forms -----------------------------------------------------------
+
+    def test_rejects_empty_and_option_like_revisions(self) -> None:
+        repo = self._repo("resolver-rejects-shape")
+
+        with self.assertRaises(RepositoryError) as empty:
+            resolve_revision_commit(repo, "   ")
+        self.assertIn("cannot be empty", str(empty.exception))
+
+        with self.assertRaises(RepositoryError) as option_like:
+            resolve_revision_commit(repo, "--all")
+        self.assertIn("cannot start with '-'", str(option_like.exception))
+
+    def test_rejects_unresolvable_and_non_commit_objects(self) -> None:
+        repo = self._repo("resolver-rejects-objects")
+
+        with self.assertRaises(RepositoryError) as missing:
+            resolve_revision_commit(repo, "no-such-ref")
+        self.assertIn("Cannot resolve revision to a commit: no-such-ref", str(missing.exception))
+
+        with self.assertRaises(RepositoryError) as blob:
+            resolve_revision_commit(repo, "main:tracked.txt")
+        self.assertIn("which is not a commit", str(blob.exception))
+
+    def test_rejects_branch_and_tag_sharing_one_short_name(self) -> None:
+        """Deterministic branch-vs-tag ambiguity, not Git warning-text parsing."""
+        repo = self._repo("resolver-branch-tag")
+        # Same short name in two namespaces, pointing at different commits.
+        self._git(repo, "branch", "duplicate", "recovered")
+        self._git(repo, "tag", "duplicate", "main")
+
+        namespaces = matching_revision_namespaces(repo, "duplicate")
+        self.assertIn("refs/heads/duplicate", namespaces)
+        self.assertIn("refs/tags/duplicate", namespaces)
+
+        with self.assertRaises(RepositoryError) as ambiguous:
+            resolve_revision_commit(repo, "duplicate")
+        message = str(ambiguous.exception)
+        self.assertIn("is ambiguous because it matches more than one ref", message)
+        self.assertIn("refs/heads/duplicate", message)
+        self.assertIn("refs/tags/duplicate", message)
+        self.assertIn("Use the full ref name instead", message)
+
+    def test_ambiguity_is_rejected_even_when_both_refs_agree(self) -> None:
+        repo = self._repo("resolver-agreeing-refs")
+        self._git(repo, "branch", "twin", "recovered")
+        self._git(repo, "tag", "twin", "recovered")
+
+        with self.assertRaises(RepositoryError) as ambiguous:
+            resolve_revision_commit(repo, "twin")
+        self.assertIn("is ambiguous", str(ambiguous.exception))
+
+    def test_full_ref_name_disambiguates(self) -> None:
+        repo = self._repo("resolver-full-ref")
+        recovered = self._git(repo, "rev-parse", "recovered")
+        main = self._git(repo, "rev-parse", "main")
+        self._git(repo, "branch", "duplicate", "recovered")
+        self._git(repo, "tag", "duplicate", "main")
+
+        self.assertEqual(resolve_revision_commit(repo, "refs/heads/duplicate"), recovered)
+        self.assertEqual(resolve_revision_commit(repo, "refs/tags/duplicate"), main)
+
+    def test_rejects_ambiguous_abbreviated_object_names(self) -> None:
+        """Deterministic: two blobs are constructed to share a 4-hex prefix."""
+        repo = self._repo("resolver-abbrev")
+
+        # Compute blob hashes locally so exactly one colliding pair is written.
+        seen: dict[str, bytes] = {}
+        pair: tuple[bytes, bytes] | None = None
+        for index in range(200000):
+            content = str(index).encode()
+            digest = hashlib.sha1(
+                b"blob " + str(len(content)).encode() + bytes(1) + content
+            ).hexdigest()
+            prefix = digest[:4]
+            if prefix in seen:
+                pair = (seen[prefix], content)
+                break
+            seen[prefix] = content
+
+        self.assertIsNotNone(pair, "expected a 4-hex blob prefix collision")
+        assert pair is not None
+
+        written = []
+        for content in pair:
+            result = subprocess.run(
+                ["git", "-C", str(repo), "hash-object", "-w", "--stdin"],
+                input=content,
+                stdout=subprocess.PIPE,
+                check=True,
+            )
+            written.append(result.stdout.decode().strip())
+
+        self.assertEqual(written[0][:4], written[1][:4])
+        prefix = written[0][:4]
+
+        candidates = ambiguous_abbreviated_object_names(repo, prefix)
+        self.assertGreater(len(candidates), 1)
+
+        with self.assertRaises(RepositoryError) as ambiguous:
+            resolve_revision_commit(repo, prefix)
+        self.assertIn("ambiguous abbreviated object name", str(ambiguous.exception))
+
+    # End-to-end through the adopt command --------------------------------------
+
+    def test_adoption_reports_branch_tag_ambiguity_specifically(self) -> None:
+        repo = self._repo("resolver-adopt-ambiguous")
+        self._git(repo, "branch", "duplicate", "recovered")
+        self._git(repo, "tag", "duplicate", "main")
+        snapshot = self._snapshot(repo)
+
+        code, _out, err = self._invoke(repo, "57", "--adopt", "duplicate")
+
+        self.assertEqual(code, 1)
+        self.assertIn("is ambiguous because it matches more than one ref", err)
+        self.assertIn("Use the full ref name instead", err)
+        self._assert_unmutated(repo, snapshot)
+
+    def test_adoption_accepts_a_remote_tracking_ref(self) -> None:
+        repo = self._repo("resolver-adopt-remote")
+        recovered = self._git(repo, "rev-parse", "recovered")
+        self._git(repo, "update-ref", "refs/remotes/origin/recovered", recovered)
+
+        code, out, err = self._invoke(repo, "57", "--adopt", "origin/recovered")
+
+        self.assertEqual((code, err), (0, ""))
+        self.assertIn("adoptedCommit: " + recovered, out)
+        self.assertEqual(self._git(repo, "rev-parse", "scratch"), recovered)
+
+
+class FlowAdoptProviderCompensationTests(_FlowAdoptFailureFixture):
+    """Remediation B: compensate with PRE-activation reference and labels."""
+
+    def _github_style_repo(self, name: str, *, fail_after_mutation: bool = False):
+        repo = self._repo(name)
+        # Pre-adoption label state that must be restored exactly.
+        payload = json.loads((repo / ".ai-dev/tickets/57.json").read_text(encoding="utf-8"))
+        payload["labels"] = ["backlog"]
+        (repo / ".ai-dev/tickets/57.json").write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        provider = _GitHubStyleProvider(repo, fail_after_mutation=fail_after_mutation)
+        return repo, provider
+
+    def test_mutate_then_raise_is_compensated_to_pre_activation_labels(self) -> None:
+        repo, provider = self._github_style_repo("compensate-mutate-raise", fail_after_mutation=True)
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+        self.assertEqual(self._ticket_state(repo, 57)[2], ("backlog",))
+
+        with patch.object(cli, "_resolve_ticket_provider_for_repo_root", return_value=provider):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertIn("simulated read-back failure after label mutation", err)
+        self.assertNotIn("Rollback failures", err)
+        # Compensation ran even though mark_active raised.
+        self.assertEqual(len(provider.deactivate_calls), 1)
+        self.assertEqual(provider.deactivate_calls[0], ("57", ("backlog",)))
+        # Labels restored exactly; "active" is gone.
+        lifecycle, workflow, labels = self._ticket_state(repo, 57)
+        self.assertEqual(labels, ("backlog",))
+        self.assertEqual(workflow, "inactive")
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+
+    def test_later_local_failure_compensates_to_pre_activation_labels(self) -> None:
+        repo, provider = self._github_style_repo("compensate-late-failure")
+        self._seed_review_and_sync_artifacts(repo)
+        before = self._visible_state(repo)
+
+        with patch.object(cli, "_resolve_ticket_provider_for_repo_root", return_value=provider):
+            with patch.object(
+                cli, "save_state", side_effect=WorkflowStateError("simulated state write failure")
+            ):
+                code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertIn("simulated state write failure", err)
+        self.assertNotIn("Rollback failures", err)
+        # mark_active succeeded and added "active"; compensation must not keep it.
+        self.assertEqual(provider.deactivate_calls, [("57", ("backlog",))])
+        lifecycle, workflow, labels = self._ticket_state(repo, 57)
+        self.assertEqual(labels, ("backlog",))
+        self.assertNotIn("active", labels)
+        self.assertEqual(workflow, "inactive")
+        self._assert_failed_adoption_preserved_everything(repo, before, code, err)
+
+    def test_compensation_never_uses_post_activation_labels(self) -> None:
+        """Regression guard for the bug this remediation fixes."""
+        repo, provider = self._github_style_repo("compensate-label-source")
+
+        with patch.object(cli, "_resolve_ticket_provider_for_repo_root", return_value=provider):
+            with patch.object(
+                cli, "save_state", side_effect=WorkflowStateError("simulated state write failure")
+            ):
+                self._invoke(repo, "57", "--adopt", "recovered")
+
+        _reference, previous_labels = provider.deactivate_calls[0]
+        # Post-activation labels would have contained "active".
+        self.assertNotIn("active", previous_labels)
+        self.assertEqual(previous_labels, ("backlog",))
+
+    def test_compensation_failure_is_reported_without_masking_original(self) -> None:
+        repo, provider = self._github_style_repo("compensate-itself-fails", fail_after_mutation=True)
+
+        def exploding_deactivate(reference, previous_labels=()):
+            raise TicketProviderError("provider unreachable")
+
+        provider.deactivate = exploding_deactivate
+
+        with patch.object(cli, "_resolve_ticket_provider_for_repo_root", return_value=provider):
+            code, _out, err = self._invoke(repo, "57", "--adopt", "recovered")
+
+        self.assertEqual(code, 1)
+        # Original failure stays primary.
+        self.assertIn("simulated read-back failure after label mutation", err)
+        # Compensation failure is surfaced, not swallowed.
+        self.assertIn("Rollback failures", err)
+        self.assertIn("provider unreachable", err)
+        # Local state is still restored despite the unreachable provider.
+        self.assertNotEqual(
+            self._git(repo, "rev-parse", "scratch"), self._git(repo, "rev-parse", "recovered")
+        )
 
 
 if __name__ == "__main__":

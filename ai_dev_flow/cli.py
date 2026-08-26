@@ -1110,16 +1110,22 @@ def _roll_back_adoption(
     main_branch: str,
     scratch_branch: str,
     provider: TicketProvider | None = None,
-    activated_ticket: Ticket | None = None,
+    pre_activation_ticket: Ticket | None = None,
+    activation_attempted: bool = False,
 ) -> list[str]:
     """Best-effort restoration. Never raises, so the original error survives."""
     failures: list[str] = []
 
-    if provider is not None and activated_ticket is not None:
+    # Compensation must use the PRE-activation reference and labels. The
+    # post-activation ticket already carries "active", so restoring from it
+    # would preserve activation instead of undoing it. Activation is also
+    # compensated when mark_active raised: providers that edit labels before a
+    # final read can fail after the remote side effect has landed.
+    if provider is not None and activation_attempted and pre_activation_ticket is not None:
         try:
             provider.deactivate(
-                activated_ticket.reference,
-                previous_labels=activated_ticket.labels,
+                pre_activation_ticket.reference,
+                previous_labels=pre_activation_ticket.labels,
             )
         except (TicketProviderError, OSError) as exc:
             failures.append(f"provider activation rollback failed: {exc}")
@@ -1194,7 +1200,7 @@ def _handle_adopt_start(
     # Everything below mutates. Adoption is all-or-nothing from here, so the
     # pre-adoption state is captured first and restored on any failure.
     snapshot = _capture_adoption_snapshot(repo_root, scratch_branch=state.scratch_branch)
-    activated_ticket: Ticket | None = None
+    activation_attempted = False
 
     try:
         checkout_branch(repo_root, state.main_branch)
@@ -1212,6 +1218,9 @@ def _handle_adopt_start(
                 f"instead of the adopted commit {target.commit}."
             )
 
+        # Set before the call: a provider may mutate remote labels and then
+        # fail its read-back, so the attempt itself obliges compensation.
+        activation_attempted = True
         try:
             activated_ticket = provider.mark_active(ticket.reference)
         except TicketProviderError as exc:
@@ -1259,7 +1268,8 @@ def _handle_adopt_start(
             main_branch=state.main_branch,
             scratch_branch=state.scratch_branch,
             provider=provider,
-            activated_ticket=activated_ticket,
+            pre_activation_ticket=ticket,
+            activation_attempted=activation_attempted,
         )
         raise _adoption_failure(str(exc), rollback_failures) from exc
 
