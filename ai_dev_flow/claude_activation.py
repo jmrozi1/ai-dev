@@ -16,20 +16,30 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shlex
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from .control_plane import (
     ControlPlaneError,
     RailState,
+    allocate_proceed_number,
+    artifact_relative,
     collect_rail_states,
+    parse_proceed_sequence,
+    proceed_sequence_relative,
+    publish as control_plane_publish,
     resolve_coordination_repo,
     resolve_read_source,
 )
 from .json_files import JsonFileError, load_json_object, write_text_atomic
 from .repository import RepositoryError, resolve_repo_root, workflow_state_file_for_repo_root
+from .ticket_status import TicketStatusError, render_active_ticket_status
 from .ticket_providers import (
     GitRemoteGitHubCurrentRepositoryResolver,
     TicketProviderError,
@@ -355,6 +365,281 @@ def discover(
     }
 
 
+# Coordination git helpers ----------------------------------------------------
+
+
+def _coordination_git(cache: Path, arguments: list[str]) -> str:
+    completed = subprocess.run(
+        ["git", "-C", str(cache), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise ClaudeActivationError(
+            f"git {' '.join(arguments)} failed in {cache}: "
+            f"{completed.stdout.strip() or completed.returncode}"
+        )
+    return completed.stdout.strip()
+
+
+def read_proceed_receipt(cache: Path, *, project: str, ticket: str) -> int:
+    """Current receipt value. A receipt is evidence of publication, never authority."""
+    try:
+        source = resolve_read_source(resolve_coordination_repo(cache))
+        return parse_proceed_sequence(source.read(proceed_sequence_relative(project, ticket)))
+    except ControlPlaneError as exc:
+        raise ClaudeActivationError(f"Cannot read the proceed receipt: {exc}") from exc
+
+
+# Status ----------------------------------------------------------------------
+
+
+def render_status(
+    repo_root: Path,
+    *,
+    home: Path | None = None,
+    cache: Path | None = None,
+    coordination_repository: str = DEFAULT_COORDINATION_REPOSITORY,
+) -> str:
+    """Contextual status for the repository the caller is standing in.
+
+    Every fact is delegated to an existing reader. Source health is reported
+    rather than guessed, so an unreachable control plane is visible instead of
+    silently rendering a partial picture.
+    """
+    lines: list[str] = []
+    identity = resolve_product_identity(repo_root)
+
+    lines.append(f"repository : {identity.repository}")
+    lines.append(f"project    : {identity.project}")
+    lines.append(f"ticket     : {identity.ticket}")
+
+    try:
+        ticket_status = render_active_ticket_status(repo_root)
+        for line in ticket_status.splitlines():
+            if line.strip():
+                lines.append(f"  {line.rstrip()}")
+    except (TicketStatusError, OSError) as exc:
+        lines.append(f"  ticket status unavailable: {exc}")
+
+    resolved_cache = (
+        cache if cache is not None else resolve_control_plane_cache(coordination_repository, home=home)
+    )
+    lines.append(f"cache      : {resolved_cache}")
+
+    if not resolved_cache.exists():
+        lines.append("source     : UNAVAILABLE - control-plane cache is missing")
+        lines.append("rail       : unknown until the control plane is reachable")
+        return "\n".join(lines)
+
+    try:
+        head = _coordination_git(resolved_cache, ["rev-parse", "--short", "HEAD"])
+        lines.append(f"source     : cache at {head}")
+    except ClaudeActivationError as exc:
+        lines.append(f"source     : UNAVAILABLE - {exc}")
+        return "\n".join(lines)
+
+    try:
+        rail = resolve_authorized_rail(
+            resolved_cache, project=identity.project, ticket=identity.ticket
+        )
+        lines.append(f"rail       : {rail.identifier} ({rail.status})")
+    except ClaudeActivationError as exc:
+        lines.append(f"rail       : UNAUTHORIZED - {exc}")
+
+    try:
+        receipt = read_proceed_receipt(
+            resolved_cache, project=identity.project, ticket=identity.ticket
+        )
+        lines.append(f"receipt    : proceed {receipt} (publication receipt only, not authorization)")
+    except ClaudeActivationError as exc:
+        lines.append(f"receipt    : unavailable - {exc}")
+
+    return "\n".join(lines)
+
+
+# Executor handoff publication ------------------------------------------------
+
+
+def publish_executor_handoff(
+    repo_root: Path,
+    *,
+    content_file: Path,
+    rail: str | None = None,
+    home: Path | None = None,
+    cache: Path | None = None,
+    coordination_repository: str = DEFAULT_COORDINATION_REPOSITORY,
+) -> dict:
+    """Own the whole executor stop-boundary transaction, in order.
+
+    discover -> publish -> push -> verify remote readability -> allocate receipt.
+
+    The receipt is allocated only after the handoff is durably readable from the
+    remote, because a receipt is evidence that publication happened. Any failure
+    stops with an actionable error; nothing is ever written to a product
+    repository as a fallback and no receipt is invented.
+    """
+    resolved_cache = (
+        cache if cache is not None else resolve_control_plane_cache(coordination_repository, home=home)
+    )
+
+    # 1. Fresh authorization, never the caller's assumption.
+    discovered = discover(
+        repo_root, home=home, coordination_repository=coordination_repository, cache=resolved_cache
+    )
+    authorized_rail = discovered["railId"]
+    if rail is not None and rail != authorized_rail:
+        raise ClaudeActivationError(
+            f"Refusing to publish: {rail} is not the authorized rail. "
+            f"{authorized_rail} is currently authorized for "
+            f"{discovered['project']}/{discovered['ticket']}."
+        )
+
+    if not content_file.is_file():
+        raise ClaudeActivationError(f"Handoff content file does not exist: {content_file}")
+    content = content_file.read_text(encoding="utf-8")
+
+    project = discovered["project"]
+    ticket = discovered["ticket"]
+    coordination = resolve_coordination_repo(resolved_cache)
+
+    # 2/3. Publish through the existing ownership rules; publish commits only.
+    try:
+        target, head = control_plane_publish(
+            coordination,
+            project=project,
+            ticket=ticket,
+            artifact="handoff",
+            role="executor",
+            content=content,
+            rail=authorized_rail,
+        )
+    except ControlPlaneError as exc:
+        raise ClaudeActivationError(f"Cannot publish the executor handoff: {exc}") from exc
+
+    relative = artifact_relative(
+        project=project, ticket=ticket, artifact="handoff", rail=authorized_rail
+    )
+
+    # 4. Durable push. Publication is not complete until the remote has it.
+    branch = _coordination_git(coordination, ["rev-parse", "--abbrev-ref", "HEAD"])
+    _coordination_git(coordination, ["push", "origin", f"HEAD:{branch}"])
+
+    # 5. Prove the remote actually serves the published content.
+    _coordination_git(coordination, ["fetch", "--quiet", "origin"])
+    remote_head = _coordination_git(coordination, ["rev-parse", f"origin/{branch}"])
+    local_head = _coordination_git(coordination, ["rev-parse", "HEAD"])
+    if remote_head != local_head:
+        raise ClaudeActivationError(
+            f"Refusing to allocate a receipt: {coordination_repository} is at {remote_head} "
+            f"but the published commit is {local_head}. The handoff is not durably published."
+        )
+    verify = subprocess.run(
+        ["git", "-C", str(coordination), "cat-file", "-e", f"origin/{branch}:{relative}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
+    )
+    if verify.returncode != 0:
+        raise ClaudeActivationError(
+            f"Refusing to allocate a receipt: {relative} is not readable from "
+            f"origin/{branch} after push."
+        )
+
+    # 6. Only now may the shared compare-and-swap allocator run.
+    try:
+        receipt = allocate_proceed_number(coordination, project=project, ticket=ticket)
+    except ControlPlaneError as exc:
+        raise ClaudeActivationError(
+            f"Handoff published and durable, but the receipt could not be allocated: {exc}"
+        ) from exc
+
+    return {
+        "railId": authorized_rail,
+        "project": project,
+        "ticket": ticket,
+        "handoffPath": relative,
+        "publishedFile": str(target),
+        "coordinationHead": head,
+        "remoteHead": remote_head,
+        "proceed": receipt,
+    }
+
+
+# Review evidence -------------------------------------------------------------
+
+
+REVIEW_EVIDENCE_RELATIVE = "skills/copilot/auto-review/scripts/review-evidence"
+
+
+def resolve_posix_shell() -> str:
+    """Locate a POSIX shell, preferring the one Git already ships.
+
+    A bare "bash" on Windows can resolve to the WSL launcher in System32, which
+    cannot execute a Windows-path script. Git is necessarily present for any AI
+    Dev repository, so its own bash is the deterministic choice.
+    """
+    if os.name != "nt":
+        return shutil.which("bash") or "/bin/bash"
+
+    completed = subprocess.run(
+        ["git", "--exec-path"], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, check=False,
+    )
+    if completed.returncode == 0 and completed.stdout.strip():
+        candidate = Path(completed.stdout.strip())
+        while candidate.parent != candidate:
+            bash = candidate / "bin" / "bash.exe"
+            if bash.is_file():
+                return str(bash)
+            candidate = candidate.parent
+
+    discovered = shutil.which("bash")
+    if discovered and "System32" not in discovered:
+        return discovered
+
+    raise ClaudeActivationError(
+        "Cannot locate a POSIX shell for the review-evidence helper. Install Git for "
+        "Windows, or run the helper from a shell that provides bash."
+    )
+
+
+def run_review_evidence(repo_root: Path, *, mode: str) -> int:
+    """Invoke the canonical review-evidence helper with a real interpreter.
+
+    The shared helper invokes ``python3``. On Windows that name can resolve to a
+    store alias stub rather than an interpreter, which the helper then misreports
+    as corrupt Flow state. This path supplies the already bootstrap-selected
+    interpreter for the duration of the call instead of editing that helper,
+    whose defect is owned elsewhere.
+    """
+    helper = repo_root / REVIEW_EVIDENCE_RELATIVE
+    if not helper.is_file():
+        raise ClaudeActivationError(f"Review evidence helper not found: {helper}")
+
+    with tempfile.TemporaryDirectory() as shim_dir:
+        shim = Path(shim_dir) / "python3"
+        shim.write_text(
+            "#!/usr/bin/env bash\nexec " + shlex.quote(sys.executable) + ' "$@"\n',
+            encoding="utf-8",
+        )
+        shim.chmod(0o755)
+
+        environment = dict(os.environ)
+        environment["PATH"] = str(shim.parent) + os.pathsep + environment.get("PATH", "")
+
+        completed = subprocess.run(
+            [resolve_posix_shell(), str(helper), "--mode", mode],
+            cwd=str(repo_root),
+            env=environment,
+            check=False,
+        )
+    return completed.returncode
+
+
 # CLI -------------------------------------------------------------------------
 
 
@@ -380,6 +665,28 @@ def _build_parser() -> argparse.ArgumentParser:
         "identity", help="Resolve repository, project, and ticket identity only."
     )
     identity_parser.add_argument("--repo-root", help="Product repository; defaults to the current one.")
+
+    status_parser = subparsers.add_parser(
+        "status", help="Contextual AI Dev status for the current repository."
+    )
+    status_parser.add_argument("--repo-root", help="Product repository; defaults to the current one.")
+    status_parser.add_argument("--cache", help="Control-plane cache path override.")
+
+    publish_parser = subparsers.add_parser(
+        "publish", help="Publish, push, verify, and receipt the executor handoff."
+    )
+    publish_parser.add_argument("--file", required=True, help="Handoff content to publish.")
+    publish_parser.add_argument("--rail", help="Expected rail id; must match the authorized rail.")
+    publish_parser.add_argument("--repo-root", help="Product repository; defaults to the current one.")
+    publish_parser.add_argument("--cache", help="Control-plane cache path override.")
+
+    evidence_parser = subparsers.add_parser(
+        "review-evidence", help="Run the canonical review-evidence helper."
+    )
+    evidence_parser.add_argument(
+        "--mode", choices=("checkpoint", "promotion"), default="checkpoint"
+    )
+    evidence_parser.add_argument("--repo-root", help="Product repository; defaults to the current one.")
 
     subparsers.add_parser("cache-path", help="Print the host-level control-plane cache path.")
     subparsers.add_parser(
@@ -412,6 +719,32 @@ def main(argv: list[str] | None = None) -> int:
             repo_root = resolve_repo_root()
         except RepositoryError as exc:
             raise ClaudeActivationError(str(exc)) from exc
+
+    if arguments.command == "status":
+        print(
+            render_status(
+                repo_root,
+                cache=Path(arguments.cache).expanduser() if arguments.cache else None,
+            )
+        )
+        return 0
+
+    if arguments.command == "review-evidence":
+        return run_review_evidence(repo_root, mode=arguments.mode)
+
+    if arguments.command == "publish":
+        result = publish_executor_handoff(
+            repo_root,
+            content_file=Path(arguments.file).expanduser(),
+            rail=arguments.rail,
+            cache=Path(arguments.cache).expanduser() if arguments.cache else None,
+        )
+        print(f"published : {result['handoffPath']}")
+        print(f"rail      : {result['railId']}")
+        print(f"remote    : {result['remoteHead']}")
+        print()
+        print(f"proceed {result['proceed']}")
+        return 0
 
     if arguments.command == "identity":
         identity = resolve_product_identity(repo_root)

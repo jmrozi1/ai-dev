@@ -6,8 +6,8 @@ description: Decide and govern checkpoint, promotion, or in-flight review compos
 # ChatGPT Auto-Review
 
 Own review policy and judgment for the current AI Dev lifecycle stage. This is
-the decision-oriented side of auto-review. Copilot owns the deterministic
-repository helpers and their execution.
+the decision-oriented side of auto-review. The executor audience owns the
+deterministic repository helpers and their execution.
 
 ## Contract
 
@@ -75,9 +75,11 @@ Do not authorize promotion while a candidate remains merely "reassess later," an
 accepted skill investment is pending or in progress, or the required ticket skill
 sections are absent/ambiguous.
 
-Request or consume evidence gathered by Copilot's
-`skills/copilot/auto-review/scripts/review-evidence --mode checkpoint|promotion`
-before making applicability decisions. The helper gathers evidence, including
+Request or consume evidence gathered by the executor before making
+applicability decisions. Claude runs `ai-dev review-evidence --mode
+checkpoint|promotion`, which invokes the canonical
+`skills/copilot/auto-review/scripts/review-evidence` helper through supported
+interpreter selection. The helper gathers evidence, including
 active ticket skill state when available; it does not make candidate or skill
 judgments.
 
