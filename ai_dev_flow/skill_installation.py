@@ -7,6 +7,7 @@ import ntpath
 import os
 from pathlib import Path
 import posixpath
+import subprocess
 import sys
 
 
@@ -41,9 +42,97 @@ class SkillInstallResult:
 
 SKILL_INSTALLATION_OWNERSHIP_VERSION = 1
 _SYMLINK_OWNERSHIP_PREFIX = "symlink:"
+_JUNCTION_OWNERSHIP_PREFIX = "junction:"
+_OWNERSHIP_PREFIXES = (_SYMLINK_OWNERSHIP_PREFIX, _JUNCTION_OWNERSHIP_PREFIX)
+
+# Windows junctions are reparse points, not symlinks: os.path.islink() is False
+# for them, so they need their own detection. Junctions need no elevation, which
+# symlinks do on stock Windows.
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003
+_EXTENDED_PATH_PREFIX = "\\\\?\\"
+
+LINK_KIND_SYMLINK = "symlink"
+LINK_KIND_JUNCTION = "junction"
 
 
-SUPPORTED_AUDIENCES = ("chatgpt", "copilot")
+def preferred_link_kind(platform: str) -> str:
+    """Junctions on Windows, symlinks elsewhere."""
+    return LINK_KIND_JUNCTION if platform == "windows" else LINK_KIND_SYMLINK
+
+
+def _ownership_target_text(ownership: str) -> str:
+    for prefix in _OWNERSHIP_PREFIXES:
+        if ownership.startswith(prefix):
+            return ownership[len(prefix):]
+    return ownership
+
+
+def _ownership_kind(ownership: str) -> str:
+    return (
+        LINK_KIND_JUNCTION
+        if ownership.startswith(_JUNCTION_OWNERSHIP_PREFIX)
+        else LINK_KIND_SYMLINK
+    )
+
+
+def _ownership_prefix_for_kind(kind: str) -> str:
+    return _JUNCTION_OWNERSHIP_PREFIX if kind == LINK_KIND_JUNCTION else _SYMLINK_OWNERSHIP_PREFIX
+
+
+def path_is_junction(path: Path) -> bool:
+    try:
+        return getattr(path.lstat(), "st_reparse_tag", 0) == _IO_REPARSE_TAG_MOUNT_POINT
+    except (OSError, ValueError):
+        return False
+
+
+def path_is_managed_link(path: Path) -> bool:
+    """A link this installer could own: symlink or Windows junction."""
+    return path.is_symlink() or path_is_junction(path)
+
+
+def read_link_target_text(path: Path) -> str | None:
+    """Link target for symlinks and junctions, without the extended-path prefix."""
+    try:
+        target = os.readlink(path)
+    except OSError:
+        return None
+    if target.startswith(_EXTENDED_PATH_PREFIX):
+        target = target[len(_EXTENDED_PATH_PREFIX):]
+    return target
+
+
+def _remove_link(path: Path) -> None:
+    """Remove a link without following it into the target directory."""
+    if path.is_symlink():
+        path.unlink()
+        return
+    if path_is_junction(path):
+        # A junction is a directory entry; rmdir removes the link, not the target.
+        os.rmdir(path)
+        return
+    if path.exists():
+        path.unlink()
+
+
+def _create_link(path: Path, target: Path, *, kind: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if kind == LINK_KIND_JUNCTION:
+        completed = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(path), str(target)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        if completed.returncode != 0 or not path_is_junction(path):
+            detail = completed.stdout.strip() or f"exit code {completed.returncode}"
+            raise OSError(f"cannot create directory junction: {detail}")
+        return
+    path.symlink_to(target)
+
+
+SUPPORTED_AUDIENCES = ("chatgpt", "claude", "copilot")
 
 
 def discover_skill_packages(
@@ -92,6 +181,26 @@ def resolve_copilot_skills_root(
     resolved_home = Path.home() if home is None else home
     resolved_home = resolved_home.expanduser().resolve()
     return resolved_home / ".agents" / "skills"
+
+
+def resolve_claude_skills_root(
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Claude Code discovers personal skill packages here."""
+    resolved_home = Path.home() if home is None else home
+    resolved_home = resolved_home.expanduser().resolve()
+    return resolved_home / ".claude" / "skills"
+
+
+def resolve_skills_root_for_audience(
+    *,
+    audience: str,
+    home: Path | None = None,
+) -> Path:
+    if audience == "claude":
+        return resolve_claude_skills_root(home=home)
+    return resolve_copilot_skills_root(home=home)
 
 
 def resolve_skill_installation_ownership_path(
@@ -147,11 +256,10 @@ def _normalized_path_identity_text_for_platform(path: Path, *, platform: str) ->
 
 
 def _normalized_literal_symlink_target_text(path: Path, *, platform: str) -> str | None:
-    if not path.is_symlink():
+    if not path_is_managed_link(path):
         return None
-    try:
-        target_text = os.readlink(path)
-    except OSError:
+    target_text = read_link_target_text(path)
+    if target_text is None:
         return None
     target_path = Path(target_text)
     if not target_path.is_absolute():
@@ -210,12 +318,12 @@ def _load_owned_skill_symlinks(path: Path, *, platform: str) -> dict[str, str]:
             raise SkillInstallationError(
                 f"Invalid skill installation ownership record in {path}: destination path must be absolute."
             )
-        if not isinstance(ownership, str) or not ownership.startswith(_SYMLINK_OWNERSHIP_PREFIX):
+        if not isinstance(ownership, str) or not ownership.startswith(_OWNERSHIP_PREFIXES):
             raise SkillInstallationError(
                 f"Invalid skill installation ownership record in {path}: ownership must be a symlink marker."
             )
 
-        target_path = ownership[len(_SYMLINK_OWNERSHIP_PREFIX) :]
+        target_path = _ownership_target_text(ownership)
         if not target_path:
             raise SkillInstallationError(
                 f"Invalid skill installation ownership record in {path}: ownership target may not be empty."
@@ -251,20 +359,51 @@ def _save_owned_skill_symlinks(path: Path, *, owned_skills: dict[str, str]) -> N
         raise SkillInstallationError(f"Cannot write skill installation ownership record {path}: {exc}") from exc
 
 
-def _symlink_ownership_value(target_path: Path, *, platform: str) -> str:
+def _symlink_ownership_value(target_path: Path, *, platform: str, kind: str = LINK_KIND_SYMLINK) -> str:
     normalized_target = _normalized_absolute_path_text_for_platform(target_path, platform=platform)
-    return f"{_SYMLINK_OWNERSHIP_PREFIX}{normalized_target}"
+    return f"{_ownership_prefix_for_kind(kind)}{normalized_target}"
 
 
-def _replace_skill_symlink(destination: Path, target: Path) -> None:
-    if destination.exists() or destination.is_symlink():
-        destination.unlink()
+def _replace_skill_link(destination: Path, target: Path, *, kind: str) -> None:
+    """Install or replace a managed link without ever destroying a working one.
+
+    The replacement is created and validated at a staging path first. Only then
+    is an existing destination removed. A failure anywhere before that leaves the
+    previously installed package untouched.
+    """
     destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.symlink_to(target)
+    staging = destination.parent / f".{destination.name}.ai-dev-staging"
+
+    if path_is_managed_link(staging):
+        _remove_link(staging)
+    elif staging.exists():
+        raise OSError(f"staging path is occupied by unmanaged content: {staging}")
+
+    _create_link(staging, target, kind=kind)
+
+    # Prove the new link resolves to the intended package before touching the
+    # working destination.
+    staged_target = read_link_target_text(staging)
+    if staged_target is None or Path(staged_target).resolve() != Path(target).resolve():
+        _remove_link(staging)
+        raise OSError(
+            f"refusing to replace {destination}: staged link did not resolve to {target}"
+        )
+
+    try:
+        if path_is_managed_link(destination):
+            _remove_link(destination)
+        elif destination.exists():
+            raise OSError(f"destination is not a managed link: {destination}")
+        os.rename(staging, destination)
+    except OSError:
+        if path_is_managed_link(staging):
+            _remove_link(staging)
+        raise
 
 
-def _path_exists_or_symlink(path: Path) -> bool:
-    return path.exists() or path.is_symlink()
+def _path_exists_or_symlink(path: Path) -> bool:  # noqa: D401 - historical name
+    return path.exists() or path_is_managed_link(path)
 
 
 def _reconcile_obsolete_managed_skills(
@@ -293,7 +432,7 @@ def _reconcile_obsolete_managed_skills(
             )
             continue
 
-        if not destination_path.is_symlink():
+        if not path_is_managed_link(destination_path):
             raise SkillInstallationError(
                 "Cannot reconcile obsolete managed skill because destination is not a symlink: "
                 f"{destination_path}"
@@ -307,10 +446,10 @@ def _reconcile_obsolete_managed_skills(
             )
 
         try:
-            destination_path.unlink()
+            _remove_link(destination_path)
         except OSError as exc:
             raise SkillInstallationError(
-                f"Cannot remove obsolete managed skill symlink {destination_path}: {exc}"
+                f"Cannot remove obsolete managed skill link {destination_path}: {exc}"
             ) from exc
 
         updated_owned_skills.pop(destination_key, None)
@@ -349,6 +488,7 @@ def install_skill_packages(
     destination_root.mkdir(parents=True, exist_ok=True)
 
     platform = "windows" if os.name == "nt" else "posix"
+    link_kind = preferred_link_kind(platform)
     ownership_path = resolve_skill_installation_ownership_path(home=home)
     owned_skills = _load_owned_skill_symlinks(ownership_path, platform=platform)
     owned_skills_updated = dict(owned_skills)
@@ -368,13 +508,15 @@ def install_skill_packages(
 
         if not _path_exists_or_symlink(destination_directory):
             try:
-                _replace_skill_symlink(destination_directory, desired_target)
+                _replace_skill_link(destination_directory, desired_target, kind=link_kind)
             except OSError as exc:
                 raise SkillInstallationError(
                     f"Cannot create managed skill symlink for {package.name} at {destination_directory}: {exc}"
                 ) from exc
 
-            owned_skills_updated[destination_key] = _symlink_ownership_value(desired_target, platform=platform)
+            owned_skills_updated[destination_key] = _symlink_ownership_value(
+                desired_target, platform=platform, kind=link_kind
+            )
             installed_count += 1
             statuses.append(
                 SkillInstallStatus(
@@ -385,9 +527,10 @@ def install_skill_packages(
             )
             continue
 
-        if not destination_directory.is_symlink():
+        if not path_is_managed_link(destination_directory):
             raise SkillInstallationError(
-                f"Cannot install skill {package.name}: destination exists and is not a symlink: {destination_directory}"
+                f"Cannot install skill {package.name}: destination exists and is not a managed "
+                f"symlink or junction: {destination_directory}"
             )
 
         actual_target = _normalized_symlink_target_text(destination_directory, platform=platform)
@@ -405,8 +548,8 @@ def install_skill_packages(
         recorded_ownership = owned_skills.get(destination_key)
         owned_and_proven = (
             recorded_ownership is not None
-            and recorded_ownership.startswith(_SYMLINK_OWNERSHIP_PREFIX)
-            and actual_target == recorded_ownership[len(_SYMLINK_OWNERSHIP_PREFIX) :]
+            and recorded_ownership.startswith(_OWNERSHIP_PREFIXES)
+            and actual_target == _ownership_target_text(recorded_ownership)
         )
         if not owned_and_proven:
             raise SkillInstallationError(
@@ -414,13 +557,15 @@ def install_skill_packages(
             )
 
         try:
-            _replace_skill_symlink(destination_directory, desired_target)
+            _replace_skill_link(destination_directory, desired_target, kind=link_kind)
         except OSError as exc:
             raise SkillInstallationError(
-                f"Cannot update managed skill symlink for {package.name} at {destination_directory}: {exc}"
+                f"Cannot update managed skill link for {package.name} at {destination_directory}: {exc}"
             ) from exc
 
-        owned_skills_updated[destination_key] = _symlink_ownership_value(desired_target, platform=platform)
+        owned_skills_updated[destination_key] = _symlink_ownership_value(
+            desired_target, platform=platform, kind=link_kind
+        )
         updated_count += 1
         statuses.append(
             SkillInstallStatus(
@@ -494,7 +639,8 @@ def main(argv: list[str] | None = None) -> int:
         home = Path(args.home).expanduser() if args.home.strip() else None
     else:
         home = Path(args.home).expanduser() if args.home.strip() else None
-        destination_root = resolve_copilot_skills_root(
+        destination_root = resolve_skills_root_for_audience(
+            audience=args.audience,
             home=home,
         )
 

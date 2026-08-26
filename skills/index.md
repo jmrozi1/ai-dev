@@ -59,7 +59,7 @@ remain in the applicable canonical `SKILL.md` files.
 | Skill | Use when | Canonical path |
 | --- | --- | --- |
 | `auto-review` | Gathering repository review evidence, including active ticket `Skill Candidates`/`Skills`, running deterministic helpers, and recording only when explicitly authorized. | `skills/copilot/auto-review/SKILL.md` |
-| `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/copilot/executor/SKILL.md` |
+| `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
 | `flow` | Executing and validating Flow lifecycle commands, preconditions, checkpoint mechanics, promotion/retry/completion safety, and evidence reporting. | `skills/copilot/flow/SKILL.md` |
 
 ## Project-local skills

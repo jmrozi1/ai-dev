@@ -16,7 +16,7 @@ class ClaudeActivationPointerTests(unittest.TestCase):
         self.pointer_path = self.repo_root / "CLAUDE.md"
         self.pointer = _normalized(self.pointer_path)
         self.executor = _normalized(
-            self.repo_root / "skills" / "copilot" / "executor" / "SKILL.md"
+            self.repo_root / "skills" / "executor" / "SKILL.md"
         )
 
     # Activation
@@ -34,7 +34,7 @@ class ClaudeActivationPointerTests(unittest.TestCase):
         self.assertIn("python -m ai_dev_flow.control_plane status", self.pointer)
 
     def test_pointer_routes_to_the_canonical_executor_skill(self) -> None:
-        self.assertIn("skills/copilot/executor/skill.md", self.pointer)
+        self.assertIn("skills/executor/skill.md", self.pointer)
         self.assertIn("operate as the executor", self.pointer)
 
     # Non-duplication boundary
@@ -55,10 +55,20 @@ class ClaudeActivationPointerTests(unittest.TestCase):
     def test_pointer_stays_a_pointer_rather_than_a_second_instruction_set(self) -> None:
         self.assertLess(len(self.pointer.split()), len(self.executor.split()) / 4)
 
-    def test_pointer_creates_no_claude_skill_or_provider_framework(self) -> None:
-        self.assertFalse((self.repo_root / "skills" / "claude").exists())
-        catalog = _normalized(self.repo_root / "skills" / "index.md")
-        self.assertNotIn("claude", catalog)
+    def test_claude_audience_stays_one_bounded_package_set(self) -> None:
+        """Issue #56 adds a single Claude audience, not a provider framework."""
+        claude_root = self.repo_root / "skills" / "claude"
+        packages = sorted(child.name for child in claude_root.iterdir() if child.is_dir())
+        self.assertEqual(packages, ["auto-review", "flow"])
+
+        # The provider-neutral role contract has exactly one shared source and is
+        # not re-stated per audience.
+        self.assertTrue((self.repo_root / "skills" / "executor" / "SKILL.md").is_file())
+        for audience in ("claude", "copilot", "chatgpt"):
+            with self.subTest(audience=audience):
+                self.assertFalse(
+                    (self.repo_root / "skills" / audience / "executor").exists()
+                )
 
     def test_provider_neutral_role_contract_is_preserved(self) -> None:
         self.assertIn("the role itself is provider-neutral", self.pointer)

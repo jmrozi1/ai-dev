@@ -17,7 +17,7 @@ python -m ai_dev_flow.control_plane rail --rail <rail-id>
 ```
 
 Then operate as the executor and follow the canonical contract in
-[`skills/copilot/executor/SKILL.md`](skills/copilot/executor/SKILL.md), whose
+[`skills/executor/SKILL.md`](skills/executor/SKILL.md), whose
 mechanics live in `ai_dev_flow/control_plane.py`. Those are authoritative for
 the role, ownership, publication, and handoff rules; do not restate or
 reimplement them here. The role itself is provider-neutral; only this activation
