@@ -14,7 +14,13 @@ from __future__ import annotations
 # an option a future SDK release may default differently; an option written down
 # is a contract a test can hold.
 #
-# Two things are deliberately not here. There is no live invocation path that
+# One thing this boundary does not do: it does not isolate the worker's
+# environment. `env={}` is an overlay the SDK merges with the inherited process
+# environment, so credential and provider selectors already in that environment
+# survive it. Sanitizing them requires owning the child process, which is the next
+# rail's work, not this module's.
+#
+# Two further things are deliberately not here. There is no live invocation path that
 # tests exercise -- the SDK is imported lazily or injected, so neither unit nor
 # integration tests need it installed. And no provider output is retained beyond
 # the identity and bounds needed to reconcile a run: transcripts are not
@@ -91,10 +97,15 @@ REASON_WORKSPACE_MISMATCH = "workspace-mismatch"
 REASON_INVALID_ALLOWED_TOOLS = "invalid-allowed-tools"
 REASON_INVALID_BOUNDS = "invalid-bounds"
 REASON_ASSET_MISSING = "asset-missing"
+REASON_ASSET_NOT_A_FILE = "asset-not-a-file"
+REASON_ASSET_NOT_A_DIRECTORY = "asset-not-a-directory"
+REASON_ASSET_UNREADABLE = "asset-unreadable"
 REASON_ASSET_OUTSIDE_CONTROLLER_ROOT = "asset-outside-controller-root"
 REASON_ASSET_INSIDE_WORKSPACE = "asset-inside-workspace"
 REASON_PLUGIN_SURFACE_UNEXPECTED = "plugin-surface-unexpected"
 REASON_PLUGIN_MANIFEST_UNEXPECTED = "plugin-manifest-unexpected"
+REASON_PLUGIN_MANIFEST_MISSING = "plugin-manifest-missing"
+REASON_PLUGIN_NESTED_ESCAPE = "plugin-nested-escape"
 REASON_PLUGIN_SKILL_MISSING = "plugin-skill-missing"
 REASON_RESULT_SESSION_MISMATCH = "result-session-mismatch"
 
@@ -187,8 +198,47 @@ def _is_within(candidate: str, ancestor: str) -> bool:
     return candidate.startswith(ancestor.rstrip(os.sep) + os.sep)
 
 
+ASSET_FILE = "file"
+ASSET_DIRECTORY = "directory"
+
+
+def require_asset_kind(resolved: str, *, kind: str, label: str) -> str:
+    """Prove an existing path is the kind of thing it is about to be used as.
+
+    Existence alone is not enough. A prompt path that is a directory, a manifest
+    that is a fifo, or a skill directory that is a file all reach the SDK as
+    something it will handle its own way -- skipping, erroring late, or blocking
+    on a read -- long after the point where refusing was still cheap.
+    """
+    if not os.path.exists(resolved):
+        raise ClaudeRuntimeError(
+            REASON_ASSET_MISSING,
+            "{0} {1} does not exist. The SDK skips a missing plugin path silently, so "
+            "this is checked before invocation.".format(label, resolved),
+        )
+    if kind == ASSET_DIRECTORY:
+        if not os.path.isdir(resolved):
+            raise ClaudeRuntimeError(
+                REASON_ASSET_NOT_A_DIRECTORY,
+                "{0} {1} is not a directory.".format(label, resolved),
+            )
+    elif not os.path.isfile(resolved):
+        # isfile() is false for directories and for every special file -- fifo,
+        # socket, device -- which is the point: a read from one of those does not
+        # behave like reading instructions.
+        raise ClaudeRuntimeError(
+            REASON_ASSET_NOT_A_FILE,
+            "{0} {1} is not a regular file.".format(label, resolved),
+        )
+    if not os.access(resolved, os.R_OK):
+        raise ClaudeRuntimeError(
+            REASON_ASSET_UNREADABLE, "{0} {1} is not readable.".format(label, resolved)
+        )
+    return resolved
+
+
 def validate_controller_asset(
-    path: Any, *, controller_root: Any, workspace_path: Any, label: str
+    path: Any, *, controller_root: Any, workspace_path: Any, label: str, kind: str = ASSET_FILE
 ) -> str:
     """Prove one input is controller-owned and not reachable from the product tree.
 
@@ -214,26 +264,24 @@ def validate_controller_asset(
             REASON_ASSET_OUTSIDE_CONTROLLER_ROOT,
             "{0} {1} is outside the controller-owned root {2}.".format(label, resolved, root),
         )
-    if not os.path.exists(resolved):
-        raise ClaudeRuntimeError(
-            REASON_ASSET_MISSING,
-            "{0} {1} does not exist. The SDK skips a missing plugin path silently, so "
-            "this is checked before invocation.".format(label, resolved),
-        )
-    return resolved
+    return require_asset_kind(resolved, kind=kind, label=label)
 
 
 def validate_plugin_surface(plugin_root: Any, *, expected_skill: str) -> str:
-    """Prove the plugin carries exactly one skill and no other capability."""
-    root = Path(_real(plugin_root))
-    if not root.is_dir():
-        raise ClaudeRuntimeError(
-            REASON_ASSET_MISSING, "plugin root {0} is not a directory.".format(root)
-        )
+    """Prove the plugin is exactly the manifest plus one skill, all of it in place.
 
-    unexpected = sorted(
-        entry.name for entry in root.iterdir() if entry.name not in ALLOWED_PLUGIN_ENTRIES
-    )
+    Every component is resolved before it is accepted and every resolved component
+    must still be inside the plugin root. Checking only the entry *names* would let
+    a `skills` symlink point anywhere -- the workspace, a sibling controller
+    directory, outside the controller root -- and the scan would then walk happily
+    into whatever it found. Links that stay inside the root are fine; the rule is
+    about where a component lands, not about how it is referenced.
+    """
+    root = _real(plugin_root)
+    require_asset_kind(root, kind=ASSET_DIRECTORY, label="plugin root")
+
+    present = set(_entry_names(root, label="plugin root"))
+    unexpected = sorted(present - ALLOWED_PLUGIN_ENTRIES)
     if unexpected:
         raise ClaudeRuntimeError(
             REASON_PLUGIN_SURFACE_UNEXPECTED,
@@ -241,35 +289,88 @@ def validate_plugin_surface(plugin_root: Any, *, expected_skill: str) -> str:
                 root, ", ".join(unexpected), " and ".join(sorted(ALLOWED_PLUGIN_ENTRIES))
             ),
         )
-
-    manifest_directory = root / PLUGIN_MANIFEST_DIRECTORY
-    if manifest_directory.exists():
-        _validate_manifest(manifest_directory)
-
-    skills_root = root / PLUGIN_SKILLS_DIRECTORY
-    if not skills_root.is_dir():
+    if PLUGIN_MANIFEST_DIRECTORY not in present:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_MISSING,
+            "plugin {0} has no {1}/{2}. This adapter requires the manifest rather than "
+            "relying on auto-discovery, so the plugin's identity and declared surface are "
+            "stated rather than inferred.".format(
+                root, PLUGIN_MANIFEST_DIRECTORY, PLUGIN_MANIFEST_FILENAME
+            ),
+        )
+    if PLUGIN_SKILLS_DIRECTORY not in present:
         raise ClaudeRuntimeError(
             REASON_PLUGIN_SKILL_MISSING,
             "plugin {0} has no {1}/ directory.".format(root, PLUGIN_SKILLS_DIRECTORY),
         )
-    present = sorted(entry.name for entry in skills_root.iterdir())
-    if present != [expected_skill]:
+
+    manifest_directory = _nested(
+        root, root, PLUGIN_MANIFEST_DIRECTORY,
+        kind=ASSET_DIRECTORY, label="plugin manifest directory",
+    )
+    _validate_manifest(root, manifest_directory)
+
+    skills_root = _nested(
+        root, root, PLUGIN_SKILLS_DIRECTORY,
+        kind=ASSET_DIRECTORY, label="plugin skills directory",
+    )
+    skills = sorted(_entry_names(skills_root, label="plugin skills directory"))
+    if skills != [expected_skill]:
         raise ClaudeRuntimeError(
             REASON_PLUGIN_SKILL_MISSING,
             "plugin {0} exposes skill(s) {1}; exactly [{2}] was expected.".format(
-                root, present or "none", expected_skill
+                root, ", ".join(skills) or "none", expected_skill
             ),
         )
-    if not (skills_root / expected_skill / SKILL_FILENAME).is_file():
+
+    skill_directory = _nested(
+        root, skills_root, expected_skill,
+        kind=ASSET_DIRECTORY, label="plugin skill directory",
+    )
+    contents = sorted(_entry_names(skill_directory, label="plugin skill directory"))
+    if SKILL_FILENAME not in contents:
         raise ClaudeRuntimeError(
             REASON_PLUGIN_SKILL_MISSING,
-            "plugin {0} skill '{1}' has no {2}.".format(root, expected_skill, SKILL_FILENAME),
+            "plugin skill '{0}' has no {1}.".format(expected_skill, SKILL_FILENAME),
         )
-    return str(root)
+    if contents != [SKILL_FILENAME]:
+        # The executor package contract is one file. Scripts, references, and
+        # nested plugin metadata are all provider-readable, so accepting them
+        # silently would widen the surface without anyone deciding to.
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_SURFACE_UNEXPECTED,
+            "plugin skill '{0}' holds {1}; exactly [{2}] is the current executor package "
+            "contract. Expanding it is a contract change, not a validation "
+            "relaxation.".format(expected_skill, ", ".join(contents) or "nothing", SKILL_FILENAME),
+        )
+    _nested(root, skill_directory, SKILL_FILENAME, kind=ASSET_FILE, label="plugin skill file")
+    return root
 
 
-def _validate_manifest(manifest_directory: Path) -> None:
-    entries = sorted(entry.name for entry in manifest_directory.iterdir())
+def _entry_names(directory: str, *, label: str) -> list:
+    try:
+        return [entry.name for entry in Path(directory).iterdir()]
+    except OSError as exc:
+        raise ClaudeRuntimeError(
+            REASON_ASSET_UNREADABLE, "cannot list {0} {1}: {2}".format(label, directory, exc)
+        ) from exc
+
+
+def _nested(plugin_root: str, parent: str, name: str, *, kind: str, label: str) -> str:
+    """Resolve one component and require it to land inside the plugin root."""
+    resolved = _real(os.path.join(parent, name))
+    if not _is_within(resolved, plugin_root):
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_NESTED_ESCAPE,
+            "{0} {1}/{2} resolves to {3}, outside the validated plugin root {4}.".format(
+                label, parent, name, resolved, plugin_root
+            ),
+        )
+    return require_asset_kind(resolved, kind=kind, label=label)
+
+
+def _validate_manifest(plugin_root: str, manifest_directory: str) -> None:
+    entries = sorted(_entry_names(manifest_directory, label="plugin manifest directory"))
     if entries != [PLUGIN_MANIFEST_FILENAME]:
         raise ClaudeRuntimeError(
             REASON_PLUGIN_MANIFEST_UNEXPECTED,
@@ -277,9 +378,12 @@ def _validate_manifest(manifest_directory: Path) -> None:
                 manifest_directory, ", ".join(entries) or "nothing", PLUGIN_MANIFEST_FILENAME
             ),
         )
-    manifest_path = manifest_directory / PLUGIN_MANIFEST_FILENAME
+    manifest_path = _nested(
+        plugin_root, manifest_directory, PLUGIN_MANIFEST_FILENAME,
+        kind=ASSET_FILE, label="plugin manifest",
+    )
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ClaudeRuntimeError(
             REASON_PLUGIN_MANIFEST_UNEXPECTED,
@@ -297,6 +401,22 @@ def _validate_manifest(manifest_directory: Path) -> None:
             "plugin manifest {0} declares {1}, which redirect component discovery "
             "outside the validated directory layout.".format(manifest_path, ", ".join(unknown)),
         )
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_UNEXPECTED,
+            "plugin manifest {0} needs a non-empty string name; got {1!r}.".format(
+                manifest_path, name
+            ),
+        )
+    for key in sorted(ALLOWED_MANIFEST_KEYS - {"name"}):
+        if key in payload and not isinstance(payload[key], str):
+            raise ClaudeRuntimeError(
+                REASON_PLUGIN_MANIFEST_UNEXPECTED,
+                "plugin manifest {0} field '{1}' must be a string; got {2!r}.".format(
+                    manifest_path, key, payload[key]
+                ),
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -400,11 +520,11 @@ def _build_request(
 
     resolved_prompt = validate_controller_asset(
         prompt_file, controller_root=controller_root, workspace_path=workspace,
-        label="system prompt file",
+        label="system prompt file", kind=ASSET_FILE,
     )
     resolved_plugin = validate_controller_asset(
         plugin_root, controller_root=controller_root, workspace_path=workspace,
-        label="plugin root",
+        label="plugin root", kind=ASSET_DIRECTORY,
     )
     validate_plugin_surface(resolved_plugin, expected_skill=expected_skill)
 
@@ -494,6 +614,12 @@ def build_option_fields(request: RuntimeRequest) -> dict:
         "allowed_tools": list(request.allowed_tools),
         "disallowed_tools": [],
         "add_dirs": [],
+        # An overlay on the worker's environment, not a scrub of it: the SDK merges
+        # this with the inherited process environment, so an empty dict adds nothing
+        # and removes nothing. Validating what the worker inherits -- credential and
+        # provider selectors above all -- belongs to the process-integration rail
+        # that actually owns the child process. Nothing here should be read as
+        # environment isolation.
         "env": {},
         "extra_args": {},
         "hooks": None,

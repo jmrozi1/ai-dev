@@ -9,6 +9,8 @@ import unittest
 from ai_dev_flow import claude_runtime
 from ai_dev_flow.claude_runtime import (
     ALLOWED_MANIFEST_KEYS,
+    ASSET_DIRECTORY,
+    ASSET_FILE,
     MINIMUM_SDK_VERSION,
     MODE_LAUNCH,
     MODE_RESUME,
@@ -310,10 +312,47 @@ class ProvenanceTests(RuntimeTestBase):
         self.assertEqual(
             validate_controller_asset(
                 self.prompt_file, controller_root=self.controller_root,
-                workspace_path=self.workspace, label="system prompt file",
+                workspace_path=self.workspace, label="system prompt file", kind=ASSET_FILE,
             ),
             str(self.prompt_file),
         )
+
+    def test_a_prompt_that_is_a_directory_is_refused(self) -> None:
+        directory = self.controller_root / "prompts" / "bundle"
+        directory.mkdir()
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            launch_request(self._record(), **self._kwargs(prompt_file=directory))
+        self.assertEqual(caught.exception.reason, claude_runtime.REASON_ASSET_NOT_A_FILE)
+
+    def test_a_prompt_that_is_a_special_file_is_refused(self) -> None:
+        fifo = self.controller_root / "prompts" / "pipe"
+        try:
+            os.mkfifo(str(fifo))
+        except (AttributeError, OSError, NotImplementedError):
+            self.skipTest("named pipes are unavailable on this platform")
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            launch_request(self._record(), **self._kwargs(prompt_file=fifo))
+        self.assertEqual(caught.exception.reason, claude_runtime.REASON_ASSET_NOT_A_FILE)
+
+    def test_a_plugin_root_that_is_a_file_is_refused(self) -> None:
+        as_file = self.controller_root / "plugins" / "not-a-directory"
+        as_file.write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            launch_request(self._record(), **self._kwargs(plugin_root=as_file))
+        self.assertEqual(caught.exception.reason, claude_runtime.REASON_ASSET_NOT_A_DIRECTORY)
+
+    def test_an_unreadable_prompt_is_refused(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("root bypasses the read permission bit")
+        os.chmod(str(self.prompt_file), 0o200)
+        try:
+            with self.assertRaises(ClaudeRuntimeError) as caught:
+                launch_request(self._record(), **self._kwargs())
+        finally:
+            # Restore here, not via addCleanup: cleanups run after tearDown has
+            # already removed the tree.
+            os.chmod(str(self.prompt_file), 0o600)
+        self.assertEqual(caught.exception.reason, claude_runtime.REASON_ASSET_UNREADABLE)
 
 
 class PluginSurfaceTests(RuntimeTestBase):
@@ -409,6 +448,72 @@ class PluginSurfaceTests(RuntimeTestBase):
             caught.exception.reason, claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED
         )
 
+    def test_a_missing_manifest_fails_closed(self) -> None:
+        # Auto-discovery would accept a manifest-less plugin, leaving its identity
+        # and declared surface inferred rather than stated.
+        manifest = self.plugin_root / ".claude-plugin" / "plugin.json"
+        manifest.unlink()
+        manifest.parent.rmdir()
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_MANIFEST_MISSING
+        )
+
+    def test_a_manifest_without_a_usable_name_fails_closed(self) -> None:
+        for name in (None, "", "   ", 7, ["ai-dev-executor"]):
+            with self.subTest(name=name):
+                payload = {} if name is None else {"name": name}
+                self._write_plugin(self.plugin_root, skill=SKILL, manifest=payload)
+                with self.assertRaises(ClaudeRuntimeError) as caught:
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                self.assertEqual(
+                    caught.exception.reason,
+                    claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED,
+                )
+
+    def test_non_string_descriptive_manifest_values_fail_closed(self) -> None:
+        for key, value in (
+            ("displayName", 1), ("version", 1.0), ("description", {"text": "x"}),
+        ):
+            with self.subTest(key=key):
+                self._write_plugin(
+                    self.plugin_root, skill=SKILL,
+                    manifest={"name": "ai-dev-executor", key: value},
+                )
+                with self.assertRaises(ClaudeRuntimeError) as caught:
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                self.assertEqual(
+                    caught.exception.reason,
+                    claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED,
+                )
+                self.assertIn(key, caught.exception.detail)
+
+    def test_extra_content_inside_the_expected_skill_fails_closed(self) -> None:
+        for relative, directory in (("scripts", True), ("reference.md", False)):
+            with self.subTest(entry=relative):
+                target = self.plugin_root / "skills" / SKILL / relative
+                if directory:
+                    target.mkdir()
+                else:
+                    target.write_text("extra\n", encoding="utf-8")
+                with self.assertRaises(ClaudeRuntimeError) as caught:
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                self.assertEqual(
+                    caught.exception.reason,
+                    claude_runtime.REASON_PLUGIN_SURFACE_UNEXPECTED,
+                )
+                self.assertIn(relative, caught.exception.detail)
+                target.rmdir() if directory else target.unlink()
+
+    def test_a_skill_file_that_is_a_directory_fails_closed(self) -> None:
+        skill_file = self.plugin_root / "skills" / SKILL / "SKILL.md"
+        skill_file.unlink()
+        skill_file.mkdir()
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+        self.assertEqual(caught.exception.reason, claude_runtime.REASON_ASSET_NOT_A_FILE)
+
     def test_a_malformed_manifest_fails_closed(self) -> None:
         (self.plugin_root / ".claude-plugin" / "plugin.json").write_text(
             "{ not json", encoding="utf-8"
@@ -418,6 +523,131 @@ class PluginSurfaceTests(RuntimeTestBase):
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED
         )
+
+
+class NestedProvenanceTests(RuntimeTestBase):
+    """Every traversed component must land inside the validated plugin root.
+
+    Checking entry names alone would let a link named `skills` point anywhere and
+    the scan would then walk into whatever it found.
+    """
+
+    def _relink(self, relative: str, target: Path) -> None:
+        source = self.plugin_root / relative
+        if source.is_dir() and not source.is_symlink():
+            for child in sorted(source.rglob("*"), reverse=True):
+                child.rmdir() if child.is_dir() else child.unlink()
+            source.rmdir()
+        elif source.exists() or source.is_symlink():
+            source.unlink()
+        try:
+            source.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable on this platform")
+
+    def _escape_targets(self) -> dict:
+        sibling = self.controller_root / "plugins" / "other-plugin"
+        self._write_plugin(sibling, skill=SKILL)
+        outside = self.tmp_path / "outside"
+        self._write_plugin(outside, skill=SKILL)
+        return {
+            "the product workspace": self.workspace,
+            "a sibling controller directory": sibling,
+            "outside the controller root": outside,
+        }
+
+    def test_a_skills_directory_symlinked_out_of_the_plugin_fails_closed(self) -> None:
+        for where, target in self._escape_targets().items():
+            with self.subTest(target=where):
+                self._write_plugin(self.plugin_root, skill=SKILL)
+                (target / "skills").mkdir(parents=True, exist_ok=True)
+                self._relink("skills", target / "skills")
+                with self.assertRaises(ClaudeRuntimeError) as caught:
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                self.assertEqual(
+                    caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
+                )
+
+    def test_a_manifest_directory_symlinked_out_of_the_plugin_fails_closed(self) -> None:
+        sibling = self.controller_root / "plugins" / "sibling-manifest"
+        self._write_plugin(sibling, skill=SKILL)
+        self._relink(".claude-plugin", sibling / ".claude-plugin")
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
+        )
+
+    def test_a_manifest_file_symlinked_out_of_the_plugin_fails_closed(self) -> None:
+        stray = self.controller_root / "stray-plugin.json"
+        stray.write_text('{"name": "stray"}\n', encoding="utf-8")
+        self._relink(".claude-plugin/plugin.json", stray)
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
+        )
+
+    def test_an_expected_skill_directory_symlinked_out_of_the_plugin_fails_closed(self) -> None:
+        sibling = self.controller_root / "plugins" / "sibling-skill"
+        self._write_plugin(sibling, skill=SKILL)
+        self._relink("skills/{0}".format(SKILL), sibling / "skills" / SKILL)
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
+        )
+
+    def test_a_skill_file_symlinked_into_the_workspace_fails_closed(self) -> None:
+        target = self.workspace / "SKILL.md"
+        target.write_text("executor-authored instructions\n", encoding="utf-8")
+        self._relink("skills/{0}/SKILL.md".format(SKILL), target)
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
+        )
+
+    def test_a_plugin_reached_through_a_link_still_validates_its_real_contents(self) -> None:
+        # Containment is judged after resolution, so a versioned plugin published
+        # behind a `current` link is fine -- and its real contents are still what
+        # gets checked.
+        link = self.controller_root / "plugins" / "current"
+        try:
+            link.symlink_to(self.plugin_root)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable on this platform")
+        self.assertEqual(
+            validate_plugin_surface(link, expected_skill=SKILL), str(self.plugin_root)
+        )
+        (self.plugin_root / "hooks").mkdir()
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            validate_plugin_surface(link, expected_skill=SKILL)
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_SURFACE_UNEXPECTED
+        )
+
+    def test_a_plugin_root_reached_through_a_link_is_accepted(self) -> None:
+        link = self.controller_root / "plugins" / "current"
+        try:
+            link.symlink_to(self.plugin_root)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks are unavailable on this platform")
+        request = launch_request(self._record(), **self._kwargs(plugin_root=link))
+        self.assertEqual(request.plugin_root, str(self.plugin_root))
+
+
+class EnvironmentScopeTests(RuntimeTestBase):
+    def test_the_env_overlay_is_not_environment_isolation(self) -> None:
+        # `env={}` is merged with the worker's inherited environment, so it adds
+        # nothing and removes nothing. Credential and provider selectors already in
+        # that environment survive it, and validating them needs ownership of the
+        # child process -- the next rail's work, not this module's.
+        fields = build_option_fields(self._launch())
+        self.assertEqual(fields["env"], {})
+        source = Path(claude_runtime.__file__).read_text(encoding="utf-8")
+        self.assertIn("not a scrub of it", source)
+        self.assertIn("process-integration rail", source)
 
 
 class BoundsTests(RuntimeTestBase):
