@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import os
+import re
 import shutil
 from pathlib import Path
 from collections.abc import Sequence
@@ -427,6 +428,15 @@ def create_or_reset_branch_from_source(
     _run_git(repo_root, ["branch", branch_name, source_branch], check=True)
 
 
+def delete_branch(repo_root: Path, branch_name: str) -> None:
+    """Delete a local branch regardless of its merge state.
+
+    Used to undo a branch this process created; callers must not invoke it on a
+    branch they did not create in the same operation.
+    """
+    _run_git(repo_root, ["branch", "-D", branch_name], check=True)
+
+
 def ensure_branches_point_to_same_commit(
     repo_root: Path,
     *,
@@ -518,6 +528,120 @@ def resolve_commit_hash(repo_root: Path, revision: str = "HEAD") -> str:
     commit_hash = completed.stdout.strip()
     if not commit_hash:
         raise RepositoryError(f"Cannot resolve commit hash for {revision}.")
+
+    return commit_hash
+
+
+_REVISION_NAMESPACE_TEMPLATES: tuple[str, ...] = (
+    "refs/{revision}",
+    "refs/heads/{revision}",
+    "refs/tags/{revision}",
+    "refs/remotes/{revision}",
+    "refs/remotes/{revision}/HEAD",
+)
+
+_ABBREVIATED_OBJECT_NAME = re.compile(r"^[0-9a-fA-F]{4,39}$")
+
+
+def ref_exists(repo_root: Path, ref_name: str) -> bool:
+    """Exact full-ref existence check that performs no disambiguation."""
+    completed = _run_git(
+        repo_root,
+        ["show-ref", "--verify", "--quiet", ref_name],
+        check=False,
+    )
+    return completed.returncode == 0
+
+
+def matching_revision_namespaces(repo_root: Path, revision: str) -> list[str]:
+    """Full ref names a short revision matches, across meaningful namespaces.
+
+    More than one match means Git would silently pick a winner by precedence,
+    so adoption refuses instead. Determined structurally, never by reading
+    Git's warning text.
+    """
+    matches: list[str] = []
+    for template in _REVISION_NAMESPACE_TEMPLATES:
+        ref_name = template.format(revision=revision)
+        if ref_name in matches:
+            continue
+        if ref_exists(repo_root, ref_name):
+            matches.append(ref_name)
+
+    return matches
+
+
+def ambiguous_abbreviated_object_names(repo_root: Path, revision: str) -> list[str]:
+    """Objects an abbreviated hash could name; more than one is ambiguous."""
+    if not _ABBREVIATED_OBJECT_NAME.match(revision):
+        return []
+
+    completed = _run_git(
+        repo_root,
+        ["rev-parse", f"--disambiguate={revision.lower()}"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        return []
+
+    return [line.strip() for line in completed.stdout.splitlines() if line.strip()]
+
+
+def resolve_revision_commit(repo_root: Path, revision: str) -> str:
+    """Resolve a caller-supplied commit-ish to exactly one commit hash.
+
+    Accepts branch refs, remote-tracking refs, lightweight and annotated tags
+    that peel to a commit, full hashes, and unambiguous abbreviated hashes.
+    Fails closed for empty, option-like, unresolvable, non-commit, ambiguous
+    abbreviated, and cross-namespace-ambiguous input.
+    """
+    normalized = revision.strip()
+    if not normalized:
+        raise RepositoryError("Revision cannot be empty.")
+
+    if normalized.startswith("-"):
+        raise RepositoryError(f"Revision cannot start with '-': {normalized}")
+
+    namespace_matches = matching_revision_namespaces(repo_root, normalized)
+    if len(namespace_matches) > 1:
+        joined = ", ".join(namespace_matches)
+        raise RepositoryError(
+            f"Cannot resolve revision to a commit: {normalized} is ambiguous because it "
+            f"matches more than one ref: {joined}. Use the full ref name instead."
+        )
+
+    abbreviated_matches = ambiguous_abbreviated_object_names(repo_root, normalized)
+    if len(abbreviated_matches) > 1:
+        joined = ", ".join(abbreviated_matches)
+        raise RepositoryError(
+            f"Cannot resolve revision to a commit: {normalized} is an ambiguous "
+            f"abbreviated object name matching {joined}. Use the full hash instead."
+        )
+
+    # Resolve the object first so a non-commit can be reported as such rather
+    # than being conflated with an unresolvable name.
+    object_result = _run_git(
+        repo_root,
+        ["rev-parse", "--verify", normalized],
+        check=False,
+    )
+    object_id = object_result.stdout.strip()
+    if object_result.returncode != 0 or not object_id:
+        detail = object_result.stderr.strip()
+        message = f"Cannot resolve revision to a commit: {normalized}"
+        raise RepositoryError(f"{message}. {detail}" if detail else f"{message}.")
+
+    commit_result = _run_git(
+        repo_root,
+        ["rev-parse", "--verify", f"{object_id}^{{commit}}"],
+        check=False,
+    )
+    commit_hash = commit_result.stdout.strip()
+    if commit_result.returncode != 0 or not commit_hash:
+        raise RepositoryError(
+            f"Cannot resolve revision to a commit: {normalized} resolves to {object_id}, "
+            f"which is not a commit."
+        )
 
     return commit_hash
 
@@ -818,21 +942,26 @@ def scratch_commit_count_relative_to_main(
     return int(count_text)
 
 
-def max_numbered_checkpoint_relative_to_main(
+def max_numbered_checkpoint_between(
     repo_root: Path,
     *,
-    main_branch: str,
-    scratch_branch: str,
+    base_revision: str,
+    head_revision: str,
 ) -> int:
-    if _resolve_branch_head(repo_root, main_branch) is None:
+    """Highest numbered checkpoint subject reachable from head but not base.
+
+    Revision-based form of :func:`max_numbered_checkpoint_relative_to_main`, so
+    callers can derive a checkpoint before moving any branch.
+    """
+    if _resolve_branch_head(repo_root, base_revision) is None:
         return 0
 
-    if _resolve_branch_head(repo_root, scratch_branch) is None:
+    if _resolve_branch_head(repo_root, head_revision) is None:
         return 0
 
     completed = _run_git(
         repo_root,
-        ["log", "--format=%s", f"{main_branch}..{scratch_branch}"],
+        ["log", "--format=%s", f"{base_revision}..{head_revision}"],
         check=True,
     )
 
@@ -845,6 +974,19 @@ def max_numbered_checkpoint_relative_to_main(
                 max_checkpoint = value
 
     return max_checkpoint
+
+
+def max_numbered_checkpoint_relative_to_main(
+    repo_root: Path,
+    *,
+    main_branch: str,
+    scratch_branch: str,
+) -> int:
+    return max_numbered_checkpoint_between(
+        repo_root,
+        base_revision=main_branch,
+        head_revision=scratch_branch,
+    )
 
 
 def commit_count_between(

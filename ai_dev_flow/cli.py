@@ -29,6 +29,7 @@ from .repository import (
     create_managed_ref,
     compare_main_to_tracked_upstream,
     current_branch_name,
+    delete_branch,
     ensure_branches_point_to_same_commit,
     ensure_local_state_excluded,
     ensure_no_active_git_operations,
@@ -37,10 +38,12 @@ from .repository import (
     hard_reset_branch_to_revision,
     resolve_repo_root,
     resolve_commit_hash,
+    resolve_revision_commit,
     resolve_short_commit_hash,
     resolve_tree_hash,
     restore_branch_to_revision,
     clear_diff_baseline_for_repo_root,
+    max_numbered_checkpoint_between,
     max_numbered_checkpoint_relative_to_main,
     fetch_tracked_upstream,
     push_main_to_tracked_upstream,
@@ -84,6 +87,7 @@ from .workflow_state import (
 )
 from .ticket_config import TicketConfigError, load_ticket_configuration_for_repo_root
 from .ticket_providers import (
+    Ticket,
     TicketProvider,
     TicketProviderError,
     instantiate_ticket_provider,
@@ -96,6 +100,7 @@ from .promotion_sync import (
     PromotionSyncRecord,
     load_promotion_sync_record,
     promotion_sync_record_matches_state,
+    promotion_sync_record_path,
     clear_promotion_sync_record,
     save_promotion_sync_record,
 )
@@ -331,13 +336,18 @@ COMMAND_HELP: dict[str, str] = {
     "start": """\
 Usage: {command_name} start <issue-number>
     {command_name} start <issue-number> --prerequisite-for <active-issue>
+    {command_name} start <issue-number> --adopt <commit-ish>
 
 Begin independent work on an unblocked issue from main. The prerequisite form
 is only for active issue A handing off to prerequisite B; it keeps A's current
 scratch tree, starts B at checkpoint 0, and preserves A's checkpoint ownership.
+The adopt form binds an existing commit that already contains main to the issue
+from an idle workflow; it publishes nothing and does not reconcile the target.
 
 Options:
-  -h, --help  Show this help.
+  --prerequisite-for <active-issue>  Hand off from the named active issue.
+  --adopt <commit-ish>               Adopt an existing commit as this issue's work.
+  -h, --help                         Show this help.
 """,
     "patch": """\
 Usage: {command_name} patch "<description>"
@@ -1060,6 +1070,370 @@ def _parse_prerequisite_start(command_name: str, arguments: list[str]) -> tuple[
     return prerequisite_number, active_number
 
 
+def _adopt_usage(command_name: str) -> FlowError:
+    return _usage_error(command_name, "start", "<issue-number> --adopt <commit-ish>")
+
+
+def _parse_adopt_start(command_name: str, arguments: list[str]) -> tuple[int, str] | None:
+    if "--adopt" not in arguments:
+        return None
+
+    if "--prerequisite-for" in arguments:
+        raise FlowError(
+            "Cannot adopt workflow: --adopt and --prerequisite-for cannot be combined."
+        )
+
+    if len(arguments) != 3 or arguments[1] != "--adopt":
+        raise _adopt_usage(command_name)
+
+    issue_number = _parse_issue_number(command_name, [arguments[0]])
+
+    revision = arguments[2].strip()
+    if not revision:
+        raise FlowError("Cannot adopt workflow: adopted revision cannot be empty.")
+
+    return issue_number, revision
+
+
+@dataclass(frozen=True)
+class _AdoptionTarget:
+    revision: str
+    commit: str
+
+
+def _resolve_adoption_target(
+    repo_root: Path,
+    *,
+    main_branch: str,
+    revision: str,
+) -> _AdoptionTarget:
+    """Resolve and validate an adoption target without mutating anything.
+
+    Refuses anything Flow would otherwise have to reconcile. Adoption never
+    fetches, merges, rebases, or cherry-picks to make a target usable.
+    """
+    try:
+        adopted_commit = resolve_revision_commit(repo_root, revision)
+    except RepositoryError as exc:
+        raise FlowError(f"Cannot adopt workflow: {exc}") from exc
+
+    try:
+        main_commit = resolve_commit_hash(repo_root, main_branch)
+    except RepositoryError as exc:
+        raise FlowError(
+            f"Cannot adopt workflow: cannot resolve {main_branch}. {exc}"
+        ) from exc
+
+    if adopted_commit == main_commit:
+        raise FlowError(
+            f"Cannot adopt workflow: adopted revision {revision} already equals "
+            f"{main_branch}; there is no work to adopt."
+        )
+
+    if not branch_is_ancestor(
+        repo_root,
+        ancestor_revision=main_commit,
+        descendant_revision=adopted_commit,
+    ):
+        raise FlowError(
+            f"Cannot adopt workflow: {main_branch} is not an ancestor of adopted "
+            f"revision {revision}. Adoption does not fetch, merge, rebase, or "
+            f"otherwise reconcile the target."
+        )
+
+    return _AdoptionTarget(revision=revision, commit=adopted_commit)
+
+
+def _validate_adoption_prerequisites(
+    command_name: str,
+    repo_root: Path,
+    state: WorkflowState,
+    issue_number: int,
+) -> None:
+    active_workflow_type = _active_workflow_type(state)
+    if active_workflow_type is not None:
+        if state.active_issue_number is not None:
+            raise FlowError(
+                f"Cannot adopt workflow: active issue {state.active_issue_number} is already set."
+            )
+        assert state.patch_description is not None
+        raise FlowError(
+            f"Cannot adopt workflow: active patch {state.patch_description} is already set."
+        )
+
+    blocked_file = blocked_workflows_file_for_repo_root(repo_root)
+    if get_blocked_workflow(blocked_file, issue_number) is not None:
+        if "-" in command_name:
+            prefix, _, _ = command_name.rpartition("-")
+            resume_command = f"{prefix}-resume"
+        else:
+            resume_command = "flow-resume"
+        raise FlowError(
+            f"Cannot adopt workflow: issue {issue_number} is blocked. "
+            f"Use {resume_command} {issue_number}."
+        )
+
+    _ensure_main_and_scratch_branches_differ(state)
+
+    if not branch_exists(repo_root, state.main_branch):
+        raise FlowError(f"Main branch does not exist locally: {state.main_branch}")
+
+    if git_status_short(repo_root):
+        raise FlowError(
+            "Cannot adopt workflow: working tree is not clean. Commit, stash, or "
+            "remove changes before adopting."
+        )
+
+    ensure_no_active_git_operations(repo_root)
+
+
+@dataclass(frozen=True)
+class _AdoptionSnapshot:
+    """Externally visible state captured before any adoption mutation."""
+
+    branch: str
+    scratch_commit: str | None
+    files: tuple[tuple[Path, bytes | None], ...]
+
+
+def _adoption_snapshot_paths(repo_root: Path) -> tuple[Path, ...]:
+    return (
+        workflow_state_file_for_repo_root(repo_root),
+        _promotion_review_record_path(repo_root),
+        promotion_sync_record_path(repo_root),
+        diff_baseline_file_for_repo_root(repo_root),
+    )
+
+
+def _capture_adoption_snapshot(repo_root: Path, *, scratch_branch: str) -> _AdoptionSnapshot:
+    branch = current_branch_name(repo_root)
+
+    scratch_commit: str | None = None
+    if branch_exists(repo_root, scratch_branch):
+        scratch_commit = resolve_commit_hash(repo_root, scratch_branch)
+
+    files = tuple(
+        (path, path.read_bytes() if path.is_file() else None)
+        for path in _adoption_snapshot_paths(repo_root)
+    )
+
+    return _AdoptionSnapshot(branch=branch, scratch_commit=scratch_commit, files=files)
+
+
+def _restore_adoption_snapshot(
+    repo_root: Path,
+    snapshot: _AdoptionSnapshot,
+    *,
+    main_branch: str,
+    scratch_branch: str,
+) -> None:
+    """Return the repository to its exact pre-adoption externally visible state."""
+    # A checked-out branch cannot be force-updated or deleted, so step off it
+    # first. Adoption supports running while scratch is checked out.
+    if current_branch_name(repo_root) == scratch_branch:
+        checkout_branch(repo_root, main_branch)
+
+    if snapshot.scratch_commit is None:
+        if branch_exists(repo_root, scratch_branch):
+            delete_branch(repo_root, scratch_branch)
+    else:
+        create_or_reset_branch_from_source(
+            repo_root,
+            branch_name=scratch_branch,
+            source_branch=snapshot.scratch_commit,
+        )
+
+    if current_branch_name(repo_root) != snapshot.branch:
+        checkout_branch(repo_root, snapshot.branch)
+
+    for path, payload in snapshot.files:
+        if payload is None:
+            if path.exists():
+                path.unlink()
+            continue
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+
+
+def _roll_back_adoption(
+    repo_root: Path,
+    snapshot: _AdoptionSnapshot,
+    *,
+    main_branch: str,
+    scratch_branch: str,
+    provider: TicketProvider | None = None,
+    pre_activation_ticket: Ticket | None = None,
+    activation_attempted: bool = False,
+) -> list[str]:
+    """Best-effort restoration. Never raises, so the original error survives."""
+    failures: list[str] = []
+
+    # Compensation must use the PRE-activation reference and labels. The
+    # post-activation ticket already carries "active", so restoring from it
+    # would preserve activation instead of undoing it. Activation is also
+    # compensated when mark_active raised: providers that edit labels before a
+    # final read can fail after the remote side effect has landed.
+    if provider is not None and activation_attempted and pre_activation_ticket is not None:
+        try:
+            provider.deactivate(
+                pre_activation_ticket.reference,
+                previous_labels=pre_activation_ticket.labels,
+            )
+        except (TicketProviderError, OSError) as exc:
+            failures.append(f"provider activation rollback failed: {exc}")
+
+    try:
+        _restore_adoption_snapshot(
+            repo_root,
+            snapshot,
+            main_branch=main_branch,
+            scratch_branch=scratch_branch,
+        )
+    except (RepositoryError, OSError) as exc:
+        failures.append(f"repository state rollback failed: {exc}")
+
+    return failures
+
+
+def _adoption_failure(message: str, rollback_failures: list[str]) -> FlowError:
+    if not rollback_failures:
+        return FlowError(message)
+    return FlowError(message + " Rollback failures: " + " | ".join(rollback_failures))
+
+
+def _handle_adopt_start(
+    command_name: str,
+    issue_number: int,
+    revision: str,
+) -> int:
+    repo_root, state_path, state = _resolve_repo_state_context()
+
+    _validate_adoption_prerequisites(command_name, repo_root, state, issue_number)
+
+    target = _resolve_adoption_target(
+        repo_root,
+        main_branch=state.main_branch,
+        revision=revision,
+    )
+
+    provider = _resolve_ticket_provider_for_repo_root(repo_root)
+    try:
+        ticket = provider.get(str(issue_number))
+    except TicketProviderError as exc:
+        raise FlowError(str(exc)) from exc
+
+    if ticket.lifecycle_state != "open":
+        raise FlowError(
+            f"Cannot adopt workflow: ticket {issue_number} is {ticket.lifecycle_state}."
+        )
+
+    # Derived before any mutation so an invalid prospective state cannot leave
+    # the repository half-adopted.
+    adopted_checkpoint = max_numbered_checkpoint_between(
+        repo_root,
+        base_revision=state.main_branch,
+        head_revision=target.commit,
+    )
+
+    adopted_state = WorkflowState(
+        main_branch=state.main_branch,
+        scratch_branch=state.scratch_branch,
+        checkpoint=adopted_checkpoint,
+        active_issue_number=issue_number,
+        active_issue_title=ticket.title,
+        active_issue_url=ticket.reference.url,
+        ticket_reference=ticket.reference,
+    )
+    normalize_and_validate(
+        adopted_state.to_dict(),
+        context="start --adopt command",
+    )
+
+    # Everything below mutates. Adoption is all-or-nothing from here, so the
+    # pre-adoption state is captured first and restored on any failure.
+    snapshot = _capture_adoption_snapshot(repo_root, scratch_branch=state.scratch_branch)
+    activation_attempted = False
+
+    try:
+        checkout_branch(repo_root, state.main_branch)
+        create_or_reset_branch_from_source(
+            repo_root,
+            branch_name=state.scratch_branch,
+            source_branch=target.commit,
+        )
+        checkout_branch(repo_root, state.scratch_branch)
+
+        placed_commit = resolve_commit_hash(repo_root, state.scratch_branch)
+        if placed_commit != target.commit:
+            raise FlowError(
+                f"Cannot adopt workflow: {state.scratch_branch} resolved to {placed_commit} "
+                f"instead of the adopted commit {target.commit}."
+            )
+
+        # Set before the call: a provider may mutate remote labels and then
+        # fail its read-back, so the attempt itself obliges compensation.
+        activation_attempted = True
+        try:
+            activated_ticket = provider.mark_active(ticket.reference)
+        except TicketProviderError as exc:
+            raise FlowError(
+                f"Cannot adopt workflow: failed to mark ticket {issue_number} active. {exc}"
+            ) from exc
+
+        _clear_promotion_review_record(repo_root)
+
+        adopted_state = WorkflowState(
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+            checkpoint=adopted_checkpoint,
+            active_issue_number=issue_number,
+            active_issue_title=activated_ticket.title,
+            active_issue_url=activated_ticket.reference.url,
+            ticket_reference=activated_ticket.reference,
+        )
+        adopted_state = normalize_and_validate(
+            adopted_state.to_dict(),
+            context="start --adopt command",
+        )
+
+        ensure_local_state_excluded(repo_root)
+        save_state(state_path, adopted_state)
+        try:
+            clear_promotion_sync_record(repo_root)
+        except PromotionSyncError as exc:
+            raise FlowError(
+                f"Cannot adopt workflow: could not clear stale promotion synchronization "
+                f"state. {exc}"
+            ) from exc
+        clear_diff_baseline_for_repo_root(repo_root)
+    except (
+        FlowError,
+        RepositoryError,
+        WorkflowStateError,
+        PromotionSyncError,
+        JsonFileError,
+        OSError,
+    ) as exc:
+        rollback_failures = _roll_back_adoption(
+            repo_root,
+            snapshot,
+            main_branch=state.main_branch,
+            scratch_branch=state.scratch_branch,
+            provider=provider,
+            pre_activation_ticket=ticket,
+            activation_attempted=activation_attempted,
+        )
+        raise _adoption_failure(str(exc), rollback_failures) from exc
+
+    print(f"Adopted issue {issue_number}")
+    print(f"mainBranch: {state.main_branch}")
+    print(f"scratchBranch: {state.scratch_branch}")
+    print(f"checkpoint: {adopted_checkpoint}")
+    print(f"adoptedCommit: {target.commit}")
+
+    return 0
+
+
 def _resolve_issue_details_with_labels(issue_number: int) -> tuple[str, str, list[str]]:
     completed = subprocess.run(
         ["gh", "issue", "view", str(issue_number), "--json", "title,url,labels"],
@@ -1231,6 +1605,10 @@ def _release_claim_quietly(repo_root: Path, record) -> None:
 
 
 def handle_start(command_name: str, arguments: list[str]) -> int:
+    adopt_arguments = _parse_adopt_start(command_name, arguments)
+    if adopt_arguments is not None:
+        return _handle_adopt_start(command_name, *adopt_arguments)
+
     prerequisite_arguments = _parse_prerequisite_start(command_name, arguments)
     if prerequisite_arguments is not None:
         return _handle_prerequisite_start(command_name, *prerequisite_arguments)

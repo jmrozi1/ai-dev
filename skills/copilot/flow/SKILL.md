@@ -54,6 +54,8 @@ Map natural-language lifecycle requests to this package's local helpers:
 | `reset this` | `scripts/flow-reset` |
 | `block this` | `scripts/flow-block "<reason>"` |
 | `resume ticket <id>` | `scripts/flow-resume <id>` |
+| `adopt <commit-ish> as ticket <id>` | `scripts/flow-start <id> --adopt <commit-ish>` |
+| `recover this branch into ticket <id>` | `scripts/flow-start <id> --adopt <commit-ish>` |
 | `close this out` | `scripts/flow-promote "<message>"`, then `scripts/flow-complete` when authorized |
 | `/status` or `what's my status?` | `scripts/ticket-status` |
 | `/status verbose` | `scripts/ticket-status verbose` |
@@ -159,6 +161,38 @@ exactly as before.
   may complete directly at its recorded promoted commit; new A work still
   requires the normal checkpoint, review, promotion, and synchronization path.
 
+### Recovered Commit Adoption
+
+- Use `scripts/flow-start <issue> --adopt <commit-ish>` when an open issue's work
+  already exists as a commit that Flow does not own: a recovered rescue branch, a
+  remote-tracking ref, a tag, or a bare SHA. It binds that commit to the issue so
+  the normal checkpoint, review, and promotion path can run over it.
+- Adoption requires an idle workflow. No active issue, no active patch, a clean
+  worktree, and no in-progress Git operation. It is not a way to switch an active
+  workflow onto different work.
+- The adopted commit becomes the managed scratch tip exactly. Its SHA is
+  preserved; no cherry-pick, replay, or rewrite establishes Flow ownership.
+- The numeric checkpoint is the highest numbered checkpoint in the adopted range
+  relative to `main`, so the next `scripts/flow-commit` continues that numbering.
+  A restarted `1…N` sequence inside the adopted history is not the checkpoint.
+- `main` must be an ancestor of the adopted commit. Divergent, behind, and
+  unrelated targets are refused; adoption never fetches, merges, rebases, or
+  cherry-picks to make a target usable. Reconcile on the producing side instead.
+- The commit-ish must name exactly one commit. Empty, option-like, unresolvable,
+  non-commit, ambiguous abbreviated hashes, and short names matching more than one
+  ref namespace (`refs/heads/x` and `refs/tags/x`) are refused. Pass the full ref
+  name or full hash to disambiguate.
+- Adoption publishes nothing. It never promotes, merges, fast-forwards, pushes, or
+  squashes, and it leaves no passing promotion-review record, so promotion still
+  requires the normal review gate.
+- Adoption is all-or-nothing. Any failure restores the pre-adoption branch,
+  workflow state, review, sync, and baseline state, and compensates provider
+  activation using the pre-activation labels. If compensation itself fails, the
+  original error stays primary and the rollback failure is reported alongside it.
+- This is issue adoption from idle state only. Adopting already-developed work as a
+  prerequisite while another issue is active is a separate capability. Adopting
+  local scratch content without a ticket binding remains `flow-patch --adopt`.
+
 ## Lifecycle Distinctions
 
 When the user asks to abandon, cancel, or clear the local workflow without changing the ticket, the executor must read the exact semantics before choosing a command:
@@ -167,7 +201,10 @@ When the user asks to abandon, cancel, or clear the local workflow without chang
 - flow-complete = provider/ticket completion = completes the workflow = may mutate/close/update the bound ticket through its provider
 - flow-abandon = local-only abandonment = never mutates the bound ticket/provider = never resets branches or discards repository content = succeeds only when the repository is already clean and synchronized
 
+- flow-start --adopt = idle-state issue adoption of an existing commit = binds the ticket and preserves the adopted SHA = publishes nothing and never reconciles the target
+
 Never use flow-reset as a substitute for abandon.
+Never use flow-start --adopt to redirect an active workflow; it requires idle state by design.
 Never use flow-complete when the user explicitly wants the ticket left unchanged.
 Never use __test-state-clear for production/local-abandon intent.
 
