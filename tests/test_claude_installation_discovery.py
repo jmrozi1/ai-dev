@@ -818,5 +818,281 @@ class OwnershipHomeIsolationTests(_TempHome):
         self.assertIn(str(alt_home.resolve()), str(ledger))
 
 
+class ClaudeCommandInstallationTests(_TempHome):
+    """Finding A: the command the activation pointer documents must really exist.
+
+    A fresh executor types `ai-dev discover` because the installed pointer says
+    to. Before this, nothing put that command anywhere a shell looks, so the
+    documented cold-start path failed on its first line.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.runtime = self.tmp_path / "runtime"
+        (self.runtime / "tools" / "claude").mkdir(parents=True)
+        (self.runtime / "tools" / "claude" / "ai-dev-entry.py").write_text(
+            "# entry point\n", encoding="utf-8"
+        )
+        self.bin = self.home.resolve() / ".local" / "bin"
+
+    def _install(self, **kwargs):
+        return activation.install_ai_dev_command(
+            home=self.home, runtime_root=self.runtime, **kwargs
+        )
+
+    # Destination and shell coverage
+
+    def test_command_lands_in_the_user_owned_directory(self) -> None:
+        directory, _ = self._install()
+        self.assertEqual(directory, self.bin)
+        self.assertEqual(
+            activation.resolve_command_directory(home=self.home), self.bin
+        )
+
+    def test_windows_covers_git_bash_and_powershell(self) -> None:
+        directory, statuses = self._install(platform="windows")
+        self.assertEqual(
+            sorted(status.path.name for status in statuses), ["ai-dev", "ai-dev.ps1"]
+        )
+        self.assertTrue((directory / "ai-dev").is_file())
+        self.assertTrue((directory / "ai-dev.ps1").is_file())
+
+    def test_posix_installation_model_is_unchanged_by_windows_support(self) -> None:
+        directory, statuses = self._install(platform="posix")
+        self.assertEqual([status.path.name for status in statuses], ["ai-dev"])
+        self.assertFalse((directory / "ai-dev.ps1").exists())
+        launcher = (directory / "ai-dev").read_text(encoding="utf-8")
+        self.assertTrue(launcher.startswith("#!/usr/bin/env bash"))
+        if os.name != "nt":
+            self.assertTrue(os.access(directory / "ai-dev", os.X_OK))
+
+    def test_unsupported_platform_fails_closed(self) -> None:
+        with self.assertRaises(ClaudeActivationError):
+            self._install(platform="plan9")
+
+    # Launcher content
+
+    def test_launchers_delegate_to_the_runtime_entry_point_by_absolute_path(self) -> None:
+        directory, _ = self._install(platform="windows")
+        entry = "tools/claude/ai-dev-entry.py"
+        posix = (directory / "ai-dev").read_text(encoding="utf-8")
+        powershell = (directory / "ai-dev.ps1").read_text(encoding="utf-8")
+        self.assertIn(self.runtime.as_posix(), posix)
+        self.assertIn(entry, posix)
+        self.assertIn(str(self.runtime), powershell)
+        self.assertIn("ai-dev-entry.py", powershell)
+
+    def test_launchers_reuse_the_repository_bootstrap_python_selector(self) -> None:
+        directory, _ = self._install(platform="windows")
+        posix = (directory / "ai-dev").read_text(encoding="utf-8")
+        powershell = (directory / "ai-dev.ps1").read_text(encoding="utf-8")
+        self.assertIn("python_select.sh", posix)
+        self.assertIn("ai_dev_select_python", posix)
+        self.assertNotIn("python3 -m", posix)
+        self.assertIn("PythonSelection.ps1", powershell)
+        self.assertIn("Resolve-AiDevPythonExecutable", powershell)
+
+    def test_every_launcher_carries_the_ownership_marker(self) -> None:
+        directory, statuses = self._install(platform="windows")
+        for status in statuses:
+            with self.subTest(launcher=status.path.name):
+                self.assertIn(
+                    activation.LAUNCHER_OWNERSHIP_MARKER,
+                    status.path.read_text(encoding="utf-8"),
+                )
+                self.assertTrue(activation.launcher_is_managed(status.path))
+        self.assertTrue(directory.is_dir())
+
+    # Idempotency and update
+
+    def test_reinstall_is_idempotent(self) -> None:
+        _, first = self._install(platform="windows")
+        self.assertEqual({status.state for status in first}, {"installed"})
+        _, second = self._install(platform="windows")
+        self.assertEqual({status.state for status in second}, {"unchanged"})
+
+    def test_reinstall_retargets_a_moved_runtime(self) -> None:
+        directory, _ = self._install(platform="windows")
+        moved = self.tmp_path / "moved-runtime"
+        (moved / "tools" / "claude").mkdir(parents=True)
+        (moved / "tools" / "claude" / "ai-dev-entry.py").write_text("", encoding="utf-8")
+
+        _, statuses = activation.install_ai_dev_command(
+            home=self.home, runtime_root=moved, platform="windows"
+        )
+        self.assertEqual({status.state for status in statuses}, {"updated"})
+        self.assertIn(moved.as_posix(), (directory / "ai-dev").read_text(encoding="utf-8"))
+        self.assertNotIn(
+            self.runtime.as_posix(), (directory / "ai-dev").read_text(encoding="utf-8")
+        )
+
+    # Ownership and failure safety
+
+    def test_unowned_collision_fails_closed_without_deleting(self) -> None:
+        self.bin.mkdir(parents=True)
+        theirs = self.bin / "ai-dev"
+        theirs.write_text("#!/bin/sh\necho someone else's command\n", encoding="utf-8")
+
+        with self.assertRaises(ClaudeActivationError) as raised:
+            self._install(platform="windows")
+
+        self.assertIn("not an AI Dev managed launcher", str(raised.exception))
+        self.assertEqual(
+            theirs.read_text(encoding="utf-8"), "#!/bin/sh\necho someone else's command\n"
+        )
+        self.assertFalse((self.bin / "ai-dev.ps1").exists())
+
+    def test_collision_on_the_second_launcher_installs_neither(self) -> None:
+        self.bin.mkdir(parents=True)
+        (self.bin / "ai-dev.ps1").write_text("# unrelated\n", encoding="utf-8")
+
+        with self.assertRaises(ClaudeActivationError):
+            self._install(platform="windows")
+
+        self.assertFalse((self.bin / "ai-dev").exists())
+        self.assertEqual((self.bin / "ai-dev.ps1").read_text(encoding="utf-8"), "# unrelated\n")
+
+    @unittest.skipIf(WINDOWS, "symlink creation needs privileges on Windows")
+    def test_symlinked_destination_is_never_replaced(self) -> None:
+        self.bin.mkdir(parents=True)
+        target = self.tmp_path / "elsewhere"
+        target.write_text("#!/bin/sh\n", encoding="utf-8")
+        (self.bin / "ai-dev").symlink_to(target)
+
+        with self.assertRaises(ClaudeActivationError):
+            self._install(platform="posix")
+
+        self.assertTrue((self.bin / "ai-dev").is_symlink())
+        self.assertEqual(target.read_text(encoding="utf-8"), "#!/bin/sh\n")
+
+    def test_missing_entry_point_fails_closed_without_creating_anything(self) -> None:
+        empty = self.tmp_path / "not-a-checkout"
+        empty.mkdir()
+        with self.assertRaises(ClaudeActivationError) as raised:
+            activation.install_ai_dev_command(home=self.home, runtime_root=empty)
+        self.assertIn("no Claude entry point", str(raised.exception))
+        self.assertFalse(self.bin.exists())
+
+    def test_command_directory_blocked_by_a_file_fails_closed(self) -> None:
+        self.bin.parent.mkdir(parents=True)
+        self.bin.write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(ClaudeActivationError) as raised:
+            self._install()
+        self.assertIn("is not a directory", str(raised.exception))
+
+    # Cleanup semantics
+
+    def test_obsolete_owned_launchers_are_retired_on_platform_change(self) -> None:
+        directory, _ = self._install(platform="windows")
+        self.assertTrue((directory / "ai-dev.ps1").is_file())
+
+        _, statuses = self._install(platform="posix")
+
+        self.assertIn(
+            ("removed", "ai-dev.ps1"),
+            [(status.state, status.path.name) for status in statuses],
+        )
+        self.assertFalse((directory / "ai-dev.ps1").exists())
+        self.assertTrue((directory / "ai-dev").is_file())
+
+    def test_cleanup_preserves_unowned_and_unrelated_files(self) -> None:
+        self.bin.mkdir(parents=True)
+        (self.bin / "ai-dev.cmd").write_text("@echo someone else\n", encoding="utf-8")
+        (self.bin / "flow.ps1").write_text("# unrelated user tool\n", encoding="utf-8")
+
+        self._install(platform="posix")
+
+        self.assertEqual((self.bin / "ai-dev.cmd").read_text(encoding="utf-8"), "@echo someone else\n")
+        self.assertEqual(
+            (self.bin / "flow.ps1").read_text(encoding="utf-8"), "# unrelated user tool\n"
+        )
+
+    # PATH reporting
+
+    def test_path_membership_is_reported_and_never_mutated(self) -> None:
+        before = os.environ.get("PATH")
+        joined = os.pathsep.join([str(self.tmp_path / "other"), str(self.bin)])
+        self.assertTrue(activation.command_directory_is_on_path(self.bin, path_value=joined))
+        self.assertFalse(
+            activation.command_directory_is_on_path(
+                self.bin, path_value=str(self.tmp_path / "other")
+            )
+        )
+        self.assertEqual(os.environ.get("PATH"), before)
+
+    def test_path_membership_tolerates_trailing_separators(self) -> None:
+        joined = os.pathsep.join([str(self.bin) + os.sep, ""])
+        self.assertTrue(activation.command_directory_is_on_path(self.bin, path_value=joined))
+
+    # Pointer / command agreement
+
+    def test_activation_pointer_documents_the_command_that_is_installed(self) -> None:
+        block = activation.render_activation_block()
+        self.assertIn(f"{activation.AI_DEV_COMMAND_NAME} discover", block)
+        for platform in ("posix", "windows"):
+            with self.subTest(platform=platform):
+                names = activation.managed_launcher_names(platform)
+                self.assertIn(activation.AI_DEV_COMMAND_NAME, names)
+
+    def test_documented_commands_all_exist_on_the_installed_surface(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        completed = subprocess.run(
+            [sys.executable, str(repo_root / "tools" / "claude" / "ai-dev-entry.py"), "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        for command in ("discover", "status", "review-evidence", "publish"):
+            with self.subTest(command=command):
+                self.assertIn(command, completed.stdout)
+
+    # Supported installation path
+
+    def test_supported_claude_installation_installs_pointer_and_command(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        exit_code = installation.main(
+            [
+                "--repo-root",
+                str(repo_root),
+                "--audience",
+                "claude",
+                "--home",
+                str(self.home),
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+
+        pointer = activation.resolve_claude_instruction_path(home=self.home)
+        self.assertTrue(pointer.is_file())
+        self.assertIn(
+            f"{activation.AI_DEV_COMMAND_NAME} discover",
+            pointer.read_text(encoding="utf-8"),
+        )
+
+        command = activation.resolve_command_directory(home=self.home) / "ai-dev"
+        self.assertTrue(command.is_file())
+        self.assertIn(str(repo_root.as_posix()), command.read_text(encoding="utf-8"))
+
+    def test_other_audiences_do_not_install_the_claude_command(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        exit_code = installation.main(
+            [
+                "--repo-root",
+                str(repo_root),
+                "--audience",
+                "copilot",
+                "--destination-root",
+                str(self.tmp_path / "copilot-skills"),
+                "--home",
+                str(self.home),
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(activation.resolve_command_directory(home=self.home).exists())
+        self.assertFalse(activation.resolve_claude_instruction_path(home=self.home).exists())
+
+
 if __name__ == "__main__":
     unittest.main()

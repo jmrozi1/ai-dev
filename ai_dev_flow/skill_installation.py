@@ -670,6 +670,40 @@ def _print_result(result: SkillInstallResult) -> None:
     print(f"Destination: {result.destination_root}")
 
 
+def _install_claude_host_activation(*, repo_root: Path, home: Path | None) -> int:
+    """Claude activation is skills plus the documented command, installed together.
+
+    The activation pointer tells a fresh executor to run `ai-dev discover`. If
+    installing the audience left that command absent, the pointer would document
+    something the host does not have, so both halves land in one supported step.
+    """
+    from .claude_activation import (
+        AI_DEV_COMMAND_NAME,
+        ClaudeActivationError,
+        command_directory_is_on_path,
+        install_claude_host_activation,
+    )
+
+    try:
+        activation = install_claude_host_activation(home=home, runtime_root=repo_root)
+    except ClaudeActivationError as exc:
+        print(f"skill-installation: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Activation pointer {activation['pointer']}: {activation['pointerPath']}")
+    for launcher in activation["launchers"]:
+        print(f"Command {launcher.state}: {launcher.path}")
+
+    directory = activation["commandDirectory"]
+    if not command_directory_is_on_path(directory):
+        print(
+            f"warning: {directory} is not on PATH, so `{AI_DEV_COMMAND_NAME}` will not resolve "
+            "in a fresh shell. Add it to PATH in your shell profile.",
+            file=sys.stderr,
+        )
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(sys.argv[1:] if argv is None else argv)
 
@@ -696,6 +730,10 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     _print_result(result)
+
+    if args.audience == "claude":
+        return _install_claude_host_activation(repo_root=repo_root, home=home)
+
     return 0
 
 

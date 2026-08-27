@@ -283,6 +283,97 @@ class ContextualStatusTests(_CoordinationFixture):
         self.assertNotIn("the-rail (ready)", rendered)
 
 
+class SourceFreshnessStatusTests(_CoordinationFixture):
+    """Finding B: status must name the revision its facts were actually read from.
+
+    The deterministic reader fetches upstream and serves the fetched revision
+    while deliberately leaving the cache checkout where it is. Reporting local
+    HEAD as the source therefore named a revision the executor never acted on.
+    """
+
+    def _advance_upstream(self, receipt: str) -> None:
+        """Publish a commit the cache checkout has not seen."""
+        seed = self.tmp_path / "seed"
+        (seed / "proj" / "issue-1" / "proceed-sequence.txt").write_text(
+            f"{receipt}\n", encoding="utf-8"
+        )
+        _git(seed, "add", "-A")
+        _git(seed, "commit", "--quiet", "-m", "advance the receipt")
+        _git(seed, "push", "--quiet", "origin", "main")
+
+    def test_behind_cache_reports_the_fetched_revision_it_read(self) -> None:
+        self._advance_upstream("7")
+        stale_head = _git(self.cache, "rev-parse", "--short", "HEAD")
+
+        rendered = activation.render_status(self.product, cache=self.cache)
+
+        upstream = _git(self.cache, "rev-parse", "--short", "origin/main")
+        self.assertNotEqual(upstream, stale_head)
+        self.assertIn(f"fetched upstream at {upstream}", rendered)
+        self.assertIn(f"cache checkout behind at {stale_head}", rendered)
+        # The rail and receipt came from that same fetched revision.
+        self.assertIn("the-rail (ready)", rendered)
+        self.assertIn("proceed 7", rendered)
+
+    def test_stale_local_head_is_never_labelled_authoritative(self) -> None:
+        self._advance_upstream("7")
+        stale_head = _git(self.cache, "rev-parse", "--short", "HEAD")
+
+        rendered = activation.render_status(self.product, cache=self.cache)
+        source_line = next(
+            line for line in rendered.splitlines() if line.startswith("source     :")
+        )
+
+        self.assertNotIn(f"fetched upstream at {stale_head}", rendered)
+        self.assertNotIn(f"cache at {stale_head} (", source_line)
+        self.assertIn("behind", source_line)
+
+    def test_synchronised_cache_says_so(self) -> None:
+        rendered = activation.render_status(self.product, cache=self.cache)
+        head = _git(self.cache, "rev-parse", "--short", "HEAD")
+        self.assertIn(f"fetched upstream at {head} (cache checkout in sync)", rendered)
+
+    def test_cache_without_a_remote_is_reported_as_local(self) -> None:
+        _git(self.cache, "remote", "remove", "origin")
+
+        rendered = activation.render_status(self.product, cache=self.cache)
+
+        head = _git(self.cache, "rev-parse", "--short", "HEAD")
+        self.assertIn(f"local cache at {head} (no coordination remote)", rendered)
+        self.assertIn("the-rail (ready)", rendered)
+
+    def test_unfetchable_upstream_stays_unavailable_and_non_authoritative(self) -> None:
+        self.remote.rename(self.tmp_path / "coordination-remote-moved.git")
+
+        rendered = activation.render_status(self.product, cache=self.cache)
+
+        self.assertIn("source     : UNAVAILABLE", rendered)
+        self.assertIn("rail       : unknown", rendered)
+        self.assertNotIn("(ready)", rendered)
+        self.assertNotIn("proceed", rendered)
+        self._assert_no_fallback_artifacts()
+
+    def test_one_read_source_serves_every_fact_status_displays(self) -> None:
+        """No second freshness model: source line, rail, and receipt share one read."""
+        with patch.object(
+            activation, "resolve_read_source", wraps=activation.resolve_read_source
+        ) as spy:
+            rendered = activation.render_status(self.product, cache=self.cache)
+
+        self.assertEqual(spy.call_count, 1)
+        self.assertIn("the-rail (ready)", rendered)
+        self.assertIn("proceed 4", rendered)
+
+    def test_reads_never_move_the_cache_checkout(self) -> None:
+        self._advance_upstream("7")
+        before = _git(self.cache, "rev-parse", "HEAD")
+
+        activation.render_status(self.product, cache=self.cache)
+
+        self.assertEqual(_git(self.cache, "rev-parse", "HEAD"), before)
+        self.assertEqual(_git(self.cache, "status", "--porcelain"), "")
+
+
 class ReviewEvidenceRoutingTests(unittest.TestCase):
     def test_review_evidence_uses_the_canonical_helper(self) -> None:
         self.assertEqual(

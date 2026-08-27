@@ -28,6 +28,7 @@ from pathlib import Path
 from .control_plane import (
     ControlPlaneError,
     RailState,
+    ReadSource,
     allocate_proceed_number,
     artifact_relative,
     collect_rail_states,
@@ -54,6 +55,15 @@ DEFAULT_COORDINATION_REPOSITORY = "jmrozi1/ai-dev-control-plane"
 
 MANAGED_BEGIN = "<!-- BEGIN ai-dev managed activation -->"
 MANAGED_END = "<!-- END ai-dev managed activation -->"
+
+# The one name the activation pointer documents and the installer provides. A
+# fresh executor types this; if the two ever disagree the pointer is a lie, so
+# both the block and the launchers are rendered from this constant.
+AI_DEV_COMMAND_NAME = "ai-dev"
+
+# Carried by every managed launcher. Installation replaces only files bearing
+# this marker, so an unrelated command of the same name is never destroyed.
+LAUNCHER_OWNERSHIP_MARKER = "AI_DEV_LAUNCHER_V1 (claude audience)"
 
 
 # Paths -----------------------------------------------------------------------
@@ -104,7 +114,7 @@ def render_activation_block() -> str:
             "first, even immediately after `/clear`:",
             "",
             "```bash",
-            "ai-dev discover",
+            f"{AI_DEV_COMMAND_NAME} discover",
             "```",
             "",
             "That reports the canonical repository identity, the active ticket and",
@@ -181,6 +191,228 @@ def sync_claude_activation(*, home: Path | None = None) -> str:
         raise ClaudeActivationError(f"Cannot write {path}: {exc}") from exc
 
     return "updated" if had_block else ("installed" if not existing else "inserted")
+
+
+# Command installation --------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LauncherStatus:
+    path: Path
+    state: str
+
+
+def resolve_command_directory(*, home: Path | None = None) -> Path:
+    """The user-owned command directory, so installation needs no admin rights."""
+    return _resolved_home(home) / ".local" / "bin"
+
+
+def _launcher_platform(platform: str | None = None) -> str:
+    if platform is None:
+        return "windows" if os.name == "nt" else "posix"
+    if platform not in {"posix", "windows"}:
+        raise ClaudeActivationError(
+            f"Unsupported launcher platform {platform!r}; expected 'posix' or 'windows'."
+        )
+    return platform
+
+
+# Every launcher name this installer has ever owned, so reinstalling can retire
+# the ones the current platform stopped using instead of letting them shadow it.
+_LAUNCHER_SUFFIXES = ("", ".ps1", ".cmd")
+
+
+def managed_launcher_names(platform: str) -> tuple[str, ...]:
+    """Git Bash resolves the extensionless script through its shebang; PowerShell
+    resolves the ``.ps1`` from PATH. Those two files cover both Windows shells."""
+    if platform == "windows":
+        return (AI_DEV_COMMAND_NAME, f"{AI_DEV_COMMAND_NAME}.ps1")
+    return (AI_DEV_COMMAND_NAME,)
+
+
+def render_posix_launcher(runtime_root: Path) -> str:
+    """POSIX/Git Bash launcher delegating to the shared interpreter selector."""
+    return "\n".join(
+        (
+            "#!/usr/bin/env bash",
+            f"# {LAUNCHER_OWNERSHIP_MARKER}",
+            f"# Managed by `{AI_DEV_COMMAND_NAME} install-command`; regenerate rather than edit.",
+            "set -euo pipefail",
+            "",
+            f"repo_root={shlex.quote(runtime_root.as_posix())}",
+            "",
+            'source "$repo_root/tools/bootstrap/python_select.sh"',
+            f'python_executable="$(ai_dev_select_python "{AI_DEV_COMMAND_NAME}")" || exit 1',
+            "",
+            "# Absolute entry-point path: sys.path[0] becomes the runtime's own directory,",
+            "# never whichever repository the caller happens to be standing in.",
+            'exec "$python_executable" "$repo_root/tools/claude/ai-dev-entry.py" "$@"',
+            "",
+        )
+    )
+
+
+def render_powershell_launcher(runtime_root: Path) -> str:
+    """PowerShell launcher using the same interpreter selection as Git Bash."""
+    return "\n".join(
+        (
+            f"# {LAUNCHER_OWNERSHIP_MARKER}",
+            f"# Managed by `{AI_DEV_COMMAND_NAME} install-command`; regenerate rather than edit.",
+            "$ErrorActionPreference = 'Stop'",
+            "$repoRoot = '{}'".format(str(runtime_root).replace("'", "''")),
+            ". (Join-Path $repoRoot 'tools\\bootstrap\\PythonSelection.ps1')",
+            f"$pythonExecutable = Resolve-AiDevPythonExecutable -CallerName '{AI_DEV_COMMAND_NAME}'",
+            "& $pythonExecutable (Join-Path $repoRoot 'tools\\claude\\ai-dev-entry.py') @args",
+            "exit $LASTEXITCODE",
+            "",
+        )
+    )
+
+
+def launcher_is_managed(path: Path) -> bool:
+    """Whether this exact file is one AI Dev wrote and may therefore replace."""
+    if path.is_symlink() or not path.is_file():
+        return False
+    try:
+        return LAUNCHER_OWNERSHIP_MARKER in path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _assert_launcher_replaceable(path: Path) -> None:
+    if not (path.exists() or path.is_symlink()):
+        return
+    if launcher_is_managed(path):
+        return
+    raise ClaudeActivationError(
+        f"Refusing to replace {path}: it exists but is not an AI Dev managed launcher. "
+        "Move it aside, then install again."
+    )
+
+
+def _retire_obsolete_launchers(
+    directory: Path, *, keep: tuple[str, ...]
+) -> tuple[LauncherStatus, ...]:
+    """Remove launchers this installer owns but no longer uses; touch nothing else."""
+    statuses: list[LauncherStatus] = []
+    for suffix in _LAUNCHER_SUFFIXES:
+        name = f"{AI_DEV_COMMAND_NAME}{suffix}"
+        if name in keep:
+            continue
+        path = directory / name
+        if not launcher_is_managed(path):
+            continue
+        try:
+            path.unlink()
+        except OSError as exc:
+            raise ClaudeActivationError(
+                f"Cannot remove obsolete launcher {path}: {exc}"
+            ) from exc
+        statuses.append(LauncherStatus(path, "removed"))
+    return tuple(statuses)
+
+
+def install_ai_dev_command(
+    *,
+    home: Path | None = None,
+    runtime_root: Path | None = None,
+    platform: str | None = None,
+) -> tuple[Path, tuple[LauncherStatus, ...]]:
+    """Put the documented command where a fresh shell will find it.
+
+    The runtime root is written into the launcher because the launcher lives
+    outside the checkout and has nothing else to resolve against. A moved or
+    re-cloned runtime is handled by installing again, never by a search path
+    that could bind the command to the wrong checkout.
+    """
+    resolved_platform = _launcher_platform(platform)
+    resolved_runtime = (
+        resolve_ai_dev_runtime_root()
+        if runtime_root is None
+        else runtime_root.expanduser().resolve()
+    )
+
+    entry_point = resolved_runtime / "tools" / "claude" / "ai-dev-entry.py"
+    if not entry_point.is_file():
+        raise ClaudeActivationError(
+            f"Cannot install the {AI_DEV_COMMAND_NAME} command: no Claude entry point at "
+            f"{entry_point}. Install from a complete AI Dev checkout."
+        )
+
+    directory = resolve_command_directory(home=home)
+    if directory.exists() and not directory.is_dir():
+        raise ClaudeActivationError(
+            f"Cannot install the {AI_DEV_COMMAND_NAME} command: {directory} exists and is not "
+            "a directory. Move it aside, then install again."
+        )
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ClaudeActivationError(f"Cannot create {directory}: {exc}") from exc
+
+    names = managed_launcher_names(resolved_platform)
+    contents = {
+        AI_DEV_COMMAND_NAME: render_posix_launcher(resolved_runtime),
+        f"{AI_DEV_COMMAND_NAME}.ps1": render_powershell_launcher(resolved_runtime),
+    }
+
+    # Validate every destination before writing any of them: a collision on the
+    # second file must not leave a half-installed command behind.
+    for name in names:
+        _assert_launcher_replaceable(directory / name)
+
+    statuses: list[LauncherStatus] = []
+    for name in names:
+        path = directory / name
+        desired = contents[name]
+        existed = path.is_file()
+        try:
+            current = path.read_text(encoding="utf-8") if existed else None
+        except (OSError, UnicodeDecodeError):
+            current = None
+        if current == desired:
+            statuses.append(LauncherStatus(path, "unchanged"))
+            continue
+        try:
+            write_text_atomic(path, desired)
+        except (JsonFileError, OSError) as exc:
+            raise ClaudeActivationError(f"Cannot write {path}: {exc}") from exc
+        if not name.endswith(".ps1"):
+            try:
+                path.chmod(0o755)
+            except OSError as exc:
+                raise ClaudeActivationError(f"Cannot make {path} executable: {exc}") from exc
+        statuses.append(LauncherStatus(path, "updated" if existed else "installed"))
+
+    statuses.extend(_retire_obsolete_launchers(directory, keep=names))
+    return directory, tuple(statuses)
+
+
+def command_directory_is_on_path(directory: Path, *, path_value: str | None = None) -> bool:
+    """Whether a fresh shell would resolve the command. Never mutates PATH."""
+    raw = os.environ.get("PATH", "") if path_value is None else path_value
+    target = os.path.normcase(os.path.normpath(str(directory)))
+    for entry in raw.split(os.pathsep):
+        candidate = entry.strip()
+        if not candidate:
+            continue
+        if os.path.normcase(os.path.normpath(os.path.expanduser(candidate))) == target:
+            return True
+    return False
+
+
+def install_claude_host_activation(
+    *, home: Path | None = None, runtime_root: Path | None = None
+) -> dict:
+    """The two halves of activation: the command, and the pointer that documents it."""
+    pointer_outcome = sync_claude_activation(home=home)
+    directory, launchers = install_ai_dev_command(home=home, runtime_root=runtime_root)
+    return {
+        "pointer": pointer_outcome,
+        "pointerPath": resolve_claude_instruction_path(home=home),
+        "commandDirectory": directory,
+        "launchers": launchers,
+    }
 
 
 def ensure_control_plane_cache(
@@ -281,13 +513,13 @@ def resolve_product_identity(repo_root: Path) -> ProductIdentity:
 # Authorization ---------------------------------------------------------------
 
 
-def resolve_authorized_rail(
-    cache: Path,
-    *,
-    project: str,
-    ticket: str,
-) -> RailState:
-    """Exactly one ready rail, using the existing deterministic rail reader."""
+def resolve_control_plane_source(cache: Path) -> ReadSource:
+    """The one deterministic read source every Claude-side read is served from.
+
+    Freshness is the shared reader's model, not a second one invented here: it
+    fetches the tracked upstream and serves the fetched revision when the cache
+    checkout is behind, without moving anything local.
+    """
     try:
         coordination = resolve_coordination_repo(cache)
     except ControlPlaneError as exc:
@@ -296,8 +528,25 @@ def resolve_authorized_rail(
         ) from exc
 
     try:
-        source = resolve_read_source(coordination)
-        states = collect_rail_states(source, project=project, ticket=ticket)
+        return resolve_read_source(coordination)
+    except ControlPlaneError as exc:
+        raise ClaudeActivationError(
+            f"Cannot read control-plane state from {cache}. {exc}"
+        ) from exc
+
+
+def resolve_authorized_rail(
+    cache: Path,
+    *,
+    project: str,
+    ticket: str,
+    source: ReadSource | None = None,
+) -> RailState:
+    """Exactly one ready rail, using the existing deterministic rail reader."""
+    resolved_source = resolve_control_plane_source(cache) if source is None else source
+
+    try:
+        states = collect_rail_states(resolved_source, project=project, ticket=ticket)
     except ControlPlaneError as exc:
         raise ClaudeActivationError(
             f"Cannot read control-plane scope {project}/{ticket}. {exc}"
@@ -384,16 +633,60 @@ def _coordination_git(cache: Path, arguments: list[str]) -> str:
     return completed.stdout.strip()
 
 
-def read_proceed_receipt(cache: Path, *, project: str, ticket: str) -> int:
+def read_proceed_receipt(
+    cache: Path,
+    *,
+    project: str,
+    ticket: str,
+    source: ReadSource | None = None,
+) -> int:
     """Current receipt value. A receipt is evidence of publication, never authority."""
+    resolved_source = resolve_control_plane_source(cache) if source is None else source
     try:
-        source = resolve_read_source(resolve_coordination_repo(cache))
-        return parse_proceed_sequence(source.read(proceed_sequence_relative(project, ticket)))
+        return parse_proceed_sequence(
+            resolved_source.read(proceed_sequence_relative(project, ticket))
+        )
     except ControlPlaneError as exc:
         raise ClaudeActivationError(f"Cannot read the proceed receipt: {exc}") from exc
 
 
 # Status ----------------------------------------------------------------------
+
+
+def _short_revision(cache: Path, revision: str) -> str:
+    if not revision:
+        return "unknown"
+    try:
+        return _coordination_git(cache, ["rev-parse", "--short", revision])
+    except ClaudeActivationError:
+        return revision[:7]
+
+
+def render_source_health(cache: Path, source: ReadSource) -> str:
+    """Name the revision the read was actually served from, not the local checkout.
+
+    The cache checkout deliberately stays put while reads follow the fetched
+    upstream. Reporting local HEAD as the source would name a revision the
+    executor never acted on, which is the one thing this line exists to prove.
+
+    ``ReadSource.head`` is the head of the state being served, so the checkout's
+    own position has to be read from Git to say honestly how far behind it is.
+    """
+    try:
+        checkout_head = _coordination_git(cache, ["rev-parse", "HEAD"])
+    except ClaudeActivationError:
+        checkout_head = ""
+    local = _short_revision(cache, checkout_head)
+
+    if source.revision is None:
+        return f"local cache at {local} (no coordination remote)"
+
+    served = _short_revision(cache, source.revision)
+    if source.revision == checkout_head:
+        return f"fetched upstream at {served} (cache checkout in sync)"
+    # resolve_read_source refuses ahead/diverged checkouts, so behind is the
+    # only way the served revision and the checkout can differ here.
+    return f"fetched upstream at {served} (cache checkout behind at {local})"
 
 
 def render_status(
@@ -435,15 +728,20 @@ def render_status(
         return "\n".join(lines)
 
     try:
-        head = _coordination_git(resolved_cache, ["rev-parse", "--short", "HEAD"])
-        lines.append(f"source     : cache at {head}")
+        source = resolve_control_plane_source(resolved_cache)
     except ClaudeActivationError as exc:
         lines.append(f"source     : UNAVAILABLE - {exc}")
+        lines.append("rail       : unknown until the control plane is reachable")
         return "\n".join(lines)
+
+    lines.append(f"source     : {render_source_health(resolved_cache, source)}")
 
     try:
         rail = resolve_authorized_rail(
-            resolved_cache, project=identity.project, ticket=identity.ticket
+            resolved_cache,
+            project=identity.project,
+            ticket=identity.ticket,
+            source=source,
         )
         lines.append(f"rail       : {rail.identifier} ({rail.status})")
     except ClaudeActivationError as exc:
@@ -451,7 +749,10 @@ def render_status(
 
     try:
         receipt = read_proceed_receipt(
-            resolved_cache, project=identity.project, ticket=identity.ticket
+            resolved_cache,
+            project=identity.project,
+            ticket=identity.ticket,
+            source=source,
         )
         lines.append(f"receipt    : proceed {receipt} (publication receipt only, not authorization)")
     except ClaudeActivationError as exc:
@@ -766,6 +1067,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "install-pointer", help="Insert or refresh the managed host-level activation block."
     )
 
+    subparsers.add_parser(
+        "install-command",
+        help=f"Install or refresh the user-owned {AI_DEV_COMMAND_NAME} command on PATH.",
+    )
+
     identity_parser = subparsers.add_parser(
         "identity", help="Resolve repository, project, and ticket identity only."
     )
@@ -815,6 +1121,18 @@ def main(argv: list[str] | None = None) -> int:
     if arguments.command == "install-pointer":
         outcome = sync_claude_activation()
         print(f"{outcome}: {resolve_claude_instruction_path()}")
+        return 0
+
+    if arguments.command == "install-command":
+        directory, launchers = install_ai_dev_command()
+        for launcher in launchers:
+            print(f"{launcher.state}: {launcher.path}")
+        if not command_directory_is_on_path(directory):
+            print(
+                f"warning: {directory} is not on PATH, so `{AI_DEV_COMMAND_NAME}` will not "
+                "resolve in a fresh shell. Add it to PATH in your shell profile.",
+                file=sys.stderr,
+            )
         return 0
 
     if arguments.repo_root:
