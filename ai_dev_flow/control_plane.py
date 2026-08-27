@@ -812,10 +812,6 @@ def _parse_rail_header(
     role = None
     if raw_role and raw_role.lower() != "none":
         role = validate_identifier(raw_role.lower(), label="rail role")
-    if role not in ("executor", "reviewer", "orchestrator"):
-        raise ControlPlaneError(
-            f"Rail '{rail_id}' has role '{role}'; expected a managed role."
-        )
     return status, depends_on, resource, role
 
 
