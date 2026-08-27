@@ -19,7 +19,11 @@ from __future__ import annotations
 # fully covered. If the person used Claude elsewhere between two readings, the
 # provider percentage rose for work the local counter never saw, and any rate
 # derived from that pair would be wrong in a direction nothing here can detect.
-# Incomplete coverage is therefore excluded from training outright.
+# Incomplete coverage is therefore excluded from training outright, and the
+# caller must state the same thing about the span between the anchor and now.
+# A fully covered reading whose percentage did not move is no new provider
+# information, so the next reading that did move trains across it rather than
+# starting from it.
 #
 # Third, one interval is one observation. It yields a `provisional` point and
 # says so. Two or more yield the empirical min/max of the rates actually seen --
@@ -31,8 +35,8 @@ from __future__ import annotations
 # with a stable reason. It never becomes zero, and an estimate that reaches the
 # top of the scale is still an estimate rather than confirmed exhaustion.
 
-from dataclasses import dataclass, field
-from decimal import Decimal
+from dataclasses import dataclass
+from decimal import ROUND_HALF_EVEN, Context, Decimal, localcontext
 from typing import Optional, Sequence, Tuple
 
 __all__ = [
@@ -43,13 +47,22 @@ __all__ = [
     "EvidenceInterval",
     "STALE_AFTER_SECONDS",
     "WINDOWS",
+    "WINDOW_SECONDS",
     "build_profile",
     "estimate_current",
 ]
 
 WINDOW_FIVE_HOUR = "five_hour"
 WINDOW_SEVEN_DAY = "seven_day"
-WINDOWS = (WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY)
+
+# A window kind names its own length, so a reset epoch further than that from
+# the reading cannot belong to the window the reading claims. Pairs rather than
+# a dict because this mapping is a constant and must not be edited in place.
+WINDOW_SECONDS = (
+    (WINDOW_FIVE_HOUR, 5 * 60 * 60),
+    (WINDOW_SEVEN_DAY, 7 * 24 * 60 * 60),
+)
+WINDOWS = tuple(name for name, _ in WINDOW_SECONDS)
 
 # Calibration older than this describes a conversion that may no longer hold.
 # Thirty-five days, expressed in seconds; the boundary itself is stale.
@@ -57,6 +70,13 @@ STALE_AFTER_SECONDS = 35 * 24 * 60 * 60
 
 PERCENT_FLOOR = Decimal("0")
 PERCENT_CEILING = Decimal("100")
+
+# Every rate and percentage is computed in this context rather than the ambient
+# one. `decimal` keeps its context in thread-local state that any caller can
+# change, so without this the same evidence produces different public numbers
+# depending on what else shares the process. This is calculation precision, not
+# a claim about what the provider or a display can resolve.
+_CALCULATION = Context(prec=28, rounding=ROUND_HALF_EVEN)
 
 # Health of an estimate.
 HEALTH_PROVISIONAL = "available-provisional"
@@ -71,6 +91,7 @@ REASON_STALE = "calibration-stale"
 REASON_WINDOW_RESET = "window-already-reset"
 REASON_ANCHOR_WINDOW_MISMATCH = "anchor-window-mismatch"
 REASON_ANCHOR_METER_MISMATCH = "anchor-meter-mismatch"
+REASON_CURRENT_COVERAGE_INCOMPLETE = "current-coverage-incomplete"
 REASON_TIME_PRECEDES_ANCHOR = "time-precedes-anchor"
 REASON_WORKLOAD_PRECEDES_ANCHOR = "workload-precedes-anchor"
 
@@ -78,6 +99,7 @@ REASON_WORKLOAD_PRECEDES_ANCHOR = "workload-precedes-anchor"
 REASON_INVALID_WINDOW = "invalid-window"
 REASON_INVALID_EPOCH = "invalid-epoch"
 REASON_OBSERVATION_AFTER_RESET = "observation-at-or-after-reset"
+REASON_RESET_BEYOND_WINDOW = "reset-beyond-named-window"
 REASON_INVALID_PERCENTAGE = "invalid-percentage"
 REASON_INVALID_WORKLOAD = "invalid-workload"
 REASON_INVALID_METER = "invalid-meter"
@@ -85,6 +107,7 @@ REASON_INVALID_COVERAGE = "invalid-coverage-flag"
 REASON_INVALID_POINT = "invalid-calibration-point"
 REASON_DUPLICATE_OBSERVATION = "duplicate-observation-epoch"
 REASON_MIXED_PROFILE = "mixed-window-or-meter"
+REASON_PERCENTAGE_DECREASED = "provider-percentage-decreased"
 
 
 class AllowanceError(Exception):
@@ -146,6 +169,32 @@ def _exact_decimal(value: object, *, label: str, reason: str) -> Decimal:
     return converted
 
 
+def _exact_epoch(value: object, *, label: str) -> int:
+    """An exact positive epoch.
+
+    Every public entry point that takes a time uses this, so a malformed clock
+    can never reach a comparison and come back as a confident answer. Zero and
+    negative are refused here rather than being left to fall out of an ordering
+    check as some other, less specific reason.
+    """
+    epoch = _exact_int(value, label=label, reason=REASON_INVALID_EPOCH)
+    if epoch <= 0:
+        raise AllowanceError(
+            REASON_INVALID_EPOCH, "{0} must be a positive epoch, got {1!r}".format(label, value)
+        )
+    return epoch
+
+
+def _window_seconds(window: str) -> int:
+    for name, seconds in WINDOW_SECONDS:
+        if name == window:
+            return seconds
+    raise AllowanceError(
+        REASON_INVALID_WINDOW,
+        "window '{0}' is not one of {1}".format(window, ", ".join(WINDOWS)),
+    )
+
+
 def _exact_text(value: object, *, label: str, reason: str) -> str:
     if type(value) is not str or not value.strip():
         raise AllowanceError(
@@ -182,16 +231,25 @@ class CalibrationPoint:
                 REASON_INVALID_WINDOW,
                 "window '{0}' is not one of {1}".format(self.window, ", ".join(WINDOWS)),
             )
-        observed = _exact_int(self.observed_at, label="observed_at", reason=REASON_INVALID_EPOCH)
-        resets = _exact_int(self.resets_at, label="resets_at", reason=REASON_INVALID_EPOCH)
-        if observed <= 0 or resets <= 0:
-            raise AllowanceError(REASON_INVALID_EPOCH, "epochs must be positive")
+        observed = _exact_epoch(self.observed_at, label="observed_at")
+        resets = _exact_epoch(self.resets_at, label="resets_at")
         if observed >= resets:
             # A reading taken at or after the reset belongs to a window that has
             # already turned over, so it identifies nothing usable.
             raise AllowanceError(
                 REASON_OBSERVATION_AFTER_RESET,
                 "observed_at {0} is not before resets_at {1}".format(observed, resets),
+            )
+        horizon = _window_seconds(self.window)
+        if resets - observed > horizon:
+            # The window kind names its own length. A reset further away than
+            # that belongs to some other window, and accepting it would let a
+            # dead window keep projecting long after it actually turned over.
+            raise AllowanceError(
+                REASON_RESET_BEYOND_WINDOW,
+                "a {0} reading at {1} cannot reset at {2}, {3}s away".format(
+                    self.window, observed, resets, resets - observed
+                ),
             )
 
         percentage = _exact_decimal(
@@ -288,8 +346,10 @@ def _interval(
         # Decimal delta still trains.
         return None
 
-    units_delta = later.workload_units - earlier.workload_units
-    percentage_delta = later.used_percentage - earlier.used_percentage
+    with localcontext(_CALCULATION):
+        units_delta = later.workload_units - earlier.workload_units
+        percentage_delta = later.used_percentage - earlier.used_percentage
+        rate = percentage_delta / units_delta
     return EvidenceInterval(
         window=later.window,
         meter=later.meter,
@@ -298,8 +358,33 @@ def _interval(
         ended_at=later.observed_at,
         units_delta=units_delta,
         percentage_delta=percentage_delta,
-        rate=percentage_delta / units_delta,
+        rate=rate,
     )
+
+
+def _refuse_decreasing_percentage(ordered: Tuple[CalibrationPoint, ...]) -> None:
+    """A provider percentage cannot fall inside one window.
+
+    Within a single reset identity the meter only climbs, so a fall is not a
+    reading this module may quietly route around: one of the two numbers is
+    wrong and nothing here can tell which. Skipping the pair would leave the bad
+    reading in place as the anchor of the next interval, so the whole profile is
+    refused instead.
+    """
+    for earlier, later in zip(ordered, ordered[1:]):
+        if earlier.reset_identity != later.reset_identity:
+            continue
+        if later.used_percentage < earlier.used_percentage:
+            raise AllowanceError(
+                REASON_PERCENTAGE_DECREASED,
+                "{0} fell from {1} at {2} to {3} at {4}".format(
+                    later.reset_identity,
+                    earlier.used_percentage,
+                    earlier.observed_at,
+                    later.used_percentage,
+                    later.observed_at,
+                ),
+            )
 
 
 @dataclass(frozen=True)
@@ -323,11 +408,16 @@ class CalibrationProfile:
     def maximum_rate(self) -> Optional[Decimal]:
         return max(self.rates) if self.intervals else None
 
-    def is_stale(self, now: int) -> bool:
-        """Calibration expires; the boundary itself counts as stale."""
+    def is_stale(self, now: object) -> bool:
+        """Calibration expires; the boundary itself counts as stale.
+
+        This is public, so it validates its own clock. A malformed time must not
+        be able to answer `False` here and be read as fresh calibration.
+        """
+        current = _exact_epoch(now, label="now")
         if self.newest_observed_at is None:
             return True
-        return (now - self.newest_observed_at) >= STALE_AFTER_SECONDS
+        return (current - self.newest_observed_at) >= STALE_AFTER_SECONDS
 
 
 def build_profile(points: Sequence[CalibrationPoint]) -> CalibrationProfile:
@@ -361,11 +451,27 @@ def build_profile(points: Sequence[CalibrationPoint]) -> CalibrationProfile:
         )
 
     ordered = _sorted_points(entries)
+    _refuse_decreasing_percentage(ordered)
+
     intervals = []
-    for earlier, later in zip(ordered, ordered[1:]):
-        found = _interval(earlier, later)
+    candidate = None
+    for reading in ordered:
+        if candidate is None or reading.reset_identity != candidate.reset_identity:
+            # The first reading of a window opens it. Its own coverage flag
+            # describes the span before this window and says nothing here.
+            candidate = reading
+            continue
+        if reading.complete_coverage and reading.used_percentage == candidate.used_percentage:
+            # A fully covered reading whose percentage did not move carries no new
+            # provider information. Keeping the candidate lets the next reading
+            # that did move train across the whole span it actually covers. Making
+            # this reading a boundary instead would throw away the workload before
+            # it and attribute the entire rise to the short segment after it.
+            continue
+        found = _interval(candidate, reading)
         if found is not None:
             intervals.append(found)
+        candidate = reading
 
     newest = max(interval.ended_at for interval in intervals) if intervals else None
     return CalibrationProfile(
@@ -438,23 +544,39 @@ def estimate_current(
     *,
     now: int,
     workload_units: object,
+    complete_coverage_since_anchor: bool,
 ) -> AllowanceEstimate:
     """Project the anchor forward by locally observed work, or refuse and say why.
 
     Never forecasts to the end of the window: that needs a rate over time, which
     one current estimate cannot establish. This answers "how much is spent now",
     and nothing else.
+
+    `complete_coverage_since_anchor` is required and has no default. Training
+    refuses any interval this manager did not fully cover; projecting the anchor
+    forward has exactly the same exposure, because use this manager never launched
+    raises the provider percentage without moving the local counter. The caller
+    is the only thing that knows, so it must say, and a caller that cannot say
+    gets `unavailable` rather than a confident number. `anchor.complete_coverage`
+    is not that answer: it describes the span ending at the anchor.
     """
     if type(profile) is not CalibrationProfile or type(anchor) is not CalibrationPoint:
         raise AllowanceError(
             REASON_INVALID_POINT, "an estimate consumes a CalibrationProfile and a CalibrationPoint"
         )
-    current_time = _exact_int(now, label="now", reason=REASON_INVALID_EPOCH)
+    current_time = _exact_epoch(now, label="now")
     current_units = _exact_decimal(
         workload_units, label="workload_units", reason=REASON_INVALID_WORKLOAD
     )
     if current_units < 0:
         raise AllowanceError(REASON_INVALID_WORKLOAD, "workload_units is negative")
+    if type(complete_coverage_since_anchor) is not bool:
+        raise AllowanceError(
+            REASON_INVALID_COVERAGE,
+            "complete_coverage_since_anchor must be a bool, got {0!r}".format(
+                complete_coverage_since_anchor
+            ),
+        )
 
     if not profile.intervals:
         return _unavailable(REASON_NO_INTERVAL, profile=profile, anchor=anchor)
@@ -472,10 +594,22 @@ def estimate_current(
         return _unavailable(REASON_WINDOW_RESET, profile=profile, anchor=anchor)
     if profile.is_stale(current_time):
         return _unavailable(REASON_STALE, profile=profile, anchor=anchor)
+    if not complete_coverage_since_anchor:
+        # Work this manager never saw would have moved the provider percentage
+        # without moving the local counter, so the projection would read low. Say
+        # nothing rather than a number that is wrong in a knowable direction.
+        return _unavailable(REASON_CURRENT_COVERAGE_INCOMPLETE, profile=profile, anchor=anchor)
 
-    delta = current_units - anchor.workload_units
+    with localcontext(_CALCULATION):
+        delta = current_units - anchor.workload_units
+        if len(profile.intervals) == 1:
+            projected = anchor.used_percentage + delta * profile.intervals[0].rate
+        else:
+            projected_lower = anchor.used_percentage + delta * profile.minimum_rate
+            projected_upper = anchor.used_percentage + delta * profile.maximum_rate
+
     if len(profile.intervals) == 1:
-        point, bounded = _bounded(anchor.used_percentage + delta * profile.intervals[0].rate)
+        point, bounded = _bounded(projected)
         return AllowanceEstimate(
             health=HEALTH_PROVISIONAL,
             reason=REASON_PROVISIONAL_SINGLE_INTERVAL,
@@ -488,8 +622,8 @@ def estimate_current(
             bounded=bounded,
         )
 
-    lower, lower_bounded = _bounded(anchor.used_percentage + delta * profile.minimum_rate)
-    upper, upper_bounded = _bounded(anchor.used_percentage + delta * profile.maximum_rate)
+    lower, lower_bounded = _bounded(projected_lower)
+    upper, upper_bounded = _bounded(projected_upper)
     return AllowanceEstimate(
         health=HEALTH_CALIBRATED,
         reason=REASON_CALIBRATED_RANGE,
