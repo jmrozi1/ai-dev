@@ -101,6 +101,25 @@ directions: an authoring defect corrected before a declared pass is not a
 failure of that pass, and a declared validation or expensive attempt does not
 become repeatable by describing its failure as a typo.
 
+The same discipline governs what a pass declares it will affect. When a negative
+control, mutation, or other deliberate-breakage pass states an exact set of tests
+it expects to fail, derive that set two ways and take both: from the prohibited
+behavioral invariant, and from searching the tests themselves for the exact text
+or construct the mutation will change, together with the assertions structurally
+coupled to it — those that index on, split around, or compare against that same
+text. Recalling which test names sound related to the behavior is not an
+enumeration method, because a test can assert the mutated construct without
+naming the idea at all.
+
+A failure caused directly by such a coupled assertion is inside the pass rather
+than outside it, but it still proves the declaration incomplete. Disclose the
+omission plainly instead of relabelling the extra failure unrelated or widening
+the original claim after seeing the result.
+
+Keep this proportional. A pass that claims no exact set owes no enumeration, and
+nothing here asks for a dependency analyzer, a mutation harness, a registry of
+controls, or any scoring of declarations.
+
 ## Size The Execution Rail To The Next Branch Point
 
 Build a rail only across work whose route is currently knowable.

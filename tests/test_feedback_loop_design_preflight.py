@@ -189,6 +189,54 @@ class FeedbackLoopDesignPreflightTests(unittest.TestCase):
             with self.subTest(task_specific=task_specific):
                 self.assertNotIn(task_specific, section)
 
+    # Declaring what a deliberate-breakage pass will affect
+
+    def test_an_exact_affected_set_is_derived_from_the_anchor_and_its_coupling(self) -> None:
+        section = self._section()
+        self.assertIn("exact set of tests", section)
+        self.assertIn("exact text", section)
+        self.assertIn("structurally coupled", section)
+
+    def test_the_behavioral_invariant_side_of_the_declaration_survives(self) -> None:
+        """Searching for the anchor is added to the invariant, never substituted for it."""
+        section = self._section()
+        self.assertIn("prohibited behavioral invariant", section)
+        self.assertIn("derive that set two ways", section)
+
+    def test_semantic_name_recall_is_rejected_as_an_enumeration_method(self) -> None:
+        section = self._section()
+        self.assertIn("sound related", section)
+        self.assertIn("is not an enumeration method", section)
+
+    def test_a_coupled_extra_failure_is_in_scope_and_still_disclosed(self) -> None:
+        section = self._section()
+        self.assertIn("inside the pass", section)
+        self.assertIn("proves the declaration incomplete", section)
+        self.assertIn("disclose the omission", section)
+        self.assertIn("relabelling the extra failure unrelated", section)
+
+    def test_a_pass_claiming_no_exact_set_owes_no_enumeration(self) -> None:
+        section = self._section()
+        self.assertIn("keep this proportional", section)
+        self.assertIn("claims no exact set owes no enumeration", section)
+
+    def test_the_declaration_rule_introduces_no_new_machinery(self) -> None:
+        section = self._section()
+        for machinery in ("dependency analyzer", "mutation harness", "registry of controls"):
+            with self.subTest(machinery=machinery):
+                self.assertIn(machinery, section)
+        for absent in ("mutation score", "control registry file", "declaration report"):
+            with self.subTest(absent=absent):
+                self.assertNotIn(absent, section)
+
+    def test_the_declaration_guidance_sits_inside_the_preflight_section(self) -> None:
+        """It is preflight discipline, not a separate stage with its own heading."""
+        headings = [line for line in self.raw.splitlines() if line.startswith("## ")]
+        self.assertEqual(headings.count(self.SECTION.replace("## ", "## ")), 1)
+        for invented in ("## Declare", "## Negative Control", "## Mutation"):
+            with self.subTest(invented=invented):
+                self.assertNotIn("\n" + invented, self.raw)
+
     # Preserved activation and existing rules
 
     def test_the_positive_activation_boundary_survives(self) -> None:
