@@ -463,6 +463,75 @@ def render_status(
 # Executor handoff publication ------------------------------------------------
 
 
+def _commit_is_on_remote(coordination: Path, *, branch: str, commit: str) -> bool:
+    """Whether the remote already contains a commit, after refreshing remote state."""
+    try:
+        _coordination_git(coordination, ["fetch", "--quiet", "origin"])
+        merge_base = subprocess.run(
+            ["git", "-C", str(coordination), "merge-base", "--is-ancestor", commit,
+             f"origin/{branch}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        return merge_base.returncode == 0
+    except ClaudeActivationError:
+        return False
+
+
+def _recover_after_failed_push(
+    coordination: Path,
+    *,
+    branch: str,
+    base_head: str,
+    push_error: Exception,
+) -> None:
+    """Leave the managed cache retryable after a failed push, or prove it published.
+
+    A push that reports failure may still have been accepted, so remote state is
+    read before anything local is undone. If the commit is genuinely absent from
+    the remote, only the commit this invocation created on top of ``base_head`` is
+    rolled back -- never unrelated local coordination work -- so an ordinary
+    ``ai-dev publish`` retry can re-discover authorization and succeed with no
+    manual Git repair.
+    """
+    current_head = _coordination_git(coordination, ["rev-parse", "HEAD"])
+
+    if _commit_is_on_remote(coordination, branch=branch, commit=current_head):
+        # The push raced: the remote has it. Durable publication must not be
+        # undone just because the client reported an error.
+        return
+
+    created_exactly_one = False
+    if current_head != base_head:
+        parents = _coordination_git(coordination, ["rev-list", "--parents", "-n", "1", current_head])
+        parts = parents.split()
+        created_exactly_one = len(parts) == 2 and parts[1] == base_head
+
+    if not created_exactly_one:
+        raise ClaudeActivationError(
+            f"Cannot publish the executor handoff: {push_error}. The coordination cache at "
+            f"{coordination} holds local commits this operation did not create, so it was "
+            "left untouched. Reconcile it before retrying."
+        )
+
+    try:
+        _coordination_git(coordination, ["reset", "--hard", base_head])
+    except ClaudeActivationError as reset_error:
+        raise ClaudeActivationError(
+            f"Cannot publish the executor handoff: {push_error}. Rolling the coordination "
+            f"cache back to {base_head} also failed ({reset_error}); repair {coordination} "
+            "before retrying."
+        ) from push_error
+
+    raise ClaudeActivationError(
+        f"Cannot publish the executor handoff: {push_error}. No receipt was consumed and "
+        "the coordination cache was rolled back, so rerunning the same ai-dev publish "
+        "command will retry cleanly."
+    ) from push_error
+
+
 def publish_executor_handoff(
     repo_root: Path,
     *,
@@ -505,6 +574,11 @@ def publish_executor_handoff(
     ticket = discovered["ticket"]
     coordination = resolve_coordination_repo(resolved_cache)
 
+    branch = _coordination_git(coordination, ["rev-parse", "--abbrev-ref", "HEAD"])
+    # Remembered so a failed push can undo exactly the commit this invocation
+    # created, and nothing else that happens to be in the cache.
+    base_head = _coordination_git(coordination, ["rev-parse", "HEAD"])
+
     # 2/3. Publish through the existing ownership rules; publish commits only.
     try:
         target, head = control_plane_publish(
@@ -524,8 +598,15 @@ def publish_executor_handoff(
     )
 
     # 4. Durable push. Publication is not complete until the remote has it.
-    branch = _coordination_git(coordination, ["rev-parse", "--abbrev-ref", "HEAD"])
-    _coordination_git(coordination, ["push", "origin", f"HEAD:{branch}"])
+    try:
+        _coordination_git(coordination, ["push", "origin", f"HEAD:{branch}"])
+    except ClaudeActivationError as push_error:
+        _recover_after_failed_push(
+            coordination,
+            branch=branch,
+            base_head=base_head,
+            push_error=push_error,
+        )
 
     # 5. Prove the remote actually serves the published content.
     _coordination_git(coordination, ["fetch", "--quiet", "origin"])
@@ -607,8 +688,34 @@ def resolve_posix_shell() -> str:
     )
 
 
+def resolve_ai_dev_runtime_root() -> Path:
+    """The AI Dev checkout that owns this runtime, whatever repository is being reviewed."""
+    return Path(__file__).resolve().parents[1]
+
+
+def resolve_review_evidence_helper() -> Path:
+    """Locate the canonical helper inside AI Dev, never inside the product repo.
+
+    A supported product repository deliberately has no AI Dev helper tree. The
+    helper already scopes its evidence to the current working directory, so it
+    only needs to be *launched* from AI Dev code and *run* in the product
+    repository.
+    """
+    helper = resolve_ai_dev_runtime_root() / REVIEW_EVIDENCE_RELATIVE
+    if not helper.is_file():
+        raise ClaudeActivationError(
+            f"Review evidence helper not found in the installed AI Dev runtime: {helper}. "
+            "Reinstall the AI Dev claude audience so the helper is available."
+        )
+    return helper
+
+
 def run_review_evidence(repo_root: Path, *, mode: str) -> int:
     """Invoke the canonical review-evidence helper with a real interpreter.
+
+    The helper comes from the AI Dev runtime that owns this module; the working
+    directory stays the product repository under review, which is what the helper
+    scopes its evidence to.
 
     The shared helper invokes ``python3``. On Windows that name can resolve to a
     store alias stub rather than an interpreter, which the helper then misreports
@@ -616,9 +723,7 @@ def run_review_evidence(repo_root: Path, *, mode: str) -> int:
     interpreter for the duration of the call instead of editing that helper,
     whose defect is owned elsewhere.
     """
-    helper = repo_root / REVIEW_EVIDENCE_RELATIVE
-    if not helper.is_file():
-        raise ClaudeActivationError(f"Review evidence helper not found: {helper}")
+    helper = resolve_review_evidence_helper()
 
     with tempfile.TemporaryDirectory() as shim_dir:
         shim = Path(shim_dir) / "python3"

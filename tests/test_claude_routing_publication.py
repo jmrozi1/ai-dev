@@ -318,10 +318,23 @@ class ReviewEvidenceRoutingTests(unittest.TestCase):
         self.assertNotIn("System32", resolved)
         self.assertTrue(Path(resolved).is_file())
 
-    def test_missing_helper_fails_closed(self) -> None:
+    def test_non_repository_working_directory_fails_closed(self) -> None:
+        """Helper resolution no longer depends on the reviewed directory.
+
+        A directory that is not a Git repository is the helper's own concern, and
+        it reports that rather than being mistaken for a missing helper.
+        """
         with tempfile.TemporaryDirectory() as tmp:
-            with self.assertRaises(ClaudeActivationError):
-                activation.run_review_evidence(Path(tmp), mode="checkpoint")
+            exit_code = activation.run_review_evidence(Path(tmp), mode="checkpoint")
+        self.assertNotEqual(exit_code, 0)
+
+    def test_missing_installed_helper_raises(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(
+                activation, "resolve_ai_dev_runtime_root", return_value=Path(tmp)
+            ):
+                with self.assertRaises(ClaudeActivationError):
+                    activation.run_review_evidence(REPO_ROOT, mode="checkpoint")
 
 
 class ChatGptDelegationTests(unittest.TestCase):
@@ -367,6 +380,233 @@ class ClaudeCommandSurfaceTests(unittest.TestCase):
         for command in ("status", "publish", "review-evidence", "discover", "identity"):
             with self.subTest(command=command):
                 self.assertIn(command, completed.stdout)
+
+
+class CrossProductReviewEvidenceTests(unittest.TestCase):
+    """Finding A: the helper lives in AI Dev; the CWD is the product repository."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmpdir.name)
+
+        # A supported product repository that deliberately has no AI Dev tree.
+        self.product = self.tmp_path / "product"
+        self.product.mkdir()
+        _git(self.product, "init", "--quiet")
+        _git(self.product, "config", "user.name", "Product")
+        _git(self.product, "config", "user.email", "product@example.com")
+        _git(self.product, "remote", "add", "origin",
+             "https://github.com/jmrozi1/family-dragonflight-server.git")
+        (self.product / "README.md").write_text("product\n", encoding="utf-8")
+        _git(self.product, "add", "-A")
+        _git(self.product, "commit", "--quiet", "-m", "initial")
+        (self.product / ".ai-dev").mkdir()
+        (self.product / ".ai-dev" / "workflow.json").write_text(
+            json.dumps({"mainBranch": "main", "scratchBranch": "scratch",
+                        "checkpoint": 19, "activeIssueNumber": 9}),
+            encoding="utf-8",
+        )
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def test_product_repository_has_no_ai_dev_helper_tree(self) -> None:
+        self.assertFalse((self.product / "skills").exists())
+        self.assertFalse(
+            (self.product / activation.REVIEW_EVIDENCE_RELATIVE).exists()
+        )
+
+    def test_helper_resolves_from_the_ai_dev_runtime_not_the_product(self) -> None:
+        helper = activation.resolve_review_evidence_helper()
+        self.assertTrue(helper.is_file())
+        self.assertEqual(helper, REPO_ROOT / activation.REVIEW_EVIDENCE_RELATIVE)
+        self.assertNotIn(str(self.product), str(helper))
+
+    def test_helper_is_launched_from_ai_dev_with_product_as_cwd(self) -> None:
+        captured = {}
+        helper = str(activation.resolve_review_evidence_helper())
+
+        def capture(args, **kwargs):
+            if isinstance(args, list) and helper in args:
+                captured["cwd"] = kwargs.get("cwd")
+                captured["args"] = args
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch.object(subprocess, "run", side_effect=capture):
+            activation.run_review_evidence(self.product, mode="checkpoint")
+
+        self.assertEqual(captured["cwd"], str(self.product))
+        self.assertIn(helper, captured["args"])
+        self.assertIn(str(REPO_ROOT), helper)
+
+    def test_evidence_scopes_the_product_repository_end_to_end(self) -> None:
+        """The helper really runs, and reports the product repo as its scope."""
+        completed = subprocess.run(
+            [sys.executable, str(REPO_ROOT / "tools" / "claude" / "ai-dev-entry.py"),
+             "review-evidence", "--mode", "checkpoint"],
+            cwd=str(self.product),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertIn("issue 9", completed.stdout)
+        self.assertIn("product", completed.stdout.replace("\\", "/"))
+        # No AI Dev tree was copied into the product repository.
+        self.assertFalse((self.product / "skills").exists())
+
+    def test_missing_installed_helper_fails_closed_without_product_artifacts(self) -> None:
+        with patch.object(
+            activation, "resolve_ai_dev_runtime_root", return_value=self.tmp_path / "absent"
+        ):
+            with self.assertRaises(ClaudeActivationError) as caught:
+                activation.run_review_evidence(self.product, mode="checkpoint")
+
+        self.assertIn("installed AI Dev runtime", str(caught.exception))
+        for relative in FORBIDDEN_FALLBACKS:
+            self.assertFalse((self.product / relative).exists())
+
+    def test_ai_dev_self_repository_case_is_preserved(self) -> None:
+        captured = {}
+        helper = str(activation.resolve_review_evidence_helper())
+
+        def capture(args, **kwargs):
+            if isinstance(args, list) and helper in args:
+                captured["cwd"] = kwargs.get("cwd")
+            return subprocess.CompletedProcess(args, 0, "", "")
+
+        with patch.object(subprocess, "run", side_effect=capture):
+            activation.run_review_evidence(REPO_ROOT, mode="checkpoint")
+
+        self.assertEqual(captured["cwd"], str(REPO_ROOT))
+
+
+class PushFailureRetryTests(_CoordinationFixture):
+    """Finding B: a failed push must leave the cache retryable, not stranded."""
+
+    def _fail_push_once(self):
+        real_git = activation._coordination_git
+        state = {"failed": False}
+
+        def maybe_fail(cache, arguments):
+            if arguments and arguments[0] == "push" and not state["failed"]:
+                state["failed"] = True
+                raise ClaudeActivationError("simulated push failure")
+            return real_git(cache, arguments)
+
+        return maybe_fail, state
+
+    def test_failed_push_consumes_no_receipt_and_publishes_nothing(self) -> None:
+        receipt_before = self._remote_receipt()
+        maybe_fail, _ = self._fail_push_once()
+
+        with patch.object(activation, "_coordination_git", side_effect=maybe_fail):
+            with self.assertRaises(ClaudeActivationError) as caught:
+                activation.publish_executor_handoff(
+                    self.product, content_file=self.handoff, cache=self.cache
+                )
+
+        self.assertIn("retry cleanly", str(caught.exception))
+        self.assertEqual(self._remote_receipt(), receipt_before)
+        with self.assertRaises(subprocess.CalledProcessError):
+            _git(self.remote, "show", "main:proj/issue-1/rails/the-rail/handoff.md")
+        self._assert_no_fallback_artifacts()
+
+    def test_cache_is_left_clean_and_not_ahead_of_upstream(self) -> None:
+        maybe_fail, _ = self._fail_push_once()
+        with patch.object(activation, "_coordination_git", side_effect=maybe_fail):
+            with self.assertRaises(ClaudeActivationError):
+                activation.publish_executor_handoff(
+                    self.product, content_file=self.handoff, cache=self.cache
+                )
+
+        self.assertEqual(_git(self.cache, "status", "--porcelain"), "")
+        ahead = _git(self.cache, "rev-list", "--count", "origin/main..HEAD")
+        self.assertEqual(ahead, "0", "cache is still ahead of upstream after rollback")
+
+    def test_ordinary_retry_succeeds_without_manual_git_repair(self) -> None:
+        maybe_fail, _ = self._fail_push_once()
+        with patch.object(activation, "_coordination_git", side_effect=maybe_fail):
+            with self.assertRaises(ClaudeActivationError):
+                activation.publish_executor_handoff(
+                    self.product, content_file=self.handoff, cache=self.cache
+                )
+
+        receipt_before = int(self._remote_receipt())
+
+        # Exactly the same supported call again. No git commands in between.
+        result = activation.publish_executor_handoff(
+            self.product, content_file=self.handoff, cache=self.cache
+        )
+
+        self.assertEqual(result["proceed"], receipt_before + 1)
+        self.assertIn(
+            "Status: completed",
+            _git(self.remote, "show", "main:proj/issue-1/rails/the-rail/handoff.md"),
+        )
+        self.assertEqual(int(self._remote_receipt()), receipt_before + 1)
+
+    def test_push_reported_failure_but_remote_accepted_it_is_not_rolled_back(self) -> None:
+        """The race: the client errored, yet the commit really did land."""
+        real_git = activation._coordination_git
+
+        def push_then_report_failure(cache, arguments):
+            if arguments and arguments[0] == "push":
+                real_git(cache, arguments)  # the push actually succeeds
+                raise ClaudeActivationError("simulated transport error after acceptance")
+            return real_git(cache, arguments)
+
+        with patch.object(activation, "_coordination_git", side_effect=push_then_report_failure):
+            result = activation.publish_executor_handoff(
+                self.product, content_file=self.handoff, cache=self.cache
+            )
+
+        # Durable publication was preserved, not destroyed, and verification still
+        # gated the receipt.
+        self.assertIn(
+            "Status: completed",
+            _git(self.remote, "show", "main:proj/issue-1/rails/the-rail/handoff.md"),
+        )
+        self.assertEqual(result["proceed"], 5)
+
+    def test_unrelated_local_coordination_work_is_never_discarded(self) -> None:
+        unrelated = self.cache / "proj" / "issue-1" / "unrelated.md"
+        unrelated.write_text("someone else's work\n", encoding="utf-8")
+        _git(self.cache, "add", "-A")
+        _git(self.cache, "commit", "--quiet", "-m", "unrelated local work")
+        unrelated_head = _git(self.cache, "rev-parse", "HEAD")
+
+        maybe_fail, _ = self._fail_push_once()
+        with patch.object(activation, "_coordination_git", side_effect=maybe_fail):
+            with self.assertRaises(ClaudeActivationError):
+                activation.publish_executor_handoff(
+                    self.product, content_file=self.handoff, cache=self.cache
+                )
+
+        # Only this invocation's commit may be undone; the unrelated commit stays.
+        self.assertEqual(_git(self.cache, "rev-parse", "HEAD"), unrelated_head)
+        self.assertTrue(unrelated.is_file())
+
+    def test_allocator_rejection_still_leaves_durable_publication(self) -> None:
+        from ai_dev_flow.control_plane import ControlPlaneError
+
+        with patch.object(
+            activation, "allocate_proceed_number",
+            side_effect=ControlPlaneError("compare-and-swap exhausted"),
+        ):
+            with self.assertRaises(ClaudeActivationError) as caught:
+                activation.publish_executor_handoff(
+                    self.product, content_file=self.handoff, cache=self.cache
+                )
+
+        self.assertIn("published and durable", str(caught.exception))
+        self.assertIn(
+            "Status: completed",
+            _git(self.remote, "show", "main:proj/issue-1/rails/the-rail/handoff.md"),
+        )
+        # A retry must not fabricate or locally count a receipt.
+        self._assert_no_fallback_artifacts()
 
 
 if __name__ == "__main__":
