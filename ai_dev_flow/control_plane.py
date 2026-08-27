@@ -476,20 +476,29 @@ def active_git_operation(repo_root: Path) -> str | None:
     return None
 
 
-def worktree_is_clean(repo_root: Path) -> bool:
-    """Report whether the checkout carries no staged, unstaged, or untracked change."""
-    completed = _git_capture(repo_root, ["status", "--porcelain", "--untracked-files=all"])
+def tracked_content_is_clean(repo_root: Path) -> bool:
+    """Report whether the checkout carries no staged or modified tracked content.
+
+    Untracked files are deliberately excluded. The coordination checkout is shared
+    across products, so an untracked artifact one product has not published yet is
+    not this product's to clear, and nothing about it is at stake in a fast-forward.
+    Git itself still refuses a fast-forward that would overwrite an untracked path.
+    """
+    completed = _git_capture(repo_root, ["status", "--porcelain", "--untracked-files=no"])
     if completed.returncode != 0:
         raise ControlPlaneError(f"Cannot inspect the coordination checkout: {completed.stderr.strip()}")
     return not completed.stdout.strip()
 
 
 def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, remote_head: str) -> None:
-    """Fast-forward a clean, strictly behind branch onto freshly fetched upstream state.
+    """Fast-forward a strictly behind branch onto freshly fetched upstream state.
 
-    This is the one unambiguous case: nothing local is at stake, so requiring a human
-    to type the same fast-forward adds no judgment. Every other shape still fails
+    This is the one unambiguous case: no tracked local work is at stake, so requiring a
+    human to type the same fast-forward adds no judgment. Every other shape still fails
     closed, and the advance itself is fast-forward only, never a rebase, merge, or reset.
+    Untracked files are left exactly as they are: they are never cleared, moved, stashed,
+    staged, or committed here, and Git's own ff-only refusal covers the case where an
+    upstream change would collide with one.
     """
     operation = active_git_operation(repo_root)
     if operation is not None:
@@ -497,11 +506,11 @@ def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, r
             f"Cannot publish: coordination upstream {upstream} is ahead of {branch}, but a Git "
             f"operation ({operation}) is in progress. Finish or abort it, then republish."
         )
-    if not worktree_is_clean(repo_root):
+    if not tracked_content_is_clean(repo_root):
         raise ControlPlaneError(
             f"Cannot publish: coordination upstream {upstream} is ahead of {branch}, but the "
-            "coordination checkout has uncommitted or untracked changes. Clear them, then "
-            "republish."
+            "coordination checkout has staged or modified tracked content. Commit or restore "
+            "that tracked content, then republish."
         )
 
     advanced = _git_capture(repo_root, ["merge", "--ff-only", "--quiet", upstream])
@@ -520,8 +529,9 @@ def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, r
 def ensure_publishable(repo_root: Path) -> str:
     """Freshly resolve remote state and refuse to publish onto stale history.
 
-    A clean, strictly behind branch is reconciled by fast-forward first, so publication
-    lands on the freshly resolved upstream state rather than on stale history.
+    A strictly behind branch with no staged or modified tracked content is reconciled by
+    fast-forward first, so publication lands on the freshly resolved upstream state rather
+    than on stale history.
     """
     branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
     upstream = _tracked_upstream(repo_root, branch) if branch and branch != "HEAD" else None

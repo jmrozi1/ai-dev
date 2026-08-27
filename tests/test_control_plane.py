@@ -205,20 +205,132 @@ class ControlPlaneTests(unittest.TestCase):
 
         with self.assertRaises(ControlPlaneError) as caught:
             self._publish(artifact="handoff", role="executor", content="# Handoff\n")
-        self.assertIn("uncommitted or untracked changes", str(caught.exception))
+        self.assertIn("staged or modified tracked content", str(caught.exception))
+        self.assertNotIn("untracked", str(caught.exception))
         self.assertEqual(resolve_current_head(self.coordination), local_head)
         self.assertFalse((self.coordination / "remote-change.txt").exists())
 
-    def test_untracked_file_blocks_automatic_reconciliation(self) -> None:
-        upstream = self._attach_shared_upstream("upstream-behind-untracked")
+    def test_staged_tracked_content_blocks_automatic_reconciliation(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-staged")
         self._advance_upstream(upstream)
-        (self.coordination / "stray.txt").write_text("stray\n", encoding="utf-8")
+        (self.coordination / "README.md").write_text("staged edit\n", encoding="utf-8")
+        self._git(self.coordination, "add", "--", "README.md")
         local_head = resolve_current_head(self.coordination)
 
         with self.assertRaises(ControlPlaneError) as caught:
             self._publish(artifact="handoff", role="executor", content="# Handoff\n")
-        self.assertIn("uncommitted or untracked changes", str(caught.exception))
+        self.assertIn("staged or modified tracked content", str(caught.exception))
         self.assertEqual(resolve_current_head(self.coordination), local_head)
+        self.assertFalse((self.coordination / "remote-change.txt").exists())
+
+    # One stranded product artifact must not block another product's publication.
+
+    WOW_HANDOFF = "family-dragonflight-server/issue-9/rails/issue-9-o-proc/handoff.md"
+    WOW_BYTES = "# Handoff\n\nstranded Phase-B investigation\n"
+
+    def _strand_foreign_handoff(self, relative: str | None = None) -> Path:
+        """Leave another product's unpublished handoff untracked in the shared cache."""
+        target = self.coordination / (relative or self.WOW_HANDOFF)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.WOW_BYTES, encoding="utf-8")
+        return target
+
+    def test_unrelated_untracked_handoff_does_not_block_safe_fast_forward(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-foreign-untracked")
+        self._advance_upstream(upstream)
+        remote_head = self._git(upstream, "rev-parse", "HEAD")
+        stranded = self._strand_foreign_handoff()
+
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nbehind\n")
+
+        self.assertEqual(self._git(self.coordination, "rev-parse", "HEAD~1"), remote_head)
+        self.assertTrue((self.coordination / "remote-change.txt").exists())
+        self.assertEqual(stranded.read_text(encoding="utf-8"), self.WOW_BYTES)
+
+    def test_publication_after_reconciliation_commits_only_its_own_artifact(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-foreign-isolation")
+        self._advance_upstream(upstream)
+        stranded = self._strand_foreign_handoff()
+
+        _, head = self._publish(artifact="handoff", role="executor", content="# Handoff\n\nmine\n")
+
+        committed = self._git(self.coordination, "show", "--name-only", "--format=", head).split()
+        self.assertEqual(committed, ["ai-dev/issue-51/rails/control-plane-surface/handoff.md"])
+        # The foreign handoff is still the other product's to publish: untracked and unchanged.
+        self.assertEqual(
+            self._git(self.coordination, "status", "--porcelain", "--untracked-files=all"),
+            f"?? {self.WOW_HANDOFF}",
+        )
+        self.assertEqual(stranded.read_text(encoding="utf-8"), self.WOW_BYTES)
+
+    def test_stranded_untracked_target_publishes_after_safe_fast_forward(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-stranded-target")
+        self._advance_upstream(upstream)
+        remote_head = self._git(upstream, "rev-parse", "HEAD")
+        # The publication target itself is the stranded untracked artifact.
+        target_relative = "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
+        self._strand_foreign_handoff(target_relative)
+
+        target, head = self._publish(artifact="handoff", role="executor", content="# Handoff\n\nrecovered\n")
+
+        self.assertEqual(self._git(self.coordination, "rev-parse", "HEAD~1"), remote_head)
+        self.assertEqual(target.read_text(encoding="utf-8"), "# Handoff\n\nrecovered\n")
+        self.assertEqual(
+            self._git(self.coordination, "show", "--name-only", "--format=", head).split(),
+            [target_relative],
+        )
+
+    def test_upstream_collision_with_untracked_path_fails_closed_and_keeps_bytes(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-behind-collision")
+        # Upstream now publishes the very path the local cache holds untracked.
+        contested = upstream / self.WOW_HANDOFF
+        contested.parent.mkdir(parents=True, exist_ok=True)
+        contested.write_text("# Handoff\n\nupstream version\n", encoding="utf-8")
+        self._git(upstream, "add", "--", self.WOW_HANDOFF)
+        self._git(upstream, "commit", "-q", "-m", "upstream publishes the contested path")
+        stranded = self._strand_foreign_handoff()
+        local_head = resolve_current_head(self.coordination)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+
+        self.assertIn("could not be fast-forwarded", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), local_head)
+        # Git refused; the preserved local bytes survive untouched.
+        self.assertEqual(stranded.read_text(encoding="utf-8"), self.WOW_BYTES)
+
+    def test_reconciliation_introduces_no_destructive_git_verb(self) -> None:
+        """Reconciliation stays ordinary ff-only Git: no stash, move, delete, or broad add."""
+        upstream = self._attach_shared_upstream("upstream-behind-verbs")
+        self._advance_upstream(upstream)
+        self._strand_foreign_handoff()
+        observed: list[list[str]] = []
+        real_capture = control_plane._git_capture
+        real_git = control_plane._git
+
+        def record_capture(repo_root, arguments, **kwargs):  # type: ignore[no-untyped-def]
+            observed.append(list(arguments))
+            return real_capture(repo_root, arguments, **kwargs)
+
+        def record_git(repo_root, arguments, **kwargs):  # type: ignore[no-untyped-def]
+            observed.append(list(arguments))
+            return real_git(repo_root, arguments, **kwargs)
+
+        with patch.object(control_plane, "_git_capture", side_effect=record_capture), \
+                patch.object(control_plane, "_git", side_effect=record_git):
+            self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+
+        verbs = {arguments[0] for arguments in observed if arguments}
+        for forbidden in ("stash", "mv", "rm", "clean", "reset", "rebase", "checkout", "restore", "push"):
+            self.assertNotIn(forbidden, verbs)
+        merges = [arguments for arguments in observed if arguments and arguments[0] == "merge"]
+        self.assertTrue(all("--ff-only" in arguments for arguments in merges))
+        # Every stage is path-scoped to the owned artifact; nothing sweeps the tree.
+        owned = ["ai-dev/issue-51/rails/control-plane-surface/handoff.md"]
+        for arguments in observed:
+            if arguments and arguments[0] == "add":
+                self.assertIn("--", arguments)
+                self.assertEqual(arguments[arguments.index("--") + 1:], owned)
 
     def test_active_git_operation_blocks_automatic_reconciliation(self) -> None:
         upstream = self._attach_shared_upstream("upstream-behind-mid-operation")
