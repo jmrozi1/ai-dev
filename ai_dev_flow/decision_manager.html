@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--CONTENT-SECURITY-POLICY-->
+<title>Decision queue</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --ink: #16181d;
+  --muted: #5c6270;
+  --line: #e2e5ea;
+  --rule: #cfd4dc;
+  --sel-bg: #eef3ff;
+  --sel-edge: #2f5fd0;
+  --fail: #a4232b;
+  --focus: #2f5fd0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --ink: #e9ebef;
+    --muted: #a0a6b3;
+    --line: #262a31;
+    --rule: #333842;
+    --sel-bg: #1b2438;
+    --sel-edge: #6d94ee;
+    --fail: #ff8e93;
+    --focus: #6d94ee;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+.app {
+  display: grid;
+  grid-template-columns: minmax(320px, 4fr) minmax(360px, 5fr);
+  height: 100vh;
+}
+.queue {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--rule);
+}
+.filters {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+  margin: 0;
+  padding: 14px 20px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+}
+.filters legend { padding: 0; font-weight: 600; }
+.filters label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 16px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.row[aria-selected="true"] {
+  background: var(--sel-bg);
+  box-shadow: inset 3px 0 0 var(--sel-edge);
+}
+.row-title { font-weight: 600; }
+.row-elapsed { color: var(--muted); font-variant-numeric: tabular-nums; }
+.row-context { grid-column: 1 / -1; color: var(--muted); font-size: 13px; }
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 22px 26px;
+  overflow-y: auto;
+  min-height: 0;
+}
+.explanation { margin: 0; max-width: 68ch; }
+.response { display: flex; flex-direction: column; gap: 8px; max-width: 68ch; }
+.response label { font-weight: 600; }
+textarea {
+  width: 100%;
+  min-height: 132px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+textarea:focus-visible, summary:focus-visible, button:focus-visible, input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.response-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.hint { margin: 0; color: var(--muted); font-size: 13px; }
+button {
+  padding: 8px 18px;
+  border: 1px solid var(--sel-edge);
+  border-radius: 6px;
+  background: var(--sel-edge);
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+button[disabled] { background: transparent; color: var(--muted); border-color: var(--rule); cursor: default; }
+.failure { margin: 0; color: var(--fail); font-weight: 600; }
+.quiet { margin: 0; color: var(--muted); }
+details summary { cursor: pointer; font-weight: 600; }
+.evidence { margin: 10px 0 0; padding-left: 20px; }
+.evidence li { margin-bottom: 4px; }
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="queue">
+    <fieldset class="filters">
+      <legend>Agents</legend>
+      <label for="filter-waiting"><input type="checkbox" id="filter-waiting" data-state="waiting" checked> Waiting</label>
+      <label for="filter-running"><input type="checkbox" id="filter-running" data-state="running"> Running</label>
+      <label for="filter-disconnected"><input type="checkbox" id="filter-disconnected" data-state="disconnected"> Disconnected</label>
+    </fieldset>
+    <ul class="rows" id="rows" role="listbox" aria-label="Decision queue" tabindex="0"></ul>
+    <p class="quiet" id="queue-empty" hidden>Nothing is waiting.</p>
+  </aside>
+
+  <section class="detail" id="detail" aria-label="Selected decision">
+    <p class="explanation" id="explanation"></p>
+
+    <form class="response" id="response">
+      <label for="response-input">Response</label>
+      <textarea id="response-input" aria-describedby="response-hint"></textarea>
+      <p class="failure" id="response-failure" role="alert" hidden></p>
+      <div class="response-actions">
+        <p class="hint" id="response-hint">Enter sends. Shift+Enter adds a newline.</p>
+        <button type="submit" id="send">Send</button>
+      </div>
+    </form>
+
+    <details id="details">
+      <summary>Details</summary>
+      <ul class="evidence" id="evidence"></ul>
+    </details>
+  </section>
+</div>
+
+<script type="application/json" id="queue-payload"><!--QUEUE-PAYLOAD--></script>
+<script>
+(function () {
+  "use strict";
+
+  var payload = JSON.parse(document.getElementById("queue-payload").textContent);
+
+  // The rows arrive oldest first from the accepted projection. Nothing here
+  // sorts, so "the oldest visible row" is simply the first one that passes the
+  // filter -- there is no second ordering rule to disagree with the first.
+  var items = payload.rows.slice();
+  var filters = {};
+  payload.states.forEach(function (state) {
+    filters[state] = payload.defaultFilters.indexOf(state) !== -1;
+  });
+  var selectedId = null;
+
+  var rowsEl = document.getElementById("rows");
+  var emptyEl = document.getElementById("queue-empty");
+  var detailEl = document.getElementById("detail");
+  var explanationEl = document.getElementById("explanation");
+  var inputEl = document.getElementById("response-input");
+  var failureEl = document.getElementById("response-failure");
+  var sendEl = document.getElementById("send");
+  var detailsEl = document.getElementById("details");
+  var evidenceEl = document.getElementById("evidence");
+
+  function visible() {
+    return items.filter(function (item) { return filters[item.state]; });
+  }
+
+  function elapsedLabel(seconds) {
+    if (seconds < 60) { return seconds + "s"; }
+    if (seconds < 3600) { return Math.floor(seconds / 60) + "m"; }
+    if (seconds < 86400) { return Math.floor(seconds / 3600) + "h"; }
+    return Math.floor(seconds / 86400) + "d";
+  }
+
+  function clearFailure() {
+    failureEl.hidden = true;
+    failureEl.textContent = "";
+  }
+
+  function renderRows(list) {
+    while (rowsEl.firstChild) { rowsEl.removeChild(rowsEl.firstChild); }
+    list.forEach(function (item) {
+      var row = document.createElement("li");
+      row.className = "row";
+      row.id = "row-" + list.indexOf(item);
+      row.setAttribute("role", "option");
+      row.setAttribute("tabindex", "-1");
+      row.setAttribute("data-item-id", item.itemId);
+      row.setAttribute("aria-selected", item.itemId === selectedId ? "true" : "false");
+
+      var title = document.createElement("span");
+      title.className = "row-title";
+      title.textContent = item.title;
+
+      var elapsed = document.createElement("span");
+      elapsed.className = "row-elapsed";
+      elapsed.textContent = elapsedLabel(item.elapsedSeconds);
+
+      var context = document.createElement("span");
+      context.className = "row-context";
+      context.textContent = item.project + " · " + item.ticket;
+
+      row.appendChild(title);
+      row.appendChild(elapsed);
+      row.appendChild(context);
+      row.addEventListener("click", function () { select(item.itemId); });
+      rowsEl.appendChild(row);
+    });
+  }
+
+  function renderDetail(list) {
+    var item = null;
+    list.forEach(function (candidate) {
+      if (candidate.itemId === selectedId) { item = candidate; }
+    });
+
+    if (item === null) {
+      detailEl.hidden = true;
+      emptyEl.hidden = list.length !== 0;
+      return;
+    }
+    detailEl.hidden = false;
+    emptyEl.hidden = true;
+
+    var detail = payload.details[item.itemId];
+    var waiting = detail.explanation !== null && detail.explanation !== undefined;
+
+    explanationEl.textContent = waiting ? detail.explanation : "";
+    explanationEl.hidden = !waiting;
+
+    // Send belongs to a decision a person was asked to make. An operational row
+    // is inspectable, and that is all it is.
+    sendEl.disabled = !waiting;
+    inputEl.disabled = !waiting;
+
+    while (evidenceEl.firstChild) { evidenceEl.removeChild(evidenceEl.firstChild); }
+    detail.evidence.forEach(function (reference) {
+      var entry = document.createElement("li");
+      entry.textContent = reference.label + ": " + reference.locator;
+      evidenceEl.appendChild(entry);
+    });
+    detailsEl.open = false;
+  }
+
+  function render() {
+    var list = visible();
+    var stillVisible = list.some(function (item) { return item.itemId === selectedId; });
+    if (!stillVisible) {
+      selectedId = list.length ? list[0].itemId : null;
+    }
+    renderRows(list);
+    renderDetail(list);
+  }
+
+  function select(itemId) {
+    if (itemId === selectedId) { return; }
+    selectedId = itemId;
+    clearFailure();
+    inputEl.value = "";
+    render();
+  }
+
+  function submit() {
+    if (sendEl.disabled) { return; }
+    var response = inputEl.value;
+    if (response.trim() === "") {
+      failureEl.textContent = "Type a response before sending.";
+      failureEl.hidden = false;
+      inputEl.focus();
+      return;
+    }
+
+    // Fixture behavior only. The response is not stored, not transmitted, and
+    // there is no endpoint that could receive it; the item simply leaves this
+    // page's memory. Nothing here may claim the decision was delivered.
+    var index = -1;
+    items.forEach(function (item, position) {
+      if (item.itemId === selectedId) { index = position; }
+    });
+    if (index !== -1) { items.splice(index, 1); }
+
+    selectedId = null;
+    inputEl.value = "";
+    clearFailure();
+    render();
+  }
+
+  payload.states.forEach(function (state) {
+    var box = document.getElementById("filter-" + state);
+    box.addEventListener("change", function () {
+      filters[state] = box.checked;
+      render();
+    });
+  });
+
+  inputEl.addEventListener("keydown", function (event) {
+    if (event.key !== "Enter" || event.shiftKey) { return; }
+    event.preventDefault();
+    submit();
+  });
+
+  document.getElementById("response").addEventListener("submit", function (event) {
+    event.preventDefault();
+    submit();
+  });
+
+  render();
+})();
+</script>
+</body>
+</html>
