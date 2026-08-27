@@ -42,6 +42,8 @@ from ai_dev_flow.session_binding import (
     BINDING_STATE_BOUND,
     BINDING_STATE_RESERVED,
     BINDING_STATE_UNBOUND,
+    BINDING_STATES,
+    NONTERMINAL_BINDING_STATES,
 )
 
 PROJECT = "ai-dev"
@@ -335,6 +337,79 @@ class ExactInvocationIdentityTests(OutcomeTestBase):
     def test_an_empty_session_id_is_refused(self) -> None:
         error = self.refused(outcome=invocation_outcome(session_id="   "))
         self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_SHAPE)
+
+
+# --------------------------------------------------------------------------
+# Terminality is an allowlist, never "absent from today's nonterminal set"
+# --------------------------------------------------------------------------
+
+
+class ExactTerminalStateTests(OutcomeTestBase):
+    """Only the canonical `unbound` proves a session finished.
+
+    A denylist would let an unknown state through as terminal, and an unknown
+    state is unproven -- the one thing a reconciliation gate may not assume.
+    """
+
+    def test_the_canonical_terminal_state_succeeds(self) -> None:
+        report = self.run_outcome(outcome=invocation_outcome(binding_state=BINDING_STATE_UNBOUND))
+        self.assertTrue(report.reconciled)
+
+    def test_the_canonical_vocabulary_still_has_exactly_one_terminal_state(self) -> None:
+        """If a second terminal state ever lands, this gate must be revisited, not guessed."""
+        terminal = [s for s in BINDING_STATES if s not in NONTERMINAL_BINDING_STATES]
+        self.assertEqual(terminal, [BINDING_STATE_UNBOUND])
+
+    def test_a_nonterminal_state_cannot_establish_terminality(self) -> None:
+        for state in (BINDING_STATE_RESERVED, BINDING_STATE_BOUND):
+            with self.subTest(state=state):
+                error = self.refused(outcome=invocation_outcome(binding_state=state))
+                self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_NONTERMINAL)
+
+    def test_an_unrecognized_state_is_unproven_rather_than_terminal(self) -> None:
+        for state in ("completed", "terminated", "gone", "garbage", "done", "finished", "closed"):
+            with self.subTest(state=state):
+                error = self.refused(outcome=invocation_outcome(binding_state=state))
+                self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_NONTERMINAL)
+                self.assertNotIn(state, NONTERMINAL_BINDING_STATES)
+
+    def test_a_whitespace_decorated_or_recased_state_is_not_the_canonical_one(self) -> None:
+        for state in (" unbound", "unbound ", "\tunbound", "unbound\n", "UNBOUND", "Unbound"):
+            with self.subTest(state=state):
+                error = self.refused(outcome=invocation_outcome(binding_state=state))
+                self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_NONTERMINAL)
+
+    def test_an_empty_or_whitespace_state_is_refused(self) -> None:
+        for state in ("", "   ", "\t", "\n"):
+            with self.subTest(state=state):
+                error = self.refused(outcome=invocation_outcome(binding_state=state))
+                self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_NONTERMINAL)
+
+    def test_a_non_string_state_is_refused(self) -> None:
+        for state in (None, 0, 1, True, object(), ["unbound"], ("unbound",)):
+            with self.subTest(state=state):
+                error = self.refused(outcome=invocation_outcome(binding_state=state))
+                self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_NONTERMINAL)
+
+    def test_a_string_subclass_cannot_pass_as_the_canonical_state(self) -> None:
+        """It compares equal and formats identically; it was still never carried."""
+
+        class BindingState(str):
+            pass
+
+        substitute = BindingState(BINDING_STATE_UNBOUND)
+        self.assertEqual(substitute, BINDING_STATE_UNBOUND)
+        error = self.refused(outcome=invocation_outcome(binding_state=substitute))
+        self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_NONTERMINAL)
+
+    def test_the_refusal_precedes_any_durable_reason_evaluation(self) -> None:
+        """A later gate would also refuse; the terminal-state one must answer first."""
+        error = self.refused(
+            outcome=invocation_outcome(binding_state="garbage"),
+            after=self.after(None),
+        )
+        self.assertEqual(error.reason, outcome_module.REASON_OUTCOME_NONTERMINAL)
+        self.assertNotEqual(error.reason, outcome_module.REASON_SOURCE_RAIL_MISSING)
 
 
 # --------------------------------------------------------------------------

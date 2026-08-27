@@ -50,7 +50,7 @@ from .orchestrator_trigger import (
     ScopeSnapshot,
     WakeProposal,
 )
-from .session_binding import NONTERMINAL_BINDING_STATES
+from .session_binding import BINDING_STATE_UNBOUND
 
 __all__ = [
     "OutcomeError",
@@ -215,11 +215,16 @@ def _require_exact_invocation(
     state = _exact_text(
         outcome.binding_state, label="binding state", reason=REASON_OUTCOME_NONTERMINAL
     )
-    if state in NONTERMINAL_BINDING_STATES:
+    if state != BINDING_STATE_UNBOUND:
+        # An allowlist, not a denylist. "Absent from today's nonterminal set" would
+        # let an unknown state through as terminal, and an unknown state is
+        # unproven -- which is the one thing a reconciliation gate may not assume.
         raise OutcomeError(
             REASON_OUTCOME_NONTERMINAL,
-            "binding is '{0}'; a nonterminal session has not finished and reconciles "
-            "nothing".format(state),
+            "binding is '{0}'; only the canonical terminal state '{1}' proves a session "
+            "finished, and an unrecognized state is unproven rather than terminal".format(
+                state, BINDING_STATE_UNBOUND
+            ),
         )
     _exact_true(
         outcome.process_group_gone,
