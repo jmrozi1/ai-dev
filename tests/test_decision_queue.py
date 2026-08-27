@@ -78,6 +78,25 @@ def agent(**overrides) -> OperationalAgent:
     return OperationalAgent(projection=proj, **base)
 
 
+def decision_id_for(decision_id, *, project=PROJECT, ticket=TICKET, rail="issue-55-some-rail"):
+    """The identity a decision with these routing facts must have."""
+    return PendingDecision(
+        decision_id=decision_id, project=project, ticket=ticket, rail=rail,
+        raised_at="raised-x", title="t", explanation="e", elapsed_seconds=0,
+    ).item_id
+
+
+def agent_id_for(rail, *, project=PROJECT, ticket=TICKET):
+    """The identity an operational agent with these routing facts must have."""
+    return OperationalAgent(
+        project=project, ticket=ticket, rail=rail, title="t",
+        projection=SessionProjection(
+            state=STATE_RUNNING, reason="r", detail="d", session_id="s",
+            rail=rail, elapsed_seconds=0,
+        ),
+    ).item_id
+
+
 def _strings(value: object, seen: Optional[List[int]] = None) -> List[str]:
     """Every string reachable from a value, so a leak cannot hide in a nested field."""
     seen = [] if seen is None else seen
@@ -109,7 +128,7 @@ def _strings(value: object, seen: Optional[List[int]] = None) -> List[str]:
 class InputValidationTests(unittest.TestCase):
     def test_the_accepted_records_build(self) -> None:
         view = build_queue([decision()], [agent()]).view()
-        self.assertEqual([row.item_id for row in view.rows], ["decision:d-1"])
+        self.assertEqual([row.item_id for row in view.rows], [decision_id_for("d-1")])
 
     def test_every_identity_and_text_field_must_be_exact_non_empty_text(self) -> None:
         for field in ("decision_id", "project", "ticket", "rail", "raised_at", "title",
@@ -220,6 +239,187 @@ class InputValidationTests(unittest.TestCase):
 
 
 # --------------------------------------------------------------------------
+# Identity is the complete durable routing scope, encoded so it cannot collide
+# --------------------------------------------------------------------------
+
+
+class CompositeIdentityTests(unittest.TestCase):
+    """One combined queue spans projects and tickets; a rail slug is unique only inside its own."""
+
+    def test_the_same_rail_slug_in_two_tickets_stays_distinct_and_selectable(self) -> None:
+        here = agent(rail="shared-slug", ticket="issue-55")
+        there = agent(rail="shared-slug", ticket="issue-56")
+        self.assertNotEqual(here.item_id, there.item_id)
+
+        view = build_queue([], [here, there]).view(filters=(STATE_RUNNING,))
+        self.assertEqual(len(view.rows), 2)
+        for entry in (here, there):
+            with self.subTest(ticket=entry.ticket):
+                selected = build_queue([], [here, there]).view(
+                    filters=(STATE_RUNNING,), selected_id=entry.item_id)
+                self.assertEqual(selected.selected_id, entry.item_id)
+
+    def test_the_same_rail_slug_in_two_projects_stays_distinct_and_selectable(self) -> None:
+        here = agent(rail="shared-slug", project="ai-dev")
+        there = agent(rail="shared-slug", project="other-product")
+        self.assertNotEqual(here.item_id, there.item_id)
+
+        queue = build_queue([], [here, there])
+        self.assertEqual(len(queue.view(filters=(STATE_RUNNING,)).rows), 2)
+        for entry in (here, there):
+            with self.subTest(project=entry.project):
+                view = queue.view(filters=(STATE_RUNNING,), selected_id=entry.item_id)
+                self.assertEqual(view.selected_id, entry.item_id)
+
+    def test_the_same_decision_id_across_rails_tickets_and_projects_stays_distinct(self) -> None:
+        variants = [
+            decision(decision_id="shared", rail="rail-a"),
+            decision(decision_id="shared", rail="rail-b"),
+            decision(decision_id="shared", rail="rail-a", ticket="issue-56"),
+            decision(decision_id="shared", rail="rail-a", project="other-product"),
+        ]
+        ids = [entry.item_id for entry in variants]
+        self.assertEqual(len(set(ids)), len(ids))
+
+        queue = build_queue(variants)
+        self.assertEqual(len(queue.view().rows), len(variants))
+        for entry in variants:
+            with self.subTest(item=entry.item_id):
+                self.assertEqual(queue.view(selected_id=entry.item_id).selected_id, entry.item_id)
+
+    def test_adversarial_components_defeat_a_naive_join_but_not_this_encoding(self) -> None:
+        """Each pair collapses to one string under separator joining. Proven, not asserted."""
+        pairs = (
+            (agent(rail="r|x"), agent(ticket="issue-55|r", rail="x")),
+            (decision(rail="r|x", decision_id="d"), decision(rail="r", decision_id="x|d")),
+            (decision(project="ai-dev|p", ticket="t"), decision(project="ai-dev", ticket="p|t")),
+        )
+
+        def naive(entry):
+            waiting = entry.state == STATE_WAITING
+            kind = queue_module.KIND_DECISION if waiting else queue_module.KIND_AGENT
+            parts = [kind, entry.project, entry.ticket, entry.rail]
+            if waiting:
+                parts.append(entry.decision_id)
+            return "|".join(parts)
+
+        for left, right in pairs:
+            with self.subTest(left=left.item_id, right=right.item_id):
+                self.assertEqual(naive(left), naive(right), "fixture does not defeat a naive join")
+                self.assertNotEqual(left.item_id, right.item_id)
+                if left.state == STATE_WAITING:
+                    queue = build_queue([left, right], [])
+                else:
+                    queue = build_queue([], [left, right])
+                self.assertEqual(len(queue.view(filters=QUEUE_STATES).rows), 2)
+
+    def test_components_imitating_the_encodings_own_shape_stay_distinct(self) -> None:
+        lookalikes = (
+            agent(rail="1:a"),
+            agent(rail="a"),
+            agent(rail="2:ab"),
+            agent(ticket="2:ab", rail="ab"),
+            decision(decision_id="8:decision"),
+            decision(decision_id="decision"),
+        )
+        ids = [entry.item_id for entry in lookalikes]
+        self.assertEqual(len(set(ids)), len(ids))
+
+    def test_a_decision_and_an_operational_agent_cannot_collide(self) -> None:
+        shared_rail = "same-rail"
+        d = decision(decision_id="x", rail=shared_rail)
+        a = agent(rail=shared_rail)
+        self.assertNotEqual(d.item_id, a.item_id)
+
+        # Even when a component is literally the other kind's name.
+        self.assertNotEqual(
+            decision(decision_id="x", rail="agent").item_id,
+            agent(rail="decision").item_id,
+        )
+        queue = build_queue([d], [a])
+        self.assertEqual(len(queue.view(filters=QUEUE_STATES).rows), 2)
+
+    def test_selection_and_detail_use_exactly_the_composite_identity(self) -> None:
+        d = decision(decision_id="d-sel", rail="rail-sel")
+        queue = build_queue([d])
+        view = queue.view(selected_id=d.item_id)
+        self.assertEqual(view.selected_id, d.item_id)
+        self.assertEqual(view.detail.item_id, d.item_id)
+        self.assertEqual(view.rows[0].item_id, d.item_id)
+
+        # A local id alone no longer selects anything; it falls back to the oldest.
+        partial = queue.view(selected_id="d-sel")
+        self.assertEqual(partial.selected_id, d.item_id)
+
+    def test_identity_is_stable_across_every_non_routing_change(self) -> None:
+        base = decision(decision_id="stable", rail="rail-stable")
+        for field, value in (("elapsed_seconds", 99_999), ("title", "A different title"),
+                             ("explanation", "A different explanation"),
+                             ("raised_at", "raised-9999"),
+                             ("evidence", (EvidenceReference(label="other", locator="elsewhere"),))):
+            with self.subTest(field=field):
+                self.assertEqual(decision(decision_id="stable", rail="rail-stable",
+                                          **{field: value}).item_id, base.item_id)
+
+        agent_base = agent(rail="rail-stable-agent")
+        for state in (STATE_RUNNING, STATE_DISCONNECTED):
+            for seconds in (0, 5_000):
+                with self.subTest(state=state, seconds=seconds):
+                    other = agent(rail="rail-stable-agent", projection=projection(
+                        rail="rail-stable-agent", state=state, elapsed_seconds=seconds,
+                        session_id="a-completely-different-session", detail="different detail",
+                        reason="different reason"))
+                    self.assertEqual(other.item_id, agent_base.item_id)
+
+    def test_identity_carries_no_session_provider_or_detail_content(self) -> None:
+        entry = agent()
+        for secret in (SESSION_SECRET, DETAIL_SECRET, REASON_SECRET):
+            self.assertNotIn(secret, entry.item_id)
+        d = decision()
+        for secret in (EXPLANATION_SECRET, EVIDENCE_SECRET):
+            self.assertNotIn(secret, d.item_id)
+        self.assertNotIn(d.title, d.item_id)
+        self.assertNotIn(str(d.elapsed_seconds), d.item_id.split("|")[0])
+
+    def test_an_exact_duplicate_routing_identity_is_still_refused(self) -> None:
+        with self.assertRaises(QueueError) as caught:
+            build_queue([decision(decision_id="dup", rail="r"), decision(decision_id="dup", rail="r")])
+        self.assertEqual(caught.exception.reason, queue_module.REASON_DUPLICATE_ITEM)
+
+        with self.assertRaises(QueueError) as caught:
+            build_queue([], [agent(rail="r"), agent(rail="r")])
+        self.assertEqual(caught.exception.reason, queue_module.REASON_DUPLICATE_ITEM)
+
+    def test_the_same_local_id_in_a_different_scope_is_not_a_duplicate(self) -> None:
+        queue = build_queue(
+            [decision(decision_id="dup", rail="r"),
+             decision(decision_id="dup", rail="r", ticket="issue-56"),
+             decision(decision_id="dup", rail="r", project="other-product")],
+            [agent(rail="r"), agent(rail="r", ticket="issue-56")],
+        )
+        self.assertEqual(len(queue.view(filters=QUEUE_STATES).rows), 5)
+
+    def test_the_encoding_is_decodable_and_therefore_injective(self) -> None:
+        """Round-trips back to the exact routing tuple it was built from."""
+        def decode(item_id):
+            parts = []
+            rest = item_id
+            while rest:
+                head, _, rest = rest.partition(":")
+                length = int(head)
+                parts.append(rest[:length])
+                rest = rest[length + 1:]
+            return tuple(parts)
+
+        d = decision(decision_id="d|1", rail="r:2", ticket="t|3")
+        self.assertEqual(decode(d.item_id),
+                         (queue_module.KIND_DECISION, d.project, d.ticket, d.rail, d.decision_id))
+        a = agent(rail="r|4")
+        self.assertEqual(decode(a.item_id),
+                         (queue_module.KIND_AGENT, a.project, a.ticket, a.rail))
+
+
+# --------------------------------------------------------------------------
 # Waiting has exactly one source
 # --------------------------------------------------------------------------
 
@@ -290,9 +490,9 @@ class FilterTests(unittest.TestCase):
 
     def test_every_nonempty_combination_filters_independently(self) -> None:
         expected = {
-            STATE_WAITING: "decision:d-wait",
-            STATE_RUNNING: "agent:rail-running",
-            STATE_DISCONNECTED: "agent:rail-gone",
+            STATE_WAITING: decision_id_for("d-wait"),
+            STATE_RUNNING: agent_id_for("rail-running"),
+            STATE_DISCONNECTED: agent_id_for("rail-gone"),
         }
         for size in (1, 2, 3):
             for combo in combinations(QUEUE_STATES, size):
@@ -341,7 +541,7 @@ class OrderingTests(unittest.TestCase):
         items = [decision(decision_id=name, elapsed_seconds=42) for name in ("d-c", "d-a", "d-b")]
         view = build_queue(items).view()
         self.assertEqual(
-            [row.item_id for row in view.rows], ["decision:d-a", "decision:d-b", "decision:d-c"]
+            [row.item_id for row in view.rows], [decision_id_for("d-a"), decision_id_for("d-b"), decision_id_for("d-c")]
         )
 
     def test_ordering_is_deterministic_across_calls_and_input_order(self) -> None:
@@ -363,8 +563,8 @@ class OrderingTests(unittest.TestCase):
         self.assertEqual(len(view.rows), 30)
         ages = [row.elapsed_seconds for row in view.rows]
         self.assertEqual(ages, sorted(ages, reverse=True))
-        self.assertEqual(view.rows[0].item_id, "decision:d-00")
-        self.assertEqual(view.rows[-1].item_id, "decision:d-29")
+        self.assertEqual(view.rows[0].item_id, decision_id_for("d-00"))
+        self.assertEqual(view.rows[-1].item_id, decision_id_for("d-29"))
         # No pagination: everything visible is returned in one list.
         self.assertEqual(len(view.rows), len(build_queue(items).items))
 
@@ -374,7 +574,7 @@ class OrderingTests(unittest.TestCase):
             [agent(rail="rail-older", projection=projection(rail="rail-older", elapsed_seconds=1200))],
         )
         view = queue.view(filters=QUEUE_STATES)
-        self.assertEqual([row.item_id for row in view.rows], ["agent:rail-older", "decision:d-old"])
+        self.assertEqual([row.item_id for row in view.rows], [agent_id_for("rail-older"), decision_id_for("d-old")])
 
 
 # --------------------------------------------------------------------------
@@ -433,21 +633,21 @@ class SelectionAndDetailTests(unittest.TestCase):
         self.queue = build_queue([self.old, self.mid, self.new], [self.running])
 
     def test_a_waiting_selection_shows_the_explanation_and_bounded_evidence(self) -> None:
-        view = self.queue.view(selected_id="decision:d-mid")
-        self.assertEqual(view.selected_id, "decision:d-mid")
+        view = self.queue.view(selected_id=decision_id_for("d-mid"))
+        self.assertEqual(view.selected_id, decision_id_for("d-mid"))
         self.assertEqual(view.detail.explanation, EXPLANATION_SECRET)
         self.assertEqual(view.detail.evidence, self.mid.evidence)
         self.assertLessEqual(len(view.detail.evidence), MAX_EVIDENCE_REFERENCES)
 
     def test_the_detail_does_not_repeat_the_title(self) -> None:
-        view = self.queue.view(selected_id="decision:d-mid")
+        view = self.queue.view(selected_id=decision_id_for("d-mid"))
         self.assertNotIn("title", {f.name for f in fields(SelectedDetail)})
         for text in _strings(view.detail):
             self.assertNotIn(self.mid.title, text)
 
     def test_an_operational_selection_fabricates_no_human_decision_explanation(self) -> None:
-        view = self.queue.view(filters=(STATE_RUNNING,), selected_id="agent:rail-running")
-        self.assertEqual(view.selected_id, "agent:rail-running")
+        view = self.queue.view(filters=(STATE_RUNNING,), selected_id=agent_id_for("rail-running"))
+        self.assertEqual(view.selected_id, agent_id_for("rail-running"))
         self.assertIsNone(view.detail.explanation)
         self.assertEqual(view.detail.evidence, ())
         for text in _strings(view.detail):
@@ -455,20 +655,20 @@ class SelectionAndDetailTests(unittest.TestCase):
             self.assertNotIn(SESSION_SECRET, text)
 
     def test_selection_is_stable_while_the_item_stays_visible(self) -> None:
-        first = self.queue.view(selected_id="decision:d-new")
+        first = self.queue.view(selected_id=decision_id_for("d-new"))
         second = self.queue.view(filters=(STATE_WAITING, STATE_RUNNING),
                                  selected_id=first.selected_id)
-        self.assertEqual(second.selected_id, "decision:d-new")
+        self.assertEqual(second.selected_id, decision_id_for("d-new"))
 
     def test_a_selection_filtered_out_falls_back_to_the_oldest_visible_row(self) -> None:
-        view = self.queue.view(filters=(STATE_RUNNING,), selected_id="decision:d-new")
-        self.assertEqual(view.selected_id, "agent:rail-running")
+        view = self.queue.view(filters=(STATE_RUNNING,), selected_id=decision_id_for("d-new"))
+        self.assertEqual(view.selected_id, agent_id_for("rail-running"))
 
     def test_a_removed_selection_falls_back_to_the_oldest_remaining_row(self) -> None:
         smaller = build_queue([self.old, self.mid])
-        view = smaller.view(selected_id="decision:d-new")
-        self.assertEqual(view.selected_id, "decision:d-old")
-        self.assertEqual(view.rows[0].item_id, "decision:d-old")
+        view = smaller.view(selected_id=decision_id_for("d-new"))
+        self.assertEqual(view.selected_id, decision_id_for("d-old"))
+        self.assertEqual(view.rows[0].item_id, decision_id_for("d-old"))
 
     def test_no_visible_row_selects_nothing(self) -> None:
         empty = build_queue([], [self.running])
@@ -478,16 +678,16 @@ class SelectionAndDetailTests(unittest.TestCase):
         self.assertIsNone(view.detail)
 
     def test_an_unknown_selection_lands_on_the_oldest_rather_than_erroring(self) -> None:
-        view = self.queue.view(selected_id="decision:never-existed")
-        self.assertEqual(view.selected_id, "decision:d-old")
+        view = self.queue.view(selected_id=decision_id_for("never-existed"))
+        self.assertEqual(view.selected_id, decision_id_for("d-old"))
 
     def test_the_default_selection_is_the_oldest_visible_row(self) -> None:
-        self.assertEqual(self.queue.view().selected_id, "decision:d-old")
+        self.assertEqual(self.queue.view().selected_id, decision_id_for("d-old"))
 
     def test_the_selection_is_always_a_visible_row(self) -> None:
         """An invisible selection would drive a right pane nothing in the list points at."""
-        candidates = ["decision:d-old", "decision:d-mid", "decision:d-new",
-                      "agent:rail-running", "decision:never-existed", None]
+        candidates = [decision_id_for("d-old"), decision_id_for("d-mid"), decision_id_for("d-new"),
+                      agent_id_for("rail-running"), decision_id_for("never-existed"), None]
         for size in (1, 2, 3):
             for combo in combinations(QUEUE_STATES, size):
                 for chosen in candidates:
@@ -519,8 +719,8 @@ class ElapsedIsDisplayOnlyTests(unittest.TestCase):
         before = build_queue([young, decision(decision_id="d-b", elapsed_seconds=100)]).view()
         after = build_queue([older, decision(decision_id="d-b", elapsed_seconds=100)]).view()
 
-        self.assertEqual([r.item_id for r in before.rows], ["decision:d-b", "decision:d-a"])
-        self.assertEqual([r.item_id for r in after.rows], ["decision:d-a", "decision:d-b"])
+        self.assertEqual([r.item_id for r in before.rows], [decision_id_for("d-b"), decision_id_for("d-a")])
+        self.assertEqual([r.item_id for r in after.rows], [decision_id_for("d-a"), decision_id_for("d-b")])
         self.assertEqual({r.state for r in before.rows}, {r.state for r in after.rows})
         self.assertEqual(before.filters, after.filters)
 
@@ -586,7 +786,8 @@ class PurityTests(unittest.TestCase):
             {
                 # its own constructors and helpers
                 "DecisionQueue", "QueueError", "QueueRow", "QueueView", "SelectedDetail",
-                "_detail", "_elapsed", "_normalize_filters", "_text", "_visible",
+                "_detail", "_elapsed", "_identity", "_normalize_filters", "_text",
+                "_visible",
                 "__init__", "super", "dataclass",
                 # pure builtins
                 "add", "append", "format", "join", "len", "set", "sorted", "strip",

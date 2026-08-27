@@ -47,6 +47,8 @@ __all__ = [
     "DEFAULT_FILTERS",
     "DecisionQueue",
     "EvidenceReference",
+    "KIND_AGENT",
+    "KIND_DECISION",
     "OperationalAgent",
     "PendingDecision",
     "QUEUE_STATES",
@@ -135,6 +137,31 @@ def _elapsed(value: object, *, label: str = "elapsed_seconds") -> int:
     return value
 
 
+# The two item kinds. They are the first encoded component, so a decision and an
+# operational agent can never produce the same identity even when every other
+# durable fact matches.
+KIND_DECISION = "decision"
+KIND_AGENT = "agent"
+
+
+def _identity(kind: str, *parts: str) -> str:
+    """A length-delimited encoding of one item's complete durable routing scope.
+
+    Joining components with a separator is not injective: ("a|b", "c") and
+    ("a", "b|c") produce the same string. Rail slugs and decision identifiers are
+    not proven unique across projects and tickets, so two legitimate items could
+    then land on one identity -- refused as a duplicate, or worse, silently
+    selecting and later routing to the wrong one. Prefixing each component with
+    its length makes the result decodable, and a decodable encoding cannot
+    collide.
+
+    Only durable routing facts are encoded. Session id, elapsed time, state,
+    title, explanation, evidence, and lifecycle detail are all excluded: identity
+    must survive every one of them changing.
+    """
+    return "|".join("{0}:{1}".format(len(part), part) for part in (kind,) + parts)
+
+
 # --------------------------------------------------------------------------
 # Inputs
 # --------------------------------------------------------------------------
@@ -204,7 +231,7 @@ class PendingDecision:
 
     @property
     def item_id(self) -> str:
-        return "decision:{0}".format(self.decision_id)
+        return _identity(KIND_DECISION, self.project, self.ticket, self.rail, self.decision_id)
 
     @property
     def state(self) -> str:
@@ -262,9 +289,10 @@ class OperationalAgent:
 
     @property
     def item_id(self) -> str:
-        # The rail, not the session id: a row must be routable without carrying
-        # provider session identity into the list.
-        return "agent:{0}".format(self.rail)
+        # The rail, never the session id: a row must be routable without carrying
+        # provider session identity into the list. Project and ticket are part of
+        # the identity because a rail slug is only unique within its own scope.
+        return _identity(KIND_AGENT, self.project, self.ticket, self.rail)
 
     @property
     def state(self) -> str:
