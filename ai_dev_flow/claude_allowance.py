@@ -276,7 +276,16 @@ def _interval(
         return None
     if later.workload_units <= earlier.workload_units:
         return None
-    if later.used_percentage < earlier.used_percentage:
+    if later.used_percentage <= earlier.used_percentage:
+        # Strictly positive, not merely nondecreasing. The provider percentage is
+        # read by a person from a rounded display, so an unchanged reading is
+        # consistent with real consumption below the display quantum. Treating it
+        # as proof of zero consumption would train a zero rate and then report that
+        # arbitrarily much work costs nothing. Excluding the pair leaves the
+        # existing no-valid-training-interval state, which says only what is known.
+        #
+        # No epsilon, floor, or assumed quantum is introduced: any exact positive
+        # Decimal delta still trains.
         return None
 
     units_delta = later.workload_units - earlier.workload_units

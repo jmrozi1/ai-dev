@@ -286,6 +286,90 @@ class CalibrationProfileTests(unittest.TestCase):
                               pct=str(later.used_percentage)):
                 self.assertEqual(build_profile([first, later]).intervals, ())
 
+    def test_an_unchanged_provider_percentage_trains_nothing(self) -> None:
+        """The reproduced defect: 23% -> 23% over 800 units once trained a zero rate.
+
+        The percentage is read by a person from a rounded display, so equality is
+        consistent with consumption below the display quantum. It cannot establish
+        that the work was free.
+        """
+        first = point(observed_at=1_000, used_percentage=Decimal("23"),
+                      workload_units=Decimal("100"), complete_coverage=False)
+        later = point(observed_at=2_000, used_percentage=Decimal("23"),
+                      workload_units=Decimal("900"), complete_coverage=True)
+        # Every other eligibility rule is satisfied, so only the zero delta can refuse.
+        self.assertEqual(first.reset_identity, later.reset_identity)
+        self.assertTrue(later.complete_coverage)
+        self.assertGreater(later.observed_at, first.observed_at)
+        self.assertGreater(later.workload_units, first.workload_units)
+        self.assertEqual(later.used_percentage, first.used_percentage)
+
+        profile = build_profile([first, later])
+        self.assertEqual(profile.intervals, ())
+        self.assertIsNone(profile.newest_observed_at)
+
+    def test_a_zero_delta_pair_leaves_the_estimate_unavailable_not_zero(self) -> None:
+        first = point(observed_at=1_000, used_percentage=Decimal("23"),
+                      workload_units=Decimal("100"), complete_coverage=False)
+        later = point(observed_at=2_000, used_percentage=Decimal("23"),
+                      workload_units=Decimal("900"))
+        profile = build_profile([first, later])
+        result = estimate_current(profile, later, now=3_000,
+                                  workload_units=Decimal("100000"))
+        self.assertFalse(result.available)
+        self.assertEqual(result.reason, allowance.REASON_NO_INTERVAL)
+        # Not the anchor value reused, and not an implied zero.
+        self.assertIsNone(result.point_percentage)
+        self.assertIsNone(result.lower_percentage)
+        self.assertIsNone(result.upper_percentage)
+        self.assertEqual(result.interval_count, 0)
+
+    def test_the_smallest_exact_positive_delta_still_trains(self) -> None:
+        """Strict comparison, with no invented epsilon, floor, or display quantum."""
+        first = point(observed_at=1_000, used_percentage=Decimal("23"),
+                      workload_units=Decimal("100"), complete_coverage=False)
+        later = point(observed_at=2_000, used_percentage=Decimal("23.000001"),
+                      workload_units=Decimal("900"))
+        profile = build_profile([first, later])
+        self.assertEqual(len(profile.intervals), 1)
+        self.assertEqual(profile.intervals[0].percentage_delta, Decimal("0.000001"))
+        self.assertGreater(profile.intervals[0].rate, Decimal("0"))
+
+    def test_zero_delta_pairs_never_dilute_valid_evidence(self) -> None:
+        """They contribute to no count, bound, rate, newest observation, or freshness."""
+        open_reading = point(observed_at=1_000, used_percentage=Decimal("10"),
+                             workload_units=Decimal("100"), complete_coverage=False)
+        trained = point(observed_at=2_000, used_percentage=Decimal("30"),
+                        workload_units=Decimal("300"))
+        flat = point(observed_at=3_000, used_percentage=Decimal("30"),
+                     workload_units=Decimal("900"))
+        with_flat = build_profile([open_reading, trained, flat])
+        without_flat = build_profile([open_reading, trained])
+
+        self.assertEqual(len(with_flat.intervals), 1)
+        self.assertEqual(with_flat.rates, without_flat.rates)
+        self.assertEqual(with_flat.minimum_rate, without_flat.minimum_rate)
+        self.assertEqual(with_flat.maximum_rate, without_flat.maximum_rate)
+        self.assertEqual(with_flat.newest_observed_at, without_flat.newest_observed_at)
+        self.assertEqual(with_flat.newest_observed_at, trained.observed_at)
+        # Freshness follows the trained observation, never the later flat reading.
+        boundary = trained.observed_at + STALE_AFTER_SECONDS
+        self.assertTrue(with_flat.is_stale(boundary))
+        self.assertFalse(with_flat.is_stale(boundary - 1))
+
+    def test_zero_delta_exclusion_does_not_depend_on_input_order(self) -> None:
+        open_reading = point(observed_at=1_000, used_percentage=Decimal("10"),
+                             workload_units=Decimal("100"), complete_coverage=False)
+        trained = point(observed_at=2_000, used_percentage=Decimal("30"),
+                        workload_units=Decimal("300"))
+        flat = point(observed_at=3_000, used_percentage=Decimal("30"),
+                     workload_units=Decimal("900"))
+        forward = build_profile([open_reading, trained, flat])
+        shuffled = build_profile([flat, open_reading, trained])
+        self.assertEqual(forward.rates, shuffled.rates)
+        self.assertEqual(forward.newest_observed_at, shuffled.newest_observed_at)
+        self.assertEqual(len(shuffled.intervals), 1)
+
     def test_a_non_point_input_is_refused(self) -> None:
         with self.assertRaises(AllowanceError) as caught:
             build_profile([point(), object()])
