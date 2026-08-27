@@ -717,7 +717,7 @@ def resolve_read_source(repo_root: Path) -> ReadSource:
 
 
 RAIL_STATUSES = ("ready", "running", "blocked", "completed")
-_RAIL_HEADER_KEYS = {"status", "depends on", "shared resource"}
+_RAIL_HEADER_KEYS = {"status", "role", "depends on", "shared resource"}
 
 
 class RailState:
@@ -731,12 +731,17 @@ class RailState:
         depends_on: list[str],
         shared_resource: str | None,
         proposed_status: str | None = None,
+        role: str | None = None,
     ) -> None:
         self.identifier = identifier
         self.status = status
         self.artifacts = artifacts
         self.depends_on = depends_on
         self.shared_resource = shared_resource
+        # Descriptive assignment metadata, not a controller-managed session role.
+        # A rail may name `evidence-worker`, or name nothing at all; deciding what
+        # that permits belongs to `authorization`, not to this reader.
+        self.role = role
         # What the executor's handoff claims. Evidence, never acceptance.
         self.proposed_status = proposed_status
 
@@ -745,9 +750,12 @@ class RailState:
         return self.proposed_status is not None and self.proposed_status != self.status
 
 
-def _parse_rail_header(text: str, *, rail_id: str) -> tuple[str, list[str], str | None]:
+def _parse_rail_header(
+    text: str, *, rail_id: str
+) -> tuple[str, list[str], str | None, str | None]:
     """Read the small current-state header the rail files already carry."""
     header: dict[str, str] = {}
+    role_headers = 0
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("## "):
@@ -757,7 +765,19 @@ def _parse_rail_header(text: str, *, rail_id: str) -> tuple[str, list[str], str 
         key, _, value = stripped.partition(":")
         key = key.strip().lower().lstrip("#").strip()
         if key in _RAIL_HEADER_KEYS:
+            if key == "role":
+                role_headers += 1
             header[key] = value.strip()
+
+    # Role became authorization-sensitive, so "last one wins" is no longer a safe
+    # way to read two of them. This is prospective integrity: no published rail
+    # carries a second `Role:`, and one appearing now would be ambiguous about
+    # which assignment a controller action was authorized against.
+    if role_headers > 1:
+        raise ControlPlaneError(
+            f"Rail '{rail_id}' declares {role_headers} 'Role:' headers; exactly one "
+            "assignment must be unambiguous."
+        )
 
     status = header.get("status", "").lower()
     if status not in RAIL_STATUSES:
@@ -782,7 +802,21 @@ def _parse_rail_header(text: str, *, rail_id: str) -> tuple[str, list[str], str 
     resource = None
     if raw_resource and raw_resource.lower() != "none":
         resource = validate_identifier(raw_resource.strip("`"), label="shared resource")
-    return status, depends_on, resource
+
+    # Optional on purpose. Most published rails predate this header, and some name
+    # a role no controller manages; refusing either would make whole scopes
+    # unreadable to every reader, which is a much worse failure than an
+    # unenforced field. The shape is still checked so the token that reaches an
+    # authorization decision is a normalized identifier and nothing else.
+    raw_role = header.get("role", "").strip().strip("`")
+    role = None
+    if raw_role and raw_role.lower() != "none":
+        role = validate_identifier(raw_role.lower(), label="rail role")
+    if role not in ("executor", "reviewer", "orchestrator"):
+        raise ControlPlaneError(
+            f"Rail '{rail_id}' has role '{role}'; expected a managed role."
+        )
+    return status, depends_on, resource, role
 
 
 def _parse_handoff_status(text: str | None) -> str | None:
@@ -825,10 +859,12 @@ def collect_rail_states(source: ReadSource, *, project: str, ticket: str) -> lis
                 f"Rail '{rail_id}' has no orchestrator authorization. An executor cannot "
                 "create a rail; publish the authorization or remove the directory."
             )
-        status, depends_on, resource = _parse_rail_header(authorization, rail_id=rail_id)
+        status, depends_on, resource, role = _parse_rail_header(authorization, rail_id=rail_id)
         artifacts = [name for name in ("rail", "handoff", "evidence") if source.exists(relative(name))]
         proposed = _parse_handoff_status(source.read(relative("handoff")))
-        states.append(RailState(rail_id, status, artifacts, depends_on, resource, proposed))
+        states.append(
+            RailState(rail_id, status, artifacts, depends_on, resource, proposed, role)
+        )
 
     known = {state.identifier for state in states}
     for state in states:

@@ -56,6 +56,8 @@ SOURCE_HANDOFF_BLOB = "d" * 40
 SESSION_ONE = "1a2b3c4d-0001-4000-8000-00000000000a"
 SESSION_TWO = "1a2b3c4d-0002-4000-8000-00000000000b"
 SKILL = "orchestrator"
+ORCHESTRATOR = "orchestrator"
+EXECUTOR = "executor"
 
 
 class FakeHandle(object):
@@ -156,7 +158,8 @@ class InvocationTestBase(unittest.TestCase):
     # -- snapshot, wake, packet, observation ------------------------------------
 
     def _snapshot(self, *, head=HEAD, orch_status="running", orch_unreconciled=False,
-                  orch_present=True, source_handoff=SOURCE_HANDOFF_BLOB, orch_blob=ORCH_BLOB):
+                  orch_present=True, source_handoff=SOURCE_HANDOFF_BLOB, orch_blob=ORCH_BLOB,
+                  orch_role=ORCHESTRATOR, source_role=EXECUTOR):
         rails = []
         if orch_present:
             rails.append(
@@ -165,6 +168,7 @@ class InvocationTestBase(unittest.TestCase):
                     authorization_blob=orch_blob,
                     status=orch_status,
                     proposed_status="completed" if orch_unreconciled else None,
+                    role=orch_role,
                 )
             )
         rails.append(
@@ -174,6 +178,7 @@ class InvocationTestBase(unittest.TestCase):
                 status="running",
                 proposed_status="completed",
                 handoff_blob=source_handoff,
+                role=source_role,
             )
         )
         return trigger.ScopeSnapshot(
@@ -211,7 +216,7 @@ class InvocationTestBase(unittest.TestCase):
 
     def _observation(self, *, head=HEAD, orch_status="running", orch_unreconciled=False,
                      orch_blob=ORCH_BLOB, workspace="ok", completeness=None,
-                     source_health=None, holders=None):
+                     source_health=None, holders=None, orch_role=ORCHESTRATOR):
         if workspace == "ok":
             observed = WorkspaceObservation(
                 workspace_key=self.workspace_key,
@@ -237,12 +242,13 @@ class InvocationTestBase(unittest.TestCase):
                     identifier=ORCH_RAIL,
                     status=orch_status,
                     rail_blob=orch_blob,
+                    role=orch_role,
                     unreconciled=orch_unreconciled,
                     shared_resource="orchestration-slot" if holders else None,
                 ),
                 RailObservation(
                     identifier=SOURCE_RAIL, status="running", rail_blob=SOURCE_BLOB,
-                    unreconciled=True,
+                    role=EXECUTOR, unreconciled=True,
                 ),
             ),
             workspace=observed,
@@ -460,8 +466,9 @@ class SuccessfulInvocationTests(InvocationTestBase):
         (scope / "state.md").write_text("# Control Plane State\n", encoding="utf-8")
         for rail, status in ((ORCH_RAIL, "running"), (SOURCE_RAIL, "running")):
             (scope / "rails" / rail / "rail.md").write_text(
-                "# Rail: {0}\n\nStatus: {1}\nOwner: orchestrator\n\n## Goal\n\nwork\n".format(
-                    rail, status
+                "# Rail: {0}\n\nStatus: {1}\nOwner: orchestrator\nRole: {2}\n"
+                "\n## Goal\n\nwork\n".format(
+                    rail, status, ORCHESTRATOR if rail == ORCH_RAIL else EXECUTOR
                 ),
                 encoding="utf-8",
             )
@@ -491,11 +498,13 @@ class SuccessfulInvocationTests(InvocationTestBase):
                     identifier=ORCH_RAIL,
                     status="running",
                     rail_blob=snapshot.rail(ORCH_RAIL).authorization_blob,
+                    role=ORCHESTRATOR,
                 ),
                 RailObservation(
                     identifier=SOURCE_RAIL,
                     status="running",
                     rail_blob=snapshot.rail(SOURCE_RAIL).authorization_blob,
+                    role=EXECUTOR,
                     unreconciled=True,
                 ),
             ),
@@ -666,6 +675,79 @@ class StandingAuthorizationGateTests(InvocationTestBase):
         refusal = self._refused(observation=self._observation(workspace=None))
         self.assertEqual(refusal.reason, invocation.REASON_NOT_AUTHORIZED)
         self.assertIn("workspace-identity-ambiguous", refusal.detail)
+
+
+class DurableRoleGateTests(InvocationTestBase):
+    """A standing rail must be durably assigned to the orchestrator, on both surfaces."""
+
+    def _refused(self, **overrides):
+        with self.assertRaises(invocation.InvocationRefused) as caught:
+            self._invoke(**overrides)
+        self.assertEqual(self.store.records(), [])
+        return caught.exception
+
+    def test_a_standing_rail_assigned_elsewhere_is_refused_before_authorization(self) -> None:
+        for role in ("executor", "reviewer", "evidence-worker"):
+            with self.subTest(role=role):
+                self.store = BindingStore(self.tmp_path / ("state-role-" + role))
+                snapshot = self._snapshot(orch_role=role)
+                refusal = self._refused(
+                    snapshot=snapshot,
+                    proposal=self._proposal(snapshot),
+                    packet=self._packet(snapshot),
+                )
+                self.assertEqual(refusal.reason, invocation.REASON_RAIL_ROLE)
+                self.assertIn(role, refusal.detail)
+
+    def test_a_standing_rail_with_no_role_is_refused(self) -> None:
+        snapshot = self._snapshot(orch_role=None)
+        refusal = self._refused(
+            snapshot=snapshot,
+            proposal=self._proposal(snapshot),
+            packet=self._packet(snapshot),
+        )
+        self.assertEqual(refusal.reason, invocation.REASON_RAIL_ROLE)
+        self.assertIn("no role", refusal.detail)
+
+    def test_the_snapshot_role_is_checked_before_any_authorization_or_lifecycle_call(self) -> None:
+        calls = []
+        real_authorize = invocation.authorize
+        real_launch = invocation.launch_session
+
+        def spy(name, target):
+            def wrapper(*args, **kwargs):
+                calls.append(name)
+                return target(*args, **kwargs)
+            return wrapper
+
+        snapshot = self._snapshot(orch_role="executor")
+        with mock.patch.object(invocation, "authorize", spy("authorize", real_authorize)), \
+             mock.patch.object(invocation, "launch_session", spy("launch", real_launch)):
+            with self.assertRaises(invocation.InvocationRefused) as caught:
+                self._invoke(
+                    snapshot=snapshot,
+                    proposal=self._proposal(snapshot),
+                    packet=self._packet(snapshot),
+                )
+        self.assertEqual(caught.exception.reason, invocation.REASON_RAIL_ROLE)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.store.records(), [])
+
+    def test_snapshot_orchestrator_with_a_disagreeing_observation_fails_closed(self) -> None:
+        """Two surfaces that must agree; neither may stand in for the other."""
+        for observed in ("executor", "evidence-worker", None):
+            with self.subTest(observed=observed):
+                self.store = BindingStore(self.tmp_path / ("state-obs-" + str(observed)))
+                refusal = self._refused(observation=self._observation(orch_role=observed))
+                self.assertEqual(refusal.reason, invocation.REASON_NOT_AUTHORIZED)
+                expected = "rail-role-missing" if observed is None else "rail-role-mismatch"
+                self.assertIn(expected, refusal.detail)
+
+    def test_an_exact_orchestrator_role_on_both_surfaces_preserves_the_launch_path(self) -> None:
+        outcome = self._invoke()
+        self.assertEqual(outcome.role, invocation.ORCHESTRATOR_ROLE)
+        self.assertEqual(outcome.session_id, SESSION_ONE)
+        self.assertEqual(outcome.binding_state, BINDING_STATE_UNBOUND)
 
 
 # --------------------------------------------------------------------------

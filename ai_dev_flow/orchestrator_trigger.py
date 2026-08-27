@@ -121,6 +121,10 @@ class RailSnapshot:
     proposed_status: Optional[str] = None
     handoff_blob: Optional[str] = None
     evidence_blob: Optional[str] = None
+    # A normalized identifier or nothing. Deliberately absent from
+    # `material_fingerprint`: changing `Role:` already changes the rail blob, so
+    # adding it there would double-count the same change as a second wake input.
+    role: Optional[str] = None
 
     @property
     def unreconciled(self) -> bool:
@@ -215,6 +219,7 @@ def build_snapshot(source: ReadSource, *, project: str, ticket: str) -> ScopeSna
                 authorization_blob=authorization_blob,
                 status=state.status,
                 proposed_status=state.proposed_status,
+                role=getattr(state, "role", None),
                 handoff_blob=_optional_blob(
                     source, project, ticket, state, artifact="handoff"
                 ),

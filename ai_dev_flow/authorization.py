@@ -57,6 +57,8 @@ REASON_OBSERVATION_INCOMPLETE = "observation-incomplete"
 REASON_SOURCE_UNHEALTHY = "source-unhealthy"
 REASON_HEAD_MISMATCH = "head-mismatch"
 REASON_RAIL_MISSING = "rail-missing"
+REASON_RAIL_ROLE_MISSING = "rail-role-missing"
+REASON_RAIL_ROLE_MISMATCH = "rail-role-mismatch"
 REASON_RAIL_DUPLICATED = "rail-duplicated"
 REASON_RAIL_UNRECONCILED = "rail-unreconciled"
 REASON_RAIL_NOT_DISPATCHED = "rail-not-dispatched"
@@ -82,6 +84,10 @@ class RailObservation:
     identifier: str
     status: str
     rail_blob: str
+    # The rail's durable assignment, exactly as the control plane read it. `None`
+    # means the rail names no role, which authorizes nothing rather than defaulting
+    # to something convenient.
+    role: Optional[str] = None
     unreconciled: bool = False
     depends_on: Tuple[str, ...] = ()
     shared_resource: Optional[str] = None
@@ -234,6 +240,23 @@ def authorize(
             "rail '{0}' appears {1} times in the observation.".format(rail, len(matching)),
         )
     state = matching[0]
+
+    # Who a rail assigns is checked before anything a rail permits. A caller may
+    # request a role; it may not invent one the rail never granted, so this refuses
+    # ahead of dispatch, binding, reservation, and any lifecycle action.
+    if not state.role:
+        return refuse(
+            REASON_RAIL_ROLE_MISSING,
+            "rail '{0}' names no durable role, so it cannot authorize a managed "
+            "'{1}' session.".format(rail, role),
+        )
+    if state.role != role:
+        return refuse(
+            REASON_RAIL_ROLE_MISMATCH,
+            "rail '{0}' is assigned to '{1}', not to the requested '{2}'.".format(
+                rail, state.role, role
+            ),
+        )
 
     if state.unreconciled:
         return refuse(

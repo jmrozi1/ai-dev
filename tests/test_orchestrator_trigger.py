@@ -65,8 +65,11 @@ class ControlPlaneFixture:
         status: str = "running",
         body: str = RAIL_SECRET,
         depends_on: Optional[str] = None,
+        role: Optional[str] = "executor",
     ) -> None:
         header = "# Rail: {0}\n\nStatus: {1}\nOwner: orchestrator\n".format(rail, status)
+        if role is not None:
+            header += "Role: {0}\n".format(role)
         if depends_on:
             header += "Depends on: {0}\n".format(depends_on)
         header += "Shared resource: product-worktree\n\n## Goal\n\n{0}\n".format(body)
@@ -316,8 +319,57 @@ class NoContentLeakageTests(TriggerTestCase):
                 "proposed_status",
                 "handoff_blob",
                 "evidence_blob",
+                "role",
             },
         )
+
+
+class DurableRoleSnapshotTests(TriggerTestCase):
+    """The snapshot carries the durable role as a normalized token, and nothing more."""
+
+    def test_the_role_is_surfaced_from_the_resolved_revision(self) -> None:
+        self.plane.write_rail("rail-alpha", role="orchestrator")
+        self.plane.commit()
+        self.assertEqual(self.snapshot().rail("rail-alpha").role, "orchestrator")
+
+    def test_a_rail_without_a_role_snapshots_as_none_and_still_reads(self) -> None:
+        self.plane.write_rail("rail-alpha", role=None)
+        self.plane.commit()
+        snapshot = self.snapshot()
+        self.assertIsNone(snapshot.rail("rail-alpha").role)
+        self.assertEqual(len(snapshot.rails), 1)
+
+    def test_a_non_managed_role_snapshots_normalized(self) -> None:
+        self.plane.write_rail("rail-alpha", role="Evidence-Worker")
+        self.plane.commit()
+        self.assertEqual(self.snapshot().rail("rail-alpha").role, "evidence-worker")
+
+    def test_the_role_is_not_a_second_wake_fingerprint_input(self) -> None:
+        """Changing `Role:` already changes the rail blob; counting it twice would
+        make one edit look like two material facts."""
+        self.plane.write_rail("rail-alpha", role="executor")
+        self.plane.write_handoff("rail-alpha", status="completed")
+        self.plane.commit()
+        rail = self.snapshot().rail("rail-alpha")
+        self.assertNotIn("executor", rail.material_fingerprint)
+        self.assertEqual(
+            rail.material_fingerprint,
+            (rail.identifier, rail.authorization_blob, rail.handoff_blob, ""),
+        )
+
+    def test_a_role_change_is_material_only_through_the_rail_blob(self) -> None:
+        self.plane.write_rail("rail-alpha", role="executor")
+        self.plane.write_handoff("rail-alpha", status="completed")
+        self.plane.commit()
+        cursor = trigger.TriggerCursor()
+        first = trigger.propose_wake(self.snapshot(), cursor=cursor)
+        self.assertIsNotNone(first)
+
+        self.plane.write_rail("rail-alpha", role="reviewer")
+        self.plane.commit()
+        second = self.snapshot().rail("rail-alpha")
+        self.assertEqual(second.role, "reviewer")
+        self.assertNotEqual(first.reasons[0].fingerprint[2], second.authorization_blob)
 
 
 # --------------------------------------------------------------------------

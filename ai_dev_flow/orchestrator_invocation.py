@@ -68,6 +68,7 @@ REASON_SELF_WAKE = "self-wake-refused"
 REASON_RAIL_MISSING = "orchestrator-rail-missing"
 REASON_RAIL_NOT_RUNNING = "orchestrator-rail-not-running"
 REASON_RAIL_UNRECONCILED = "orchestrator-rail-unreconciled"
+REASON_RAIL_ROLE = "orchestrator-rail-role-mismatch"
 REASON_NOT_AUTHORIZED = "not-authorized"
 REASON_CONTINUATION_REFUSED = "continuation-refused"
 REASON_WORKSPACE_UNPROVEN = "workspace-identity-unproven"
@@ -193,6 +194,15 @@ def _require_standing_authorization(
             REASON_RAIL_UNRECONCILED,
             "orchestrator rail '{0}' carries an unreconciled handoff; its authorization is "
             "not settled".format(orchestrator_rail),
+        )
+    if rail.role != ORCHESTRATOR_ROLE:
+        # Checked here, from the snapshot, before the predicate re-checks it from
+        # the observation. Two sources that must agree; neither may stand in for
+        # the other, and an executor or evidence rail can never become one.
+        raise InvocationRefused(
+            REASON_RAIL_ROLE,
+            "rail '{0}' is assigned to '{1}'; only a rail durably assigned to '{2}' may "
+            "start one".format(orchestrator_rail, rail.role or "no role", ORCHESTRATOR_ROLE),
         )
 
     # The accepted predicate decides. Nothing here re-implements or overrides it,

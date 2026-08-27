@@ -48,6 +48,9 @@ def rail_state(**overrides: object) -> RailObservation:
         "identifier": RAIL,
         "status": "running",
         "rail_blob": BLOB,
+        # Stated, never defaulted: these fixtures represent an actionable rail, and
+        # the durable assignment is now part of what makes it actionable.
+        "role": "executor",
         "unreconciled": False,
         "depends_on": (),
         "shared_resource": RESOURCE,
@@ -435,6 +438,63 @@ class AuthorizationDecisionTests(unittest.TestCase):
     def test_unsupported_role_is_refused(self) -> None:
         decision = decide(observation(), role="controller")
         self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_INVALID_ROLE)
+
+
+class DurableRoleTests(unittest.TestCase):
+    """A caller may request a role; it may not invent one the rail never granted."""
+
+    def test_a_rail_with_no_durable_role_authorizes_nothing(self) -> None:
+        decision = decide(observation(rails=(rail_state(role=None),)))
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_RAIL_ROLE_MISSING)
+        self.assertIsNone(decision.action)
+
+    def test_a_non_managed_rail_role_refuses_by_mismatch_and_never_widens_the_vocabulary(self):
+        decision = decide(observation(rails=(rail_state(role="evidence-worker"),)))
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_RAIL_ROLE_MISMATCH)
+        self.assertIn("evidence-worker", decision.detail)
+        self.assertNotIn("evidence-worker", authorization.BINDING_ROLES)
+
+    def test_a_rail_assigned_to_another_managed_role_refuses(self) -> None:
+        decision = decide(observation(rails=(rail_state(role="orchestrator"),)), role="executor")
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_RAIL_ROLE_MISMATCH)
+
+    def test_an_exact_match_still_authorizes_launch(self) -> None:
+        for role in authorization.BINDING_ROLES:
+            with self.subTest(role=role):
+                decision = decide(observation(rails=(rail_state(role=role),)), role=role)
+                self.assertTrue(decision.authorized)
+                self.assertEqual(decision.action, ACTION_LAUNCH)
+
+    def test_role_is_checked_before_dispatch_binding_and_reservation(self) -> None:
+        """Whoever a rail assigns is settled before anything the rail permits."""
+        decision = decide(
+            observation(rails=(rail_state(role="reviewer", status="ready", unreconciled=True),)),
+            role="executor",
+        )
+        self.assertEqual(decision.reason, authorization.REASON_RAIL_ROLE_MISMATCH)
+
+    def test_a_role_mismatch_refuses_continuation_too(self) -> None:
+        decision = decide(
+            observation(rails=(rail_state(role="reviewer"),)),
+            role="executor",
+            bindings=(binding(),),
+        )
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_RAIL_ROLE_MISMATCH)
+
+    def test_a_role_refusal_mutates_no_binding(self) -> None:
+        existing = binding()
+        before = existing.to_dict()
+        decision = decide(observation(rails=(rail_state(role=None),)), bindings=(existing,))
+        self.assertFalse(decision.authorized)
+        self.assertEqual(existing.to_dict(), before)
+
+    def test_the_requested_role_is_still_validated_against_the_managed_vocabulary(self) -> None:
+        decision = decide(observation(rails=(rail_state(role="controller"),)), role="controller")
         self.assertEqual(decision.reason, authorization.REASON_INVALID_ROLE)
 
 

@@ -379,8 +379,21 @@ class ControlPlaneTests(unittest.TestCase):
 
     # Multiple bounded rails
 
-    def _authorize(self, rail: str, status: str, *, depends_on: str = "", resource: str = "") -> None:
+    def _authorize(
+        self,
+        rail: str,
+        status: str,
+        *,
+        depends_on: str = "",
+        resource: str = "",
+        role: str | None = None,
+        extra_role: str | None = None,
+    ) -> None:
         header = [f"# Rail: {rail}", "", f"Status: {status}"]
+        if role is not None:
+            header.append(f"Role: {role}")
+        if extra_role is not None:
+            header.append(f"Role: {extra_role}")
         if depends_on:
             header.append(f"Depends on: {depends_on}")
         if resource:
@@ -408,6 +421,59 @@ class ControlPlaneTests(unittest.TestCase):
                              ("rail-blocked", "blocked"), ("rail-completed", "completed")):
             with self.subTest(rail=rail):
                 self.assertIn(f"- {rail}: {status}; artifacts: rail", rendered)
+
+    # Durable rail role
+
+    def test_a_rail_without_a_role_still_reads_and_surfaces_none(self) -> None:
+        """38 of 81 published rails predate this header; refusing them would retire
+        whole scopes for every reader, which is far worse than an unenforced field."""
+        self._authorize("rail-legacy", "running")
+        state = self._states()["rail-legacy"]
+        self.assertIsNone(state.role)  # type: ignore[attr-defined]
+        self.assertIn("rail-legacy: running", render_status(
+            self.coordination, project="ai-dev", ticket="issue-51"))
+
+    def test_an_empty_or_none_role_reads_as_absent(self) -> None:
+        for value in ("", "   ", "none", "None"):
+            with self.subTest(value=value):
+                rail = "rail-empty-{0}".format(abs(hash(value)) % 9973)
+                self._authorize(rail, "running", role=value)
+                self.assertIsNone(self._states()[rail].role)  # type: ignore[attr-defined]
+
+    def test_a_non_managed_role_stays_readable_and_normalized(self) -> None:
+        """`evidence-worker` is a real assignment in Issue #55's own history. It must
+        remain observable here; refusing it belongs to authorization, not the reader."""
+        self._authorize("rail-evidence", "running", role="Evidence-Worker")
+        self.assertEqual(self._states()["rail-evidence"].role, "evidence-worker")  # type: ignore[attr-defined]
+
+    def test_every_managed_role_parses(self) -> None:
+        for role in ("executor", "reviewer", "orchestrator"):
+            with self.subTest(role=role):
+                rail = "rail-{0}".format(role)
+                self._authorize(rail, "running", role=role)
+                self.assertEqual(self._states()[rail].role, role)  # type: ignore[attr-defined]
+
+    def test_a_backticked_role_is_normalized(self) -> None:
+        self._authorize("rail-quoted", "running", role="`orchestrator`")
+        self.assertEqual(self._states()["rail-quoted"].role, "orchestrator")  # type: ignore[attr-defined]
+
+    def test_two_role_headers_fail_the_scope_read(self) -> None:
+        """Role is authorization-sensitive now, so 'last one wins' is not a safe read."""
+        self._authorize("rail-ambiguous", "running", role="executor", extra_role="orchestrator")
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._states()
+        self.assertIn("Role:", str(caught.exception))
+        self.assertIn("unambiguous", str(caught.exception))
+
+    def test_two_identical_role_headers_are_still_ambiguous(self) -> None:
+        self._authorize("rail-twice", "running", role="executor", extra_role="executor")
+        with self.assertRaises(ControlPlaneError):
+            self._states()
+
+    def test_the_reader_never_checks_the_role_against_a_managed_vocabulary(self) -> None:
+        """Three namespaces stay distinct; the reader owns none of them."""
+        self._authorize("rail-odd", "running", role="release-captain")
+        self.assertEqual(self._states()["rail-odd"].role, "release-captain")  # type: ignore[attr-defined]
 
     def test_target_rail_read_stays_bounded_with_many_rails(self) -> None:
         self._authorize("rail-alpha", "running")
