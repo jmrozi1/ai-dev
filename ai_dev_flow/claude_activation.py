@@ -16,7 +16,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import ntpath
 import os
+import posixpath
 import shlex
 import shutil
 import subprocess
@@ -38,7 +40,12 @@ from .control_plane import (
     resolve_coordination_repo,
     resolve_read_source,
 )
-from .json_files import JsonFileError, load_json_object, write_text_atomic
+from .json_files import (
+    JsonFileError,
+    load_json_object,
+    write_json_object_atomic,
+    write_text_atomic,
+)
 from .repository import RepositoryError, resolve_repo_root, workflow_state_file_for_repo_root
 from .ticket_status import TicketStatusError, render_active_ticket_status
 from .ticket_providers import (
@@ -79,8 +86,13 @@ def resolve_claude_instruction_path(*, home: Path | None = None) -> Path:
     return _resolved_home(home) / ".claude" / "CLAUDE.md"
 
 
+# The managed cache root, relative to home, named once so the Path form and the
+# settings-entry text below cannot describe different directories.
+CONTROL_PLANE_CACHE_RELATIVE = (".ai-dev", "control-plane")
+
+
 def resolve_control_plane_cache_root(*, home: Path | None = None) -> Path:
-    return _resolved_home(home) / ".ai-dev" / "control-plane"
+    return _resolved_home(home).joinpath(*CONTROL_PLANE_CACHE_RELATIVE)
 
 
 def resolve_control_plane_cache(
@@ -193,6 +205,182 @@ def sync_claude_activation(*, home: Path | None = None) -> str:
     return "updated" if had_block else ("installed" if not existing else "inserted")
 
 
+# Control-plane directory access ----------------------------------------------
+
+# Claude Code reads user-level settings from this path at session start, and its
+# ``permissions.additionalDirectories`` is the supported way to put a directory
+# outside the working tree permanently in scope.
+CLAUDE_SETTINGS_RELATIVE = (".claude", "settings.json")
+PERMISSIONS_KEY = "permissions"
+ADDITIONAL_DIRECTORIES_KEY = "additionalDirectories"
+
+_SETTINGS_REPAIR_HINT = (
+    "Repair that file by hand, or move it aside and install again. AI Dev does "
+    "not own your Claude settings and never rewrites a file it cannot read "
+    "unambiguously."
+)
+
+
+def resolve_claude_settings_path(*, home: Path | None = None) -> Path:
+    """User-level Claude Code settings: durable, and not per product repository."""
+    return _resolved_home(home).joinpath(*CLAUDE_SETTINGS_RELATIVE)
+
+
+def _host_platform(platform: str | None = None) -> str:
+    """The host convention that decides path shape and launcher set."""
+    if platform is None:
+        return "windows" if os.name == "nt" else "posix"
+    if platform not in {"posix", "windows"}:
+        raise ClaudeActivationError(
+            f"Unsupported platform {platform!r}; expected 'posix' or 'windows'."
+        )
+    return platform
+
+
+def _path_module(platform: str):
+    return ntpath if platform == "windows" else posixpath
+
+
+def _json_type_name(value: object) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, dict):
+        return "object"
+    if isinstance(value, list):
+        return "array"
+    if isinstance(value, str):
+        return "string"
+    return "number"
+
+
+def render_managed_directory_entry(
+    *, home: Path | None = None, platform: str | None = None
+) -> str:
+    """The one narrow directory AI Dev asks Claude Code to keep in scope.
+
+    Every project's coordination clone lives under the managed cache root and
+    nothing else does, so this stays bounded no matter how many products the
+    user works on. It is deliberately not the home directory, the Projects tree,
+    or a blanket tool-allow rule.
+    """
+    module = _path_module(_host_platform(platform))
+    home_text = str(_resolved_home(home))
+    return module.normpath(module.join(home_text, *CONTROL_PLANE_CACHE_RELATIVE))
+
+
+def _directory_identity(text: str, *, home: Path | None, platform: str) -> str:
+    """Compare directory entries the way the host filesystem would.
+
+    An entry a user already added by hand may be spelled with ``~``, with
+    forward slashes on Windows, or in different case. Installing again has to
+    recognise those as the same directory rather than appending a duplicate.
+    """
+    module = _path_module(platform)
+    candidate = text.strip()
+    if candidate == "~" or candidate.startswith(("~/", "~\\")):
+        # Split on both separators: a hand-written entry may use either, whatever
+        # host wrote it.
+        parts = [part for part in candidate[2:].replace("\\", "/").split("/") if part]
+        candidate = module.join(str(_resolved_home(home)), *parts)
+    normalized = module.normpath(candidate)
+    return ntpath.normcase(normalized) if platform == "windows" else normalized
+
+
+@dataclass(frozen=True)
+class DirectoryAccessStatus:
+    path: Path
+    entry: str
+    state: str
+
+
+def sync_control_plane_directory_permission(
+    *, home: Path | None = None, platform: str | None = None
+) -> DirectoryAccessStatus:
+    """Give every fresh product session durable access to the managed cache.
+
+    Claude Code denies file access outside the session's working directory,
+    which is how a product session could discover its rail correctly and then be
+    unable to publish the handoff the rail asked for. A per-session ``/add-dir``
+    is a manual relay, not an installation, so normal installation grants the
+    access instead through the provider's own persistent mechanism.
+
+    Ownership is deliberately narrow and additive. AI Dev contributes exactly
+    one directory entry and preserves every other key, permission rule, and
+    directory in the user's settings. It does not touch ``defaultMode``: the
+    defect is directory scope, and widening the permission mode would answer a
+    question nobody asked.
+
+    Retirement stays additive too. The entry is a plain string in a
+    user-owned list that the user may also have written by hand or through
+    ``/add-dir``, so there is no marker that proves AI Dev wrote any particular
+    element. Deleting an entry we cannot prove we own risks removing the user's
+    own access, and a stale entry naming a directory the user removed is inert,
+    so uninstallation leaves it and says so rather than guessing.
+    """
+    resolved_platform = _host_platform(platform)
+    path = resolve_claude_settings_path(home=home)
+    entry = render_managed_directory_entry(home=home, platform=resolved_platform)
+
+    existed = path.exists()
+    try:
+        settings = load_json_object(path, missing_default={})
+    except JsonFileError as exc:
+        raise ClaudeActivationError(
+            f"Cannot grant control-plane access. {exc} {_SETTINGS_REPAIR_HINT}"
+        ) from exc
+
+    permissions = settings.get(PERMISSIONS_KEY, {})
+    if not isinstance(permissions, dict):
+        raise ClaudeActivationError(
+            f"Cannot grant control-plane access: {path} holds a "
+            f"{_json_type_name(permissions)} at {PERMISSIONS_KEY!r}, expected an "
+            f"object. {_SETTINGS_REPAIR_HINT}"
+        )
+
+    directories = permissions.get(ADDITIONAL_DIRECTORIES_KEY, [])
+    if not isinstance(directories, list):
+        raise ClaudeActivationError(
+            f"Cannot grant control-plane access: {path} holds a "
+            f"{_json_type_name(directories)} at "
+            f"{PERMISSIONS_KEY}.{ADDITIONAL_DIRECTORIES_KEY}, expected an array of "
+            f"directory strings. {_SETTINGS_REPAIR_HINT}"
+        )
+    for existing in directories:
+        if not isinstance(existing, str):
+            raise ClaudeActivationError(
+                f"Cannot grant control-plane access: {path} lists a "
+                f"{_json_type_name(existing)} in "
+                f"{PERMISSIONS_KEY}.{ADDITIONAL_DIRECTORIES_KEY}, expected directory "
+                f"strings. {_SETTINGS_REPAIR_HINT}"
+            )
+
+    wanted = _directory_identity(entry, home=home, platform=resolved_platform)
+    if any(
+        _directory_identity(existing, home=home, platform=resolved_platform) == wanted
+        for existing in directories
+    ):
+        return DirectoryAccessStatus(path, entry, "unchanged")
+
+    # Rebuilt rather than mutated in place: a merge failure must leave the
+    # caller's parsed settings untouched, and the on-disk file is only ever
+    # replaced atomically below.
+    merged = dict(settings)
+    merged_permissions = dict(permissions)
+    merged_permissions[ADDITIONAL_DIRECTORIES_KEY] = [*directories, entry]
+    merged[PERMISSIONS_KEY] = merged_permissions
+
+    try:
+        write_json_object_atomic(path, merged)
+    except JsonFileError as exc:
+        raise ClaudeActivationError(
+            f"Cannot grant control-plane access: {exc}"
+        ) from exc
+
+    return DirectoryAccessStatus(path, entry, "updated" if existed else "installed")
+
+
 # Command installation --------------------------------------------------------
 
 
@@ -207,14 +395,6 @@ def resolve_command_directory(*, home: Path | None = None) -> Path:
     return _resolved_home(home) / ".local" / "bin"
 
 
-def _launcher_platform(platform: str | None = None) -> str:
-    if platform is None:
-        return "windows" if os.name == "nt" else "posix"
-    if platform not in {"posix", "windows"}:
-        raise ClaudeActivationError(
-            f"Unsupported launcher platform {platform!r}; expected 'posix' or 'windows'."
-        )
-    return platform
 
 
 # Every launcher name this installer has ever owned, so reinstalling can retire
@@ -325,7 +505,7 @@ def install_ai_dev_command(
     re-cloned runtime is handled by installing again, never by a search path
     that could bind the command to the wrong checkout.
     """
-    resolved_platform = _launcher_platform(platform)
+    resolved_platform = _host_platform(platform)
     resolved_runtime = (
         resolve_ai_dev_runtime_root()
         if runtime_root is None
@@ -404,14 +584,22 @@ def command_directory_is_on_path(directory: Path, *, path_value: str | None = No
 def install_claude_host_activation(
     *, home: Path | None = None, runtime_root: Path | None = None
 ) -> dict:
-    """The two halves of activation: the command, and the pointer that documents it."""
+    """Everything activation promises: the command, the pointer, and cache access.
+
+    A pointer that documents a command the host lacks is a lie, and a command
+    that can discover a rail but not publish to it is only half an activation.
+    All three land in one supported step so no part of the promise depends on a
+    manual follow-up.
+    """
     pointer_outcome = sync_claude_activation(home=home)
     directory, launchers = install_ai_dev_command(home=home, runtime_root=runtime_root)
+    access = sync_control_plane_directory_permission(home=home)
     return {
         "pointer": pointer_outcome,
         "pointerPath": resolve_claude_instruction_path(home=home),
         "commandDirectory": directory,
         "launchers": launchers,
+        "controlPlaneAccess": access,
     }
 
 

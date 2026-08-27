@@ -1094,5 +1094,289 @@ class ClaudeCommandInstallationTests(_TempHome):
         self.assertFalse(activation.resolve_claude_instruction_path(home=self.home).exists())
 
 
+class ControlPlaneDirectoryAccessTests(_TempHome):
+    """Durable, bounded write access to the managed cache from any product repo.
+
+    Checkpoint 4 Phase B failed here: a fresh product session discovered its rail
+    correctly and was then denied the write that publication needs, because the
+    coordination cache lives outside that repository's working directory.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.settings = activation.resolve_claude_settings_path(home=self.home)
+
+    def _write(self, payload: str) -> None:
+        self.settings.parent.mkdir(parents=True, exist_ok=True)
+        self.settings.write_text(payload, encoding="utf-8")
+
+    def _read(self) -> dict:
+        return json.loads(self.settings.read_text(encoding="utf-8"))
+
+    def _directories(self) -> list:
+        return self._read()["permissions"]["additionalDirectories"]
+
+    # Scope
+
+    def test_the_granted_directory_is_the_managed_cache_root_only(self) -> None:
+        entry = activation.render_managed_directory_entry(home=self.home)
+        root = activation.resolve_control_plane_cache_root(home=self.home)
+        self.assertEqual(Path(entry), root)
+
+        # Bounded: the granted root is strictly inside the home directory, not
+        # the home directory itself and not the tree of product checkouts.
+        self.assertNotEqual(Path(entry), self.home)
+        self.assertIn(self.home.resolve(), Path(entry).parents)
+
+        # Every project's clone still lives under the one granted root, so this
+        # stays a single narrow grant however many products the user works on.
+        for repository in ("jmrozi1/ai-dev-control-plane", "someone/other-plane"):
+            with self.subTest(repository=repository):
+                cache = activation.resolve_control_plane_cache(repository, home=self.home)
+                self.assertIn(Path(entry), cache.parents)
+
+    def test_grant_is_directory_scope_and_never_a_permission_mode_change(self) -> None:
+        self._write(json.dumps({"permissions": {"defaultMode": "default"}}))
+        activation.sync_control_plane_directory_permission(home=self.home)
+        permissions = self._read()["permissions"]
+        self.assertEqual(permissions["defaultMode"], "default")
+        self.assertEqual(
+            permissions["additionalDirectories"],
+            [activation.render_managed_directory_entry(home=self.home)],
+        )
+
+    # First install and idempotency
+
+    def test_first_install_creates_settings_with_exactly_the_bounded_entry(self) -> None:
+        status = activation.sync_control_plane_directory_permission(home=self.home)
+        self.assertEqual(status.state, "installed")
+        self.assertEqual(status.path, self.settings)
+        self.assertEqual(
+            self._read(),
+            {"permissions": {"additionalDirectories": [status.entry]}},
+        )
+
+    def test_second_install_is_unchanged_and_does_not_rewrite(self) -> None:
+        activation.sync_control_plane_directory_permission(home=self.home)
+        first = self.settings.read_bytes()
+        status = activation.sync_control_plane_directory_permission(home=self.home)
+        self.assertEqual(status.state, "unchanged")
+        self.assertEqual(self.settings.read_bytes(), first)
+
+    def test_an_entry_the_user_added_by_hand_is_not_duplicated(self) -> None:
+        entry = activation.render_managed_directory_entry(home=self.home)
+        self._write(json.dumps({"permissions": {"additionalDirectories": [entry]}}))
+        status = activation.sync_control_plane_directory_permission(home=self.home)
+        self.assertEqual(status.state, "unchanged")
+        self.assertEqual(self._directories(), [entry])
+
+    # Preservation of what AI Dev does not own
+
+    def test_unrelated_keys_rules_and_directories_all_survive(self) -> None:
+        payload = {
+            "autoUpdatesChannel": "latest",
+            "model": "claude-opus-5",
+            "permissions": {
+                "defaultMode": "acceptEdits",
+                "allow": ["Bash(git status:*)"],
+                "deny": ["Read(./secrets/**)"],
+                "additionalDirectories": ["/srv/shared", "/srv/notes"],
+            },
+            "hooks": {"Stop": []},
+        }
+        self._write(json.dumps(payload, indent=2))
+
+        status = activation.sync_control_plane_directory_permission(home=self.home)
+        self.assertEqual(status.state, "updated")
+
+        merged = self._read()
+        self.assertEqual(merged["autoUpdatesChannel"], "latest")
+        self.assertEqual(merged["model"], "claude-opus-5")
+        self.assertEqual(merged["hooks"], {"Stop": []})
+        self.assertEqual(merged["permissions"]["defaultMode"], "acceptEdits")
+        self.assertEqual(merged["permissions"]["allow"], ["Bash(git status:*)"])
+        self.assertEqual(merged["permissions"]["deny"], ["Read(./secrets/**)"])
+
+        # Appended, never reordered or replaced.
+        self.assertEqual(
+            merged["permissions"]["additionalDirectories"],
+            ["/srv/shared", "/srv/notes", status.entry],
+        )
+
+        # Nothing outside the one entry differs from what the user wrote.
+        expected = json.loads(json.dumps(payload))
+        expected["permissions"]["additionalDirectories"].append(status.entry)
+        self.assertEqual(merged, expected)
+
+    def test_no_broad_directory_or_blanket_rule_is_ever_added(self) -> None:
+        self._write(json.dumps({"permissions": {"allow": []}}))
+        activation.sync_control_plane_directory_permission(home=self.home)
+        permissions = self._read()["permissions"]
+        self.assertEqual(permissions["allow"], [])
+        self.assertNotIn("deny", permissions)
+        self.assertNotIn("defaultMode", permissions)
+        for granted in permissions["additionalDirectories"]:
+            with self.subTest(granted=granted):
+                self.assertNotEqual(Path(granted), self.home)
+
+    def test_retirement_is_additive_and_never_deletes_a_users_entry(self) -> None:
+        """No marker proves AI Dev wrote any element, so nothing is removed.
+
+        A stale directory entry is inert; deleting an entry we cannot prove we
+        own would silently take away access the user granted themselves.
+        """
+        self.assertFalse(
+            [name for name in dir(activation) if "remove" in name and "director" in name.lower()]
+        )
+
+        stale = str(self.tmp_path / "old-home" / ".ai-dev" / "control-plane")
+        self._write(json.dumps({"permissions": {"additionalDirectories": [stale]}}))
+        status = activation.sync_control_plane_directory_permission(home=self.home)
+        self.assertEqual(status.state, "updated")
+        self.assertEqual(self._directories(), [stale, status.entry])
+
+    # Fail-closed behaviour
+
+    def _assert_fails_closed_byte_identically(self, payload: str) -> None:
+        self._write(payload)
+        before = self.settings.read_bytes()
+        with self.assertRaises(ClaudeActivationError) as raised:
+            activation.sync_control_plane_directory_permission(home=self.home)
+        self.assertEqual(self.settings.read_bytes(), before)
+        message = str(raised.exception)
+        self.assertIn(str(self.settings), message)
+        self.assertIn("install again", message)
+
+    def test_malformed_json_fails_closed_without_rewriting(self) -> None:
+        self._assert_fails_closed_byte_identically('{"permissions": {,}')
+
+    def test_a_non_object_settings_document_fails_closed(self) -> None:
+        self._assert_fails_closed_byte_identically('["not", "settings"]')
+
+    def test_wrong_typed_permissions_fails_closed(self) -> None:
+        self._assert_fails_closed_byte_identically('{"permissions": "all"}')
+
+    def test_wrong_typed_additional_directories_fails_closed(self) -> None:
+        self._assert_fails_closed_byte_identically(
+            '{"permissions": {"additionalDirectories": "/srv/shared"}}'
+        )
+
+    def test_a_non_string_directory_entry_fails_closed(self) -> None:
+        self._assert_fails_closed_byte_identically(
+            '{"permissions": {"additionalDirectories": ["/srv/shared", 7]}}'
+        )
+
+    def test_the_write_uses_the_atomic_primitive(self) -> None:
+        with patch.object(activation, "write_json_object_atomic") as writer:
+            activation.sync_control_plane_directory_permission(home=self.home)
+        writer.assert_called_once()
+
+    # Path normalization
+
+    def test_windows_entries_normalize_separators_and_case(self) -> None:
+        entry = activation.render_managed_directory_entry(home=self.home, platform="windows")
+        self.assertNotIn("/", entry)
+
+        for spelling in (
+            entry.replace("\\", "/"),
+            entry.upper(),
+            entry.lower(),
+            entry + "\\",
+        ):
+            with self.subTest(spelling=spelling):
+                self._write(
+                    json.dumps({"permissions": {"additionalDirectories": [spelling]}})
+                )
+                status = activation.sync_control_plane_directory_permission(
+                    home=self.home, platform="windows"
+                )
+                self.assertEqual(status.state, "unchanged")
+                self.assertEqual(self._directories(), [spelling])
+
+    def test_posix_keeps_case_significant(self) -> None:
+        entry = activation.render_managed_directory_entry(home=self.home, platform="posix")
+        self._write(
+            json.dumps({"permissions": {"additionalDirectories": [entry.upper()]}})
+        )
+        status = activation.sync_control_plane_directory_permission(
+            home=self.home, platform="posix"
+        )
+        self.assertEqual(status.state, "updated")
+        self.assertEqual(self._directories(), [entry.upper(), entry])
+
+    def test_a_home_relative_entry_is_recognised_on_both_platforms(self) -> None:
+        for platform, spelling in (
+            ("posix", "~/.ai-dev/control-plane"),
+            ("windows", "~\\.ai-dev\\control-plane"),
+            ("windows", "~/.ai-dev/control-plane"),
+        ):
+            with self.subTest(platform=platform, spelling=spelling):
+                self._write(
+                    json.dumps({"permissions": {"additionalDirectories": [spelling]}})
+                )
+                status = activation.sync_control_plane_directory_permission(
+                    home=self.home, platform=platform
+                )
+                self.assertEqual(status.state, "unchanged")
+                self.assertEqual(self._directories(), [spelling])
+
+    def test_an_unsupported_platform_fails_closed(self) -> None:
+        with self.assertRaises(ClaudeActivationError):
+            activation.render_managed_directory_entry(home=self.home, platform="plan9")
+
+    # Installation seam
+
+    def test_supported_claude_installation_grants_the_access(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        arguments = [
+            "--repo-root",
+            str(repo_root),
+            "--audience",
+            "claude",
+            "--home",
+            str(self.home),
+        ]
+
+        self.assertEqual(installation.main(arguments), 0)
+        entry = activation.render_managed_directory_entry(home=self.home)
+        self.assertEqual(self._directories(), [entry])
+
+        # Reinstalling the audience neither duplicates nor rewrites the grant.
+        settled = self.settings.read_bytes()
+        self.assertEqual(installation.main(arguments), 0)
+        self.assertEqual(self.settings.read_bytes(), settled)
+
+    def test_host_activation_installs_pointer_command_and_access_together(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        result = activation.install_claude_host_activation(
+            home=self.home, runtime_root=repo_root
+        )
+        self.assertTrue(result["pointerPath"].is_file())
+        self.assertTrue(result["launchers"])
+        access = result["controlPlaneAccess"]
+        self.assertEqual(access.state, "installed")
+        self.assertEqual(
+            Path(access.entry),
+            activation.resolve_control_plane_cache_root(home=self.home),
+        )
+
+    def test_other_audiences_never_touch_the_users_claude_settings(self) -> None:
+        repo_root = Path(__file__).resolve().parents[1]
+        exit_code = installation.main(
+            [
+                "--repo-root",
+                str(repo_root),
+                "--audience",
+                "copilot",
+                "--destination-root",
+                str(self.tmp_path / "copilot-skills"),
+                "--home",
+                str(self.home),
+            ]
+        )
+        self.assertEqual(exit_code, 0)
+        self.assertFalse(self.settings.exists())
+
+
 if __name__ == "__main__":
     unittest.main()

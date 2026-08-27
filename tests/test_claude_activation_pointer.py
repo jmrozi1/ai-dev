@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 import unittest
 
+from ai_dev_flow import claude_activation as activation
+
 
 def _normalized(path: Path) -> str:
     return " ".join(path.read_text(encoding="utf-8").lower().split())
@@ -31,7 +33,7 @@ class ClaudeActivationPointerTests(unittest.TestCase):
     def test_proceed_reads_fresh_durable_state_after_clear(self) -> None:
         self.assertIn("read fresh durable state before acting", self.pointer)
         self.assertIn("even immediately after `/clear`", self.pointer)
-        self.assertIn("python -m ai_dev_flow.control_plane status", self.pointer)
+        self.assertIn(f"{activation.AI_DEV_COMMAND_NAME} discover", self.pointer)
 
     def test_pointer_routes_to_the_canonical_executor_skill(self) -> None:
         self.assertIn("skills/executor/skill.md", self.pointer)
@@ -101,15 +103,65 @@ class ClaudeActivationPointerTests(unittest.TestCase):
 
     # Tasking precedence
 
-    def test_configured_rail_outranks_local_tasking_file(self) -> None:
-        self.assertIn("the authorized rail is the assignment", self.pointer)
-        self.assertIn("`.ai-dev/tasking.md` is not canonical", self.pointer)
-        self.assertIn("prefer the rail wherever the two disagree", self.pointer)
+    def test_the_reported_rail_is_the_whole_assignment(self) -> None:
+        self.assertIn("the rail discovery reports is the assignment", self.pointer)
 
-    def test_unconfigured_fallback_matches_the_executor_contract(self) -> None:
-        fallback = "when no control plane is configured, `.ai-dev/tasking.md` remains the rail"
-        self.assertIn(fallback, self.pointer)
-        self.assertIn(fallback, self.executor)
+    def test_no_local_branch_can_contradict_durable_authorization(self) -> None:
+        """A checked-in fallback rail would compete with the authorized one."""
+        self.assertIn("outranks durable control-plane authorization", self.pointer)
+        for retired in (".ai-dev/tasking.md", "when no control plane is configured"):
+            with self.subTest(retired=retired):
+                self.assertNotIn(retired, self.pointer)
+
+        # The provider-neutral role contract still owns the unconfigured case;
+        # only this repository's pointer stops restating it.
+        self.assertIn(
+            "when no control plane is configured, `.ai-dev/tasking.md` remains the rail",
+            self.executor,
+        )
+
+
+def _fenced_commands(text: str) -> list[str]:
+    """Every command line inside a fenced block, in order."""
+    commands: list[str] = []
+    inside = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            inside = not inside
+            continue
+        if inside and stripped:
+            commands.append(stripped)
+    return commands
+
+
+class ActivationBootstrapAgreementTests(unittest.TestCase):
+    """Repo-local and host activation must not drift to different bootstraps.
+
+    They drifted once: this file kept documenting a repository-local control
+    plane after the accepted path became the installed command, so a fresh
+    session followed instructions that reported `control plane: not configured`.
+    """
+
+    def setUp(self) -> None:
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.pointer = (self.repo_root / "CLAUDE.md").read_text(encoding="utf-8")
+        self.block = activation.render_activation_block()
+
+    def test_both_name_the_same_installed_bootstrap_command(self) -> None:
+        command = f"{activation.AI_DEV_COMMAND_NAME} discover"
+        self.assertIn(command, self.block)
+        self.assertIn(command, self.pointer)
+
+    def test_the_repository_pointer_documents_no_second_bootstrap(self) -> None:
+        expected = [f"{activation.AI_DEV_COMMAND_NAME} discover"]
+        self.assertEqual(_fenced_commands(self.pointer), expected)
+        self.assertEqual(_fenced_commands(self.block), expected)
+
+    def test_neither_documents_the_retired_local_control_plane_bootstrap(self) -> None:
+        for label, text in (("CLAUDE.md", self.pointer), ("activation block", self.block)):
+            with self.subTest(label=label):
+                self.assertNotIn("python -m ai_dev_flow.control_plane", text)
 
 
 if __name__ == "__main__":

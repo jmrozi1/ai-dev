@@ -671,11 +671,15 @@ def _print_result(result: SkillInstallResult) -> None:
 
 
 def _install_claude_host_activation(*, repo_root: Path, home: Path | None) -> int:
-    """Claude activation is skills plus the documented command, installed together.
+    """Claude activation is skills, the documented command, and cache access.
 
     The activation pointer tells a fresh executor to run `ai-dev discover`. If
     installing the audience left that command absent, the pointer would document
-    something the host does not have, so both halves land in one supported step.
+    something the host does not have; if the command could discover a rail but
+    not write to the coordination cache, discovery would lead to a publication
+    the session cannot perform. All of it lands in one supported step so no part
+    of the promise depends on a manual follow-up such as a per-session
+    `/add-dir`.
     """
     from .claude_activation import (
         AI_DEV_COMMAND_NAME,
@@ -693,6 +697,10 @@ def _install_claude_host_activation(*, repo_root: Path, home: Path | None) -> in
     print(f"Activation pointer {activation['pointer']}: {activation['pointerPath']}")
     for launcher in activation["launchers"]:
         print(f"Command {launcher.state}: {launcher.path}")
+
+    access = activation["controlPlaneAccess"]
+    print(f"Control-plane access {access.state}: {access.entry}")
+    print(f"Claude settings: {access.path}")
 
     directory = activation["commandDirectory"]
     if not command_directory_is_on_path(directory):
