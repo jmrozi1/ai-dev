@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Dict
+from html.parser import HTMLParser
 import ast
 import http.client
 import json
@@ -105,6 +106,45 @@ def policy_of(page: str) -> str:
     match = re.search(r'http-equiv="Content-Security-Policy" content="([^"]+)"', page)
     assert match is not None, "no content-security policy in the page"
     return match.group(1)
+
+
+class _Ancestry(HTMLParser):
+    """Records each element id's ancestor ids, so containment is parsed, not assumed."""
+
+    VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link",
+            "meta", "param", "source", "track", "wbr"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self._stack = []
+        self.ancestors = {}
+        self.tags = {}
+
+    def handle_starttag(self, tag, attrs):
+        attributes = dict(attrs)
+        element_id = attributes.get("id")
+        if element_id is not None:
+            self.ancestors[element_id] = [entry for entry in self._stack if entry is not None]
+            self.tags[element_id] = tag
+        if tag not in self.VOID:
+            self._stack.append(element_id)
+
+    def handle_startendtag(self, tag, attrs):
+        attributes = dict(attrs)
+        element_id = attributes.get("id")
+        if element_id is not None:
+            self.ancestors[element_id] = [entry for entry in self._stack if entry is not None]
+            self.tags[element_id] = tag
+
+    def handle_endtag(self, tag):
+        if tag not in self.VOID and self._stack:
+            self._stack.pop()
+
+
+def ancestry_of(page: str) -> _Ancestry:
+    parser = _Ancestry()
+    parser.feed(page)
+    return parser
 
 
 # --------------------------------------------------------------------------
@@ -424,6 +464,90 @@ class DeclaredInteractionTests(unittest.TestCase):
         self.assertNotIn("insertAdjacentHTML", self.script)
         self.assertNotIn("document.write", self.script)
         self.assertGreaterEqual(self.script.count("textContent"), 5)
+
+
+# --------------------------------------------------------------------------
+# The response composer is a single state-dependent unit
+# --------------------------------------------------------------------------
+
+
+class OperationalComposerTests(unittest.TestCase):
+    """No response action exists for an operational row, so nothing offers one."""
+
+    COMPOSER_CHILDREN = ("response-input", "response-failure", "response-hint", "send")
+
+    def setUp(self) -> None:
+        self.page, _, _ = rendered([a_decision()], [an_agent()])
+        self.script = script_of(self.page)
+        self.ancestry = ancestry_of(self.page)
+
+    def test_every_response_control_lives_inside_the_one_composer(self) -> None:
+        self.assertEqual(self.ancestry.tags.get("response"), "form")
+        for child in self.COMPOSER_CHILDREN:
+            with self.subTest(child=child):
+                self.assertIn("response", self.ancestry.ancestors.get(child, []), child)
+
+    def test_the_response_label_is_inside_the_composer_too(self) -> None:
+        """The label has no id, so its containment is checked in the markup itself."""
+        form = self.page.split('<form class="response" id="response">', 1)[1]
+        form = form.split("</form>", 1)[0]
+        self.assertIn('<label for="response-input">Response</label>', form)
+
+    def test_the_whole_composer_is_hidden_for_an_operational_selection(self) -> None:
+        self.assertIn("formEl.hidden = !waiting;", self.script)
+
+    def test_no_response_control_is_hidden_independently_of_the_composer(self) -> None:
+        """Five separately hidden children could drift out of agreement; one parent cannot.
+
+        Scoped to the function that makes the state decision. The failure line is
+        shown and cleared by validation elsewhere, which is accepted Waiting
+        behavior and has nothing to do with whether responding is possible.
+        """
+        decision_block = self.script.split("function renderDetail", 1)[1] \
+                                    .split("function render(", 1)[0]
+        for child in ("inputEl", "sendEl", "failureEl", "hintEl", "labelEl"):
+            with self.subTest(child=child):
+                self.assertNotIn("{0}.hidden".format(child), decision_block, child)
+        self.assertEqual(decision_block.count("formEl.hidden = !waiting;"), 1)
+        self.assertEqual(self.script.count("formEl.hidden"), 1)
+
+    def test_validation_still_shows_and_clears_the_failure_line(self) -> None:
+        """Preserved exactly: this is Waiting behavior, not composer visibility."""
+        self.assertIn("failureEl.hidden = true;", self.script)
+        self.assertIn("failureEl.hidden = false;", self.script)
+    def test_the_controls_stay_disabled_as_a_backstop(self) -> None:
+        self.assertIn("sendEl.disabled = !waiting;", self.script)
+        self.assertIn("inputEl.disabled = !waiting;", self.script)
+        self.assertIn("if (sendEl.disabled) { return; }", self.script)
+
+    def test_visibility_and_the_backstop_derive_from_the_same_waiting_condition(self) -> None:
+        block = self.script.split("var waiting =", 1)[1].split("function render(", 1)[0]
+        for assignment in ("formEl.hidden = !waiting;", "sendEl.disabled = !waiting;",
+                           "inputEl.disabled = !waiting;"):
+            self.assertIn(assignment, block, assignment)
+
+    def test_switching_selection_clears_the_input_and_any_stale_failure(self) -> None:
+        block = self.script.split("function select(", 1)[1].split("function submit(", 1)[0]
+        self.assertIn("clearFailure();", block)
+        self.assertIn('inputEl.value = "";', block)
+
+    def test_details_remains_available_and_collapsed_for_an_operational_selection(self) -> None:
+        detail_block = self.script.split("function renderDetail", 1)[1].split("function render(", 1)[0]
+        self.assertIn("detailsEl.open = false;", detail_block)
+        self.assertNotIn("detailsEl.hidden", self.script)
+
+    def test_no_substitute_operational_prose_or_status_control_was_added(self) -> None:
+        """Removing the composer must not smuggle in a replacement that explains itself."""
+        paragraphs = [
+            element for element, tag in self.ancestry.tags.items() if tag == "p"
+        ]
+        self.assertEqual(sorted(paragraphs),
+                         ["explanation", "queue-empty", "response-failure", "response-hint"])
+        self.assertEqual(self.page.count("<button"), 1)
+        self.assertEqual(self.page.count("<textarea"), 1)
+        for substitute in ("No response", "not available", "read-only", "cannot respond",
+                           "This agent", "In progress"):
+            self.assertNotIn(substitute, self.page, substitute)
 
 
 # --------------------------------------------------------------------------

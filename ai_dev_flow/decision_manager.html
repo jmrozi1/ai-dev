@@ -185,6 +185,7 @@ details summary { cursor: pointer; font-weight: 600; }
   var emptyEl = document.getElementById("queue-empty");
   var detailEl = document.getElementById("detail");
   var explanationEl = document.getElementById("explanation");
+  var formEl = document.getElementById("response");
   var inputEl = document.getElementById("response-input");
   var failureEl = document.getElementById("response-failure");
   var sendEl = document.getElementById("send");
@@ -258,8 +259,18 @@ details summary { cursor: pointer; font-weight: 600; }
     explanationEl.textContent = waiting ? detail.explanation : "";
     explanationEl.hidden = !waiting;
 
-    // Send belongs to a decision a person was asked to make. An operational row
-    // is inspectable, and that is all it is.
+    // Responding belongs to a decision a person was asked to make. An operational
+    // row is inspectable, and that is all it is -- so the whole composer goes
+    // away rather than sitting there greyed out. A disabled control still
+    // advertises an action that does not exist for this row.
+    //
+    // One hidden parent, never five hidden children: the label, textarea,
+    // failure line, hint, and Send all live inside this form, so they cannot
+    // drift out of agreement about whether responding is possible.
+    formEl.hidden = !waiting;
+
+    // Kept as a backstop. If the form were ever revealed by other means, the
+    // controls still refuse, and `submit` still returns early on a disabled Send.
     sendEl.disabled = !waiting;
     inputEl.disabled = !waiting;
 
@@ -329,7 +340,7 @@ details summary { cursor: pointer; font-weight: 600; }
     submit();
   });
 
-  document.getElementById("response").addEventListener("submit", function (event) {
+  formEl.addEventListener("submit", function (event) {
     event.preventDefault();
     submit();
   });
