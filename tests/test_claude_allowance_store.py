@@ -1058,7 +1058,7 @@ class ResetOrderTests(StoreTestCase):
             store = AllowanceStore(self.root / ("corpus-%02d.json" % case))
             last_clean_ordinal = {w: 0 for w in windows}
             for step in range(steps):
-                missing = (case + step) % 4 == 0
+                missing = (case + step) % 4 == 1
                 store.record_result(result(None if missing else 1.0 + step),
                                     idempotency_key="c%02d-%d" % (case, step))
                 for index, window in enumerate(windows):
