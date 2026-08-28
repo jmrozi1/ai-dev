@@ -28,9 +28,12 @@ from __future__ import annotations
 # change what "preceding" means.
 
 from decimal import Decimal, DecimalException, localcontext
+import errno
 import json
+import os
 from pathlib import Path
 import re
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from .claude_allowance import (
@@ -75,9 +78,13 @@ REASON_STORE_WRITE_FAILED = "store-write-failed"
 REASON_METER_MISMATCH = "meter-mismatch"
 REASON_WORKLOAD_OVERFLOW = "workload-overflow"
 REASON_INVALID_WINDOW = "invalid-window"
+REASON_STORE_LOCKED = "store-locked"
+REASON_LOCK_MALFORMED = "store-lock-malformed"
+REASON_LOCK_LOST = "store-lock-lost"
 
 _STORE_KEYS = ("version", "meter", "workloadUnits", "results", "observations")
 _RESULT_KEYS = ("key", "ordinal", "cost")
+_LOCK_KEYS = ("version", "generation", "pid", "acquiredAt", "operation")
 _OBSERVATION_KEYS = (
     "window", "observedAt", "resetsAt", "usedPercentage",
     "workloadUnits", "ledgerOrdinal", "humanCoverage", "completeCoverage",
@@ -230,6 +237,96 @@ class AllowanceStore:
 
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
+        self.lock_path = self.path.with_name(self.path.name + ".lock")
+
+    # -- exclusive boundary -----------------------------------------------
+
+    def _acquire(self, operation: str) -> str:
+        """Take exclusive ownership of one read-decide-write generation.
+
+        Atomic replacement stops a torn read; it does not stop two processes from
+        each loading the same generation and both replacing it, which loses one
+        of them silently. Exclusive creation is the boundary that does.
+
+        An existing lock is never read, aged out, or broken here. Held and
+        malformed are the same answer -- refuse -- because a lock whose owner
+        cannot be proven is exactly when guessing is most expensive. The refusal
+        leaves the store byte-unchanged, so the caller may retry the same
+        idempotency key safely.
+        """
+        generation = os.urandom(16).hex()
+        payload = json.dumps(
+            {"version": SCHEMA_VERSION, "generation": generation, "pid": os.getpid(),
+             "acquiredAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "operation": operation},
+            indent=2, sort_keys=True,
+        ) + "\n"
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(
+                str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise AllowanceStoreError(
+                    REASON_STORE_LOCKED,
+                    "{0} is held by another writer; retry the same key".format(self.lock_path),
+                ) from exc
+            raise AllowanceStoreError(
+                REASON_STORE_WRITE_FAILED,
+                "cannot create {0}: {1}".format(self.lock_path, exc),
+            ) from exc
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            try:
+                os.unlink(str(self.lock_path))
+            except OSError:
+                pass
+            raise AllowanceStoreError(
+                REASON_STORE_WRITE_FAILED,
+                "cannot write {0}: {1}".format(self.lock_path, exc),
+            ) from exc
+        return generation
+
+    def _release(self, generation: str) -> None:
+        """Release only the generation this call acquired."""
+        try:
+            text = self.lock_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise AllowanceStoreError(
+                REASON_LOCK_LOST, "{0} vanished before release".format(self.lock_path)
+            )
+        except OSError as exc:
+            raise AllowanceStoreError(
+                REASON_UNREADABLE_STORE,
+                "cannot read {0}: {1}".format(self.lock_path, exc),
+            ) from exc
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AllowanceStoreError(
+                REASON_LOCK_MALFORMED,
+                "{0} is invalid JSON: {1}".format(self.lock_path, exc.msg),
+            ) from exc
+        if not isinstance(payload, dict) or set(payload) != set(_LOCK_KEYS):
+            raise AllowanceStoreError(
+                REASON_LOCK_MALFORMED, "{0} is not a lock record".format(self.lock_path)
+            )
+        if payload.get("generation") != generation:
+            raise AllowanceStoreError(
+                REASON_LOCK_LOST,
+                "{0} was replaced since this call acquired it".format(self.lock_path),
+            )
+        try:
+            os.unlink(str(self.lock_path))
+        except OSError as exc:
+            raise AllowanceStoreError(
+                REASON_STORE_WRITE_FAILED,
+                "cannot release {0}: {1}".format(self.lock_path, exc),
+            ) from exc
 
     # -- reading ----------------------------------------------------------
 
@@ -350,7 +447,9 @@ class AllowanceStore:
             )
         loaded = []
         previous_ordinal = 0
-        previous_observed = None
+        # Predecessor ordinal and observation time are both per window, exactly as
+        # they are on the write side; a shared instant across windows is normal.
+        previous_by_window = {}
         for index, entry in enumerate(raw):
             label = "{0} observations[{1}]".format(self.path, index)
             _require_exact_keys(entry, _OBSERVATION_KEYS, label=label)
@@ -362,9 +461,11 @@ class AllowanceStore:
                         label, ledger_ordinal, previous_ordinal, len(results)
                     ),
                 )
+            window = entry["window"]
+            window_ordinal, window_observed = previous_by_window.get(window, (0, None))
             human = _persisted_bool(entry["humanCoverage"], label=label + " humanCoverage")
             complete = _persisted_bool(entry["completeCoverage"], label=label + " completeCoverage")
-            expected = human and _span_is_clean(results, previous_ordinal, ledger_ordinal)
+            expected = human and _span_is_clean(results, window_ordinal, ledger_ordinal)
             if complete != expected:
                 # completeCoverage is derived, so a stored value that disagrees
                 # with the ledger it was derived from is edited state.
@@ -374,19 +475,31 @@ class AllowanceStore:
                         label, complete, expected
                     ),
                 )
+            stored_workload = _persisted_decimal(
+                entry["workloadUnits"], label=label + " workloadUnits",
+                reason=REASON_MALFORMED_STORE,
+            )
+            derived_workload = _sum_through(results, ledger_ordinal)
+            if stored_workload != derived_workload:
+                # The snapshot is derivable from the ledger, so a value that no
+                # longer follows from it was edited. Trusting it would let an
+                # inflated or deflated workload manufacture training evidence.
+                raise AllowanceStoreError(
+                    REASON_MALFORMED_STORE,
+                    "{0} stores workload {1} but ordinal {2} derives {3}".format(
+                        label, stored_workload, ledger_ordinal, derived_workload
+                    ),
+                )
             try:
                 point = CalibrationPoint(
-                    window=entry["window"],
+                    window=window,
                     observed_at=entry["observedAt"],
                     resets_at=entry["resetsAt"],
                     used_percentage=_persisted_decimal(
                         entry["usedPercentage"], label=label + " usedPercentage",
                         reason=REASON_MALFORMED_STORE,
                     ),
-                    workload_units=_persisted_decimal(
-                        entry["workloadUnits"], label=label + " workloadUnits",
-                        reason=REASON_MALFORMED_STORE,
-                    ),
+                    workload_units=stored_workload,
                     meter=CURRENT_METER,
                     complete_coverage=complete,
                 )
@@ -394,14 +507,14 @@ class AllowanceStore:
                 raise AllowanceStoreError(
                     REASON_MALFORMED_STORE, "{0} is not a valid reading: {1}".format(label, exc)
                 ) from exc
-            if previous_observed is not None and point.observed_at <= previous_observed:
+            if window_observed is not None and point.observed_at <= window_observed:
                 raise AllowanceStoreError(
                     REASON_MALFORMED_STORE,
-                    "{0} observed at {1} does not follow {2}".format(
-                        label, point.observed_at, previous_observed
+                    "{0} observed at {1} does not follow the previous {2} reading at {3}".format(
+                        label, point.observed_at, window, window_observed
                     ),
                 )
-            previous_observed = point.observed_at
+            previous_by_window[window] = (ledger_ordinal, point.observed_at)
             previous_ordinal = ledger_ordinal
             loaded.append({"point": point, "ledger_ordinal": ledger_ordinal, "human": human})
         return loaded
@@ -460,27 +573,31 @@ class AllowanceStore:
         key = _exact_key(idempotency_key)
         cost = result_workload(result.total_cost_usd)
 
-        state = self._load()
-        for existing_key, _, existing_cost in state["results"]:
-            if existing_key != key:
-                continue
-            if existing_cost is None and cost is None:
-                return state["workload_units"]
-            if existing_cost is not None and cost is not None and existing_cost == cost:
-                return state["workload_units"]
-            raise AllowanceStoreError(
-                REASON_KEY_CONFLICT,
-                "key {0!r} already recorded cost {1} and cannot now record {2}".format(
-                    key, existing_cost, cost
-                ),
-            )
+        generation = self._acquire("record_result")
+        try:
+            state = self._load()
+            for existing_key, _, existing_cost in state["results"]:
+                if existing_key != key:
+                    continue
+                if existing_cost is None and cost is None:
+                    return state["workload_units"]
+                if existing_cost is not None and cost is not None and existing_cost == cost:
+                    return state["workload_units"]
+                raise AllowanceStoreError(
+                    REASON_KEY_CONFLICT,
+                    "key {0!r} already recorded cost {1} and cannot now record {2}".format(
+                        key, existing_cost, cost
+                    ),
+                )
 
-        results = list(state["results"])
-        results.append((key, len(results) + 1, cost))
-        state["results"] = results
-        state["workload_units"] = _sum_costs([entry[2] for entry in results])
-        self._save(state)
-        return state["workload_units"]
+            results = list(state["results"])
+            results.append((key, len(results) + 1, cost))
+            state["results"] = results
+            state["workload_units"] = _sum_costs([entry[2] for entry in results])
+            self._save(state)
+            return state["workload_units"]
+        finally:
+            self._release(generation)
 
     def append_observation(
         self,
@@ -499,37 +616,49 @@ class AllowanceStore:
         the ledger actually shows for the same span.
         """
         human = _exact_bool(human_complete_coverage, label="human_complete_coverage")
-        state = self._load()
-        results = state["results"]
-        observations = state["observations"]
-        previous_ordinal = observations[-1]["ledger_ordinal"] if observations else 0
-        ledger_ordinal = len(results)
-        complete = human and _span_is_clean(results, previous_ordinal, ledger_ordinal)
+        generation = self._acquire("append_observation")
+        try:
+            state = self._load()
+            results = state["results"]
+            observations = state["observations"]
+            # Predecessor is per window. One `/usage` view reports both windows, so
+            # the reading written second would otherwise inherit the other window's
+            # ordinal, look at an empty span, and call itself covered while a
+            # missing-cost result sat inside the span it actually spans.
+            same_window = [e for e in observations if e["point"].window == window]
+            previous_ordinal = same_window[-1]["ledger_ordinal"] if same_window else 0
+            ledger_ordinal = len(results)
+            complete = human and _span_is_clean(results, previous_ordinal, ledger_ordinal)
 
-        point = CalibrationPoint(
-            window=window,
-            observed_at=observed_at,
-            resets_at=resets_at,
-            used_percentage=used_percentage,
-            workload_units=state["workload_units"],
-            meter=CURRENT_METER,
-            complete_coverage=complete,
-        )
-        if observations and point.observed_at <= observations[-1]["point"].observed_at:
-            # Coverage is predecessor-relative, so inserting a reading behind an
-            # existing one would silently redefine a flag already written.
-            raise AllowanceStoreError(
-                REASON_OBSERVATION_OUT_OF_ORDER,
-                "a reading at {0} cannot follow one at {1}".format(
-                    point.observed_at, observations[-1]["point"].observed_at
-                ),
+            point = CalibrationPoint(
+                window=window,
+                observed_at=observed_at,
+                resets_at=resets_at,
+                used_percentage=used_percentage,
+                workload_units=state["workload_units"],
+                meter=CURRENT_METER,
+                complete_coverage=complete,
             )
+            if same_window and point.observed_at <= same_window[-1]["point"].observed_at:
+                # Coverage is predecessor-relative, so inserting a reading behind an
+                # existing one would silently redefine a flag already written. The
+                # rule is per window: the two readings of one `/usage` view share an
+                # instant and neither precedes the other.
+                raise AllowanceStoreError(
+                    REASON_OBSERVATION_OUT_OF_ORDER,
+                    "a {0} reading at {1} cannot follow one at {2}".format(
+                        point.window, point.observed_at,
+                        same_window[-1]["point"].observed_at
+                    ),
+                )
 
-        state["observations"] = list(observations) + [
-            {"point": point, "ledger_ordinal": ledger_ordinal, "human": human}
-        ]
-        self._save(state)
-        return point
+            state["observations"] = list(observations) + [
+                {"point": point, "ledger_ordinal": ledger_ordinal, "human": human}
+            ]
+            self._save(state)
+            return point
+        finally:
+            self._release(generation)
 
     def observations(self, window: str) -> Tuple[CalibrationPoint, ...]:
         """The complete recorded history for one window, in recorded order."""
@@ -550,6 +679,17 @@ class AllowanceStore:
     def latest_observation(self, window: str) -> Optional[CalibrationPoint]:
         recorded = self.observations(window)
         return recorded[-1] if recorded else None
+
+
+def _sum_through(
+    results: List[Tuple[str, int, Optional[Decimal]]], ordinal: int
+) -> Decimal:
+    """The cumulative cost through an exact ledger ordinal.
+
+    An observation's stored workload is a snapshot of this, so it is derivable
+    rather than something to take the store's word for.
+    """
+    return _sum_costs([cost for _, position, cost in results if position <= ordinal])
 
 
 def _span_is_clean(
