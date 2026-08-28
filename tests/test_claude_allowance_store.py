@@ -22,6 +22,7 @@ from ai_dev_flow.claude_allowance_store import (
     SCHEMA_VERSION,
     AllowanceStore,
     AllowanceStoreError,
+    ProjectionInputs,
     allowance_store_path,
     result_workload,
 )
@@ -1106,6 +1107,248 @@ class ResetOrderTests(StoreTestCase):
                 self.assertEqual(refused[window], 64, "not every regression was refused")
                 self.assertEqual(coverage_values[window], {True, False},
                                  "the coverage statement never varied")
+
+
+# --------------------------------------------------------------------------
+# One generation's worth of projection evidence
+# --------------------------------------------------------------------------
+
+
+class ProjectionInputsTests(StoreTestCase):
+    """The composition an honest current projection reads, proved to be one read."""
+
+    def _count_reads(self):
+        """Count generations, not method calls: `_read_payload` is what a load reads."""
+        reads = []
+        original = self.store._read_payload
+
+        def counting():
+            reads.append(1)
+            return original()
+
+        self.store._read_payload = counting
+        return reads
+
+    def test_an_empty_store_still_names_the_window_and_the_current_meter(self) -> None:
+        """`build_profile(())` reports blank values; the caller must not inherit them."""
+        for window in ("five_hour", "seven_day"):
+            with self.subTest(window=window):
+                inputs = self.store.projection_inputs(window)
+                self.assertEqual(inputs.window, window)
+                self.assertEqual(inputs.meter, CURRENT_METER)
+                self.assertEqual(inputs.profile.window, "")
+                self.assertEqual(inputs.profile.meter, "")
+                self.assertIsNone(inputs.anchor)
+                self.assertEqual(inputs.workload_units, Decimal(0))
+                self.assertTrue(inputs.ledger_clean_since_anchor)
+
+    def test_it_reports_the_newest_reading_for_the_requested_window_only(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20", window="five_hour")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40", window="five_hour")
+        seven = self.store.append_observation(
+            window="seven_day", observed_at=BASE + 30, resets_at=SEVEN_RESET,
+            used_percentage=Decimal("9"), human_complete_coverage=True,
+        )
+
+        five = self.store.projection_inputs("five_hour")
+        self.assertEqual(five.anchor.used_percentage, Decimal("40"))
+        self.assertEqual(five.anchor.window, "five_hour")
+        self.assertEqual(five.workload_units, Decimal("0.75"))
+        self.assertEqual(five.profile.window, "five_hour")
+        self.assertEqual(len(five.profile.intervals), 1)
+
+        seven_inputs = self.store.projection_inputs("seven_day")
+        self.assertEqual(seven_inputs.anchor, seven)
+        self.assertEqual(seven_inputs.workload_units, Decimal("0.75"))
+        self.assertEqual(seven_inputs.profile.window, "seven_day")
+
+    def test_the_anchor_and_the_profile_agree_with_the_public_surface(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40")
+        inputs = self.store.projection_inputs("five_hour")
+        self.assertEqual(inputs.anchor, self.store.latest_observation("five_hour"))
+        self.assertEqual(inputs.profile, self.store.profile("five_hour"))
+        self.assertEqual(inputs.workload_units, self.store.workload_units())
+
+    def test_a_hole_after_the_anchor_makes_the_ledger_span_dirty(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.assertFalse(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+        # A later reading re-anchors past the hole, so the span becomes clean again
+        # without anything being repaired or forgotten.
+        self.observe(20, "40")
+        self.store.record_result(result(0.25), idempotency_key="after")
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+    def test_a_hole_before_the_anchor_does_not_dirty_the_span_after_it(self) -> None:
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="after")
+        inputs = self.store.projection_inputs("five_hour")
+        self.assertTrue(inputs.ledger_clean_since_anchor)
+        self.assertFalse(inputs.anchor.complete_coverage)
+
+    def test_with_no_reading_the_span_is_the_whole_ledger(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.assertFalse(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+    def test_each_window_gets_its_own_predecessor_ordinal(self) -> None:
+        """One `/usage` view writes both windows; a hole must dirty the right span."""
+        self.observe(10, "20", window="five_hour")
+        self.store.append_observation(
+            window="seven_day", observed_at=BASE + 10, resets_at=SEVEN_RESET,
+            used_percentage=Decimal("5"), human_complete_coverage=True,
+        )
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.observe(20, "40", window="five_hour")
+
+        # `five_hour` re-anchored past the hole; `seven_day` did not.
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+        self.assertFalse(self.store.projection_inputs("seven_day").ledger_clean_since_anchor)
+
+    def test_it_reads_exactly_one_generation(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        reads = self._count_reads()
+        self.store.projection_inputs("five_hour")
+        self.assertEqual(len(reads), 1)
+
+    def test_a_write_landing_mid_read_cannot_change_what_is_reported(self) -> None:
+        """One generation means the generation that was read, whatever lands after.
+
+        The store gains a costed result and a hole once the first read is done. A
+        reader that went back for a second generation would answer partly from
+        the newer one -- which is how a newer workload total ends up beside a
+        cleanliness flag derived from an older ledger, the pairing that overstates
+        coverage. Reporting the first generation unchanged is the only answer that
+        cannot be such a mixture.
+        """
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        before = self.store.workload_units()
+        self.assertEqual(before, Decimal("0.5"))
+
+        original = self.store._read_payload
+        reads = []
+
+        def mutating():
+            reads.append(1)
+            if len(reads) == 1:
+                return original()
+            # Stand down first: the writes below load the store themselves, and a
+            # hook that re-entered here would deadlock on its own lock instead of
+            # letting the reader reach its assertion.
+            self.store._read_payload = original
+            self.store.record_result(result(0.25), idempotency_key="late")
+            self.store.record_result(result(None), idempotency_key="late-hole")
+            return original()
+
+        self.store._read_payload = mutating
+        inputs = self.store.projection_inputs("five_hour")
+
+        self.assertEqual(inputs.workload_units, before,
+                         "the workload came from a generation the reader should not have read")
+        self.assertTrue(inputs.ledger_clean_since_anchor,
+                        "the cleanliness flag came from a later generation")
+        self.assertEqual(len(reads), 1)
+
+        # And the later generation really was different, so the assertions above
+        # are not passing because there was nothing to notice.
+        self.assertEqual(self.store.workload_units(), Decimal("0.75"))
+        self.assertFalse(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+    def test_it_refuses_a_window_that_is_not_one_of_the_two(self) -> None:
+        for window in ("hourly", "", "FIVE_HOUR", None, 5):
+            with self.subTest(window=window):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.projection_inputs(window)
+                self.assertEqual(caught.exception.reason, store_module.REASON_INVALID_WINDOW)
+
+    def test_it_exposes_no_ledger_ordinal_and_takes_no_subset(self) -> None:
+        """The ordinal is the store's numbering; a caller may neither read nor choose one."""
+        inputs = self.store.projection_inputs("five_hour")
+        self.assertEqual(
+            ProjectionInputs._fields,
+            ("window", "meter", "profile", "anchor", "workload_units",
+             "ledger_clean_since_anchor"),
+        )
+        self.assertNotIn("ordinal", " ".join(ProjectionInputs._fields))
+        with self.assertRaises(TypeError):
+            self.store.projection_inputs("five_hour", since_ordinal=1)
+        self.assertIsInstance(inputs, ProjectionInputs)
+
+    def test_the_value_is_immutable(self) -> None:
+        inputs = self.store.projection_inputs("five_hour")
+        with self.assertRaises(AttributeError):
+            inputs.workload_units = Decimal("99")
+
+    def test_every_load_refusal_still_applies(self) -> None:
+        """No refusal is caught and softened into a value on this path."""
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+
+        cases = (
+            ("meter", lambda p: p.update({"meter": "other-meter-v1"}),
+             store_module.REASON_METER_MISMATCH),
+            ("workload", lambda p: p.update({"workloadUnits": "9.99"}),
+             store_module.REASON_MALFORMED_STORE),
+            ("version", lambda p: p.update({"version": 2}),
+             store_module.REASON_MALFORMED_STORE),
+            ("coverage", lambda p: p["observations"][0].update({"completeCoverage": False}),
+             store_module.REASON_MALFORMED_STORE),
+        )
+        good = self.payload()
+        for label, mutate, reason in cases:
+            with self.subTest(case=label):
+                payload = json.loads(json.dumps(good))
+                mutate(payload)
+                self.rewrite(payload)
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.projection_inputs("five_hour")
+                self.assertEqual(caught.exception.reason, reason)
+        self.rewrite(good)
+
+    def test_a_contradicting_history_raises_rather_than_returning_a_value(self) -> None:
+        """A percentage that fell has no append-only repair; it must not be softened."""
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40")
+        payload = self.payload()
+        payload["observations"][1]["usedPercentage"] = "10"
+        self.rewrite(payload)
+        with self.assertRaises(AllowanceError) as caught:
+            self.store.projection_inputs("five_hour")
+        self.assertEqual(caught.exception.reason, "provider-percentage-decreased")
+
+    def test_it_feeds_the_estimator_without_a_second_read(self) -> None:
+        """The composition exists to be handed straight to `estimate_current`."""
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40")
+        self.store.record_result(result(0.25), idempotency_key="c")
+
+        inputs = self.store.projection_inputs("five_hour")
+        estimate = estimate_current(
+            inputs.profile,
+            inputs.anchor,
+            now=BASE + 30,
+            workload_units=inputs.workload_units,
+            complete_coverage_since_anchor=inputs.ledger_clean_since_anchor and True,
+        )
+        self.assertTrue(estimate.available)
+        self.assertFalse(estimate.confirmed_exhausted)
 
 
 if __name__ == "__main__":

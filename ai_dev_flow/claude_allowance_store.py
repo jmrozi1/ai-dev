@@ -34,7 +34,7 @@ import os
 from pathlib import Path
 import re
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from .claude_allowance import (
     _CALCULATION,
@@ -50,6 +50,7 @@ __all__ = [
     "AllowanceStoreError",
     "AllowanceStore",
     "CURRENT_METER",
+    "ProjectionInputs",
     "SCHEMA_VERSION",
     "allowance_store_path",
 ]
@@ -220,6 +221,43 @@ def _require_exact_keys(payload: object, expected: Tuple[str, ...], *, label: st
             "{0} has unknown key(s) {1} and missing key(s) {2}".format(label, unknown, missing),
         )
     return payload
+
+
+# --------------------------------------------------------------------------
+# One generation's worth of projection evidence
+# --------------------------------------------------------------------------
+
+
+class ProjectionInputs(NamedTuple):
+    """Everything a current-allowance projection needs, from one read of the store.
+
+    A caller that assembled these by calling `profile`, `latest_observation` and
+    `workload_units` in turn would read three separate generations, so a result
+    recorded between two of them could pair a newer workload total with a
+    cleanliness flag computed over an older ledger -- which is exactly the
+    combination that overstates coverage. These fields are derived together or
+    not at all.
+
+    `meter` is the store's own current meter rather than the profile's, because
+    `build_profile(())` reports an empty window and meter and there is no reading
+    to take them from. The window is the one that was asked for, always.
+
+    `ledger_clean_since_anchor` is the ledger half of the estimator's
+    `complete_coverage_since_anchor` and nothing more. Work this manager never
+    launched is invisible here, so a consumer must conjoin a separate human
+    assertion; this value alone must never be passed through as coverage.
+
+    A `NamedTuple` and not a frozen dataclass on purpose: this module's import set
+    is fixed by contract and `dataclasses` is not in it. Immutability is what the
+    value needs, and `typing` already provides it.
+    """
+
+    window: str
+    meter: str
+    profile: CalibrationProfile
+    anchor: Optional[CalibrationPoint]
+    workload_units: Decimal
+    ledger_clean_since_anchor: bool
 
 
 # --------------------------------------------------------------------------
@@ -702,6 +740,47 @@ class AllowanceStore:
     def latest_observation(self, window: str) -> Optional[CalibrationPoint]:
         recorded = self.observations(window)
         return recorded[-1] if recorded else None
+
+    def projection_inputs(self, window: str) -> ProjectionInputs:
+        """Profile, anchor, workload and ledger cleanliness from one generation.
+
+        Every refusal the store already makes still applies, because this reads
+        through the same `_load`: a wrong meter, an edited total, a coverage flag
+        that no longer follows from its span, a regressed reset, and a profile
+        whose readings contradict each other all raise here exactly as they do
+        elsewhere. Nothing is caught and softened into a value.
+
+        The anchor is the newest reading for this window, and cleanliness spans
+        that reading's recorded ledger ordinal through the current end of the
+        ledger -- the same private predicate and the same per-window predecessor
+        rule that decided the anchor's own coverage flag. With no reading for the
+        window the span is the whole ledger, which is the honest reading of "since
+        the anchor" when there is not one yet.
+
+        The ordinal itself is not returned. It is the store's own numbering, a
+        caller cannot supply one, and exposing it would invite exactly the
+        caller-chosen subset the append-only design refuses.
+        """
+        if window not in WINDOWS:
+            raise AllowanceStoreError(
+                REASON_INVALID_WINDOW,
+                "window {0!r} is not one of {1}".format(window, ", ".join(WINDOWS)),
+            )
+        state = self._load()
+        results = state["results"]
+        same_window = [
+            entry for entry in state["observations"] if entry["point"].window == window
+        ]
+        anchor_entry = same_window[-1] if same_window else None
+        anchor_ordinal = anchor_entry["ledger_ordinal"] if anchor_entry is not None else 0
+        return ProjectionInputs(
+            window=window,
+            meter=state["meter"],
+            profile=build_profile(tuple(entry["point"] for entry in same_window)),
+            anchor=anchor_entry["point"] if anchor_entry is not None else None,
+            workload_units=state["workload_units"],
+            ledger_clean_since_anchor=_span_is_clean(results, anchor_ordinal, len(results)),
+        )
 
 
 def _sum_through(
