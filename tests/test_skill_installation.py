@@ -488,7 +488,7 @@ class SkillInstallationTests(unittest.TestCase):
                 else:
                     conflict.write_text("user\n", encoding="utf-8")
 
-                with self.assertRaisesRegex(SkillInstallationError, "is not a symlink"):
+                with self.assertRaisesRegex(SkillInstallationError, "is not a managed symlink or junction"):
                     self._install(destination, home=home)
 
     def test_unmanaged_symlink_conflict_fails_closed(self) -> None:
