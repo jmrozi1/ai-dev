@@ -345,19 +345,18 @@ class CalibrationProfileTests(unittest.TestCase):
             build_profile([first, later, conflicting])
         self.assertEqual(caught.exception.reason, allowance.REASON_DUPLICATE_OBSERVATION)
 
-    def test_nonmonotonic_units_do_not_train(self) -> None:
+    def test_unchanged_units_train_nothing_but_are_not_a_contradiction(self) -> None:
+        """No work done is not a fall; it simply cannot establish a rate."""
         first, _ = trained_pair()
-        for later in (point(observed_at=BASE + 1_000, used_percentage=Decimal("30"),
-                            workload_units=Decimal("100")),
-                      point(observed_at=BASE + 1_000, used_percentage=Decimal("30"),
-                            workload_units=Decimal("50"))):
-            with self.subTest(units=str(later.workload_units)):
-                # Every other rule holds, so only the workload rule can refuse it.
-                self.assertEqual(first.reset_identity, later.reset_identity)
-                self.assertTrue(later.complete_coverage)
-                self.assertGreater(later.observed_at, first.observed_at)
-                self.assertGreater(later.used_percentage, first.used_percentage)
-                self.assertEqual(build_profile([first, later]).intervals, ())
+        later = point(observed_at=BASE + 1_000, used_percentage=Decimal("30"),
+                      workload_units=Decimal("100"))
+        # Every other rule holds, so only the workload rule can refuse the interval.
+        self.assertEqual(first.reset_identity, later.reset_identity)
+        self.assertTrue(later.complete_coverage)
+        self.assertGreater(later.observed_at, first.observed_at)
+        self.assertGreater(later.used_percentage, first.used_percentage)
+        self.assertEqual(later.workload_units, first.workload_units)
+        self.assertEqual(build_profile([first, later]).intervals, ())
 
     def test_an_unchanged_provider_percentage_trains_nothing(self) -> None:
         """The reproduced defect: 23% -> 23% over 800 units once trained a zero rate.
@@ -477,13 +476,19 @@ class FlatReadingTests(unittest.TestCase):
         opening = point(observed_at=BASE, used_percentage=Decimal("10"),
                         workload_units=Decimal("100"), complete_coverage=False)
         flats = [point(observed_at=BASE + step, used_percentage=Decimal("10"),
-                       workload_units=Decimal(str(100 + step)))
-                 for step in (500, 1_000, 1_500)]
+                       workload_units=Decimal(units))
+                 for step, units in ((500, "300"), (1_000, "500"), (1_500, "700"))]
         moved = point(observed_at=BASE + 2_000, used_percentage=Decimal("30"),
                       workload_units=Decimal("1000"))
+        previous = opening
         for flat in flats:
             self.assertTrue(flat.complete_coverage)
             self.assertEqual(flat.used_percentage, opening.used_percentage)
+            # The counter climbs all the way through, so nothing here is a
+            # contradiction and only flatness can keep them from training.
+            self.assertGreater(flat.workload_units, previous.workload_units)
+            previous = flat
+        self.assertGreater(moved.workload_units, previous.workload_units)
 
         without = build_profile([opening, moved])
         with_flats = build_profile([opening] + flats + [moved])
@@ -532,6 +537,56 @@ class FlatReadingTests(unittest.TestCase):
                     build_profile(entries)
                 self.assertEqual(caught.exception.reason,
                                  allowance.REASON_PERCENTAGE_DECREASED)
+
+    def test_a_workload_that_falls_inside_one_window_is_refused(self) -> None:
+        """The local counter climbs too, and the flat skip would hide a fall."""
+        opening = point(observed_at=BASE, used_percentage=Decimal("10"),
+                        workload_units=Decimal("900"), complete_coverage=False)
+        fell = point(observed_at=BASE + 1_000, used_percentage=Decimal("20"),
+                     workload_units=Decimal("100"))
+        moved = point(observed_at=BASE + 2_000, used_percentage=Decimal("30"),
+                      workload_units=Decimal("1000"))
+        self.assertEqual(fell.reset_identity, opening.reset_identity)
+        self.assertLess(fell.workload_units, opening.workload_units)
+        # Every other rule is satisfied, so only the workload fall can refuse it.
+        self.assertTrue(fell.complete_coverage)
+        self.assertGreater(fell.observed_at, opening.observed_at)
+        self.assertGreater(fell.used_percentage, opening.used_percentage)
+
+        for entries in ([opening, fell], [opening, fell, moved], [moved, fell, opening]):
+            with self.subTest(shape=[str(e.workload_units) for e in entries]):
+                with self.assertRaises(AllowanceError) as caught:
+                    build_profile(entries)
+                self.assertEqual(caught.exception.reason,
+                                 allowance.REASON_WORKLOAD_DECREASED)
+
+    def test_a_fallen_workload_behind_a_flat_reading_is_still_refused(self) -> None:
+        """A covered flat reading is passed over, so the fall must be caught first."""
+        opening = point(observed_at=BASE, used_percentage=Decimal("10"),
+                        workload_units=Decimal("900"), complete_coverage=False)
+        flat = point(observed_at=BASE + 1_000, used_percentage=Decimal("10"),
+                     workload_units=Decimal("100"))
+        moved = point(observed_at=BASE + 2_000, used_percentage=Decimal("30"),
+                      workload_units=Decimal("1000"))
+        self.assertEqual(flat.used_percentage, opening.used_percentage)
+        self.assertTrue(flat.complete_coverage)
+        with self.assertRaises(AllowanceError) as caught:
+            build_profile([opening, flat, moved])
+        self.assertEqual(caught.exception.reason, allowance.REASON_WORKLOAD_DECREASED)
+
+    def test_a_lower_workload_in_a_later_window_is_not_a_decrease(self) -> None:
+        """The rule is scoped to one reset identity, where a fall can corrupt a rate.
+
+        Across identities no interval can span the pair and the candidate restarts,
+        so a lower reading there is inert rather than contradictory.
+        """
+        first, later = trained_pair()
+        fresh_window = point(observed_at=SECOND_BASE, resets_at=SECOND_RESET,
+                             used_percentage=Decimal("35"), workload_units=Decimal("1"),
+                             complete_coverage=False)
+        self.assertLess(fresh_window.workload_units, later.workload_units)
+        self.assertNotEqual(fresh_window.reset_identity, later.reset_identity)
+        self.assertEqual(len(build_profile([first, later, fresh_window]).intervals), 1)
 
     def test_a_lower_reading_in_a_later_window_is_not_a_decrease(self) -> None:
         """A new window legitimately starts lower; only one window is monotonic."""

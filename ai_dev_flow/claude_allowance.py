@@ -108,6 +108,7 @@ REASON_INVALID_POINT = "invalid-calibration-point"
 REASON_DUPLICATE_OBSERVATION = "duplicate-observation-epoch"
 REASON_MIXED_PROFILE = "mixed-window-or-meter"
 REASON_PERCENTAGE_DECREASED = "provider-percentage-decreased"
+REASON_WORKLOAD_DECREASED = "local-workload-decreased"
 
 
 class AllowanceError(Exception):
@@ -362,14 +363,19 @@ def _interval(
     )
 
 
-def _refuse_decreasing_percentage(ordered: Tuple[CalibrationPoint, ...]) -> None:
-    """A provider percentage cannot fall inside one window.
+def _refuse_contradictions(ordered: Tuple[CalibrationPoint, ...]) -> None:
+    """Neither meter can fall inside one window.
 
-    Within a single reset identity the meter only climbs, so a fall is not a
-    reading this module may quietly route around: one of the two numbers is
-    wrong and nothing here can tell which. Skipping the pair would leave the bad
-    reading in place as the anchor of the next interval, so the whole profile is
-    refused instead.
+    The provider percentage and the local workload counter both only climb
+    within a single reset identity, so a fall in either is not a reading this
+    module may quietly route around: one of the two numbers is wrong and nothing
+    here can tell which. Skipping only the bad pair would leave the bad reading
+    in place as the anchor of the next interval -- and a fully covered flat
+    reading is now passed over entirely, which would discard the contradiction
+    without a trace. The whole profile is refused instead.
+
+    Equal values are not a fall. An unchanged percentage is no new information
+    and an unchanged workload is simply no work done; both stay inert.
     """
     for earlier, later in zip(ordered, ordered[1:]):
         if earlier.reset_identity != later.reset_identity:
@@ -382,6 +388,17 @@ def _refuse_decreasing_percentage(ordered: Tuple[CalibrationPoint, ...]) -> None
                     earlier.used_percentage,
                     earlier.observed_at,
                     later.used_percentage,
+                    later.observed_at,
+                ),
+            )
+        if later.workload_units < earlier.workload_units:
+            raise AllowanceError(
+                REASON_WORKLOAD_DECREASED,
+                "{0} workload fell from {1} at {2} to {3} at {4}".format(
+                    later.reset_identity,
+                    earlier.workload_units,
+                    earlier.observed_at,
+                    later.workload_units,
                     later.observed_at,
                 ),
             )
@@ -451,7 +468,7 @@ def build_profile(points: Sequence[CalibrationPoint]) -> CalibrationProfile:
         )
 
     ordered = _sorted_points(entries)
-    _refuse_decreasing_percentage(ordered)
+    _refuse_contradictions(ordered)
 
     intervals = []
     candidate = None
