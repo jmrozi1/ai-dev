@@ -1026,58 +1026,86 @@ class ResetOrderTests(StoreTestCase):
     def test_no_trained_interval_ever_spans_a_missing_cost(self) -> None:
         """A bounded public-API corpus, judged by the ledger rather than by flags.
 
-        Every case deliberately attempts the adversarial shape: a reading whose
-        reset sits behind the one already recorded for that window, arriving later
-        in time so nothing but the reset rule can object. Whatever the store
-        accepts, no trained interval may span a ledger entry whose cost is missing.
+        Every one of the 64 cases records both windows from each reading, as one
+        `/usage` view does, and every case attempts a reset that regresses behind
+        the one already recorded for that window. All three reset epochs sit far
+        above every observation the case can append, so an accepted regression
+        stays readable and the oracle is reachable: with the reset rule removed the
+        prohibited history trains across a hole and this test fails on its own
+        `assertEqual(offenders, [])`, not on a horizon or premise error.
+
+        Window choice and the human coverage statement are driven by disjoint bits,
+        so neither window's coverage can be inferred from which window it is.
         """
         windows = ("five_hour", "seven_day")
         spans = {"five_hour": FIVE_HOUR, "seven_day": SEVEN_DAY}
-        intervals_seen = regressions_refused = holes_seen = advanced = 0
-        for case in range(96):
+        steps = 6
+        # Three identities per window, all beyond any observation this corpus makes,
+        # so only the ordering rule can ever object to the regressing one.
+        base = {w: BASE + spans[w] for w in windows}
+        advanced = {w: BASE + spans[w] + 100 for w in windows}
+        regressing = {w: BASE + spans[w] - 50 for w in windows}
+        reset_for = {0: base, 1: base, 2: regressing, 3: base, 4: advanced, 5: advanced}
+
+        trained = {w: 0 for w in windows}
+        attempted = {w: 0 for w in windows}
+        refused = {w: 0 for w in windows}
+        holes_in_span = {w: 0 for w in windows}
+        oracles_run = {w: 0 for w in windows}
+        coverage_values = {w: set() for w in windows}
+
+        for case in range(64):
             store = AllowanceStore(self.root / ("corpus-%02d.json" % case))
-            last = {w: None for w in windows}
-            identities = {w: set() for w in windows}
-            for step in range(5):
-                missing = (case + step) % 3 == 0
-                holes_seen += 1 if missing else 0
+            last_clean_ordinal = {w: 0 for w in windows}
+            for step in range(steps):
+                missing = (case + step) % 4 == 0
                 store.record_result(result(None if missing else 1.0 + step),
                                     idempotency_key="c%02d-%d" % (case, step))
-                window = windows[(case >> step) & 1]
-                span = spans[window]
-                previous = last[window]
-                observed = BASE + 100 if previous is None else previous[0] + 100
-                if previous is None:
-                    reset = observed + span          # this window's first identity
-                elif (case >> (step + 1)) & 1:
-                    reset = previous[1]              # another reading, same identity
-                elif (case >> (step + 2)) & 1:
-                    reset = observed + span          # the provider moved on
-                else:
-                    reset = observed + 60            # a reset behind the recorded one
-                try:
-                    store.append_observation(
-                        window=window, observed_at=observed, resets_at=reset,
-                        used_percentage=Decimal(str(10 + 5 * step)),
-                        human_complete_coverage=bool((case >> step) & 1))
-                    last[window] = (observed, reset)
-                    identities[window].add(reset)
-                except AllowanceStoreError as exc:
-                    self.assertEqual(exc.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
-                    regressions_refused += 1
-                    # A refused reading must leave the recorded history untouched.
-                    last[window] = previous
+                for index, window in enumerate(windows):
+                    # Disjoint bits: window index picks the triple, step picks the bit.
+                    covered = bool((case >> (3 * index + step % 3)) & 1)
+                    coverage_values[window].add(covered)
+                    reset = reset_for[step][window]
+                    if step == 2:
+                        attempted[window] += 1
+                    try:
+                        store.append_observation(
+                            window=window, observed_at=BASE + 100 * (step + 1),
+                            resets_at=reset,
+                            used_percentage=Decimal(str(10 + 5 * step)),
+                            human_complete_coverage=covered)
+                        if missing:
+                            holes_in_span[window] += 1
+                        last_clean_ordinal[window] = step
+                    except AllowanceStoreError as exc:
+                        self.assertEqual(exc.reason,
+                                         store_module.REASON_RESET_EPOCH_REGRESSED)
+                        refused[window] += 1
             for window in windows:
                 offenders = trained_spans_with_holes(store, window)
+                oracles_run[window] += 1
                 self.assertEqual(offenders, [], "case %d %s trained across a hole: %s"
                                  % (case, window, offenders))
-                intervals_seen += len(store.profile(window).intervals)
-                advanced += 1 if len(identities[window]) > 1 else 0
-        # The corpus must exercise what it claims.
-        self.assertGreater(intervals_seen, 0, "no interval was ever trained")
-        self.assertGreater(holes_seen, 0, "no missing cost was ever recorded")
-        self.assertGreater(regressions_refused, 0, "no regressing reset was ever attempted")
-        self.assertGreater(advanced, 0, "no window ever held two reset identities")
+                trained[window] += len(store.profile(window).intervals)
+
+        # Emitted so the fixture can be audited from the validation record rather
+        # than taken on trust.
+        for window in windows:
+            print("corpus[%s]: oracles=%d intervals=%d holes_in_span=%d "
+                  "regressions_attempted=%d refused=%d coverage=%s"
+                  % (window, oracles_run[window], trained[window], holes_in_span[window],
+                     attempted[window], refused[window], sorted(coverage_values[window])))
+
+        # Per-window premises, so neither window can be carried by the other.
+        for window in windows:
+            with self.subTest(window=window):
+                self.assertEqual(oracles_run[window], 64, "the oracle did not run every case")
+                self.assertGreater(trained[window], 0, "no interval was ever trained")
+                self.assertGreater(holes_in_span[window], 0, "no missing cost landed in a span")
+                self.assertEqual(attempted[window], 64, "not every case attempted a regression")
+                self.assertEqual(refused[window], 64, "not every regression was refused")
+                self.assertEqual(coverage_values[window], {True, False},
+                                 "the coverage statement never varied")
 
 
 if __name__ == "__main__":
