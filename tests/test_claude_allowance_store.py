@@ -849,5 +849,236 @@ class ReDerivationTests(StoreTestCase):
                          self.store.observations("five_hour"))
 
 
+# --------------------------------------------------------------------------
+# Reset ordering within a window
+# --------------------------------------------------------------------------
+
+# A window's second reset identity is one whole window later, and its readings
+# necessarily fall inside it -- a five-hour reading cannot sit five hours before
+# a reset two windows away, and the record refuses that outright.
+WINDOW_SPANS = {"five_hour": (FIVE_HOUR, RESET), "seven_day": (SEVEN_DAY, SEVEN_RESET)}
+
+
+def window_reading(window, identity, step):
+    """An `(observed_at, resets_at)` pair inside the given reset identity."""
+    span, first_reset = WINDOW_SPANS[window]
+    reset = first_reset + identity * span
+    return reset - span + 100 * (step + 1), reset
+
+
+def trained_spans_with_holes(store, window):
+    """Every trained interval, checked against the ledger it actually spans.
+
+    Deliberately ignores the stored `completeCoverage` flag and reads the durable
+    file instead. A flag computed against a shorter recorded span must not be able
+    to vouch for an interval that really covers more, so the oracle re-derives each
+    span from the two readings' own ledger ordinals.
+    """
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    costs = {entry["ordinal"]: entry["cost"] for entry in payload["results"]}
+    ordinal_of = {
+        (entry["resetsAt"], entry["observedAt"]): entry["ledgerOrdinal"]
+        for entry in payload["observations"] if entry["window"] == window
+    }
+    offenders = []
+    for interval in store.profile(window).intervals:
+        start = ordinal_of[(interval.resets_at, interval.started_at)]
+        end = ordinal_of[(interval.resets_at, interval.ended_at)]
+        holes = [o for o in range(start + 1, end + 1) if costs.get(o) is None]
+        if holes:
+            offenders.append((interval.started_at, interval.ended_at, holes))
+    return offenders
+
+
+class ResetOrderTests(StoreTestCase):
+    def _reading(self, store, window, identity, step, percentage):
+        observed_at, reset = window_reading(window, identity, step)
+        return store.append_observation(
+            window=window, observed_at=observed_at, resets_at=reset,
+            used_percentage=Decimal(percentage), human_complete_coverage=True)
+
+    def test_an_unchanged_reset_epoch_is_accepted(self) -> None:
+        """Successive readings inside one reset identity are the normal case."""
+        first = self._reading(self.store, "five_hour", 0, 0, "10")
+        second = self._reading(self.store, "five_hour", 0, 1, "20")
+        self.assertEqual(first.resets_at, second.resets_at)
+        self.assertGreater(second.observed_at, first.observed_at)
+        self.assertEqual(len(self.store.observations("five_hour")), 2)
+
+    def test_an_advancing_reset_epoch_is_accepted(self) -> None:
+        """The provider moving on to a later window is also normal."""
+        first = self._reading(self.store, "five_hour", 0, 0, "10")
+        later = self._reading(self.store, "five_hour", 1, 0, "5")
+        self.assertGreater(later.resets_at, first.resets_at)
+        self.assertNotEqual(later.reset_identity, first.reset_identity)
+        self.assertEqual(len(self.store.observations("five_hour")), 2)
+
+    def test_a_regressing_reset_epoch_is_refused(self) -> None:
+        first = self._reading(self.store, "five_hour", 1, 0, "10")
+        before_bytes = self.path.read_bytes()
+        # Later in time, but claiming a reset behind the one already recorded, with
+        # its own horizon valid so only the ordering rule can object.
+        observed_at = first.observed_at + 100
+        regressing = observed_at + 60
+        self.assertLess(regressing, first.resets_at)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.append_observation(
+                window="five_hour", observed_at=observed_at, resets_at=regressing,
+                used_percentage=Decimal("20"), human_complete_coverage=True)
+        self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
+        self.assertEqual(self.path.read_bytes(), before_bytes)
+        self.assertFalse(self.store.lock_path.exists())
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+
+    def test_reset_order_is_independent_between_windows(self) -> None:
+        """Each window carries its own reset history; neither constrains the other."""
+        five = self._reading(self.store, "five_hour", 1, 0, "10")
+        # five_hour has already advanced to its second identity. That constrains
+        # nothing in seven_day, whose own first reading is accepted regardless.
+        seven = self._reading(self.store, "seven_day", 0, 0, "10")
+        self.assertNotEqual(seven.resets_at, five.resets_at)
+        self.assertEqual(len(self.store.observations("seven_day")), 1)
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+        # The identical shape inside five_hour is still refused.
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.append_observation(
+                window="five_hour", observed_at=five.observed_at + 100,
+                resets_at=five.observed_at + 160,
+                used_percentage=Decimal("20"), human_complete_coverage=True)
+        self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
+
+    def test_interleaved_two_window_histories_survive_in_both_orders(self) -> None:
+        for order in ("five_first", "seven_first"):
+            with self.subTest(order=order):
+                store = AllowanceStore(self.root / ("interleaved-%s.json" % order))
+                windows = ["five_hour", "seven_day"]
+                if order == "seven_first":
+                    windows.reverse()
+                for step in (0, 1):
+                    store.record_result(result(1.0),
+                                        idempotency_key="k-%s-%d" % (order, step))
+                    for window in windows:
+                        self._reading(store, window, 0, step, str(10 + 10 * step))
+                for window in ("five_hour", "seven_day"):
+                    self.assertEqual(len(store.observations(window)), 2)
+                reloaded = AllowanceStore(store.path)
+                for window in ("five_hour", "seven_day"):
+                    self.assertEqual(reloaded.observations(window), store.observations(window))
+
+    def test_persisted_reset_order_tampering_is_refused_on_reload(self) -> None:
+        self._reading(self.store, "five_hour", 0, 0, "10")
+        self._reading(self.store, "five_hour", 0, 1, "20")
+        payload = self.payload()
+        # Raise the first reading's reset so the second now reads as a regression,
+        # keeping every horizon valid so only the ordering rule can object.
+        payload["observations"][0]["resetsAt"] += 50
+        self.assertLess(payload["observations"][1]["resetsAt"],
+                        payload["observations"][0]["resetsAt"])
+        self.assertLessEqual(
+            payload["observations"][0]["resetsAt"] - payload["observations"][0]["observedAt"],
+            FIVE_HOUR)
+        self.rewrite(payload)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.observations("five_hour")
+        self.assertEqual(caught.exception.reason, store_module.REASON_MALFORMED_STORE)
+
+    def test_equal_and_advancing_histories_reload_unchanged(self) -> None:
+        self.store.record_result(result(1.0), idempotency_key="a")
+        self._reading(self.store, "five_hour", 0, 0, "10")
+        self.store.record_result(result(2.0), idempotency_key="b")
+        self._reading(self.store, "five_hour", 0, 1, "20")
+        self.store.record_result(result(3.0), idempotency_key="c")
+        self._reading(self.store, "five_hour", 1, 0, "5")
+        identities = {p.resets_at for p in self.store.observations("five_hour")}
+        self.assertEqual(len(identities), 2)
+        reloaded = AllowanceStore(self.path)
+        self.assertEqual(reloaded.observations("five_hour"), self.store.observations("five_hour"))
+        self.assertEqual(reloaded.profile("five_hour"), self.store.profile("five_hour"))
+
+    def test_the_reviewer_reproduction_cannot_be_recorded(self) -> None:
+        """A/B/A: an earlier-reset reading recorded between two later-reset ones.
+
+        On checkpoint 24 this history was writable, and `build_profile` paired the
+        two later-reset readings across a span containing a missing cost. The guard
+        now refuses the middle reading, so that history cannot exist.
+        """
+        self.store.record_result(result(1.0), idempotency_key="k1")
+        first = self._reading(self.store, "five_hour", 1, 0, "10")
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.store.record_result(result(4.0), idempotency_key="k2")
+        observed_at, earlier = window_reading("five_hour", 0, 1)
+        self.assertLess(earlier, first.resets_at)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.append_observation(
+                window="five_hour", observed_at=first.observed_at + 10,
+                resets_at=first.observed_at + 10 + 60,
+                used_percentage=Decimal("15"), human_complete_coverage=True)
+        self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
+
+        # The premise really was adversarial: a hole sits in the ledger, and only
+        # the one surviving reset identity remains, so nothing can pair across it.
+        payload = self.payload()
+        self.assertIn(None, [entry["cost"] for entry in payload["results"]])
+        self.assertEqual({entry["resetsAt"] for entry in payload["observations"]},
+                         {first.resets_at})
+        self.assertEqual(trained_spans_with_holes(self.store, "five_hour"), [])
+
+    def test_no_trained_interval_ever_spans_a_missing_cost(self) -> None:
+        """A bounded public-API corpus, judged by the ledger rather than by flags.
+
+        Every case deliberately attempts the adversarial shape: a reading whose
+        reset sits behind the one already recorded for that window, arriving later
+        in time so nothing but the reset rule can object. Whatever the store
+        accepts, no trained interval may span a ledger entry whose cost is missing.
+        """
+        windows = ("five_hour", "seven_day")
+        spans = {"five_hour": FIVE_HOUR, "seven_day": SEVEN_DAY}
+        intervals_seen = regressions_refused = holes_seen = advanced = 0
+        for case in range(96):
+            store = AllowanceStore(self.root / ("corpus-%02d.json" % case))
+            last = {w: None for w in windows}
+            identities = {w: set() for w in windows}
+            for step in range(5):
+                missing = (case + step) % 3 == 0
+                holes_seen += 1 if missing else 0
+                store.record_result(result(None if missing else 1.0 + step),
+                                    idempotency_key="c%02d-%d" % (case, step))
+                window = windows[(case >> step) & 1]
+                span = spans[window]
+                previous = last[window]
+                observed = BASE + 100 if previous is None else previous[0] + 100
+                if previous is None:
+                    reset = observed + span          # this window's first identity
+                elif (case >> (step + 1)) & 1:
+                    reset = previous[1]              # another reading, same identity
+                elif (case >> (step + 2)) & 1:
+                    reset = observed + span          # the provider moved on
+                else:
+                    reset = observed + 60            # a reset behind the recorded one
+                try:
+                    store.append_observation(
+                        window=window, observed_at=observed, resets_at=reset,
+                        used_percentage=Decimal(str(10 + 5 * step)),
+                        human_complete_coverage=bool((case >> step) & 1))
+                    last[window] = (observed, reset)
+                    identities[window].add(reset)
+                except AllowanceStoreError as exc:
+                    self.assertEqual(exc.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
+                    regressions_refused += 1
+                    # A refused reading must leave the recorded history untouched.
+                    last[window] = previous
+            for window in windows:
+                offenders = trained_spans_with_holes(store, window)
+                self.assertEqual(offenders, [], "case %d %s trained across a hole: %s"
+                                 % (case, window, offenders))
+                intervals_seen += len(store.profile(window).intervals)
+                advanced += 1 if len(identities[window]) > 1 else 0
+        # The corpus must exercise what it claims.
+        self.assertGreater(intervals_seen, 0, "no interval was ever trained")
+        self.assertGreater(holes_seen, 0, "no missing cost was ever recorded")
+        self.assertGreater(regressions_refused, 0, "no regressing reset was ever attempted")
+        self.assertGreater(advanced, 0, "no window ever held two reset identities")
+
+
 if __name__ == "__main__":
     unittest.main()

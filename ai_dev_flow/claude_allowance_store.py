@@ -72,6 +72,7 @@ REASON_INVALID_KEY = "invalid-idempotency-key"
 REASON_KEY_CONFLICT = "duplicate-key-conflict"
 REASON_INVALID_COVERAGE = "invalid-coverage-flag"
 REASON_OBSERVATION_OUT_OF_ORDER = "observation-out-of-order"
+REASON_RESET_EPOCH_REGRESSED = "reset-epoch-regressed"
 REASON_MALFORMED_STORE = "malformed-store"
 REASON_UNREADABLE_STORE = "unreadable-store"
 REASON_STORE_WRITE_FAILED = "store-write-failed"
@@ -462,7 +463,8 @@ class AllowanceStore:
                     ),
                 )
             window = entry["window"]
-            window_ordinal, window_observed = previous_by_window.get(window, (0, None))
+            window_ordinal, window_observed, window_reset = previous_by_window.get(
+                window, (0, None, None))
             human = _persisted_bool(entry["humanCoverage"], label=label + " humanCoverage")
             complete = _persisted_bool(entry["completeCoverage"], label=label + " completeCoverage")
             expected = human and _span_is_clean(results, window_ordinal, ledger_ordinal)
@@ -507,6 +509,13 @@ class AllowanceStore:
                 raise AllowanceStoreError(
                     REASON_MALFORMED_STORE, "{0} is not a valid reading: {1}".format(label, exc)
                 ) from exc
+            if window_reset is not None and point.resets_at < window_reset:
+                raise AllowanceStoreError(
+                    REASON_MALFORMED_STORE,
+                    "{0} resets at {1}, behind the previous {2} reading at {3}".format(
+                        label, point.resets_at, window, window_reset
+                    ),
+                )
             if window_observed is not None and point.observed_at <= window_observed:
                 raise AllowanceStoreError(
                     REASON_MALFORMED_STORE,
@@ -514,7 +523,7 @@ class AllowanceStore:
                         label, point.observed_at, window, window_observed
                     ),
                 )
-            previous_by_window[window] = (ledger_ordinal, point.observed_at)
+            previous_by_window[window] = (ledger_ordinal, point.observed_at, point.resets_at)
             previous_ordinal = ledger_ordinal
             loaded.append({"point": point, "ledger_ordinal": ledger_ordinal, "human": human})
         return loaded
@@ -639,6 +648,20 @@ class AllowanceStore:
                 meter=CURRENT_METER,
                 complete_coverage=complete,
             )
+            if same_window and point.resets_at < same_window[-1]["point"].resets_at:
+                # A window's reset only ever moves forward. Allowing it to go back
+                # would make recorded order and profile order disagree: the profile
+                # sorts by reset epoch, so an earlier-reset reading recorded in the
+                # middle lets two readings of the *later* reset become neighbours
+                # there while their coverage was computed against the reading
+                # recorded between them. The interval then spans a ledger the flag
+                # never vouched for.
+                raise AllowanceStoreError(
+                    REASON_RESET_EPOCH_REGRESSED,
+                    "a {0} reading resetting at {1} cannot follow one resetting at {2}".format(
+                        point.window, point.resets_at, same_window[-1]["point"].resets_at
+                    ),
+                )
             if same_window and point.observed_at <= same_window[-1]["point"].observed_at:
                 # Coverage is predecessor-relative, so inserting a reading behind an
                 # existing one would silently redefine a flag already written. The
