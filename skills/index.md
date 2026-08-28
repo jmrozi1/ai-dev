@@ -37,6 +37,7 @@ remain in the applicable canonical `SKILL.md` files.
 
 | Skill | Use when | Canonical path |
 | --- | --- | --- |
+| `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
 | `feedback-loop-design` | Designing discovery, prototyping, implementation, or validation loops when builds, live environments, screenshots, human relay, or other feedback are materially slow or costly. | `skills/feedback-loop-design/SKILL.md` |
 | `investigation-synthesis` | Preserving the durable results of substantial research, debugging, reverse engineering, or source comparison without turning the investigation into transcript documentation; route accepted findings to the smallest correct durable home and discard the rest. | `skills/investigation-synthesis/SKILL.md` |
 | `frontend-design-review` | Reviewing screenshots, implemented UI, mockups, or proposed front-end designs for unnecessary cognitive load, weak action hierarchy, redundant visual containment, or failure to prioritize the normal happy path. | `skills/frontend-design-review/SKILL.md` |
@@ -54,12 +55,18 @@ remain in the applicable canonical `SKILL.md` files.
 | `ticket-creation` | Creating task records using the canonical ticket schema, including `Skill Candidates` and `Skills` accounting sections, and repository ticket-provider contract. | `skills/chatgpt/ticket-creation/SKILL.md` |
 | `work-skill-refinement` | Designing and refining work-side AI skills and capability boundaries from observed work-agent behavior, including deciding when a task should not be delegated to the work AI. | `skills/chatgpt/work-skill-refinement/SKILL.md` |
 
+## Claude
+
+| Skill | Use when | Canonical path |
+| --- | --- | --- |
+| `auto-review` | Routing Claude checkpoint and promotion review to the shared deterministic review-evidence and recording helpers without duplicating review judgment. | `skills/claude/auto-review/SKILL.md` |
+| `flow` | Resolving AI Dev repository, ticket, workspace, and control-plane rail identity from a Claude session, and routing lifecycle intents to the shared deterministic Flow runtime. | `skills/claude/flow/SKILL.md` |
+
 ## Copilot
 
 | Skill | Use when | Canonical path |
 | --- | --- | --- |
 | `auto-review` | Gathering repository review evidence, including active ticket `Skill Candidates`/`Skills`, running deterministic helpers, and recording only when explicitly authorized. | `skills/copilot/auto-review/SKILL.md` |
-| `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/copilot/executor/SKILL.md` |
 | `flow` | Executing and validating Flow lifecycle commands, preconditions, checkpoint mechanics, promotion/retry/completion safety, and evidence reporting. | `skills/copilot/flow/SKILL.md` |
 
 ## Project-local skills

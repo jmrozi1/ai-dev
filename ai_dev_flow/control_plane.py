@@ -476,20 +476,29 @@ def active_git_operation(repo_root: Path) -> str | None:
     return None
 
 
-def worktree_is_clean(repo_root: Path) -> bool:
-    """Report whether the checkout carries no staged, unstaged, or untracked change."""
-    completed = _git_capture(repo_root, ["status", "--porcelain", "--untracked-files=all"])
+def tracked_content_is_clean(repo_root: Path) -> bool:
+    """Report whether the checkout carries no staged or modified tracked content.
+
+    Untracked files are deliberately excluded. The coordination checkout is shared
+    across products, so an untracked artifact one product has not published yet is
+    not this product's to clear, and nothing about it is at stake in a fast-forward.
+    Git itself still refuses a fast-forward that would overwrite an untracked path.
+    """
+    completed = _git_capture(repo_root, ["status", "--porcelain", "--untracked-files=no"])
     if completed.returncode != 0:
         raise ControlPlaneError(f"Cannot inspect the coordination checkout: {completed.stderr.strip()}")
     return not completed.stdout.strip()
 
 
 def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, remote_head: str) -> None:
-    """Fast-forward a clean, strictly behind branch onto freshly fetched upstream state.
+    """Fast-forward a strictly behind branch onto freshly fetched upstream state.
 
-    This is the one unambiguous case: nothing local is at stake, so requiring a human
-    to type the same fast-forward adds no judgment. Every other shape still fails
+    This is the one unambiguous case: no tracked local work is at stake, so requiring a
+    human to type the same fast-forward adds no judgment. Every other shape still fails
     closed, and the advance itself is fast-forward only, never a rebase, merge, or reset.
+    Untracked files are left exactly as they are: they are never cleared, moved, stashed,
+    staged, or committed here, and Git's own ff-only refusal covers the case where an
+    upstream change would collide with one.
     """
     operation = active_git_operation(repo_root)
     if operation is not None:
@@ -497,11 +506,11 @@ def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, r
             f"Cannot publish: coordination upstream {upstream} is ahead of {branch}, but a Git "
             f"operation ({operation}) is in progress. Finish or abort it, then republish."
         )
-    if not worktree_is_clean(repo_root):
+    if not tracked_content_is_clean(repo_root):
         raise ControlPlaneError(
             f"Cannot publish: coordination upstream {upstream} is ahead of {branch}, but the "
-            "coordination checkout has uncommitted or untracked changes. Clear them, then "
-            "republish."
+            "coordination checkout has staged or modified tracked content. Commit or restore "
+            "that tracked content, then republish."
         )
 
     advanced = _git_capture(repo_root, ["merge", "--ff-only", "--quiet", upstream])
@@ -520,8 +529,9 @@ def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, r
 def ensure_publishable(repo_root: Path) -> str:
     """Freshly resolve remote state and refuse to publish onto stale history.
 
-    A clean, strictly behind branch is reconciled by fast-forward first, so publication
-    lands on the freshly resolved upstream state rather than on stale history.
+    A strictly behind branch with no staged or modified tracked content is reconciled by
+    fast-forward first, so publication lands on the freshly resolved upstream state rather
+    than on stale history.
     """
     branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
     upstream = _tracked_upstream(repo_root, branch) if branch and branch != "HEAD" else None
@@ -547,6 +557,58 @@ def ensure_publishable(repo_root: Path) -> str:
                     "Re-read the current state and reconcile before republishing."
                 )
     return resolve_current_head(repo_root)
+
+
+def materialize_tracked_upstream(repo_root: Path) -> str:
+    """Advance a checkout onto upstream state that has already been fetched.
+
+    Fetching proves what the remote holds; it does not put that content on disk.
+    A caller that reports a clone as refreshed while its checkout still predates
+    the fetched state is claiming something untrue, so this exists to make the
+    claim and the checkout agree.
+
+    Returns "current" when the checkout already holds the fetched upstream state
+    and "advanced" when a safe fast-forward moved it there. Never fetches: the
+    caller owns freshness, so this reports only on materialization.
+
+    Reconciliation is the same accepted safe path publication uses, so a
+    tracked-clean strictly behind checkout fast-forwards, unrelated untracked
+    artifacts are preserved, and Git stays the collision authority. Every other
+    shape fails closed rather than guessing.
+    """
+    branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    if not branch or branch == "HEAD":
+        raise ControlPlaneError(
+            f"Cannot materialize {repo_root}: it is not on a branch, so there is no "
+            "tracked upstream to advance onto. Check out a branch, then sync again."
+        )
+    upstream = _tracked_upstream(repo_root, branch)
+    if upstream is None:
+        raise ControlPlaneError(
+            f"Cannot materialize {repo_root}: {branch} has no tracked upstream, so the "
+            "state to advance onto is ambiguous. Set an upstream, then sync again."
+        )
+
+    local_head = _git(repo_root, ["rev-parse", branch])
+    remote_head = _git(repo_root, ["rev-parse", upstream])
+    if local_head == remote_head:
+        return "current"
+
+    base = _git(repo_root, ["merge-base", branch, upstream], check=False)
+    if base == local_head:
+        _reconcile_strictly_behind(
+            repo_root, branch=branch, upstream=upstream, remote_head=remote_head
+        )
+        return "advanced"
+    if base == remote_head:
+        raise ControlPlaneError(
+            f"Cannot materialize {repo_root}: {branch} is ahead of {upstream} and carries "
+            "commits the remote does not have. Publish or reconcile them, then sync again."
+        )
+    raise ControlPlaneError(
+        f"Cannot materialize {repo_root}: {branch} and {upstream} have diverged. "
+        "Reconcile them, then sync again."
+    )
 
 
 def publish(
