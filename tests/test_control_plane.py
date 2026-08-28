@@ -14,6 +14,7 @@ from ai_dev_flow.control_plane import (
     ControlPlaneError,
     allocate_proceed_number,
     collect_rail_states,
+    materialize_tracked_upstream,
     parse_proceed_sequence,
     publish,
     resolve_control_plane_config,
@@ -761,6 +762,167 @@ class ControlPlaneTests(unittest.TestCase):
             self._git(self.coordination, "rev-parse", "--abbrev-ref", "HEAD"),
         )
         self.assertEqual(before, after)
+
+    # Cache materialization: a fetch proves what the remote holds, not what is on disk.
+
+    NEW_RAIL = "ai-dev/issue-51/rails/freshly-authorized/rail.md"
+    NEW_RAIL_BYTES = "# Rail: freshly-authorized\n\nStatus: ready\n"
+
+    def _authorize_rail_upstream(self, upstream: Path) -> None:
+        """Publish a newly authorized rail on the remote only."""
+        target = upstream / self.NEW_RAIL
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(self.NEW_RAIL_BYTES, encoding="utf-8")
+        self._git(upstream, "add", "--", self.NEW_RAIL)
+        self._git(upstream, "commit", "-q", "-m", "authorize a new rail")
+
+    def _fetch(self) -> None:
+        self._git(self.coordination, "fetch", "-q", "origin")
+
+    def test_materialize_advances_a_strictly_behind_tracked_clean_checkout(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-materialize-behind")
+        self._authorize_rail_upstream(upstream)
+        remote_head = self._git(upstream, "rev-parse", "HEAD")
+        self._fetch()
+        # The rail is fetched but not yet on disk: this is the reported-fresh, actually-stale state.
+        self.assertFalse((self.coordination / self.NEW_RAIL).exists())
+
+        self.assertEqual(materialize_tracked_upstream(self.coordination), "advanced")
+
+        self.assertEqual(self._git(self.coordination, "rev-parse", "HEAD"), remote_head)
+        self.assertEqual(
+            (self.coordination / self.NEW_RAIL).read_text(encoding="utf-8"), self.NEW_RAIL_BYTES
+        )
+
+    def test_materialize_reports_current_when_the_checkout_already_holds_it(self) -> None:
+        self._attach_shared_upstream("upstream-materialize-current")
+        self._fetch()
+        head = resolve_current_head(self.coordination)
+        self.assertEqual(materialize_tracked_upstream(self.coordination), "current")
+        self.assertEqual(resolve_current_head(self.coordination), head)
+
+    def test_materialize_preserves_an_unrelated_untracked_handoff(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-materialize-foreign")
+        self._authorize_rail_upstream(upstream)
+        stranded = self._strand_foreign_handoff()
+        self._fetch()
+
+        self.assertEqual(materialize_tracked_upstream(self.coordination), "advanced")
+
+        self.assertEqual(stranded.read_text(encoding="utf-8"), self.WOW_BYTES)
+        self.assertEqual(
+            self._git(self.coordination, "status", "--porcelain", "--untracked-files=all"),
+            f"?? {self.WOW_HANDOFF}",
+        )
+
+    def test_materialize_fails_closed_on_untracked_collision_and_keeps_bytes(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-materialize-collision")
+        contested = upstream / self.WOW_HANDOFF
+        contested.parent.mkdir(parents=True, exist_ok=True)
+        contested.write_text("# Handoff\n\nupstream version\n", encoding="utf-8")
+        self._git(upstream, "add", "--", self.WOW_HANDOFF)
+        self._git(upstream, "commit", "-q", "-m", "upstream publishes the contested path")
+        stranded = self._strand_foreign_handoff()
+        self._fetch()
+        head = resolve_current_head(self.coordination)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            materialize_tracked_upstream(self.coordination)
+
+        self.assertIn("could not be fast-forwarded", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), head)
+        self.assertEqual(stranded.read_text(encoding="utf-8"), self.WOW_BYTES)
+
+    def _assert_tracked_mutation_blocks(self, fixture: str, *, stage: bool) -> None:
+        upstream = self._attach_shared_upstream(fixture)
+        self._advance_upstream(upstream)
+        (self.coordination / "README.md").write_text("edited\n", encoding="utf-8")
+        if stage:
+            self._git(self.coordination, "add", "--", "README.md")
+        self._fetch()
+        head = resolve_current_head(self.coordination)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            materialize_tracked_upstream(self.coordination)
+
+        self.assertIn("staged or modified tracked content", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), head)
+
+    def test_materialize_fails_closed_on_modified_tracked_content(self) -> None:
+        self._assert_tracked_mutation_blocks("upstream-materialize-dirty", stage=False)
+
+    def test_materialize_fails_closed_on_staged_tracked_content(self) -> None:
+        self._assert_tracked_mutation_blocks("upstream-materialize-staged", stage=True)
+
+    def test_materialize_fails_closed_when_ahead(self) -> None:
+        self._attach_shared_upstream("upstream-materialize-ahead")
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nlocal\n")
+        self._fetch()
+        with self.assertRaises(ControlPlaneError) as caught:
+            materialize_tracked_upstream(self.coordination)
+        self.assertIn("ahead", str(caught.exception))
+
+    def test_materialize_fails_closed_when_diverged(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-materialize-diverged")
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nlocal\n")
+        self._advance_upstream(upstream)
+        self._fetch()
+        with self.assertRaises(ControlPlaneError) as caught:
+            materialize_tracked_upstream(self.coordination)
+        self.assertIn("diverged", str(caught.exception))
+
+    def test_materialize_fails_closed_without_a_tracked_upstream(self) -> None:
+        self._attach_shared_upstream("upstream-materialize-no-upstream")
+        self._git(self.coordination, "branch", "--unset-upstream", "main")
+        with self.assertRaises(ControlPlaneError) as caught:
+            materialize_tracked_upstream(self.coordination)
+        self.assertIn("no tracked upstream", str(caught.exception))
+
+    def test_materialize_fails_closed_during_an_active_git_operation(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-materialize-mid-operation")
+        self._advance_upstream(upstream)
+        self._fetch()
+        git_dir = Path(self._git(self.coordination, "rev-parse", "--absolute-git-dir"))
+        (git_dir / "MERGE_HEAD").write_text(
+            f"{resolve_current_head(self.coordination)}\n", encoding="utf-8"
+        )
+        head = resolve_current_head(self.coordination)
+
+        with self.assertRaises(ControlPlaneError) as caught:
+            materialize_tracked_upstream(self.coordination)
+
+        self.assertIn("MERGE_HEAD", str(caught.exception))
+        self.assertEqual(resolve_current_head(self.coordination), head)
+
+    def test_materialize_never_fetches_and_uses_no_destructive_git_verb(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-materialize-verbs")
+        self._authorize_rail_upstream(upstream)
+        self._fetch()
+        self._strand_foreign_handoff()
+        observed: list[list[str]] = []
+        real_capture = control_plane._git_capture
+        real_git = control_plane._git
+
+        def record_capture(repo_root, arguments, **kwargs):  # type: ignore[no-untyped-def]
+            observed.append(list(arguments))
+            return real_capture(repo_root, arguments, **kwargs)
+
+        def record_git(repo_root, arguments, **kwargs):  # type: ignore[no-untyped-def]
+            observed.append(list(arguments))
+            return real_git(repo_root, arguments, **kwargs)
+
+        with patch.object(control_plane, "_git_capture", side_effect=record_capture), \
+                patch.object(control_plane, "_git", side_effect=record_git):
+            self.assertEqual(materialize_tracked_upstream(self.coordination), "advanced")
+
+        verbs = {arguments[0] for arguments in observed if arguments}
+        # Freshness is the caller's concern; this function only materializes.
+        self.assertNotIn("fetch", verbs)
+        for forbidden in ("stash", "mv", "rm", "clean", "reset", "rebase", "checkout", "restore", "push", "add"):
+            self.assertNotIn(forbidden, verbs)
+        merges = [arguments for arguments in observed if arguments and arguments[0] == "merge"]
+        self.assertTrue(merges)
+        self.assertTrue(all("--ff-only" in arguments for arguments in merges))
 
     # Handoff indicator: optimistic compare-and-swap on one mechanical counter
 

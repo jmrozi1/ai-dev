@@ -10,6 +10,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from ai_dev_flow import claude_activation as activation
+from ai_dev_flow.cli import FIXED_FLOW_EXECUTABLE_COMMANDS
 from ai_dev_flow import skill_installation as installation
 from ai_dev_flow.claude_activation import ClaudeActivationError
 
@@ -833,7 +834,17 @@ class ClaudeCommandInstallationTests(_TempHome):
         (self.runtime / "tools" / "claude" / "ai-dev-entry.py").write_text(
             "# entry point\n", encoding="utf-8"
         )
+        (self.runtime / "tools" / "claude" / "flow-entry.py").write_text(
+            "# flow entry point\n", encoding="utf-8"
+        )
         self.bin = self.home.resolve() / ".local" / "bin"
+
+    @staticmethod
+    def _flow_names(platform: str) -> list[str]:
+        names = [activation.flow_command_name(c) for c in FIXED_FLOW_EXECUTABLE_COMMANDS]
+        if platform == "windows":
+            names += [f"{name}.ps1" for name in names]
+        return sorted(names)
 
     def _install(self, **kwargs):
         return activation.install_ai_dev_command(
@@ -852,15 +863,20 @@ class ClaudeCommandInstallationTests(_TempHome):
     def test_windows_covers_git_bash_and_powershell(self) -> None:
         directory, statuses = self._install(platform="windows")
         self.assertEqual(
-            sorted(status.path.name for status in statuses), ["ai-dev", "ai-dev.ps1"]
+            sorted(status.path.name for status in statuses),
+            sorted(["ai-dev", "ai-dev.ps1"] + self._flow_names("windows")),
         )
         self.assertTrue((directory / "ai-dev").is_file())
         self.assertTrue((directory / "ai-dev.ps1").is_file())
 
     def test_posix_installation_model_is_unchanged_by_windows_support(self) -> None:
         directory, statuses = self._install(platform="posix")
-        self.assertEqual([status.path.name for status in statuses], ["ai-dev"])
-        self.assertFalse((directory / "ai-dev.ps1").exists())
+        self.assertEqual(
+            sorted(status.path.name for status in statuses),
+            sorted(["ai-dev"] + self._flow_names("posix")),
+        )
+        for name in ["ai-dev.ps1"] + [f"{n}.ps1" for n in self._flow_names("posix")]:
+            self.assertFalse((directory / name).exists())
         launcher = (directory / "ai-dev").read_text(encoding="utf-8")
         self.assertTrue(launcher.startswith("#!/usr/bin/env bash"))
         if os.name != "nt":
@@ -916,6 +932,7 @@ class ClaudeCommandInstallationTests(_TempHome):
         moved = self.tmp_path / "moved-runtime"
         (moved / "tools" / "claude").mkdir(parents=True)
         (moved / "tools" / "claude" / "ai-dev-entry.py").write_text("", encoding="utf-8")
+        (moved / "tools" / "claude" / "flow-entry.py").write_text("", encoding="utf-8")
 
         _, statuses = activation.install_ai_dev_command(
             home=self.home, runtime_root=moved, platform="windows"
@@ -1092,6 +1109,192 @@ class ClaudeCommandInstallationTests(_TempHome):
         self.assertEqual(exit_code, 0)
         self.assertFalse(activation.resolve_command_directory(home=self.home).exists())
         self.assertFalse(activation.resolve_claude_instruction_path(home=self.home).exists())
+
+
+class InstalledFlowLifecycleTests(_TempHome):
+    """Finding A: installed Flow lifecycle commands must work from any product repository.
+
+    The skill-directory launchers derived the runtime by walking four parents up
+    from their own location. That holds only inside the AI Dev checkout; once the
+    skill package is installed elsewhere it resolves to the user's home, so the
+    WoW executor could reach Flow only by calling into the AI Dev source tree by
+    hand. Installed launchers must name the runtime absolutely instead.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.runtime = self.tmp_path / "runtime"
+        (self.runtime / "tools" / "claude").mkdir(parents=True)
+        (self.runtime / "tools" / "claude" / "ai-dev-entry.py").write_text("", encoding="utf-8")
+        (self.runtime / "tools" / "claude" / "flow-entry.py").write_text("", encoding="utf-8")
+        self.bin = self.home.resolve() / ".local" / "bin"
+
+    def _install(self, **kwargs):
+        return activation.install_ai_dev_command(
+            home=self.home, runtime_root=self.runtime, **kwargs
+        )
+
+    def test_lifecycle_commands_are_installed_for_both_windows_shells(self) -> None:
+        directory, _ = self._install(platform="windows")
+        for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+            name = activation.flow_command_name(command)
+            with self.subTest(command=command):
+                self.assertTrue((directory / name).is_file())
+                self.assertTrue((directory / f"{name}.ps1").is_file())
+
+    def test_posix_installs_the_shebang_launcher_only(self) -> None:
+        directory, _ = self._install(platform="posix")
+        launcher = directory / activation.flow_command_name("status")
+        self.assertTrue(launcher.is_file())
+        self.assertTrue(launcher.read_text(encoding="utf-8").startswith("#!/usr/bin/env bash"))
+        self.assertFalse((directory / "flow-status.ps1").exists())
+        if os.name != "nt":
+            self.assertTrue(os.access(launcher, os.X_OK))
+
+    def test_launcher_names_the_runtime_absolutely_and_never_walks_parents(self) -> None:
+        directory, _ = self._install(platform="windows")
+        posix = (directory / "flow-commit").read_text(encoding="utf-8")
+        powershell = (directory / "flow-commit.ps1").read_text(encoding="utf-8")
+
+        self.assertIn(self.runtime.as_posix(), posix)
+        self.assertIn("tools/claude/flow-entry.py", posix)
+        self.assertIn(str(self.runtime), powershell)
+        self.assertIn("flow-entry.py", powershell)
+        # The defect was parent-walking; no launcher may reintroduce it.
+        for rendered in (posix, powershell):
+            self.assertNotIn("..", rendered)
+            self.assertNotIn("PSScriptRoot", rendered)
+
+    def test_launcher_never_pins_the_working_directory(self) -> None:
+        """Runtime ownership and the product repository are separate concerns."""
+        directory, _ = self._install(platform="windows")
+        for name in ("flow-status", "flow-status.ps1"):
+            rendered = (directory / name).read_text(encoding="utf-8")
+            with self.subTest(launcher=name):
+                self.assertNotIn("cd ", rendered)
+                self.assertNotIn("Set-Location", rendered)
+                self.assertNotIn("PYTHONPATH", rendered)
+
+    def test_launchers_reuse_the_repository_bootstrap_python_selector(self) -> None:
+        directory, _ = self._install(platform="windows")
+        self.assertIn(
+            "ai_dev_select_python", (directory / "flow-commit").read_text(encoding="utf-8")
+        )
+        self.assertIn(
+            "Resolve-AiDevPythonExecutable",
+            (directory / "flow-commit.ps1").read_text(encoding="utf-8"),
+        )
+
+    def test_every_flow_launcher_carries_the_ownership_marker(self) -> None:
+        directory, _ = self._install(platform="windows")
+        for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+            path = directory / activation.flow_command_name(command)
+            with self.subTest(command=command):
+                self.assertTrue(activation.launcher_is_managed(path))
+
+    def test_reinstall_is_idempotent_across_the_whole_surface(self) -> None:
+        _, first = self._install(platform="windows")
+        self.assertEqual({status.state for status in first}, {"installed"})
+        _, second = self._install(platform="windows")
+        self.assertEqual({status.state for status in second}, {"unchanged"})
+
+    def test_obsolete_flow_launchers_are_retired_on_platform_change(self) -> None:
+        directory, _ = self._install(platform="windows")
+        self.assertTrue((directory / "flow-commit.ps1").is_file())
+
+        _, statuses = self._install(platform="posix")
+
+        self.assertIn(
+            ("removed", "flow-commit.ps1"),
+            [(status.state, status.path.name) for status in statuses],
+        )
+        self.assertFalse((directory / "flow-commit.ps1").exists())
+        self.assertTrue((directory / "flow-commit").is_file())
+
+    def test_unowned_flow_collision_fails_closed_and_installs_nothing(self) -> None:
+        self.bin.mkdir(parents=True)
+        theirs = self.bin / "flow-status"
+        theirs.write_text("#!/bin/sh\necho someone else\n", encoding="utf-8")
+
+        with self.assertRaises(ClaudeActivationError) as raised:
+            self._install(platform="windows")
+
+        self.assertIn("not an AI Dev managed launcher", str(raised.exception))
+        self.assertEqual(theirs.read_text(encoding="utf-8"), "#!/bin/sh\necho someone else\n")
+        self.assertFalse((self.bin / "ai-dev").exists())
+        self.assertFalse((self.bin / "flow-commit").exists())
+
+    def test_a_legacy_unowned_flow_wrapper_is_preserved_not_deleted(self) -> None:
+        """`~/.local/bin/flow.ps1` predates this installer and carries no marker."""
+        self.bin.mkdir(parents=True)
+        legacy = self.bin / "flow.ps1"
+        legacy.write_text("# stale legacy launcher\n", encoding="utf-8")
+
+        self._install(platform="windows")
+
+        self.assertEqual(legacy.read_text(encoding="utf-8"), "# stale legacy launcher\n")
+
+    def test_missing_flow_entry_point_fails_closed_without_creating_anything(self) -> None:
+        incomplete = self.tmp_path / "incomplete"
+        (incomplete / "tools" / "claude").mkdir(parents=True)
+        (incomplete / "tools" / "claude" / "ai-dev-entry.py").write_text("", encoding="utf-8")
+
+        with self.assertRaises(ClaudeActivationError) as raised:
+            activation.install_ai_dev_command(home=self.home, runtime_root=incomplete)
+
+        self.assertIn("no Flow entry point", str(raised.exception))
+        self.assertFalse(self.bin.exists())
+
+
+class InstalledFlowEntryPointTests(unittest.TestCase):
+    """The entry point must bind to its own runtime, not to the caller's directory."""
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.tmp_path = Path(self._tmpdir.name)
+        self.repo_root = Path(__file__).resolve().parents[1]
+        self.entry = self.repo_root / "tools" / "claude" / "flow-entry.py"
+
+    def tearDown(self) -> None:
+        self._tmpdir.cleanup()
+
+    def _run(self, *args: str, cwd: Path):
+        return subprocess.run(
+            [sys.executable, str(self.entry), *args],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            check=False,
+        )
+
+    def test_entry_point_exists_in_the_checkout(self) -> None:
+        self.assertTrue(self.entry.is_file())
+
+    def test_runtime_is_this_checkout_even_from_a_foreign_working_directory(self) -> None:
+        """A decoy package in the caller's directory must never be imported."""
+        decoy = self.tmp_path / "decoy-product"
+        (decoy / "ai_dev_flow").mkdir(parents=True)
+        (decoy / "ai_dev_flow" / "__init__.py").write_text("", encoding="utf-8")
+        (decoy / "ai_dev_flow" / "cli.py").write_text(
+            "raise SystemExit('decoy runtime was imported')\n", encoding="utf-8"
+        )
+
+        completed = self._run("status", cwd=decoy)
+
+        self.assertNotIn("decoy runtime was imported", completed.stdout)
+
+    def test_missing_command_fails_closed(self) -> None:
+        completed = self._run(cwd=self.tmp_path)
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("missing lifecycle command", completed.stdout)
+
+    def test_status_outside_a_repository_reports_rather_than_crashing(self) -> None:
+        outside = self.tmp_path / "not-a-repo"
+        outside.mkdir()
+        completed = self._run("status", cwd=outside)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("flow-status", completed.stdout)
 
 
 class ControlPlaneDirectoryAccessTests(_TempHome):

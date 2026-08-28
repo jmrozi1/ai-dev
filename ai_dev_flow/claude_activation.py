@@ -27,6 +27,7 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
+from .cli import FIXED_FLOW_EXECUTABLE_COMMANDS
 from .control_plane import (
     ControlPlaneError,
     RailState,
@@ -34,6 +35,7 @@ from .control_plane import (
     allocate_proceed_number,
     artifact_relative,
     collect_rail_states,
+    materialize_tracked_upstream,
     parse_proceed_sequence,
     proceed_sequence_relative,
     publish as control_plane_publish,
@@ -71,6 +73,14 @@ AI_DEV_COMMAND_NAME = "ai-dev"
 # Carried by every managed launcher. Installation replaces only files bearing
 # this marker, so an unrelated command of the same name is never destroyed.
 LAUNCHER_OWNERSHIP_MARKER = "AI_DEV_LAUNCHER_V1 (claude audience)"
+
+# Installed Flow lifecycle commands are spelled `flow-<command>`, the names the
+# Flow documentation and the executor both already use.
+FLOW_COMMAND_PREFIX = "flow"
+
+
+def flow_command_name(command: str) -> str:
+    return f"{FLOW_COMMAND_PREFIX}-{command}"
 
 
 # Paths -----------------------------------------------------------------------
@@ -402,12 +412,27 @@ def resolve_command_directory(*, home: Path | None = None) -> Path:
 _LAUNCHER_SUFFIXES = ("", ".ps1", ".cmd")
 
 
+def managed_base_names() -> tuple[str, ...]:
+    """Every command name this installer owns: the entry command and Flow lifecycle."""
+    return (AI_DEV_COMMAND_NAME,) + tuple(
+        flow_command_name(command) for command in FIXED_FLOW_EXECUTABLE_COMMANDS
+    )
+
+
 def managed_launcher_names(platform: str) -> tuple[str, ...]:
     """Git Bash resolves the extensionless script through its shebang; PowerShell
-    resolves the ``.ps1`` from PATH. Those two files cover both Windows shells."""
-    if platform == "windows":
-        return (AI_DEV_COMMAND_NAME, f"{AI_DEV_COMMAND_NAME}.ps1")
-    return (AI_DEV_COMMAND_NAME,)
+    resolves the ``.ps1`` from PATH. Those two files cover both Windows shells.
+
+    Flow lifecycle commands are installed the same way as the entry command, so a
+    product repository gets a working ``flow-status`` without knowing where the AI
+    Dev checkout lives.
+    """
+    names: list[str] = []
+    for base in managed_base_names():
+        names.append(base)
+        if platform == "windows":
+            names.append(f"{base}.ps1")
+    return tuple(names)
 
 
 def render_posix_launcher(runtime_root: Path) -> str:
@@ -449,6 +474,50 @@ def render_powershell_launcher(runtime_root: Path) -> str:
     )
 
 
+def render_flow_posix_launcher(runtime_root: Path, command: str) -> str:
+    """POSIX/Git Bash Flow launcher for one lifecycle command."""
+    name = flow_command_name(command)
+    return "\n".join(
+        (
+            "#!/usr/bin/env bash",
+            f"# {LAUNCHER_OWNERSHIP_MARKER}",
+            f"# Managed by `{AI_DEV_COMMAND_NAME} install-command`; regenerate rather than edit.",
+            "set -euo pipefail",
+            "",
+            f"repo_root={shlex.quote(runtime_root.as_posix())}",
+            "",
+            'source "$repo_root/tools/bootstrap/python_select.sh"',
+            f'python_executable="$(ai_dev_select_python "{name}")" || exit 1',
+            "",
+            "# Absolute entry-point path: sys.path[0] becomes the runtime's own directory,",
+            "# never whichever repository the caller happens to be standing in. The working",
+            "# directory is left alone, because that is the product repository being acted on.",
+            'exec "$python_executable" "$repo_root/tools/claude/flow-entry.py" '
+            f'{shlex.quote(command)} "$@"',
+            "",
+        )
+    )
+
+
+def render_flow_powershell_launcher(runtime_root: Path, command: str) -> str:
+    """PowerShell Flow launcher using the same interpreter selection as Git Bash."""
+    name = flow_command_name(command)
+    return "\n".join(
+        (
+            f"# {LAUNCHER_OWNERSHIP_MARKER}",
+            f"# Managed by `{AI_DEV_COMMAND_NAME} install-command`; regenerate rather than edit.",
+            "$ErrorActionPreference = 'Stop'",
+            "$repoRoot = '{}'".format(str(runtime_root).replace("'", "''")),
+            ". (Join-Path $repoRoot 'tools\\bootstrap\\PythonSelection.ps1')",
+            f"$pythonExecutable = Resolve-AiDevPythonExecutable -CallerName '{name}'",
+            "& $pythonExecutable (Join-Path $repoRoot 'tools\\claude\\flow-entry.py') "
+            "'{}' @args".format(command.replace("'", "''")),
+            "exit $LASTEXITCODE",
+            "",
+        )
+    )
+
+
 def launcher_is_managed(path: Path) -> bool:
     """Whether this exact file is one AI Dev wrote and may therefore replace."""
     if path.is_symlink() or not path.is_file():
@@ -475,20 +544,21 @@ def _retire_obsolete_launchers(
 ) -> tuple[LauncherStatus, ...]:
     """Remove launchers this installer owns but no longer uses; touch nothing else."""
     statuses: list[LauncherStatus] = []
-    for suffix in _LAUNCHER_SUFFIXES:
-        name = f"{AI_DEV_COMMAND_NAME}{suffix}"
-        if name in keep:
-            continue
-        path = directory / name
-        if not launcher_is_managed(path):
-            continue
-        try:
-            path.unlink()
-        except OSError as exc:
-            raise ClaudeActivationError(
-                f"Cannot remove obsolete launcher {path}: {exc}"
-            ) from exc
-        statuses.append(LauncherStatus(path, "removed"))
+    for base in managed_base_names():
+        for suffix in _LAUNCHER_SUFFIXES:
+            name = f"{base}{suffix}"
+            if name in keep:
+                continue
+            path = directory / name
+            if not launcher_is_managed(path):
+                continue
+            try:
+                path.unlink()
+            except OSError as exc:
+                raise ClaudeActivationError(
+                    f"Cannot remove obsolete launcher {path}: {exc}"
+                ) from exc
+            statuses.append(LauncherStatus(path, "removed"))
     return tuple(statuses)
 
 
@@ -518,6 +588,12 @@ def install_ai_dev_command(
             f"Cannot install the {AI_DEV_COMMAND_NAME} command: no Claude entry point at "
             f"{entry_point}. Install from a complete AI Dev checkout."
         )
+    flow_entry_point = resolved_runtime / "tools" / "claude" / "flow-entry.py"
+    if not flow_entry_point.is_file():
+        raise ClaudeActivationError(
+            f"Cannot install the Flow lifecycle commands: no Flow entry point at "
+            f"{flow_entry_point}. Install from a complete AI Dev checkout."
+        )
 
     directory = resolve_command_directory(home=home)
     if directory.exists() and not directory.is_dir():
@@ -535,6 +611,10 @@ def install_ai_dev_command(
         AI_DEV_COMMAND_NAME: render_posix_launcher(resolved_runtime),
         f"{AI_DEV_COMMAND_NAME}.ps1": render_powershell_launcher(resolved_runtime),
     }
+    for command in FIXED_FLOW_EXECUTABLE_COMMANDS:
+        base = flow_command_name(command)
+        contents[base] = render_flow_posix_launcher(resolved_runtime, command)
+        contents[f"{base}.ps1"] = render_flow_powershell_launcher(resolved_runtime, command)
 
     # Validate every destination before writing any of them: a collision on the
     # second file must not leave a half-installed command behind.
@@ -608,10 +688,25 @@ def ensure_control_plane_cache(
     *,
     home: Path | None = None,
 ) -> tuple[Path, str]:
-    """Establish or refresh the single host-level coordination clone.
+    """Establish, refresh, and materialize the single host-level coordination clone.
 
     Uses the user's existing authenticated Git/GitHub access; no new credential
     store is introduced and nothing is written inside any product repository.
+
+    Fetching alone would leave the checkout behind the state it just proved the
+    remote holds, so a rail authorized moments ago would not exist on disk for the
+    fresh session that was told the cache is current. The fetch is therefore
+    followed by the same safe reconciliation publication uses, and the reported
+    outcome describes what the checkout actually holds:
+
+    - "cloned"    the cache did not exist and was created;
+    - "current"   the checkout already held the fetched state;
+    - "refreshed" a safe fast-forward advanced the checkout onto it.
+
+    Anything else -- dirty tracked content, ahead or diverged history, a Git
+    operation in progress, a missing upstream, or an untracked path that upstream
+    would overwrite -- fails closed with an actionable diagnostic rather than
+    reporting a freshness the checkout does not have.
     """
     cache = resolve_control_plane_cache(repository, home=home)
 
@@ -628,7 +723,14 @@ def ensure_control_plane_cache(
                 f"Cannot refresh control-plane cache at {cache}: "
                 f"{completed.stdout.strip() or completed.returncode}"
             )
-        return cache, "refreshed"
+        try:
+            materialized = materialize_tracked_upstream(cache)
+        except ControlPlaneError as exc:
+            raise ClaudeActivationError(
+                f"Fetched control-plane cache at {cache}, but it could not be "
+                f"materialized, so it is not safe to report as refreshed: {exc}"
+            ) from exc
+        return cache, "current" if materialized == "current" else "refreshed"
 
     if cache.exists() and any(cache.iterdir()):
         raise ClaudeActivationError(

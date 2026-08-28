@@ -152,6 +152,10 @@ from .workspaces import (
 
 
 _DIRECT_FLOW_ROUTE_TOKEN = "__ai_dev_flow_exec__"
+
+# The installed launchers live outside this checkout and route through the same
+# token, so it is part of their contract rather than an internal detail.
+DIRECT_FLOW_ROUTE_TOKEN = _DIRECT_FLOW_ROUTE_TOKEN
 _FLOW_DIFF_BASELINE_INVALID = "Review baseline is stale or invalid; run flow-diff --refresh."
 _PROMOTION_REVIEW_RECORD_PATH = ".ai-dev/promotion-review.json"
 _SUSPENDED_REF_PREFIX = "refs/ai-dev/suspended/"

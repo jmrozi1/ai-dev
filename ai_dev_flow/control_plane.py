@@ -559,6 +559,58 @@ def ensure_publishable(repo_root: Path) -> str:
     return resolve_current_head(repo_root)
 
 
+def materialize_tracked_upstream(repo_root: Path) -> str:
+    """Advance a checkout onto upstream state that has already been fetched.
+
+    Fetching proves what the remote holds; it does not put that content on disk.
+    A caller that reports a clone as refreshed while its checkout still predates
+    the fetched state is claiming something untrue, so this exists to make the
+    claim and the checkout agree.
+
+    Returns "current" when the checkout already holds the fetched upstream state
+    and "advanced" when a safe fast-forward moved it there. Never fetches: the
+    caller owns freshness, so this reports only on materialization.
+
+    Reconciliation is the same accepted safe path publication uses, so a
+    tracked-clean strictly behind checkout fast-forwards, unrelated untracked
+    artifacts are preserved, and Git stays the collision authority. Every other
+    shape fails closed rather than guessing.
+    """
+    branch = _git(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"], check=False)
+    if not branch or branch == "HEAD":
+        raise ControlPlaneError(
+            f"Cannot materialize {repo_root}: it is not on a branch, so there is no "
+            "tracked upstream to advance onto. Check out a branch, then sync again."
+        )
+    upstream = _tracked_upstream(repo_root, branch)
+    if upstream is None:
+        raise ControlPlaneError(
+            f"Cannot materialize {repo_root}: {branch} has no tracked upstream, so the "
+            "state to advance onto is ambiguous. Set an upstream, then sync again."
+        )
+
+    local_head = _git(repo_root, ["rev-parse", branch])
+    remote_head = _git(repo_root, ["rev-parse", upstream])
+    if local_head == remote_head:
+        return "current"
+
+    base = _git(repo_root, ["merge-base", branch, upstream], check=False)
+    if base == local_head:
+        _reconcile_strictly_behind(
+            repo_root, branch=branch, upstream=upstream, remote_head=remote_head
+        )
+        return "advanced"
+    if base == remote_head:
+        raise ControlPlaneError(
+            f"Cannot materialize {repo_root}: {branch} is ahead of {upstream} and carries "
+            "commits the remote does not have. Publish or reconcile them, then sync again."
+        )
+    raise ControlPlaneError(
+        f"Cannot materialize {repo_root}: {branch} and {upstream} have diverged. "
+        "Reconcile them, then sync again."
+    )
+
+
 def publish(
     repo_root: Path,
     *,
