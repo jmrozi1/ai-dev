@@ -34,15 +34,32 @@ from __future__ import annotations
 # Failure is never retried here. In particular, an invocation that fails after the
 # process bound leaves the binding nonterminal on purpose -- that is the truth, and
 # it is what later projects Disconnected instead of a cleaner story.
+#
+# One dispatched invocation is worth exactly one allowance entry, and only a caller
+# that owns a ledger gets one. The ledger is supplied, never built: this module has
+# no business knowing where a store lives, and a per-invocation ledger would restart
+# the ordinals it exists to keep unique. Omit it and nothing below changes at all --
+# no id is minted here, no store is imported, no file is written.
+#
+# The entry is named before the dispatch it names. The session id is obtained up
+# front and handed to the lifecycle, so the key and the binding cannot disagree and
+# no recovery path is ever tempted to mint a second key for one invocation.
+#
+# The `try` around `launch_session` is exactly as wide as the dispatch. Stretching it
+# over `stop_session` or the outcome would let `shutdown-incomplete` reach
+# `record_failure` and be written down as an invocation hole, which is a different
+# and false claim about what the provider consumed.
 
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
+import uuid
 
 from .authorization import (
     ACTION_LAUNCH,
     ControlPlaneObservation,
     authorize,
 )
+from .claude_allowance_ledger import KIND_LAUNCH, AllowanceLedger
 from .orchestrator_trigger import (
     OrchestratorPacket,
     ScopeSnapshot,
@@ -271,12 +288,19 @@ def invoke_orchestrator(
     markers: Sequence = (),
     launch_kwargs: Optional[Mapping] = None,
     stop_kwargs: Optional[Mapping] = None,
+    ledger: Optional[AllowanceLedger] = None,
 ) -> InvocationOutcome:
     """Both gates, then exactly one fresh orchestrator session, stopped and unbound.
 
     Raises `InvocationRefused` before anything is enacted when either gate fails,
     and lets a lifecycle failure propagate unchanged: a failed invocation is not
     retried, resumed, or terminalized without proof.
+
+    When `ledger` is supplied, this dispatch is accounted for exactly once: the
+    reported cost when the launch returned one, a hole when it did not, and nothing
+    at all when the refusal is proven to precede the provider. Accounting never
+    weakens cleanup -- a launched session is stopped even when its recording fails --
+    and never invents success: the outcome is returned only once both have.
     """
     if packet.role != ORCHESTRATOR_ROLE:
         raise InvocationRefused(
@@ -310,18 +334,51 @@ def invoke_orchestrator(
         workspace_path=workspace.workspace_path,
     )
 
-    launched = launch_session(
-        decision,
-        assignment,
-        store=store,
-        registry=registry,
-        reference=reference,
-        request_kwargs=request_kwargs,
-        prompt=packet.directive,
-        package_root=package_root,
-        markers=markers,
-        **dict(launch_kwargs or {})
-    )
+    launch_arguments = dict(launch_kwargs or {})
+    identity = None
+    if ledger is not None:
+        # Before the dispatch, so the key exists before the outcome does. An injected
+        # mint is the caller's, and it is called once; otherwise this reproduces the
+        # lifecycle's own default. The canonical spelling `next_identity` returns is
+        # what the lifecycle is then given, so one invocation cannot end up with a
+        # key and a binding that name the session two different ways.
+        injected_mint = launch_arguments.get("new_session_id")
+        session_id = injected_mint() if injected_mint is not None else str(uuid.uuid4())
+        identity = ledger.next_identity(session_id, KIND_LAUNCH)
+        preassigned = identity.session_id
+        launch_arguments["new_session_id"] = lambda: preassigned
+
+    try:
+        launched = launch_session(
+            decision,
+            assignment,
+            store=store,
+            registry=registry,
+            reference=reference,
+            request_kwargs=request_kwargs,
+            prompt=packet.directive,
+            package_root=package_root,
+            markers=markers,
+            **launch_arguments
+        )
+    except Exception as error:
+        # Only what escaped the dispatch, and only the ledger decides what it was
+        # worth: `launch-failed` is a hole, a proven pre-dispatch refusal is nothing.
+        # If that recording itself fails the accounting failure is raised from here,
+        # so the launch failure it displaces remains its context -- allowance is never
+        # lost quietly.
+        if identity is not None:
+            ledger.record_failure(identity, error)
+        raise
+
+    if identity is not None:
+        try:
+            ledger.record_completed(identity, launched.result)
+        except Exception:
+            # The session really is running. Recording it badly is no reason to leave
+            # it running, and no reason to report success either.
+            stop_session(store, registry, launched.binding, **dict(stop_kwargs or {}))
+            raise
 
     stopped = stop_session(
         store, registry, launched.binding, **dict(stop_kwargs or {})

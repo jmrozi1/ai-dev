@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import fields
+from decimal import Decimal
 from pathlib import Path
 import json
 import subprocess
 import tempfile
 import types
 import unittest
+import uuid
 from unittest import mock
 
 from ai_dev_flow import orchestrator_invocation as invocation
@@ -22,13 +24,31 @@ from ai_dev_flow.authorization import (
     WorkspaceObservation,
     authorize,
 )
+from ai_dev_flow.claude_allowance_ledger import (
+    KIND_LAUNCH,
+    REASON_INVALID_MESSAGE,
+    AllowanceLedger,
+    AllowanceLedgerError,
+)
+from ai_dev_flow.claude_allowance_store import (
+    REASON_KEY_CONFLICT,
+    AllowanceStore,
+    AllowanceStoreError,
+)
 from ai_dev_flow.claude_runtime import ClaudeRuntimeError
+from ai_dev_flow.claude_worker import (
+    MESSAGE_RESULT,
+    PROTOCOL_VERSION,
+    REASON_SPAWN_FAILED,
+    ClaudeWorkerError,
+)
 from ai_dev_flow.session_binding import (
     BINDING_STATE_BOUND,
     BINDING_STATE_RESERVED,
     BINDING_STATE_UNBOUND,
     BindingStore,
     RailIteration,
+    SessionBindingError,
     attach_process,
     reserve_binding,
 )
@@ -1004,6 +1024,502 @@ class ModulePurityTests(InvocationTestBase):
         )
         self._absent(("_require_decision", "reserve_binding", "attach_process", "unbind_session"))
 
+
+# --------------------------------------------------------------------------
+# One dispatched invocation is worth exactly one allowance entry
+# --------------------------------------------------------------------------
+
+
+_ABSENT = object()
+
+
+class LedgerWiringTestBase(InvocationTestBase):
+    """A real store on disk and a real ledger. The evidence is the file, not a mock."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.allowance_path = self.tmp_path / "allowance" / "allowance.json"
+        self.allowance_path.parent.mkdir(parents=True)
+        self.allowance_store = AllowanceStore(self.allowance_path)
+        self.ledger = AllowanceLedger(self.allowance_store)
+
+    # -- durable evidence -------------------------------------------------
+
+    def _entries(self):
+        """Exactly what the store file says, as (key, ordinal, cost-as-written).
+
+        An absent file is no entries, not an error: 'nothing was recorded' has to be
+        comparable to a list, or a wiring fault would surface as a broken fixture
+        instead of as the claim that failed.
+        """
+        if not self.allowance_path.exists():
+            return []
+        payload = json.loads(self.allowance_path.read_text(encoding="utf-8"))
+        return [(e["key"], e["ordinal"], e["cost"]) for e in payload["results"]]
+
+    def _launch_key(self, session_id=SESSION_ONE, ordinal=1):
+        return "{0}:launch:{1}".format(session_id, ordinal)
+
+    # -- messages ---------------------------------------------------------
+
+    def _message(self, session_id, *, cost=0.5, subtype="success", is_error=False):
+        """A complete launch result message, the shape the worker actually emits."""
+        message = {
+            "type": MESSAGE_RESULT,
+            "protocol": PROTOCOL_VERSION,
+            "mode": "launch",
+            "session_id": session_id,
+            "subtype": subtype,
+            "is_error": is_error,
+            "num_turns": 2,
+        }
+        if cost is not _ABSENT:
+            message["total_cost_usd"] = cost
+        return message
+
+    def _result_sender(self, *, record_calls=None, fail=None, **message_kwargs):
+        sent = record_calls if record_calls is not None else []
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            sent.append(
+                {"mode": request.mode, "session_id": request.session_id, "prompt": prompt}
+            )
+            if fail is not None:
+                raise fail
+            return self._message(request.session_id, **message_kwargs)
+
+        return send, sent
+
+    def _bare_sender(self, *, record_calls=None):
+        """A result the ledger cannot read: no protocol, so reconstruction refuses."""
+        sent = record_calls if record_calls is not None else []
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            sent.append({"mode": request.mode, "session_id": request.session_id})
+            return {
+                "type": MESSAGE_RESULT,
+                "mode": request.mode,
+                "session_id": request.session_id,
+                "subtype": "success",
+                "is_error": False,
+            }
+
+        return send, sent
+
+    # -- wiring -----------------------------------------------------------
+
+    def _wire(self, *, session_ids=(SESSION_ONE,), send=None, start=None, gone=True, observe=None):
+        """One invocation's injected seams, recording exactly what each one did."""
+        calls = {"mints": [], "sent": [], "stops": []}
+        minted = list(session_ids)
+        # Spares, so a second mint answers with a different id instead of raising.
+        # A wiring fault that mints twice must show up as the wrong session id, not
+        # as an exhausted fixture.
+        spares = ["1a2b3c4d-000{0}-4000-8000-00000000000c".format(n) for n in range(3, 9)]
+
+        def mint():
+            value = minted.pop(0) if minted else spares.pop(0)
+            calls["mints"].append(value)
+            return value
+
+        if send is None:
+            send, _ = self._result_sender(record_calls=calls["sent"])
+        if start is None:
+            start, _ = self._starter()
+
+        state = {"alive": True}
+
+        def stop(handle, **kwargs):
+            calls["stops"].append(handle.pgid)
+            if observe is not None:
+                observe.append(self._entries())
+            if gone:
+                state["alive"] = False
+            return {"process_group_gone": gone, "graceful": True, "exit_code": 0}
+
+        def alive(pgid):
+            return state["alive"]
+
+        launch_kwargs = {
+            "now": lambda: self.clock,
+            "new_session_id": mint,
+            "start": start,
+            "send": send,
+            "stop": stop,
+        }
+        return calls, launch_kwargs, {"stop": stop, "alive": alive}
+
+    def _seed_other_session_entry(self):
+        """One real, unrelated entry, so 'nothing was written' has bytes to compare."""
+        identity = self.ledger.next_identity(SESSION_TWO, KIND_LAUNCH)
+        self.ledger.record_completed(identity, self._message(SESSION_TWO, cost=0.25))
+        return self._entries()
+
+
+class LedgerOmittedTests(LedgerWiringTestBase):
+    def test_omitting_the_ledger_leaves_the_launch_and_the_disk_exactly_as_they_were(self):
+        calls, launch_kwargs, stop_kwargs = self._wire()
+
+        outcome = self._invoke(launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs)
+
+        # The lifecycle minted once, from its own injected mint, and nothing else did.
+        self.assertEqual(calls["mints"], [SESSION_ONE])
+        self.assertEqual(len(calls["sent"]), 1)
+        self.assertEqual(calls["stops"], [4242])
+        self.assertEqual(outcome.session_id, SESSION_ONE)
+        self.assertEqual(outcome.binding_state, BINDING_STATE_UNBOUND)
+        self.assertEqual(self.store.read(SESSION_ONE).state, BINDING_STATE_UNBOUND)
+        self.assertIsNone(self.registry.get(SESSION_ONE))
+
+        # No allowance call happened: no file was written, and no ordinal was spent.
+        self.assertFalse(self.allowance_path.exists())
+        self.assertEqual(self.ledger.next_identity(SESSION_ONE, KIND_LAUNCH).ordinal, 1)
+
+    def test_omitting_the_ledger_still_propagates_a_launch_failure_unchanged(self):
+        failure = RuntimeError("provider refused")
+        send, _ = self._result_sender(fail=failure)
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        with self.assertRaises(LifecycleError) as caught:
+            self._invoke(launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs)
+
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_LAUNCH_FAILED)
+        self.assertIs(caught.exception.__cause__, failure)
+        self.assertFalse(self.allowance_path.exists())
+
+
+class LedgerIdentityTests(LedgerWiringTestBase):
+    def test_the_injected_mint_runs_once_and_names_both_the_key_and_the_binding(self):
+        calls, launch_kwargs, stop_kwargs = self._wire()
+
+        outcome = self._invoke(
+            launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+        )
+
+        # Called once, by this module, before dispatch -- not again by the lifecycle.
+        self.assertEqual(calls["mints"], [SESSION_ONE])
+        # The one id reaches the request, the binding, the outcome and the key.
+        self.assertEqual(calls["sent"][0]["session_id"], SESSION_ONE)
+        self.assertEqual(outcome.session_id, SESSION_ONE)
+        self.assertEqual(self.store.read(SESSION_ONE).session_id, SESSION_ONE)
+        self.assertEqual(self._entries(), [(self._launch_key(), 1, "0.5")])
+
+    def test_two_launches_through_one_ledger_get_independent_keys_and_no_collision(self):
+        first_calls, first_launch, first_stop = self._wire(session_ids=(SESSION_ONE,))
+        first = self._invoke(
+            launch_kwargs=first_launch, stop_kwargs=first_stop, ledger=self.ledger
+        )
+
+        second_snapshot = self._snapshot(source_handoff="9" * 40)
+        second_calls, second_launch, second_stop = self._wire(session_ids=(SESSION_TWO,))
+        second = self._invoke(
+            snapshot=second_snapshot,
+            proposal=self._proposal(second_snapshot),
+            packet=self._packet(second_snapshot),
+            launch_kwargs=second_launch,
+            stop_kwargs=second_stop,
+            ledger=self.ledger,
+        )
+
+        self.assertEqual({first.session_id, second.session_id}, {SESSION_ONE, SESSION_TWO})
+        self.assertEqual(first_calls["mints"], [SESSION_ONE])
+        self.assertEqual(second_calls["mints"], [SESSION_TWO])
+        # Two entries, each the first invocation of its own session. The ordinal is
+        # per session, so neither launch is `launch:2` and neither key repeats.
+        self.assertEqual(
+            self._entries(),
+            [
+                (self._launch_key(SESSION_ONE), 1, "0.5"),
+                (self._launch_key(SESSION_TWO), 2, "0.5"),
+            ],
+        )
+
+    def test_without_an_injected_mint_the_launch_still_uses_the_identity_it_recorded(self):
+        calls, launch_kwargs, stop_kwargs = self._wire()
+        del launch_kwargs["new_session_id"]
+
+        outcome = self._invoke(
+            launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+        )
+
+        # The id is a real UUID this module minted, and the key names that exact id.
+        self.assertEqual(calls["mints"], [])
+        self.assertEqual(uuid.UUID(outcome.session_id).version, 4)
+        self.assertEqual(calls["sent"][0]["session_id"], outcome.session_id)
+        self.assertEqual(
+            self._entries(), [(self._launch_key(outcome.session_id), 1, "0.5")]
+        )
+
+    def test_an_identity_refusal_is_pre_dispatch_and_enacts_nothing(self):
+        calls, launch_kwargs, stop_kwargs = self._wire(session_ids=("not-a-uuid",))
+
+        with self.assertRaises(SessionBindingError):
+            self._invoke(
+                launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+            )
+
+        self.assertEqual(calls["sent"], [])
+        self.assertEqual(calls["stops"], [])
+        self.assertEqual(self.store.records(), [])
+        self.assertFalse(self.allowance_path.exists())
+
+
+class LedgerCompletedResultTests(LedgerWiringTestBase):
+    def test_the_reported_cost_is_recorded_exactly_once_before_the_session_is_stopped(self):
+        at_stop = []
+        calls, launch_kwargs, stop_kwargs = self._wire(observe=at_stop)
+
+        outcome = self._invoke(
+            launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+        )
+
+        expected = [(self._launch_key(), 1, "0.5")]
+        # Already durable by the time stop ran, so it is durable before the return.
+        self.assertEqual(at_stop, [expected])
+        self.assertEqual(self._entries(), expected)
+        self.assertEqual(calls["stops"], [4242])
+        self.assertEqual(outcome.binding_state, BINDING_STATE_UNBOUND)
+
+    def test_a_provider_error_result_that_still_cost_something_records_that_cost(self):
+        send, _ = self._result_sender(
+            cost=0.25, subtype="error_during_execution", is_error=True
+        )
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        self._invoke(
+            launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+        )
+
+        # An errored turn still consumed allowance. The store weighs cost, not success.
+        self.assertEqual(self._entries(), [(self._launch_key(), 1, "0.25")])
+
+    def test_an_absent_cost_is_a_hole_and_not_a_zero(self):
+        send, _ = self._result_sender(cost=_ABSENT)
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        self._invoke(
+            launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+        )
+
+        self.assertEqual(self._entries(), [(self._launch_key(), 1, None)])
+
+    def test_an_explicitly_null_cost_is_a_hole_and_not_a_zero(self):
+        send, _ = self._result_sender(cost=None)
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        self._invoke(
+            launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+        )
+
+        self.assertEqual(self._entries(), [(self._launch_key(), 1, None)])
+
+    def test_a_real_zero_cost_is_recorded_as_zero_and_not_as_a_hole(self):
+        send, _ = self._result_sender(cost=0.0)
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        self._invoke(
+            launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+        )
+
+        key, ordinal, cost = self._entries()[0]
+        self.assertEqual(key, self._launch_key())
+        self.assertIsNotNone(cost)
+        self.assertEqual(Decimal(cost), Decimal("0"))
+
+
+class LedgerFailedLaunchTests(LedgerWiringTestBase):
+    def test_a_failed_launch_records_exactly_one_hole_and_re_raises_the_original(self):
+        seeded = self._seed_other_session_entry()
+        failure = RuntimeError("provider refused")
+        send, _ = self._result_sender(fail=failure)
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        with self.assertRaises(LifecycleError) as caught:
+            self._invoke(
+                launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+            )
+
+        # The lifecycle's own exception, unchanged, with its own cause intact.
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_LAUNCH_FAILED)
+        self.assertIs(caught.exception.__cause__, failure)
+        # Exactly one hole, added to what was already there.
+        self.assertEqual(self._entries(), seeded + [(self._launch_key(), 2, None)])
+        # The process bound and stayed bound; the failure is not tidied away.
+        self.assertEqual(
+            [record.state for record in self.store.records()], [BINDING_STATE_BOUND]
+        )
+
+    def test_the_hole_names_the_session_that_was_actually_launched(self):
+        seeded = self._seed_other_session_entry()
+        send, _ = self._result_sender(fail=RuntimeError("provider refused"))
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        with self.assertRaises(LifecycleError):
+            self._invoke(
+                launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+            )
+
+        # One id was minted, and it is the one the lifecycle bound.
+        self.assertEqual(calls["mints"], [SESSION_ONE])
+        self.assertEqual(
+            [record.session_id for record in self.store.records()], [SESSION_ONE]
+        )
+        # The hole is filed under that same session, not under some other one.
+        # The ordinal in a key is the ledger's, per session -- this is still the
+        # first invocation of this session, whatever else the store already holds.
+        self.assertEqual(
+            [key for key, _, _ in self._entries()][len(seeded):],
+            [self._launch_key(SESSION_ONE)],
+        )
+
+    def _assert_pre_dispatch_records_nothing(self, error) -> None:
+        seeded = self._seed_other_session_entry()
+        before = self.allowance_path.read_bytes()
+        start, _ = self._starter(fail=error)
+        calls, launch_kwargs, stop_kwargs = self._wire(start=start)
+
+        with self.assertRaises(type(error)) as caught:
+            self._invoke(
+                launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+            )
+
+        self.assertIs(caught.exception, error)
+        self.assertEqual(calls["sent"], [])
+        # Byte-identical: a proven pre-dispatch refusal is not a hole, it is nothing.
+        self.assertEqual(self.allowance_path.read_bytes(), before)
+        self.assertEqual(self._entries(), seeded)
+
+    def test_a_binding_refusal_before_dispatch_records_nothing(self):
+        self._assert_pre_dispatch_records_nothing(
+            SessionBindingError("invalid-session-id", "not a session")
+        )
+
+    def test_a_worker_start_up_refusal_before_dispatch_records_nothing(self):
+        self._assert_pre_dispatch_records_nothing(
+            ClaudeWorkerError(REASON_SPAWN_FAILED, "the worker never started")
+        )
+
+    def test_a_runtime_refusal_before_the_first_command_records_nothing(self):
+        self._assert_pre_dispatch_records_nothing(
+            ClaudeRuntimeError("prompt-file-missing", "the prompt asset is gone")
+        )
+
+
+class LedgerAccountingFailureTests(LedgerWiringTestBase):
+    def test_a_recording_refusal_after_a_launch_still_stops_it_and_reports_no_success(self):
+        seeded = self._seed_other_session_entry()
+        before = self.allowance_path.read_bytes()
+        send, _ = self._bare_sender()
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        with self.assertRaises(AllowanceLedgerError) as caught:
+            self._invoke(
+                launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+            )
+
+        self.assertEqual(caught.exception.reason, REASON_INVALID_MESSAGE)
+        # Cleanup is not weakened by an accounting fault: stopped once, and terminal.
+        self.assertEqual(calls["stops"], [4242])
+        self.assertEqual(
+            [record.state for record in self.store.records()], [BINDING_STATE_UNBOUND]
+        )
+        self.assertIsNone(self.registry.get(SESSION_ONE))
+        # And nothing false was written for the invocation that could not be weighed.
+        self.assertEqual(self.allowance_path.read_bytes(), before)
+        self.assertEqual(self._entries(), seeded)
+
+    def test_an_accounting_failure_while_handling_a_launch_failure_is_loud(self):
+        # A prior process already wrote this exact key with a cost, so recording a
+        # hole under it is a genuine, non-retryable store conflict.
+        prior = AllowanceLedger(self.allowance_store)
+        prior.record_completed(
+            prior.next_identity(SESSION_ONE, KIND_LAUNCH),
+            self._message(SESSION_ONE, cost=0.25),
+        )
+        before = self.allowance_path.read_bytes()
+
+        failure = RuntimeError("provider refused")
+        send, _ = self._result_sender(fail=failure)
+        calls, launch_kwargs, stop_kwargs = self._wire(send=send)
+
+        # Caught broadly on purpose: the claim under test is *which* exception
+        # surfaces. A wiring that silently dropped the accounting would raise the
+        # launch failure here, and that must read as a failed assertion.
+        with self.assertRaises(Exception) as caught:
+            self._invoke(
+                launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+            )
+
+        self.assertIsInstance(caught.exception, AllowanceStoreError)
+        self.assertEqual(caught.exception.reason, REASON_KEY_CONFLICT)
+        # The launch failure it displaced is still inspectable, with its own cause.
+        context = caught.exception.__context__
+        self.assertIsInstance(context, LifecycleError)
+        self.assertEqual(context.reason, session_lifecycle.REASON_LAUNCH_FAILED)
+        self.assertIs(context.__cause__, failure)
+        self.assertEqual(self.allowance_path.read_bytes(), before)
+
+    def test_a_stop_failure_is_never_recorded_and_never_adds_a_second_entry(self):
+        calls, launch_kwargs, stop_kwargs = self._wire(gone=False)
+
+        with self.assertRaises(LifecycleError) as caught:
+            self._invoke(
+                launch_kwargs=launch_kwargs, stop_kwargs=stop_kwargs, ledger=self.ledger
+            )
+
+        self.assertEqual(
+            caught.exception.reason, session_lifecycle.REASON_SHUTDOWN_INCOMPLETE
+        )
+        # The completed cost stands, unconverted; the shutdown fault is not a hole.
+        self.assertEqual(self._entries(), [(self._launch_key(), 1, "0.5")])
+        self.assertEqual(calls["stops"], [4242])
+        # Exactly one identity was minted for this invocation.
+        self.assertEqual(self.ledger.next_identity(SESSION_ONE, KIND_LAUNCH).ordinal, 2)
+
+
+class LedgerSeamPurityTests(LedgerWiringTestBase):
+    EXPECTED_PARAMETERS = [
+        "snapshot",
+        "proposal",
+        "packet",
+        "observation",
+        "orchestrator_rail",
+        "store",
+        "registry",
+        "reference",
+        "request_kwargs",
+        "package_root",
+        "bindings",
+        "in_flight_session_ids",
+        "markers",
+        "launch_kwargs",
+        "stop_kwargs",
+        "ledger",
+    ]
+
+    def test_the_seam_is_one_optional_keyword_and_nothing_else_moved(self):
+        import inspect
+
+        signature = inspect.signature(invocation.invoke_orchestrator)
+        self.assertEqual(list(signature.parameters), self.EXPECTED_PARAMETERS)
+        parameter = signature.parameters["ledger"]
+        self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIsNone(parameter.default)
+
+    def test_the_seam_consumes_a_ledger_and_never_builds_one(self):
+        source = Path(invocation.__file__).with_suffix(".py").read_text(encoding="utf-8")
+        for forbidden in (
+            "AllowanceStore",
+            "allowance_store_path",
+            "claude_allowance_store",
+            "record_result",
+            "record_hole",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+        for required in ("next_identity", "record_completed", "record_failure"):
+            with self.subTest(required=required):
+                self.assertIn(required, source)
 
 if __name__ == "__main__":
     unittest.main()
