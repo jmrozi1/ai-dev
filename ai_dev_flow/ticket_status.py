@@ -6,7 +6,13 @@ import re
 import sys
 
 from .repository import RepositoryError, resolve_repo_root, workflow_state_file_for_repo_root
-from .ticket_providers import TicketProviderError, resolve_ticket_provider_for_reference
+from .ticket_config import TicketConfigError, load_ticket_configuration_for_repo_root
+from .ticket_providers import (
+    TicketProviderError,
+    instantiate_ticket_provider,
+    resolve_ticket_provider_for_reference,
+)
+from .tickets import Ticket
 from .workflow_state import WorkflowStateError, load_state
 
 
@@ -83,6 +89,23 @@ def _render_checkpoints(checkpoints: tuple[TicketCheckpoint, ...]) -> str:
     )
 
 
+def _resolve_legacy_active_ticket(repo_root: Path, active_issue_number: int) -> Ticket:
+    """Read the active issue for a workflow that predates persisted references.
+
+    Such a workflow names its issue but never stored a ticket reference, so the
+    configured provider is resolved and asked for that issue id directly. A
+    missing or invalid provider configuration surfaces its own diagnostic rather
+    than being reported as an absent workflow.
+    """
+    try:
+        configuration = load_ticket_configuration_for_repo_root(repo_root)
+    except TicketConfigError as exc:
+        raise TicketStatusError(str(exc)) from exc
+
+    provider = instantiate_ticket_provider(repo_root=repo_root, config=configuration)
+    return provider.get(str(active_issue_number))
+
+
 def render_active_ticket_status(repo_root: Path, *, verbose: bool = False) -> str:
     """Render the active ticket's roadmap progress without repository diagnostics."""
     try:
@@ -90,14 +113,22 @@ def render_active_ticket_status(repo_root: Path, *, verbose: bool = False) -> st
     except WorkflowStateError as exc:
         raise TicketStatusError(str(exc)) from exc
 
-    if state.active_issue_number is None or state.ticket_reference is None:
+    if state.active_issue_number is None:
         raise TicketStatusError("No active ticket workflow is available for /status.")
 
     try:
-        ticket = resolve_ticket_provider_for_reference(
-            repo_root=repo_root,
-            reference=state.ticket_reference,
-        ).get(state.ticket_reference.ticket_id)
+        if state.ticket_reference is not None:
+            ticket = resolve_ticket_provider_for_reference(
+                repo_root=repo_root,
+                reference=state.ticket_reference,
+            ).get(state.ticket_reference.ticket_id)
+        else:
+            # Compatibility path for legacy workflows created before ticket
+            # references were persisted, matching the compatibility the
+            # complete and block paths already carry. Rendering stays
+            # read-only: nothing is written back to workflow state or to the
+            # provider ticket.
+            ticket = _resolve_legacy_active_ticket(repo_root, state.active_issue_number)
     except TicketProviderError as exc:
         raise TicketStatusError(str(exc)) from exc
 

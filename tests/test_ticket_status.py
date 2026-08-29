@@ -156,6 +156,20 @@ Detailed implementation context belongs here.
         self.assertNotIn("Executive Summary", output)
         self.assertNotIn("Acceptance Criteria", output)
 
+    _referenced_verbose_output = "\n".join(
+        (
+            "Active ticket: #39 Ticket-oriented status",
+            "Checkpoints: 1/3 completed",
+            "Current checkpoint: Render active roadmap",
+            "Full Description:",
+            "Detailed implementation context belongs here.",
+            "Checkpoints:",
+            "- [x] Define status contract: Document the project-progress surface.",
+            "- [ ] Render active roadmap: Use the first incomplete named checkpoint.",
+            "- [ ] Validate output: Cover normal and verbose output.",
+        )
+    )
+
     def test_inactive_status_behavior_is_unchanged(self) -> None:
         workflow_path = self.repo_root / ".ai-dev" / "workflow.json"
         workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
@@ -163,6 +177,107 @@ Detailed implementation context belongs here.
         workflow.pop("activeIssueTitle", None)
         workflow.pop("ticket")
         workflow_path.write_text(json.dumps(workflow), encoding="utf-8")
+
+        with self.assertRaisesRegex(TicketStatusError, "No active ticket workflow"):
+            render_active_ticket_status(self.repo_root)
+
+    def _make_legacy_workflow(self) -> Path:
+        """Drop the persisted ticket reference, keeping the workflow active."""
+        workflow_path = self.repo_root / ".ai-dev" / "workflow.json"
+        workflow = json.loads(workflow_path.read_text(encoding="utf-8"))
+        workflow.pop("ticket")
+        workflow_path.write_text(json.dumps(workflow), encoding="utf-8")
+        return workflow_path
+
+    def test_legacy_active_workflow_without_ticket_reference_renders_through_provider(self) -> None:
+        workflow_path = self._make_legacy_workflow()
+        before = workflow_path.read_bytes()
+
+        output = render_active_ticket_status(self.repo_root)
+
+        self.assertEqual(
+            output,
+            "\n".join(
+                (
+                    "Active ticket: #39 Ticket-oriented status",
+                    "Checkpoints: 1/3 completed",
+                    "Current checkpoint: Render active roadmap",
+                )
+            ),
+        )
+        # Rendering status must not migrate, backfill, or otherwise rewrite the
+        # workflow it just read.
+        self.assertEqual(workflow_path.read_bytes(), before)
+        self.assertNotIn("ticket", json.loads(workflow_path.read_text(encoding="utf-8")))
+
+    def test_legacy_active_workflow_verbose_output_matches_referenced_workflow(self) -> None:
+        self._make_legacy_workflow()
+
+        self.assertEqual(
+            render_active_ticket_status(self.repo_root, verbose=True),
+            self._referenced_verbose_output,
+        )
+
+    def test_legacy_active_workflow_does_not_mutate_the_provider_ticket(self) -> None:
+        self._make_legacy_workflow()
+        ticket_path = self.repo_root / ".ai-dev" / "tickets" / "39.json"
+        before = ticket_path.read_bytes()
+
+        render_active_ticket_status(self.repo_root)
+
+        self.assertEqual(ticket_path.read_bytes(), before)
+        self.assertEqual(
+            json.loads(ticket_path.read_text(encoding="utf-8"))["workflowState"],
+            "active",
+        )
+
+    def test_legacy_active_workflow_reports_missing_provider_configuration(self) -> None:
+        self._make_legacy_workflow()
+        (self.repo_root / ".ai-dev" / "config.json").unlink()
+
+        with self.assertRaises(TicketStatusError) as raised:
+            render_active_ticket_status(self.repo_root)
+
+        message = str(raised.exception)
+        self.assertNotIn("No active ticket workflow", message)
+        self.assertIn("config.json", message)
+
+    def test_legacy_active_workflow_reports_invalid_provider_configuration(self) -> None:
+        self._make_legacy_workflow()
+        (self.repo_root / ".ai-dev" / "config.json").write_text(
+            json.dumps({"tickets": {"provider": "unsupported-provider"}}),
+            encoding="utf-8",
+        )
+
+        with self.assertRaises(TicketStatusError) as raised:
+            render_active_ticket_status(self.repo_root)
+
+        message = str(raised.exception)
+        self.assertNotIn("No active ticket workflow", message)
+        self.assertIn("unsupported provider", message)
+
+    def test_legacy_active_workflow_reports_unresolvable_ticket(self) -> None:
+        self._make_legacy_workflow()
+        (self.repo_root / ".ai-dev" / "tickets" / "39.json").unlink()
+
+        with self.assertRaises(TicketStatusError) as raised:
+            render_active_ticket_status(self.repo_root)
+
+        self.assertNotIn("No active ticket workflow", str(raised.exception))
+
+    def test_patch_workflow_status_behavior_is_unchanged(self) -> None:
+        workflow_path = self.repo_root / ".ai-dev" / "workflow.json"
+        workflow_path.write_text(
+            json.dumps(
+                {
+                    "mainBranch": "main",
+                    "scratchBranch": "scratch",
+                    "checkpoint": 3,
+                    "patchDescription": "adjust logging",
+                }
+            ),
+            encoding="utf-8",
+        )
 
         with self.assertRaisesRegex(TicketStatusError, "No active ticket workflow"):
             render_active_ticket_status(self.repo_root)
