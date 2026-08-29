@@ -122,13 +122,13 @@ class LedgerTestCase(unittest.TestCase):
     def identity(self, kind: str = KIND_LAUNCH, session_id: str = SESSION):
         return self.ledger.next_identity(session_id, kind)
 
-    def observe(self, offset: int, percentage: str, *, human: bool = True):
+    def observe(self, offset: int, percentage: str, *, since=BASE - 1):
         return self.store.append_observation(
             window="five_hour",
             observed_at=BASE + offset,
             resets_at=RESET,
             used_percentage=Decimal(percentage),
-            human_complete_coverage=human,
+            human_exclusive_since=since,
         )
 
 
@@ -343,13 +343,13 @@ class MissingCostTests(LedgerTestCase):
                 ledger = AllowanceLedger(store, sleep=self.slept.append)
                 store.append_observation(
                     window="five_hour", observed_at=BASE, resets_at=RESET,
-                    used_percentage=Decimal("10"), human_complete_coverage=True,
+                    used_percentage=Decimal("10"), human_exclusive_since=BASE - 1,
                 )
                 identity = ledger.next_identity(SESSION, KIND_LAUNCH)
                 ledger.record_completed(identity, payload)
                 point = store.append_observation(
                     window="five_hour", observed_at=BASE + 60, resets_at=RESET,
-                    used_percentage=Decimal("20"), human_complete_coverage=True,
+                    used_percentage=Decimal("20"), human_exclusive_since=BASE - 1,
                 )
                 self.assertEqual(point.complete_coverage, expect_complete)
                 self.assertEqual(store.workload_units(), Decimal("0.0")

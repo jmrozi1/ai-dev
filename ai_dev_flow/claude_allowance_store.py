@@ -38,8 +38,11 @@ from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
 from .claude_allowance import (
     _CALCULATION,
+    _exact_epoch,
+    AllowanceError,
     CalibrationPoint,
     CalibrationProfile,
+    REASON_INVALID_EPOCH,
     WINDOWS,
     build_profile,
 )
@@ -154,12 +157,21 @@ def _exact_key(value: object) -> str:
     return value
 
 
-def _exact_bool(value: object, *, label: str) -> bool:
-    if type(value) is not bool:
-        raise AllowanceStoreError(
-            REASON_INVALID_COVERAGE, "{0} must be a bool, got {1!r}".format(label, value)
-        )
-    return value
+def _exact_instant(value: object, *, label: str) -> Optional[int]:
+    """Exactly `None`, or the package's own positive epoch.
+
+    `None` is the explicit statement that the human has affirmed nothing for this
+    run; it is not a missing argument, and the caller must say which it means.
+    Anything else goes through the estimator's own rule, so `True` and
+    `time.time()` stay invalid here for exactly the reasons they are invalid
+    there, and the two spellings cannot drift apart.
+    """
+    if value is None:
+        return None
+    try:
+        return _exact_epoch(value, label=label)
+    except AllowanceError as exc:
+        raise AllowanceStoreError(REASON_INVALID_EPOCH, exc.detail) from exc
 
 
 def _sum_costs(costs: List[Optional[Decimal]]) -> Decimal:
@@ -653,16 +665,20 @@ class AllowanceStore:
         observed_at: int,
         resets_at: int,
         used_percentage: object,
-        human_complete_coverage: bool,
+        human_exclusive_since: Optional[int],
     ) -> CalibrationPoint:
         """Record one human `/usage` reading against the current ledger.
 
-        The human supplies only what a human can see. Workload and meter come
-        from the store, so a caller cannot assert a cumulative number, and the
-        recorded coverage is the conjunction of what the human stated and what
-        the ledger actually shows for the same span.
+        The human supplies only what a human can see: one run-scoped instant
+        from which they claim every use of Claude went through this manager.
+        Workload and meter come from the store, so a caller cannot assert a
+        cumulative number, and the recorded coverage is the conjunction of what
+        that instant covers and what the ledger actually shows for the same span.
+
+        The instant is checked before the lock, so a malformed one costs neither
+        a lock nor a write.
         """
-        human = _exact_bool(human_complete_coverage, label="human_complete_coverage")
+        since = _exact_instant(human_exclusive_since, label="human_exclusive_since")
         generation = self._acquire("append_observation")
         try:
             state = self._load()
@@ -675,6 +691,17 @@ class AllowanceStore:
             same_window = [e for e in observations if e["point"].window == window]
             previous_ordinal = same_window[-1]["ledger_ordinal"] if same_window else 0
             ledger_ordinal = len(results)
+            # Per window, against that window's own predecessor, from this one
+            # loaded generation. A run-scoped statement covers a window only if it
+            # began at or before the reading it is compared against, and with no
+            # predecessor there is no span it can vouch for. Deriving once and
+            # reusing it across windows would let one window's predecessor answer
+            # for the other's.
+            human = (
+                since is not None
+                and bool(same_window)
+                and since <= same_window[-1]["point"].observed_at
+            )
             complete = human and _span_is_clean(results, previous_ordinal, ledger_ordinal)
 
             point = CalibrationPoint(

@@ -132,19 +132,25 @@ class AllowanceWindowView:
 # --------------------------------------------------------------------------
 
 
-def _exact_view_bool(value: object, *, label: str) -> bool:
-    """Exactly a `bool`.
+def _view_instant(value: object, *, label: str) -> Optional[int]:
+    """Exactly `None`, or the estimator's own positive epoch.
 
-    A truthy string or a `1` would let a caller assert complete coverage without
-    ever having decided it, which is precisely the assertion that must be
-    deliberate. `bool` is an `int` subclass, so this checks the type itself.
+    `None` is the caller explicitly stating that the human has affirmed nothing
+    for this run. It is not the argument being missing -- there is no default, so
+    the caller must say which of the two it means.
+
+    Anything else goes through `_exact_epoch`, the rule the estimator itself
+    applies, so a truthy string, a `1`, a `True`, or a `time.time()` float stays
+    invalid for exactly the reasons it is invalid there and the two cannot drift
+    apart. Only the category changes: asking with a malformed instant is the
+    caller's fault, not the store's evidence being unreadable.
     """
-    if type(value) is not bool:
-        raise AllowanceViewError(
-            REASON_INVALID_COVERAGE_ASSERTION,
-            "{0} must be an exact bool, got {1!r}".format(label, value),
-        )
-    return value
+    if value is None:
+        return None
+    try:
+        return _exact_epoch(value, label=label)
+    except AllowanceError as exc:
+        raise AllowanceViewError(REASON_INVALID_EPOCH, exc.detail) from exc
 
 
 def _canonical_window(value: object) -> str:
@@ -240,7 +246,7 @@ def _view_from_inputs(
     inputs: ProjectionInputs,
     *,
     now: int,
-    human_complete_coverage_since_anchor: bool,
+    human_exclusive_since: Optional[int],
 ) -> AllowanceWindowView:
     """Pure: one generation of evidence in, one view out.
 
@@ -265,7 +271,8 @@ def _view_from_inputs(
             # used Claude somewhere this manager never launched.
             complete_coverage_since_anchor=(
                 inputs.ledger_clean_since_anchor
-                and human_complete_coverage_since_anchor
+                and human_exclusive_since is not None
+                and human_exclusive_since <= inputs.anchor.observed_at
             ),
         )
     except (AllowanceStoreError, AllowanceError) as exc:
@@ -298,15 +305,16 @@ def project_window(
     *,
     window: object,
     now: object,
-    human_complete_coverage_since_anchor: object,
+    human_exclusive_since: object,
 ) -> AllowanceWindowView:
     """Project one window from exactly one read of the store.
 
-    `human_complete_coverage_since_anchor` is required and has no default, for the
-    same reason `estimate_current` requires its half: the caller is the only thing
-    that knows whether Claude was used outside this manager since the anchor
-    reading, and a caller that cannot say must get `unavailable` rather than a
-    confident number that reads low.
+    `human_exclusive_since` is required and has no default, for the same reason
+    `estimate_current` requires its half: the caller is the only thing that knows
+    whether Claude was used outside this manager since the anchor reading, and a
+    caller that cannot say must get `unavailable` rather than a confident number
+    that reads low. It carries one run-scoped instant, and it covers this window
+    only if it began at or before this window's own anchor.
 
     All three caller inputs -- that assertion, the window, and the clock -- are
     checked before the store is touched, and a caller fault raises
@@ -316,10 +324,7 @@ def project_window(
     *store* refuses still comes back as an unavailable view, so a render that
     asked properly can always draw something truthful.
     """
-    human = _exact_view_bool(
-        human_complete_coverage_since_anchor,
-        label="human_complete_coverage_since_anchor",
-    )
+    since = _view_instant(human_exclusive_since, label="human_exclusive_since")
     # Before the read, and in this order, so no caller fault can be answered from
     # the store -- including on a store with no anchor, which would otherwise
     # return early and never look at the clock at all.
@@ -331,7 +336,7 @@ def project_window(
     except (AllowanceStoreError, AllowanceError) as exc:
         return _source_unhealthy_view(projected_window, exc)
     return _view_from_inputs(
-        inputs, now=current_time, human_complete_coverage_since_anchor=human
+        inputs, now=current_time, human_exclusive_since=since
     )
 
 
@@ -378,7 +383,7 @@ def _append_reconciled(
     observed_at: object,
     resets_at: object,
     used_percentage: object,
-    human_complete_coverage: bool,
+    human_exclusive_since: Optional[int],
 ) -> CalibrationPoint:
     """One append, with the one refusal that may already have landed reconciled.
 
@@ -398,7 +403,7 @@ def _append_reconciled(
             observed_at=observed_at,
             resets_at=resets_at,
             used_percentage=used_percentage,
-            human_complete_coverage=human_complete_coverage,
+            human_exclusive_since=human_exclusive_since,
         )
     except AllowanceStoreError as exc:
         if exc.reason != REASON_LOCK_LOST:
@@ -423,7 +428,7 @@ def record_usage_reading(
     observed_at: object,
     five_hour: Optional[Sequence[Any]] = None,
     seven_day: Optional[Sequence[Any]] = None,
-    human_complete_coverage: object,
+    human_exclusive_since: object,
 ) -> Dict[str, CalibrationPoint]:
     """Record one human `/usage` view against the ledger, per window.
 
@@ -436,9 +441,11 @@ def record_usage_reading(
     filled in from the other window: the two windows measure different spans, and
     `CalibrationPoint` has no "unknown percentage" to write.
 
-    `human_complete_coverage` is the human's assertion about the span since their
-    previous reading of each window submitted. The store conjoins it with its own
-    ledger cleanliness, so a truthful human plus a holed ledger still records
+    `human_exclusive_since` is one run-scoped instant from which the human claims
+    every use of Claude went through this manager. The store compares it against
+    each submitted window's own previous reading -- so one statement can cover the
+    seven-day window and not the five-hour one -- and conjoins the result with its
+    own ledger cleanliness, so a truthful human plus a holed ledger still records
     incomplete coverage.
 
     Not transactional, and deliberately not pretending to be. The accepted store
@@ -447,9 +454,7 @@ def record_usage_reading(
     there is no append-only way to take it back. The refusal propagates and this
     returns nothing at all, so no caller can read a partial result as a whole one.
     """
-    human = _exact_view_bool(
-        human_complete_coverage, label="human_complete_coverage"
-    )
+    since = _view_instant(human_exclusive_since, label="human_exclusive_since")
     # Shape first, both windows, before anything is written. A malformed
     # seven-day pair must not be discovered after the five-hour reading is
     # already durable.
@@ -470,6 +475,6 @@ def record_usage_reading(
             observed_at=observed_at,
             resets_at=window_resets_at,
             used_percentage=used_percentage,
-            human_complete_coverage=human,
+            human_exclusive_since=since,
         )
     return recorded

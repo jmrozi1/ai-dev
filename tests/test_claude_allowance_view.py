@@ -87,12 +87,12 @@ class ViewTestCase(unittest.TestCase):
     def spend(self, cost, key: str) -> None:
         self.store.record_result(result(cost), idempotency_key=key)
 
-    def read(self, offset: int, percentage: str, *, human: bool = True) -> None:
+    def read(self, offset: int, percentage: str, *, since=BASE - 1) -> None:
         record_usage_reading(
             self.store,
             observed_at=BASE + offset,
             five_hour=(RESET, Decimal(percentage)),
-            human_complete_coverage=human,
+            human_exclusive_since=since,
         )
 
     def one_interval(self) -> None:
@@ -107,12 +107,12 @@ class ViewTestCase(unittest.TestCase):
         self.spend(1.0, "k3")
         self.read(120, "45")
 
-    def project(self, *, window: str = "five_hour", now: int = BASE + 180, human: bool = True):
+    def project(self, *, window: str = "five_hour", now: int = BASE + 180, since=BASE - 1):
         return project_window(
             self.store,
             window=window,
             now=now,
-            human_complete_coverage_since_anchor=human,
+            human_exclusive_since=since,
         )
 
     def payload(self) -> dict:
@@ -168,7 +168,7 @@ class NoAnchorTests(ViewTestCase):
                     self.store,
                     window="five_hour",
                     now=now,
-                    human_complete_coverage_since_anchor=True,
+                    human_exclusive_since=BASE - 1,
                 )
                 self.assertEqual(view.reason, REASON_NO_ANCHOR)
                 self.assertIs(view.source_healthy, True)
@@ -276,12 +276,12 @@ class AvailableProjectionTests(ViewTestCase):
 class CoverageConjunctionTests(ViewTestCase):
     def test_a_clean_ledger_and_a_truthful_human_project(self) -> None:
         self.one_interval()
-        self.assertEqual(self.project(human=True).health, HEALTH_PROVISIONAL)
+        self.assertEqual(self.project(since=BASE - 1).health, HEALTH_PROVISIONAL)
 
     def test_a_human_who_cannot_assert_coverage_gets_nothing(self) -> None:
         """The ledger is spotless; the human is the only thing that changed."""
         self.one_interval()
-        view = self.project(human=False)
+        view = self.project(since=None)
         self.assertEqual(view.health, HEALTH_UNAVAILABLE)
         self.assertEqual(view.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
         self.assertIsNone(view.point_percentage)
@@ -290,21 +290,21 @@ class CoverageConjunctionTests(ViewTestCase):
         """A result recorded without a cost is work this manager cannot weigh."""
         self.one_interval()
         self.spend(None, "k-hole")
-        view = self.project(human=True)
+        view = self.project(since=BASE - 1)
         self.assertEqual(view.health, HEALTH_UNAVAILABLE)
         self.assertEqual(view.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
 
     def test_each_half_alone_is_enough_to_withhold_the_number(self) -> None:
         """Neither input is decorative: flipping either one alone changes the answer."""
         self.one_interval()
-        clean_and_asserted = self.project(human=True)
-        clean_not_asserted = self.project(human=False)
+        clean_and_asserted = self.project(since=BASE - 1)
+        clean_not_asserted = self.project(since=None)
         self.assertEqual(clean_and_asserted.health, HEALTH_PROVISIONAL)
         self.assertEqual(clean_not_asserted.health, HEALTH_UNAVAILABLE)
 
         self.spend(None, "k-hole")
-        holed_and_asserted = self.project(human=True)
-        holed_not_asserted = self.project(human=False)
+        holed_and_asserted = self.project(since=BASE - 1)
+        holed_not_asserted = self.project(since=None)
         self.assertEqual(holed_and_asserted.health, HEALTH_UNAVAILABLE)
         self.assertEqual(holed_not_asserted.health, HEALTH_UNAVAILABLE)
 
@@ -313,7 +313,7 @@ class CoverageConjunctionTests(ViewTestCase):
         self.one_interval()
         inputs = self.store.projection_inputs("five_hour")
         self.assertIs(inputs.ledger_clean_since_anchor, True)
-        self.assertEqual(self.project(human=False).reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+        self.assertEqual(self.project(since=None).reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
 
     def test_the_assertion_is_required_and_has_no_default(self) -> None:
         with self.assertRaises(TypeError):
@@ -369,7 +369,7 @@ class ReadableButUnavailableTests(ViewTestCase):
             self.store,
             observed_at=later,
             five_hour=(later + 3600, Decimal("5")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         view = self.project(now=later + 60)
         self.assertEqual(view.reason, REASON_STALE)
@@ -387,9 +387,9 @@ class ReadableButUnavailableTests(ViewTestCase):
     def test_no_readable_unavailable_reason_implies_exhaustion(self) -> None:
         """Unavailable means 'cannot say', which is not 'spent'."""
         self.one_interval()
-        for now, human in ((RESET, True), (BASE + 180, False)):
-            with self.subTest(now=now, human=human):
-                view = self.project(now=now, human=human)
+        for now, since in ((RESET, BASE - 1), (BASE + 180, None)):
+            with self.subTest(now=now, since=since):
+                view = self.project(now=now, since=since)
                 self.assertEqual(view.health, HEALTH_UNAVAILABLE)
                 self.assertIsNone(view.point_percentage)
                 self.assertIs(view.bounded, False)
@@ -457,9 +457,9 @@ class SourceUnhealthyTests(ViewTestCase):
     def test_source_unhealthy_is_distinguishable_from_readable_unavailable(self) -> None:
         """Both are unavailable; only one of them means the evidence could not be read."""
         self.one_interval()
-        readable = self.project(human=False)
+        readable = self.project(since=None)
         self.path.write_text("{not json", encoding="utf-8")
-        unreadable = self.project(human=False)
+        unreadable = self.project(since=None)
         self.assertEqual(readable.health, unreadable.health)
         self.assertIs(readable.source_healthy, True)
         self.assertIs(unreadable.source_healthy, False)
@@ -528,7 +528,7 @@ class OneGenerationTests(ViewTestCase):
             counting,
             window="five_hour",
             now=BASE + 180,
-            human_complete_coverage_since_anchor=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(counting.windows, ["five_hour"])
         self.assertEqual(view.health, HEALTH_PROVISIONAL)
@@ -541,7 +541,7 @@ class OneGenerationTests(ViewTestCase):
             counting,
             window="five_hour",
             now=BASE + 180,
-            human_complete_coverage_since_anchor=True,
+            human_exclusive_since=BASE - 1,
         )
         for name in ("profile", "latest_observation", "workload_units", "observations"):
             with self.subTest(name=name):
@@ -555,7 +555,7 @@ class OneGenerationTests(ViewTestCase):
             racing,
             window="five_hour",
             now=BASE + 180,
-            human_complete_coverage_since_anchor=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(len(racing.windows), 1)
         self.assertEqual(view.point_percentage, Decimal("30"))
@@ -571,25 +571,34 @@ class ExplodingStore:
         raise AssertionError("the store was touched: {0}".format(name))
 
 
-class CoverageAssertionTests(ViewTestCase):
-    def test_a_non_bool_assertion_refuses_before_any_read(self) -> None:
-        for value in (1, 0, "true", "", None, [], Decimal("1")):
+class ExclusivityInstantTests(ViewTestCase):
+    def test_a_malformed_instant_refuses_before_any_read(self) -> None:
+        """The store is never consulted about a question the caller asked wrongly."""
+        for value in (True, False, 0, -1, 1.0, float(BASE), "true", "", [], (BASE,),
+                      Decimal("1"), object()):
             with self.subTest(value=value):
                 with self.assertRaises(AllowanceViewError) as caught:
                     project_window(
                         ExplodingStore(),
                         window="five_hour",
                         now=BASE,
-                        human_complete_coverage_since_anchor=value,
+                        human_exclusive_since=value,
                     )
-                self.assertEqual(caught.exception.reason, REASON_INVALID_COVERAGE_ASSERTION)
+                self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
 
-    def test_a_truthy_one_is_not_an_assertion(self) -> None:
-        """`1` is what a form field yields; asserting coverage must be deliberate."""
+    def test_a_truthy_one_is_not_an_instant(self) -> None:
+        """`True` is what a checkbox yields; the claim must carry a real epoch."""
         self.one_interval()
         with self.assertRaises(AllowanceViewError):
-            self.project(human=1)
-        self.assertEqual(self.project(human=True).health, HEALTH_PROVISIONAL)
+            self.project(since=True)
+        self.assertEqual(self.project(since=BASE - 1).health, HEALTH_PROVISIONAL)
+
+    def test_a_wall_clock_float_is_not_an_instant(self) -> None:
+        """`time.time()` is the obvious wrong thing to pass, so it is pinned."""
+        self.one_interval()
+        with self.assertRaises(AllowanceViewError) as caught:
+            self.project(since=time.time())
+        self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
 
     def test_the_refusal_carries_a_stable_reason(self) -> None:
         with self.assertRaises(AllowanceViewError) as caught:
@@ -597,10 +606,31 @@ class CoverageAssertionTests(ViewTestCase):
                 ExplodingStore(),
                 window="five_hour",
                 now=BASE,
-                human_complete_coverage_since_anchor="yes",
+                human_exclusive_since="yes",
             )
-        self.assertEqual(caught.exception.reason, "invalid-coverage-assertion")
-        self.assertIn("human_complete_coverage_since_anchor", caught.exception.detail)
+        self.assertEqual(caught.exception.reason, "invalid-epoch")
+        self.assertIn("human_exclusive_since", caught.exception.detail)
+
+    def test_no_boolean_keyword_survives_on_either_view_surface(self) -> None:
+        """The old contract is gone, not merely unused."""
+        with self.assertRaises(TypeError):
+            project_window(ExplodingStore(), window="five_hour", now=BASE,
+                           human_complete_coverage_since_anchor=True)
+        with self.assertRaises(TypeError):
+            record_usage_reading(ExplodingStore(), observed_at=BASE,
+                                 five_hour=(RESET, Decimal("10")),
+                                 human_complete_coverage=True)
+
+    def test_the_claim_is_required_and_has_no_default(self) -> None:
+        with self.assertRaises(TypeError):
+            project_window(self.store, window="five_hour", now=BASE)
+        with self.assertRaises(TypeError):
+            record_usage_reading(self.store, observed_at=BASE,
+                                 five_hour=(RESET, Decimal("10")))
+        # `None` is explicit, and accepted.
+        self.one_interval()
+        self.assertEqual(self.project(since=None).reason,
+                         REASON_CURRENT_COVERAGE_INCOMPLETE)
 
 
 # --------------------------------------------------------------------------
@@ -690,7 +720,7 @@ class CallerInputTests(ViewTestCase):
                         store,
                         window=value,
                         now=BASE,
-                        human_complete_coverage_since_anchor=True,
+                        human_exclusive_since=BASE - 1,
                     )
                 self.assertEqual(caught.exception.reason, REASON_INVALID_WINDOW)
                 self.assertEqual(store.reads, [])
@@ -704,7 +734,7 @@ class CallerInputTests(ViewTestCase):
                         store,
                         window="five_hour",
                         now=value,
-                        human_complete_coverage_since_anchor=True,
+                        human_exclusive_since=BASE - 1,
                     )
                 self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
                 self.assertEqual(store.reads, [])
@@ -718,7 +748,7 @@ class CallerInputTests(ViewTestCase):
                 store,
                 window="five_hour",
                 now=time.time(),
-                human_complete_coverage_since_anchor=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
         self.assertEqual(store.reads, [])
@@ -727,21 +757,44 @@ class CallerInputTests(ViewTestCase):
         self.assertEqual(healthy.point_percentage, Decimal("30"))
 
     def test_the_three_caller_inputs_are_checked_in_a_fixed_order(self) -> None:
-        """Assertion, then window, then clock, and all of them before the store."""
-        for window, now, human, expected in (
-            (None, None, 1, REASON_INVALID_COVERAGE_ASSERTION),
-            (None, None, True, REASON_INVALID_WINDOW),
-            ("five_hour", None, True, REASON_INVALID_EPOCH),
+        """Claim, then window, then clock, and all of them before the store.
+
+        The claim keeps the position the coverage assertion held. It and the
+        clock now share `invalid-epoch`, so the order is pinned by which
+        argument the detail names, not by the reason alone.
+        """
+        for window, now, since, expected, named in (
+            (None, None, 1.0, REASON_INVALID_EPOCH, "human_exclusive_since"),
+            (None, None, BASE - 1, REASON_INVALID_WINDOW, "window"),
+            ("five_hour", None, BASE - 1, REASON_INVALID_EPOCH, "now"),
         ):
-            with self.subTest(expected=expected):
+            with self.subTest(expected=expected, named=named):
                 with self.assertRaises(AllowanceViewError) as caught:
                     project_window(
                         ExplodingStore(),
                         window=window,
                         now=now,
-                        human_complete_coverage_since_anchor=human,
+                        human_exclusive_since=since,
                     )
                 self.assertEqual(caught.exception.reason, expected)
+                self.assertIn(named, caught.exception.detail)
+
+    def test_a_malformed_instant_is_distinguishable_from_a_malformed_clock(self) -> None:
+        """One reason, two arguments: only the detail separates them."""
+        bad_claim = None
+        bad_clock = None
+        with self.assertRaises(AllowanceViewError) as caught:
+            project_window(ExplodingStore(), window="five_hour", now=BASE,
+                           human_exclusive_since=1.5)
+        bad_claim = caught.exception
+        with self.assertRaises(AllowanceViewError) as caught:
+            project_window(ExplodingStore(), window="five_hour", now=1.5,
+                           human_exclusive_since=BASE - 1)
+        bad_clock = caught.exception
+        self.assertEqual(bad_claim.reason, bad_clock.reason)
+        self.assertIn("human_exclusive_since", bad_claim.detail)
+        self.assertIn("now", bad_clock.detail)
+        self.assertNotIn("human_exclusive_since", bad_clock.detail)
 
     def test_an_unaccepted_clock_refuses_on_a_store_with_no_anchor_too(self) -> None:
         """A no-anchor store returns early, so an unchecked clock would go unseen."""
@@ -751,7 +804,7 @@ class CallerInputTests(ViewTestCase):
                 empty,
                 window="five_hour",
                 now="not-a-clock",
-                human_complete_coverage_since_anchor=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
         self.assertEqual(empty.reads, [])
@@ -764,7 +817,7 @@ class CallerInputTests(ViewTestCase):
                 populated,
                 window="five_hour",
                 now="not-a-clock",
-                human_complete_coverage_since_anchor=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
         self.assertEqual(populated.reads, [])
@@ -799,7 +852,7 @@ class CallerInputTests(ViewTestCase):
         self.assert_canonical(available, "five_hour")
         self.assertEqual(available.health, HEALTH_PROVISIONAL)
 
-        readable = self.project(window=asked, human=False)
+        readable = self.project(window=asked, since=None)
         self.assert_canonical(readable, "five_hour")
         self.assertIs(readable.source_healthy, True)
         self.assertEqual(readable.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
@@ -865,7 +918,7 @@ class CallerInputTests(ViewTestCase):
 
     def test_readable_unavailability_is_still_a_healthy_source(self) -> None:
         self.one_interval()
-        view = self.project(human=False)
+        view = self.project(since=None)
         self.assertIs(view.source_healthy, True)
         self.assertEqual(view.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
         self.assertIsNone(view.point_percentage)
@@ -877,7 +930,7 @@ class CallerInputTests(ViewTestCase):
                 self.store,
                 observed_at="not-a-clock",
                 five_hour=(RESET, Decimal("10")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertNotIsInstance(caught.exception, AllowanceViewError)
         self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
@@ -887,7 +940,7 @@ class CallerInputTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(len(self.payload()["observations"]), 1)
 
@@ -907,7 +960,7 @@ class SubmittedWindowTests(ViewTestCase):
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
             seven_day=(SEVEN_RESET, Decimal("4")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(sorted(points), ["five_hour", "seven_day"])
         self.assertEqual(points["five_hour"].used_percentage, Decimal("10"))
@@ -918,7 +971,7 @@ class SubmittedWindowTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(list(points), ["five_hour"])
         self.assertEqual(self.recorded_windows(), ["five_hour"])
@@ -929,7 +982,7 @@ class SubmittedWindowTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             seven_day=(SEVEN_RESET, Decimal("4")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(list(points), ["seven_day"])
         self.assertEqual(self.recorded_windows(), ["seven_day"])
@@ -937,7 +990,7 @@ class SubmittedWindowTests(ViewTestCase):
 
     def test_neither_window_writes_nothing_at_all(self) -> None:
         points = record_usage_reading(
-            self.store, observed_at=BASE, human_complete_coverage=True
+            self.store, observed_at=BASE, human_exclusive_since=BASE - 1
         )
         self.assertEqual(points, {})
         self.assertFalse(self.path.exists())
@@ -948,7 +1001,7 @@ class SubmittedWindowTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             five_hour=(RESET, Decimal("77")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(self.store.observations("seven_day"), ())
         for entry in self.payload()["observations"]:
@@ -960,7 +1013,7 @@ class SubmittedWindowTests(ViewTestCase):
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
             seven_day=(SEVEN_RESET, Decimal("4")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(points["five_hour"].observed_at, BASE)
         self.assertEqual(points["seven_day"].observed_at, BASE)
@@ -971,7 +1024,7 @@ class SubmittedWindowTests(ViewTestCase):
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
             seven_day=(SEVEN_RESET, Decimal("4")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(self.recorded_windows(), ["five_hour", "seven_day"])
 
@@ -981,7 +1034,7 @@ class SubmittedWindowTests(ViewTestCase):
             observed_at=BASE,
             seven_day=(SEVEN_RESET, Decimal("4")),
             five_hour=(RESET, Decimal("10")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(self.recorded_windows(), ["five_hour", "seven_day"])
 
@@ -992,43 +1045,80 @@ class SubmittedWindowTests(ViewTestCase):
 
 
 class ReadingCoverageTests(ViewTestCase):
-    def submit(self, *, human):
+    def open_both(self, *, offset=0):
+        """Give each window a predecessor, so a claim has a span to cover."""
         return record_usage_reading(
             self.store,
+            observed_at=BASE + offset,
+            five_hour=(RESET, Decimal("5")),
+            seven_day=(SEVEN_RESET, Decimal("2")),
+            human_exclusive_since=None,
+        )
+
+    def submit(self, *, since, offset=60, five=True, seven=True):
+        return record_usage_reading(
+            self.store,
+            observed_at=BASE + offset,
+            five_hour=(RESET, Decimal("10")) if five else None,
+            seven_day=(SEVEN_RESET, Decimal("4")) if seven else None,
+            human_exclusive_since=since,
+        )
+
+    def recorded(self, window):
+        return [e["humanCoverage"] for e in self.payload()["observations"]
+                if e["window"] == window]
+
+    def test_a_first_reading_has_no_predecessor_and_records_uncovered(self) -> None:
+        """Inert, conservative, and schema-valid: there is no span to vouch for."""
+        self.submit(since=BASE - 1, offset=0)
+        self.assertEqual(self.recorded("five_hour"), [False])
+        self.assertEqual(self.recorded("seven_day"), [False])
+
+    def test_one_claim_is_compared_against_each_window_own_predecessor(self) -> None:
+        self.open_both()
+        self.submit(since=BASE - 1)
+        self.assertEqual(self.recorded("five_hour"), [False, True])
+        self.assertEqual(self.recorded("seven_day"), [False, True])
+
+    def test_no_claim_records_uncovered_on_both_windows(self) -> None:
+        self.open_both()
+        self.submit(since=None)
+        self.assertEqual(self.recorded("five_hour"), [False, False])
+        self.assertEqual(self.recorded("seven_day"), [False, False])
+
+    def test_a_previously_omitted_window_records_false_where_the_other_records_true(self) -> None:
+        """One statement, two windows, two different predecessors, two answers."""
+        # Only the five-hour window is opened, so the seven-day reading below is
+        # that window's first and has no predecessor of its own.
+        record_usage_reading(
+            self.store,
             observed_at=BASE,
-            five_hour=(RESET, Decimal("10")),
-            seven_day=(SEVEN_RESET, Decimal("4")),
-            human_complete_coverage=human,
+            five_hour=(RESET, Decimal("5")),
+            human_exclusive_since=None,
         )
+        self.submit(since=BASE - 1)
+        self.assertEqual(self.recorded("five_hour"), [False, True])
+        self.assertEqual(self.recorded("seven_day"), [False])
 
-    def test_the_same_assertion_reaches_both_windows(self) -> None:
-        self.assertEqual(
-            [entry["humanCoverage"] for entry in self.payload_after(self.submit(human=False))],
-            [False, False],
-        )
+    def test_a_claim_equal_to_the_predecessor_covers_and_one_second_later_does_not(self) -> None:
+        self.open_both()
+        self.submit(since=BASE, offset=60)
+        self.assertEqual(self.recorded("five_hour"), [False, True])
+        self.submit(since=BASE + 60 + 1, offset=120)
+        self.assertEqual(self.recorded("five_hour"), [False, True, False])
 
-    def payload_after(self, _points):
-        return self.payload()["observations"]
-
-    def test_a_truthful_human_is_recorded_as_asserted(self) -> None:
-        self.submit(human=True)
-        self.assertEqual(
-            [entry["humanCoverage"] for entry in self.payload()["observations"]],
-            [True, True],
-        )
-
-    def test_a_holed_ledger_overrides_a_truthful_human_on_both_windows(self) -> None:
+    def test_a_holed_ledger_overrides_a_truthful_claim_on_both_windows(self) -> None:
+        self.open_both()
         self.store.record_result(result(None), idempotency_key="k-hole")
-        points = self.submit(human=True)
+        points = self.submit(since=BASE - 1)
         self.assertIs(points["five_hour"].complete_coverage, False)
         self.assertIs(points["seven_day"].complete_coverage, False)
-        self.assertEqual(
-            [entry["humanCoverage"] for entry in self.payload()["observations"]],
-            [True, True],
-        )
+        # The human half was still true; the ledger is what withheld it.
+        self.assertEqual(self.recorded("five_hour"), [False, True])
 
-    def test_a_clean_ledger_and_a_truthful_human_record_complete_coverage(self) -> None:
-        points = self.submit(human=True)
+    def test_a_clean_ledger_and_a_truthful_claim_record_complete_coverage(self) -> None:
+        self.open_both()
+        points = self.submit(since=BASE - 1)
         self.assertIs(points["five_hour"].complete_coverage, True)
         self.assertIs(points["seven_day"].complete_coverage, True)
 
@@ -1038,7 +1128,7 @@ class ReadingCoverageTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.store.record_result(result(None), idempotency_key="k-hole")
         points = record_usage_reading(
@@ -1046,29 +1136,28 @@ class ReadingCoverageTests(ViewTestCase):
             observed_at=BASE + 60,
             five_hour=(RESET, Decimal("20")),
             seven_day=(SEVEN_RESET, Decimal("4")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertIs(points["five_hour"].complete_coverage, False)
         self.assertIs(points["seven_day"].complete_coverage, False)
 
-    def test_a_non_bool_assertion_refuses_before_any_write(self) -> None:
-        for value in (1, "yes", None, 0):
+    def test_a_malformed_instant_refuses_before_any_write(self) -> None:
+        for value in (True, 0, "yes", 1.0, Decimal("1"), []):
             with self.subTest(value=value):
                 with self.assertRaises(AllowanceViewError) as caught:
                     record_usage_reading(
                         ExplodingStore(),
                         observed_at=BASE,
                         five_hour=(RESET, Decimal("10")),
-                        human_complete_coverage=value,
+                        human_exclusive_since=value,
                     )
-                self.assertEqual(caught.exception.reason, REASON_INVALID_COVERAGE_ASSERTION)
+                self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
         self.assertFalse(self.path.exists())
 
-    def test_the_assertion_is_required_and_has_no_default(self) -> None:
-        with self.assertRaises(TypeError):
-            record_usage_reading(
-                self.store, observed_at=BASE, five_hour=(RESET, Decimal("10"))
-            )
+    def test_no_claim_instant_reaches_the_file(self) -> None:
+        self.open_both()
+        self.submit(since=BASE - 1)
+        self.assertNotIn(str(BASE - 1), self.path.read_text(encoding="utf-8"))
 
 
 # --------------------------------------------------------------------------
@@ -1081,7 +1170,7 @@ class CarriedRefusalTests(ViewTestCase):
         return record_usage_reading(
             self.store,
             observed_at=BASE + offset,
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
             **{window: (resets_at, percentage)}
         )
 
@@ -1127,7 +1216,7 @@ class CarriedRefusalTests(ViewTestCase):
                         self.store,
                         observed_at=BASE,
                         five_hour=shape,
-                        human_complete_coverage=True,
+                        human_exclusive_since=BASE - 1,
                     )
                 self.assertEqual(caught.exception.reason, REASON_INVALID_READING)
         self.assertFalse(self.path.exists())
@@ -1140,7 +1229,7 @@ class CarriedRefusalTests(ViewTestCase):
                 observed_at=BASE,
                 five_hour=(RESET, Decimal("10")),
                 seven_day=(SEVEN_RESET,),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertFalse(self.path.exists())
 
@@ -1218,7 +1307,7 @@ class LockLostTests(ViewTestCase):
             lossy,
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(points["five_hour"].used_percentage, Decimal("10"))
         self.assertEqual(points["five_hour"].observed_at, BASE)
@@ -1230,7 +1319,7 @@ class LockLostTests(ViewTestCase):
             lossy,
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(lossy.appends, 1)
         self.assertEqual(len(self.store.observations("five_hour")), 1)
@@ -1241,14 +1330,14 @@ class LockLostTests(ViewTestCase):
             lossy,
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         self.assertEqual(lossy.latest_reads, 1)
 
     def test_an_int_percentage_reconciles_against_the_stored_decimal(self) -> None:
         lossy = LockLostAfterWriteStore(self.store)
         points = record_usage_reading(
-            lossy, observed_at=BASE, five_hour=(RESET, 10), human_complete_coverage=True
+            lossy, observed_at=BASE, five_hour=(RESET, 10), human_exclusive_since=BASE - 1
         )
         self.assertEqual(points["five_hour"].used_percentage, Decimal("10"))
 
@@ -1259,7 +1348,7 @@ class LockLostTests(ViewTestCase):
                 missing,
                 observed_at=BASE,
                 five_hour=(RESET, Decimal("10")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_LOCK_LOST)
         self.assertEqual(missing.latest_reads, 1)
@@ -1272,7 +1361,7 @@ class LockLostTests(ViewTestCase):
                 lossy,
                 observed_at=BASE,
                 five_hour=(RESET, Decimal("10")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_LOCK_LOST)
 
@@ -1283,7 +1372,7 @@ class LockLostTests(ViewTestCase):
                 lossy,
                 observed_at=BASE,
                 five_hour=(RESET, Decimal("10")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_LOCK_LOST)
 
@@ -1294,7 +1383,7 @@ class LockLostTests(ViewTestCase):
                 lossy,
                 observed_at=BASE,
                 five_hour=(RESET, Decimal("10")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_LOCK_LOST)
 
@@ -1307,7 +1396,7 @@ class LockLostTests(ViewTestCase):
                 lossy,
                 observed_at=BASE,
                 five_hour=(RESET, Decimal("10")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_LOCK_LOST)
 
@@ -1320,7 +1409,7 @@ class LockLostTests(ViewTestCase):
                         held,
                         observed_at=BASE,
                         five_hour=(RESET, Decimal("10")),
-                        human_complete_coverage=True,
+                        human_exclusive_since=BASE - 1,
                     )
                 self.assertEqual(caught.exception.reason, reason)
                 self.assertEqual(held.latest_reads, 0)
@@ -1333,7 +1422,7 @@ class LockLostTests(ViewTestCase):
                 held,
                 observed_at=BASE,
                 five_hour=(RESET, Decimal("10")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertFalse(self.path.exists())
 
@@ -1349,7 +1438,7 @@ class PartialWriteTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             seven_day=(SEVEN_RESET, Decimal("9")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         with self.assertRaises(AllowanceStoreError) as caught:
             record_usage_reading(
@@ -1357,7 +1446,7 @@ class PartialWriteTests(ViewTestCase):
                 observed_at=BASE + 60,
                 five_hour=(RESET, Decimal("10")),
                 seven_day=(SEVEN_RESET - 1, Decimal("11")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(caught.exception.reason, REASON_RESET_EPOCH_REGRESSED)
 
@@ -1371,7 +1460,7 @@ class PartialWriteTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             seven_day=(SEVEN_RESET, Decimal("9")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         with self.assertRaises(AllowanceStoreError):
             record_usage_reading(
@@ -1379,7 +1468,7 @@ class PartialWriteTests(ViewTestCase):
                 observed_at=BASE + 60,
                 five_hour=(RESET, Decimal("10")),
                 seven_day=(SEVEN_RESET - 1, Decimal("11")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(
             [entry["window"] for entry in self.payload()["observations"]],
@@ -1391,7 +1480,7 @@ class PartialWriteTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             seven_day=(SEVEN_RESET, Decimal("9")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         with self.assertRaises(AllowanceStoreError):
             record_usage_reading(
@@ -1399,7 +1488,7 @@ class PartialWriteTests(ViewTestCase):
                 observed_at=BASE + 60,
                 five_hour=(RESET, Decimal("10")),
                 seven_day=(SEVEN_RESET - 1, Decimal("11")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         seven = self.store.observations("seven_day")
         self.assertEqual(len(seven), 1)
@@ -1411,7 +1500,7 @@ class PartialWriteTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             seven_day=(SEVEN_RESET, Decimal("9")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         returned = None
         try:
@@ -1420,7 +1509,7 @@ class PartialWriteTests(ViewTestCase):
                 observed_at=BASE + 60,
                 five_hour=(RESET, Decimal("10")),
                 seven_day=(SEVEN_RESET - 1, Decimal("11")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         except AllowanceStoreError:
             pass
@@ -1432,7 +1521,7 @@ class PartialWriteTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             five_hour=(RESET, Decimal("9")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         with self.assertRaises(AllowanceStoreError):
             record_usage_reading(
@@ -1440,7 +1529,7 @@ class PartialWriteTests(ViewTestCase):
                 observed_at=BASE + 60,
                 five_hour=(RESET - 1, Decimal("10")),
                 seven_day=(SEVEN_RESET, Decimal("4")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         self.assertEqual(self.store.observations("seven_day"), ())
 
@@ -1450,7 +1539,7 @@ class PartialWriteTests(ViewTestCase):
             self.store,
             observed_at=BASE,
             seven_day=(SEVEN_RESET, Decimal("9")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         with self.assertRaises(AllowanceStoreError):
             record_usage_reading(
@@ -1458,7 +1547,7 @@ class PartialWriteTests(ViewTestCase):
                 observed_at=BASE + 60,
                 five_hour=(RESET, Decimal("10")),
                 seven_day=(SEVEN_RESET - 1, Decimal("11")),
-                human_complete_coverage=True,
+                human_exclusive_since=BASE - 1,
             )
         anchor = self.store.projection_inputs("five_hour").anchor
         self.assertIsNotNone(anchor)
@@ -1564,7 +1653,7 @@ class BoundaryTests(ViewTestCase):
             observed_at=BASE,
             five_hour=(RESET, Decimal("10")),
             seven_day=(SEVEN_RESET, Decimal("4")),
-            human_complete_coverage=True,
+            human_exclusive_since=BASE - 1,
         )
         payload = self.payload()
         self.assertEqual(
@@ -1616,3 +1705,223 @@ class BoundaryTests(ViewTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+# 20. The run-scoped claim is compared to each window's own anchor
+# --------------------------------------------------------------------------
+
+
+CHECKPOINT_31_PAYLOAD = """{
+  "version": 1,
+  "meter": "claude-agent-sdk-result-total-cost-usd-v1",
+  "workloadUnits": "3.0",
+  "results": [
+    {"key": "a", "ordinal": 1, "cost": "1.0"},
+    {"key": "b", "ordinal": 2, "cost": "2.0"},
+    {"key": "hole", "ordinal": 3, "cost": null}
+  ],
+  "observations": [
+    {"window": "five_hour", "observedAt": 1700000000, "resetsAt": 1700018000,
+     "usedPercentage": "10", "workloadUnits": "1.0", "ledgerOrdinal": 1,
+     "humanCoverage": true, "completeCoverage": true},
+    {"window": "seven_day", "observedAt": 1700000000, "resetsAt": 1700604800,
+     "usedPercentage": "4", "workloadUnits": "1.0", "ledgerOrdinal": 1,
+     "humanCoverage": true, "completeCoverage": true},
+    {"window": "five_hour", "observedAt": 1700000060, "resetsAt": 1700018000,
+     "usedPercentage": "30", "workloadUnits": "3.0", "ledgerOrdinal": 2,
+     "humanCoverage": true, "completeCoverage": true},
+    {"window": "seven_day", "observedAt": 1700000120, "resetsAt": 1700604800,
+     "usedPercentage": "9", "workloadUnits": "3.0", "ledgerOrdinal": 3,
+     "humanCoverage": true, "completeCoverage": false}
+  ]
+}"""
+
+
+class ProjectionCoverageDerivationTests(ViewTestCase):
+    """Projection-time coverage, derived against each window's own anchor."""
+
+    def both(self, offset, five, seven):
+        record_usage_reading(
+            self.store,
+            observed_at=BASE + offset,
+            five_hour=(RESET, Decimal(five)),
+            seven_day=(SEVEN_RESET, Decimal(seven)),
+            human_exclusive_since=BASE - 1,
+        )
+
+    def divergent_anchors(self):
+        """Both windows trained, then a five-hour-only reading moves one anchor."""
+        self.spend(1.0, "k1")
+        self.both(0, "10", "4")
+        self.spend(2.0, "k2")
+        self.both(60, "30", "8")
+        self.spend(1.0, "k3")
+        record_usage_reading(
+            self.store,
+            observed_at=BASE + 3_600,
+            five_hour=(RESET, Decimal("50")),
+            human_exclusive_since=BASE - 1,
+        )
+
+    def anchors(self):
+        return {w: self.store.projection_inputs(w).anchor.observed_at
+                for w in ("five_hour", "seven_day")}
+
+    def test_the_fixture_really_does_diverge(self) -> None:
+        self.divergent_anchors()
+        self.assertEqual(self.anchors(),
+                         {"five_hour": BASE + 3_600, "seven_day": BASE + 60})
+
+    def test_no_claim_withholds_both_anchored_windows(self) -> None:
+        """Partition 1: `None` is unavailable, and the source is still healthy."""
+        self.divergent_anchors()
+        for window in ("five_hour", "seven_day"):
+            with self.subTest(window=window):
+                view = self.project(window=window, now=BASE + 3_700, since=None)
+                self.assertEqual(view.health, HEALTH_UNAVAILABLE)
+                self.assertEqual(view.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+                self.assertIs(view.source_healthy, True)
+                self.assertIsNone(view.point_percentage)
+
+    def test_a_claim_at_or_before_each_anchor_permits_both_windows(self) -> None:
+        """Partition 2: the boundary is inclusive, and older still covers."""
+        self.divergent_anchors()
+        anchors = self.anchors()
+        for window in ("five_hour", "seven_day"):
+            for label, since in (("exactly the anchor", anchors[window]),
+                                 ("one second before", anchors[window] - 1),
+                                 ("a decade before", anchors[window] - 315_360_000)):
+                with self.subTest(window=window, case=label):
+                    view = self.project(window=window, now=BASE + 3_700, since=since)
+                    self.assertNotEqual(view.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+                    self.assertIs(view.source_healthy, True)
+
+    def test_one_claim_splits_two_windows_whose_anchors_straddle_it(self) -> None:
+        """Partitions 3 and 4: one statement, two anchors, two different answers."""
+        self.divergent_anchors()
+        since = BASE + 100          # after the seven-day anchor, before the five-hour one
+        five = self.project(window="five_hour", now=BASE + 3_700, since=since)
+        seven = self.project(window="seven_day", now=BASE + 3_700, since=since)
+        self.assertNotEqual(five.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+        self.assertEqual(seven.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+        self.assertIs(seven.source_healthy, True)
+
+    def test_a_claim_one_second_after_the_anchor_withholds_that_window(self) -> None:
+        """Partition 6, at projection time."""
+        self.divergent_anchors()
+        anchor = self.anchors()["five_hour"]
+        self.assertNotEqual(
+            self.project(now=BASE + 3_700, since=anchor).reason,
+            REASON_CURRENT_COVERAGE_INCOMPLETE)
+        self.assertEqual(
+            self.project(now=BASE + 3_700, since=anchor + 1).reason,
+            REASON_CURRENT_COVERAGE_INCOMPLETE)
+
+    def test_the_claim_is_never_compared_against_now(self) -> None:
+        """A claim after the anchor stays refused however far `now` advances."""
+        self.divergent_anchors()
+        anchor = self.anchors()["five_hour"]
+        for now in (BASE + 3_700, BASE + 7_200, BASE + 10_000):
+            with self.subTest(now=now):
+                self.assertEqual(
+                    self.project(now=now, since=anchor + 1).reason,
+                    REASON_CURRENT_COVERAGE_INCOMPLETE)
+
+    def test_the_derivation_costs_no_second_generation(self) -> None:
+        """Partition 12: one read, whatever the claim says."""
+        self.divergent_anchors()
+        anchor = self.anchors()["five_hour"]
+        for since in (None, anchor, anchor + 1, BASE - 1):
+            with self.subTest(since=since):
+                counting = CountingStore(self.store)
+                project_window(counting, window="five_hour", now=BASE + 3_700,
+                               human_exclusive_since=since)
+                self.assertEqual(len(counting.reads), 1)
+
+    def test_a_holed_ledger_still_beats_a_covering_claim(self) -> None:
+        """The conjunction survives: the human half alone never permits a number."""
+        self.divergent_anchors()
+        self.spend(None, "k-hole")
+        self.assertEqual(
+            self.project(now=BASE + 3_700, since=BASE - 1).reason,
+            REASON_CURRENT_COVERAGE_INCOMPLETE)
+
+
+class RunScopedClaimTests(ViewTestCase):
+    """Nothing about the claim is persisted, and nothing persisted decides it."""
+
+    def test_a_reading_time_truth_does_not_substitute_for_a_projection_time_one(self) -> None:
+        """Partition 13: a covered anchor still needs a claim to project."""
+        self.one_interval()                      # anchors recorded as covered
+        anchor_entry = self.payload()["observations"][-1]
+        self.assertIs(anchor_entry["humanCoverage"], True)
+        self.assertEqual(self.project(since=None).reason,
+                         REASON_CURRENT_COVERAGE_INCOMPLETE)
+
+    def test_an_uncovered_anchor_still_projects_when_the_claim_covers_the_span_after_it(self) -> None:
+        """The converse: the anchor's stored flag is not the projection's answer."""
+        self.one_interval()
+        self.spend(1.0, "k-late")
+        self.read(120, "45", since=None)         # anchor recorded uncovered
+        self.assertIs(self.payload()["observations"][-1]["humanCoverage"], False)
+        view = self.project(now=BASE + 180, since=BASE - 1)
+        self.assertNotEqual(view.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+        self.assertIs(view.source_healthy, True)
+
+    def test_the_inert_first_flag_costs_no_training_evidence(self) -> None:
+        """Partition 7: a first reading is uncovered and trains nothing anyway."""
+        self.one_interval()
+        first, second = self.payload()["observations"][:2]
+        self.assertIs(first["humanCoverage"], False)
+        self.assertIs(second["humanCoverage"], True)
+        self.assertEqual(self.project().interval_count, 1)
+
+    def test_a_checkpoint_31_store_loads_unchanged(self) -> None:
+        """Partition 11: an older store still loads, byte-for-byte as written."""
+        path = self.root / "checkpoint31.json"
+        path.write_text(CHECKPOINT_31_PAYLOAD, encoding="utf-8")
+        before = path.read_bytes()
+        older = AllowanceStore(path)
+        inputs = older.projection_inputs("five_hour")
+        self.assertEqual(inputs.anchor.observed_at, BASE + 60)
+        self.assertEqual(inputs.anchor.used_percentage, Decimal("30"))
+        self.assertEqual(inputs.meter, CURRENT_METER)
+        self.assertEqual(older.workload_units(), Decimal("3.0"))
+        # A first reading carrying humanCoverage true is exactly what the new
+        # derivation can never produce, and it is still accepted on load.
+        self.assertIs(json.loads(before.decode("utf-8"))["observations"][0]["humanCoverage"],
+                      True)
+        self.assertEqual(path.read_bytes(), before, "loading must not rewrite")
+
+    def test_an_append_to_an_older_store_keeps_the_schema_and_persists_no_claim(self) -> None:
+        path = self.root / "checkpoint31-append.json"
+        path.write_text(CHECKPOINT_31_PAYLOAD, encoding="utf-8")
+        older = AllowanceStore(path)
+        record_usage_reading(
+            older,
+            observed_at=BASE + 3_600,
+            five_hour=(RESET, Decimal("50")),
+            human_exclusive_since=BASE - 1,
+        )
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertEqual(payload["version"], 1)
+        self.assertEqual(payload["meter"], CURRENT_METER)
+        self.assertNotIn(str(BASE - 1), path.read_text(encoding="utf-8"))
+        self.assertEqual(
+            sorted(payload["observations"][-1]),
+            sorted(["window", "observedAt", "resetsAt", "usedPercentage",
+                    "workloadUnits", "ledgerOrdinal", "humanCoverage",
+                    "completeCoverage"]))
+        # No new top-level key appeared alongside the accepted four.
+        self.assertEqual(sorted(payload),
+                         sorted(["version", "meter", "workloadUnits", "results",
+                                 "observations"]))
+
+    def test_the_estimator_contract_this_module_feeds_is_unchanged(self) -> None:
+        """Partition 16: the estimator still owns the already-derived boolean."""
+        import inspect
+        from ai_dev_flow.claude_allowance import estimate_current
+        names = list(inspect.signature(estimate_current).parameters)
+        self.assertIn("complete_coverage_since_anchor", names)
+        self.assertNotIn("human_exclusive_since", names)

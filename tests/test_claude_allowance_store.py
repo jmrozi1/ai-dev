@@ -66,13 +66,13 @@ class StoreTestCase(unittest.TestCase):
         text = payload if isinstance(payload, str) else json.dumps(payload, indent=2)
         self.path.write_text(text, encoding="utf-8")
 
-    def observe(self, offset: int, percentage: str, *, human: bool = True, window="five_hour"):
+    def observe(self, offset: int, percentage: str, *, since=BASE - 1, window="five_hour"):
         return self.store.append_observation(
             window=window,
             observed_at=BASE + offset,
             resets_at=RESET,
             used_percentage=Decimal(percentage),
-            human_complete_coverage=human,
+            human_exclusive_since=since,
         )
 
 
@@ -215,7 +215,7 @@ class IdempotencyTests(StoreTestCase):
 class PersistenceTests(StoreTestCase):
     def _populate(self) -> None:
         self.store.record_result(result(0.1), idempotency_key="a")
-        self.observe(0, "10", human=False)
+        self.observe(0, "10", since=None)
         self.store.record_result(result(0.2), idempotency_key="b")
         self.observe(1_000, "30")
 
@@ -225,10 +225,10 @@ class PersistenceTests(StoreTestCase):
         twin = AllowanceStore(self.root / "twin.json")
         twin.record_result(result(0.1), idempotency_key="a")
         twin.append_observation(window="five_hour", observed_at=BASE, resets_at=RESET,
-                                used_percentage=Decimal("10"), human_complete_coverage=False)
+                                used_percentage=Decimal("10"), human_exclusive_since=None)
         twin.record_result(result(0.2), idempotency_key="b")
         twin.append_observation(window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
-                                used_percentage=Decimal("30"), human_complete_coverage=True)
+                                used_percentage=Decimal("30"), human_exclusive_since=BASE - 1)
         self.assertEqual(first, twin.path.read_bytes())
 
     def test_the_schema_declares_its_version_and_meter(self) -> None:
@@ -385,11 +385,16 @@ class ObservationTests(StoreTestCase):
                 with self.assertRaises(TypeError):
                     self.store.append_observation(
                         window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
-                        used_percentage=Decimal("20"), human_complete_coverage=True,
+                        used_percentage=Decimal("20"), human_exclusive_since=BASE - 1,
                         **injected)
 
     def test_coverage_is_the_conjunction_of_the_human_and_the_ledger(self) -> None:
-        """Every truth-table case, with the other input held fixed."""
+        """Every truth-table case, with the other input held fixed.
+
+        The human half is now derived: a claim starting at or before this
+        window's predecessor is the `True` row, and no claim at all is the
+        `False` row.
+        """
         cases = (
             (True, True, True),
             (True, False, False),
@@ -402,44 +407,103 @@ class ObservationTests(StoreTestCase):
                 store.record_result(result(0.1), idempotency_key="opening")
                 store.append_observation(
                     window="five_hour", observed_at=BASE, resets_at=RESET,
-                    used_percentage=Decimal("10"), human_complete_coverage=True)
+                    used_percentage=Decimal("10"), human_exclusive_since=BASE - 1)
                 store.record_result(result(0.2), idempotency_key="inside")
                 if not ledger_clean:
                     store.record_result(result(None), idempotency_key="hole")
                 point = store.append_observation(
                     window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
-                    used_percentage=Decimal("30"), human_complete_coverage=human)
+                    used_percentage=Decimal("30"),
+                    human_exclusive_since=(BASE - 1 if human else None))
                 self.assertEqual(point.complete_coverage, expected)
 
     def test_a_gap_only_affects_the_span_that_contains_it(self) -> None:
+        # The window is opened first so both readings below have a predecessor
+        # and a covering claim. The ledger half is then the only thing that can
+        # separate them -- without the opening reading, the holed one would be
+        # uncovered by the human half as well and prove nothing about the span.
+        self.observe(0, "5")
         self.store.record_result(result(None), idempotency_key="hole")
-        first = self.observe(0, "10")
+        first = self.observe(1_000, "10")
         self.store.record_result(result(0.2), idempotency_key="clean")
-        second = self.observe(1_000, "30")
+        second = self.observe(2_000, "30")
         self.assertFalse(first.complete_coverage)
         self.assertTrue(second.complete_coverage)
 
     def test_coverage_is_never_inferred_from_a_neighbouring_reading(self) -> None:
+        # The window is opened first: a first reading has no predecessor and is
+        # uncovered by derivation alone, which would confound the claim varied here.
+        self.observe(0, "5")
         self.store.record_result(result(0.1), idempotency_key="a")
-        covered = self.observe(0, "10", human=True)
+        covered = self.observe(1_000, "10", since=BASE - 1)
         self.store.record_result(result(0.2), idempotency_key="b")
-        uncovered = self.observe(1_000, "30", human=False)
+        uncovered = self.observe(2_000, "30", since=None)
         self.store.record_result(result(0.3), idempotency_key="c")
-        recovered = self.observe(2_000, "50", human=True)
+        recovered = self.observe(3_000, "50", since=BASE - 1)
         self.assertEqual([covered.complete_coverage, uncovered.complete_coverage,
                           recovered.complete_coverage], [True, False, True])
 
-    def test_the_human_coverage_statement_has_no_default(self) -> None:
+    def test_the_exclusivity_claim_has_no_default_and_admits_only_an_instant(self) -> None:
+        """`None` is a statement, not an omission, and only an exact epoch is one.
+
+        Omitting the keyword is a Python `TypeError` rather than a refusal with a
+        reason, because a caller that never decided must not be able to fall
+        through to a default in either direction.
+        """
         with self.assertRaises(TypeError):
             self.store.append_observation(window="five_hour", observed_at=BASE,
                                           resets_at=RESET, used_percentage=Decimal("10"))
-        for value in (1, 0, "yes", None):
+        # `None` is accepted and means the human has affirmed nothing this run.
+        point = self.store.append_observation(
+            window="five_hour", observed_at=BASE, resets_at=RESET,
+            used_percentage=Decimal("10"), human_exclusive_since=None)
+        self.assertFalse(point.complete_coverage)
+        for value in (True, False, 0, -1, 1.0, float(BASE), "yes", Decimal("1"),
+                      (BASE,), [BASE], object()):
             with self.subTest(value=value):
                 with self.assertRaises(AllowanceStoreError) as caught:
                     self.store.append_observation(
-                        window="five_hour", observed_at=BASE, resets_at=RESET,
-                        used_percentage=Decimal("10"), human_complete_coverage=value)
-                self.assertEqual(caught.exception.reason, store_module.REASON_INVALID_COVERAGE)
+                        window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
+                        used_percentage=Decimal("10"), human_exclusive_since=value)
+                self.assertEqual(caught.exception.reason, "invalid-epoch")
+        # Nothing above reached the history.
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+
+    def test_a_malformed_claim_costs_neither_a_lock_nor_a_write(self) -> None:
+        fresh = AllowanceStore(self.root / "untouched.json")
+        with self.assertRaises(AllowanceStoreError) as caught:
+            fresh.append_observation(window="five_hour", observed_at=BASE,
+                                     resets_at=RESET, used_percentage=Decimal("10"),
+                                     human_exclusive_since=1.0)
+        self.assertEqual(caught.exception.reason, "invalid-epoch")
+        self.assertFalse(fresh.path.exists())
+        self.assertFalse(fresh.lock_path.exists())
+
+    def test_no_boolean_keyword_survives_on_the_store_surface(self) -> None:
+        with self.assertRaises(TypeError):
+            self.store.append_observation(
+                window="five_hour", observed_at=BASE, resets_at=RESET,
+                used_percentage=Decimal("10"), human_complete_coverage=True)
+
+    def test_the_claim_is_compared_against_this_window_own_predecessor(self) -> None:
+        """Equal covers; one second later does not; no predecessor never does."""
+        first = self.observe(1_000, "10", since=BASE - 1)
+        self.assertFalse(first.complete_coverage, "a first reading has no span")
+        equal = self.observe(2_000, "20", since=BASE + 1_000)
+        self.assertTrue(equal.complete_coverage)
+        later = self.observe(3_000, "30", since=BASE + 2_000 + 1)
+        self.assertFalse(later.complete_coverage)
+
+    def test_no_claim_instant_reaches_the_file(self) -> None:
+        self.observe(0, "10")
+        self.observe(1_000, "20", since=BASE - 1)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertNotIn(str(BASE - 1), text)
+        entry = self.payload()["observations"][-1]
+        self.assertEqual(sorted(entry), sorted([
+            "window", "observedAt", "resetsAt", "usedPercentage",
+            "workloadUnits", "ledgerOrdinal", "humanCoverage", "completeCoverage"]))
+        self.assertIs(entry["humanCoverage"], True)
 
     def test_readings_append_in_strict_chronological_order(self) -> None:
         self.observe(1_000, "10")
@@ -451,7 +515,7 @@ class ObservationTests(StoreTestCase):
                     self.store.append_observation(
                         window="five_hour", observed_at=BASE + offset,
                         resets_at=RESET, used_percentage=Decimal("20"),
-                        human_complete_coverage=True)
+                        human_exclusive_since=BASE - 1)
                 self.assertEqual(caught.exception.reason,
                                  store_module.REASON_OBSERVATION_OUT_OF_ORDER)
         self.assertEqual(len(self.store.observations("five_hour")), 1)
@@ -466,7 +530,7 @@ class ObservationTests(StoreTestCase):
         ):
             with self.subTest(overrides=sorted(overrides)):
                 call = dict(window="five_hour", observed_at=BASE, resets_at=RESET,
-                            used_percentage=Decimal("10"), human_complete_coverage=True)
+                            used_percentage=Decimal("10"), human_exclusive_since=BASE - 1)
                 call.update(overrides)
                 with self.assertRaises(AllowanceError) as caught:
                     self.store.append_observation(**call)
@@ -481,7 +545,7 @@ class ObservationTests(StoreTestCase):
         """
         appended = []
         for offset, percentage in ((0, "10"), (1_000, "30"), (2_000, "50")):
-            appended.append(self.observe(offset, percentage, human=False))
+            appended.append(self.observe(offset, percentage, since=None))
             self.store.record_result(
                 result(0.1), idempotency_key="k%d" % offset)
         recorded = self.store.observations("five_hour")
@@ -492,7 +556,7 @@ class ObservationTests(StoreTestCase):
         baseline = self.store.profile("five_hour")
         self.store.append_observation(
             window="seven_day", observed_at=BASE + 3_000, resets_at=SEVEN_RESET,
-            used_percentage=Decimal("15"), human_complete_coverage=True)
+            used_percentage=Decimal("15"), human_exclusive_since=BASE - 1)
         self.assertEqual(self.store.observations("five_hour"), recorded)
         self.assertEqual(self.store.profile("five_hour"), baseline)
 
@@ -512,7 +576,7 @@ class ObservationTests(StoreTestCase):
 class RoundTripTests(StoreTestCase):
     def _history(self):
         self.store.record_result(result(0.1), idempotency_key="a")
-        opening = self.observe(0, "10", human=False)
+        opening = self.observe(0, "10", since=None)
         self.store.record_result(result(0.3), idempotency_key="b")
         middle = self.observe(1_000, "30")
         self.store.record_result(result(0.6), idempotency_key="c")
@@ -559,7 +623,7 @@ class RoundTripTests(StoreTestCase):
 
     def test_a_restart_does_not_turn_absence_into_zero_or_coverage(self) -> None:
         self.store.record_result(result(None), idempotency_key="hole")
-        point = self.observe(0, "10", human=True)
+        point = self.observe(0, "10", since=BASE - 1)
         self.assertFalse(point.complete_coverage)
         restarted = AllowanceStore(self.path)
         self.assertEqual(restarted.workload_units(), Decimal("0"))
@@ -707,7 +771,7 @@ class ExclusionTests(StoreTestCase):
 
 
 class WindowRelativeTests(StoreTestCase):
-    def _reading(self, offset, percentage, *, order, human=True):
+    def _reading(self, offset, percentage, *, order, since=BASE - 1):
         """One human `/usage` view recorded into both windows at one instant."""
         pair = [("five_hour", RESET), ("seven_day", SEVEN_RESET)]
         if order == "seven_first":
@@ -715,7 +779,7 @@ class WindowRelativeTests(StoreTestCase):
         return [
             self.store.append_observation(
                 window=window, observed_at=BASE + offset, resets_at=reset,
-                used_percentage=Decimal(percentage), human_complete_coverage=human)
+                used_percentage=Decimal(percentage), human_exclusive_since=since)
             for window, reset in pair
         ]
 
@@ -763,16 +827,16 @@ class WindowRelativeTests(StoreTestCase):
     def test_each_window_keeps_its_own_workload_and_predecessor(self) -> None:
         """A gap before one window's reading does not follow it into the other."""
         self.store.record_result(result(1.0), idempotency_key="open")
-        self.observe(0, "10", human=True)                       # five_hour only
+        self.observe(0, "10", since=BASE - 1)                   # five_hour only
         self.store.record_result(result(None), idempotency_key="hole")
         seven = self.store.append_observation(
             window="seven_day", observed_at=BASE + 50, resets_at=SEVEN_RESET,
-            used_percentage=Decimal("12"), human_complete_coverage=True)
+            used_percentage=Decimal("12"), human_exclusive_since=BASE - 1)
         # seven_day has no predecessor, so its span starts at ordinal 0 and
         # traverses the missing cost.
         self.assertFalse(seven.complete_coverage)
         self.store.record_result(result(2.0), idempotency_key="after")
-        five = self.observe(100, "20", human=True)
+        five = self.observe(100, "20", since=BASE - 1)
         self.assertFalse(five.complete_coverage)
 
     def test_same_window_equal_time_and_backfill_still_fail_closed(self) -> None:
@@ -782,7 +846,7 @@ class WindowRelativeTests(StoreTestCase):
                 with self.assertRaises(AllowanceStoreError) as caught:
                     self.store.append_observation(
                         window="five_hour", observed_at=BASE + offset, resets_at=RESET,
-                        used_percentage=Decimal("20"), human_complete_coverage=True)
+                        used_percentage=Decimal("20"), human_exclusive_since=BASE - 1)
                 self.assertEqual(caught.exception.reason,
                                  store_module.REASON_OBSERVATION_OUT_OF_ORDER)
         self.assertEqual(len(self.store.observations("five_hour")), 1)
@@ -896,7 +960,7 @@ class ResetOrderTests(StoreTestCase):
         observed_at, reset = window_reading(window, identity, step)
         return store.append_observation(
             window=window, observed_at=observed_at, resets_at=reset,
-            used_percentage=Decimal(percentage), human_complete_coverage=True)
+            used_percentage=Decimal(percentage), human_exclusive_since=BASE - 1)
 
     def test_an_unchanged_reset_epoch_is_accepted(self) -> None:
         """Successive readings inside one reset identity are the normal case."""
@@ -925,7 +989,7 @@ class ResetOrderTests(StoreTestCase):
         with self.assertRaises(AllowanceStoreError) as caught:
             self.store.append_observation(
                 window="five_hour", observed_at=observed_at, resets_at=regressing,
-                used_percentage=Decimal("20"), human_complete_coverage=True)
+                used_percentage=Decimal("20"), human_exclusive_since=BASE - 1)
         self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
         self.assertEqual(self.path.read_bytes(), before_bytes)
         self.assertFalse(self.store.lock_path.exists())
@@ -945,7 +1009,7 @@ class ResetOrderTests(StoreTestCase):
             self.store.append_observation(
                 window="five_hour", observed_at=five.observed_at + 100,
                 resets_at=five.observed_at + 160,
-                used_percentage=Decimal("20"), human_complete_coverage=True)
+                used_percentage=Decimal("20"), human_exclusive_since=BASE - 1)
         self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
 
     def test_interleaved_two_window_histories_survive_in_both_orders(self) -> None:
@@ -1013,7 +1077,7 @@ class ResetOrderTests(StoreTestCase):
             self.store.append_observation(
                 window="five_hour", observed_at=first.observed_at + 10,
                 resets_at=first.observed_at + 10 + 60,
-                used_percentage=Decimal("15"), human_complete_coverage=True)
+                used_percentage=Decimal("15"), human_exclusive_since=BASE - 1)
         self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
 
         # The premise really was adversarial: a hole sits in the ledger, and only
@@ -1065,7 +1129,6 @@ class ResetOrderTests(StoreTestCase):
                 for index, window in enumerate(windows):
                     # Disjoint bits: window index picks the triple, step picks the bit.
                     covered = bool((case >> (3 * index + step % 3)) & 1)
-                    coverage_values[window].add(covered)
                     reset = reset_for[step][window]
                     if step == 2:
                         attempted[window] += 1
@@ -1074,7 +1137,13 @@ class ResetOrderTests(StoreTestCase):
                             window=window, observed_at=BASE + 100 * (step + 1),
                             resets_at=reset,
                             used_percentage=Decimal(str(10 + 5 * step)),
-                            human_complete_coverage=covered)
+                            human_exclusive_since=(BASE - 1 if covered else None))
+                        # The store's own derived flag, read back from the file:
+                        # a strictly stronger premise than the argument sent in.
+                        coverage_values[window].add(
+                            [e for e in json.loads(
+                                store.path.read_text(encoding="utf-8"))["observations"]
+                             if e["window"] == window][-1]["humanCoverage"])
                         if missing:
                             holes_in_span[window] += 1
                         last_clean_ordinal[window] = step
@@ -1149,7 +1218,7 @@ class ProjectionInputsTests(StoreTestCase):
         self.observe(20, "40", window="five_hour")
         seven = self.store.append_observation(
             window="seven_day", observed_at=BASE + 30, resets_at=SEVEN_RESET,
-            used_percentage=Decimal("9"), human_complete_coverage=True,
+            used_percentage=Decimal("9"), human_exclusive_since=BASE - 1,
         )
 
         five = self.store.projection_inputs("five_hour")
@@ -1207,7 +1276,7 @@ class ProjectionInputsTests(StoreTestCase):
         self.observe(10, "20", window="five_hour")
         self.store.append_observation(
             window="seven_day", observed_at=BASE + 10, resets_at=SEVEN_RESET,
-            used_percentage=Decimal("5"), human_complete_coverage=True,
+            used_percentage=Decimal("5"), human_exclusive_since=BASE - 1,
         )
         self.store.record_result(result(None), idempotency_key="hole")
         self.observe(20, "40", window="five_hour")
@@ -1304,7 +1373,11 @@ class ProjectionInputsTests(StoreTestCase):
              store_module.REASON_MALFORMED_STORE),
             ("version", lambda p: p.update({"version": 2}),
              store_module.REASON_MALFORMED_STORE),
-            ("coverage", lambda p: p["observations"][0].update({"completeCoverage": False}),
+            # Flipped, not set to a literal: a first reading already carries
+            # `False`, and writing the value it already holds would mutate
+            # nothing and prove nothing.
+            ("coverage", lambda p: p["observations"][0].update(
+                {"completeCoverage": not p["observations"][0]["completeCoverage"]}),
              store_module.REASON_MALFORMED_STORE),
         )
         good = self.payload()
