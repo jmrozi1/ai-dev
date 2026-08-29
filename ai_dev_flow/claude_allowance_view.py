@@ -37,12 +37,16 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 from .claude_allowance import (
     _exact_decimal,
+    _exact_epoch,
     AllowanceError,
     CalibrationPoint,
     HEALTH_UNAVAILABLE,
+    REASON_INVALID_EPOCH,
     REASON_INVALID_PERCENTAGE,
+    REASON_INVALID_WINDOW,
     WINDOW_FIVE_HOUR,
     WINDOW_SEVEN_DAY,
+    WINDOWS,
     estimate_current,
 )
 from .claude_allowance_store import (
@@ -64,7 +68,11 @@ __all__ = [
 ]
 
 # This module's own refusals. Everything else keeps the accepted reason it was
-# raised with; wrapping an accepted refusal would give one fact two names.
+# raised with; wrapping an accepted refusal would give one fact two names. A
+# malformed window or clock is refused with the accepted `invalid-window` and
+# `invalid-epoch` spellings for exactly that reason -- only the exception type
+# changes, to say that the caller asked wrongly rather than that the evidence
+# could not be read.
 REASON_INVALID_COVERAGE_ASSERTION = "invalid-coverage-assertion"
 REASON_INVALID_READING = "invalid-usage-reading"
 
@@ -139,6 +147,39 @@ def _exact_view_bool(value: object, *, label: str) -> bool:
     return value
 
 
+def _canonical_window(value: object) -> str:
+    """Exactly one of the accepted windows, returned as the package's own `str`.
+
+    Canonicalised rather than merely checked, so the value that reaches a frozen
+    field declared `str` is the constant itself and never an equal-but-different
+    object. A window this package does not name is the caller asking about the
+    wrong thing, which is the caller's fault and not the store's evidence being
+    unreadable.
+    """
+    if isinstance(value, str):
+        for window in WINDOWS:
+            if value == window:
+                return window
+    raise AllowanceViewError(
+        REASON_INVALID_WINDOW,
+        "window must be one of {0}, got {1!r}".format(", ".join(WINDOWS), value),
+    )
+
+
+def _view_epoch(value: object) -> int:
+    """Exactly the estimator's own positive epoch, refused as a caller fault.
+
+    The rule is not restated here. `_exact_epoch` is the one the estimator
+    applies, so `time.time()` stays invalid and the two cannot drift apart; only
+    the category changes. A caller's clock is the caller's, and reporting a bad
+    one as an unreadable source sends a human to inspect a healthy ledger.
+    """
+    try:
+        return _exact_epoch(value, label="now")
+    except AllowanceError as exc:
+        raise AllowanceViewError(REASON_INVALID_EPOCH, exc.detail) from exc
+
+
 def _reading_pair(value: object, *, window: str) -> Tuple[Any, Any]:
     """Exactly one `(resets_at, used_percentage)` pair.
 
@@ -162,7 +203,7 @@ def _reading_pair(value: object, *, window: str) -> Tuple[Any, Any]:
 
 
 def _unavailable_view(
-    window: object, meter: object, reason: str, *, source_healthy: bool
+    window: str, meter: str, reason: str, *, source_healthy: bool
 ) -> AllowanceWindowView:
     """One unavailable view. Never zero, and never without a reason."""
     return AllowanceWindowView(
@@ -181,14 +222,14 @@ def _unavailable_view(
     )
 
 
-def _source_unhealthy_view(window: object, error: Exception) -> AllowanceWindowView:
+def _source_unhealthy_view(window: str, error: Exception) -> AllowanceWindowView:
     """A store or profile refusal, said out loud rather than rendered as a number.
 
     The meter is the one this view is *about*, not a claim about what the store
     holds: the accepted loader refuses any store written for a different meter, so
-    a readable store always reports this same meter. The window is echoed exactly
-    as asked for, because a caller that asked about the wrong thing must be able
-    to see which thing it asked about.
+    a readable store always reports this same meter. The window is the canonical
+    one this projection is for; a caller that named something else never reaches
+    here, because that is a caller fault and this is only ever a source failure.
     """
     return _unavailable_view(
         window, CURRENT_METER, error.reason, source_healthy=False
@@ -198,7 +239,7 @@ def _source_unhealthy_view(window: object, error: Exception) -> AllowanceWindowV
 def _view_from_inputs(
     inputs: ProjectionInputs,
     *,
-    now: object,
+    now: int,
     human_complete_coverage_since_anchor: bool,
 ) -> AllowanceWindowView:
     """Pure: one generation of evidence in, one view out.
@@ -255,7 +296,7 @@ def _view_from_inputs(
 def project_window(
     store: AllowanceStore,
     *,
-    window: str,
+    window: object,
     now: object,
     human_complete_coverage_since_anchor: object,
 ) -> AllowanceWindowView:
@@ -267,21 +308,30 @@ def project_window(
     reading, and a caller that cannot say must get `unavailable` rather than a
     confident number that reads low.
 
-    Nothing raises out of here except that assertion, which is checked before the
-    store is touched. A store that refuses comes back as an unavailable view, so a
-    render can always draw something truthful.
+    All three caller inputs -- that assertion, the window, and the clock -- are
+    checked before the store is touched, and a caller fault raises
+    `AllowanceViewError` rather than returning a view. They are the caller's to
+    get right, and answering a malformed question with "the evidence could not be
+    read" would accuse a healthy store of a fault that is not its own. What the
+    *store* refuses still comes back as an unavailable view, so a render that
+    asked properly can always draw something truthful.
     """
     human = _exact_view_bool(
         human_complete_coverage_since_anchor,
         label="human_complete_coverage_since_anchor",
     )
+    # Before the read, and in this order, so no caller fault can be answered from
+    # the store -- including on a store with no anchor, which would otherwise
+    # return early and never look at the clock at all.
+    projected_window = _canonical_window(window)
+    current_time = _view_epoch(now)
     try:
         # Exactly once. A second read would be a second generation.
-        inputs = store.projection_inputs(window)
+        inputs = store.projection_inputs(projected_window)
     except (AllowanceStoreError, AllowanceError) as exc:
-        return _source_unhealthy_view(window, exc)
+        return _source_unhealthy_view(projected_window, exc)
     return _view_from_inputs(
-        inputs, now=now, human_complete_coverage_since_anchor=human
+        inputs, now=current_time, human_complete_coverage_since_anchor=human
     )
 
 

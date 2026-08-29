@@ -8,6 +8,7 @@ import ast
 import dataclasses
 import json
 import tempfile
+import time
 import unittest
 
 from ai_dev_flow import claude_allowance_view as view_module
@@ -16,6 +17,8 @@ from ai_dev_flow.claude_allowance import (
     HEALTH_PROVISIONAL,
     HEALTH_UNAVAILABLE,
     REASON_CURRENT_COVERAGE_INCOMPLETE,
+    REASON_INVALID_EPOCH,
+    REASON_INVALID_WINDOW,
     REASON_NO_INTERVAL,
     REASON_PERCENTAGE_DECREASED,
     REASON_STALE,
@@ -26,7 +29,6 @@ from ai_dev_flow.claude_allowance_store import (
     CURRENT_METER,
     AllowanceStore,
     AllowanceStoreError,
-    REASON_INVALID_WINDOW,
     REASON_LOCK_LOST,
     REASON_LOCK_MALFORMED,
     REASON_MALFORMED_STORE,
@@ -154,15 +156,22 @@ class NoAnchorTests(ViewTestCase):
         self.assertNotEqual(self.project(window="five_hour").reason, REASON_NO_ANCHOR)
 
     def test_without_an_anchor_the_clock_is_never_consulted(self) -> None:
-        """No reading means no projection, whatever time the caller thinks it is."""
-        view = project_window(
-            self.store,
-            window="five_hour",
-            now="not-a-clock",
-            human_complete_coverage_since_anchor=True,
-        )
-        self.assertEqual(view.reason, REASON_NO_ANCHOR)
-        self.assertIs(view.source_healthy, True)
+        """No reading means no projection, whatever time the caller thinks it is.
+
+        Three valid epochs decades apart, and the same answer from all of them.
+        A malformed clock is a different matter and is refused outright, so it
+        cannot stand in for this: see `CallerInputTests`.
+        """
+        for now in (1, BASE, BASE + 10 * STALE_SECONDS):
+            with self.subTest(now=now):
+                view = project_window(
+                    self.store,
+                    window="five_hour",
+                    now=now,
+                    human_complete_coverage_since_anchor=True,
+                )
+                self.assertEqual(view.reason, REASON_NO_ANCHOR)
+                self.assertIs(view.source_healthy, True)
 
 
 # --------------------------------------------------------------------------
@@ -456,22 +465,25 @@ class SourceUnhealthyTests(ViewTestCase):
         self.assertIs(unreadable.source_healthy, False)
         self.assertNotEqual(readable.reason, unreadable.reason)
 
-    def test_an_unusable_clock_cannot_crash_a_render(self) -> None:
-        self.one_interval()
-        view = project_window(
-            self.store,
-            window="five_hour",
-            now="not-a-clock",
-            human_complete_coverage_since_anchor=True,
-        )
-        self.assertIs(view.source_healthy, False)
-        self.assertIsNone(view.point_percentage)
+    def test_a_caller_fault_is_not_a_source_failure(self) -> None:
+        """`source_healthy` says whether the evidence could be read. Only that.
 
-    def test_an_unknown_window_is_the_accepted_store_refusal(self) -> None:
-        """No duplicate window check here: the store already owns that refusal."""
-        view = self.project(window="ten_minute")
-        self.assert_unhealthy(view, REASON_INVALID_WINDOW)
-        self.assertEqual(view.window, "ten_minute")
+        An unusable clock and an unnamed window are the caller's mistakes. They
+        raise instead of producing a view, so this category keeps meaning one
+        thing, and the same store answers healthily on either side of them.
+        """
+        self.one_interval()
+        for label, kwargs in (
+            ("clock", {"now": "not-a-clock"}),
+            ("window", {"window": "ten_minute"}),
+        ):
+            with self.subTest(label=label):
+                self.assertIs(self.project().source_healthy, True)
+                with self.assertRaises(AllowanceViewError):
+                    self.project(**kwargs)
+                still = self.project()
+                self.assertIs(still.source_healthy, True)
+                self.assertEqual(still.point_percentage, Decimal("30"))
 
 
 # --------------------------------------------------------------------------
@@ -589,6 +601,295 @@ class CoverageAssertionTests(ViewTestCase):
             )
         self.assertEqual(caught.exception.reason, "invalid-coverage-assertion")
         self.assertIn("human_complete_coverage_since_anchor", caught.exception.detail)
+
+
+# --------------------------------------------------------------------------
+# 10b. So are the window and the clock
+# --------------------------------------------------------------------------
+
+
+class CountingStore:
+    """Delegates, and remembers every projection read it was asked for."""
+
+    def __init__(self, inner) -> None:
+        self.inner = inner
+        self.reads = []
+
+    def projection_inputs(self, window):
+        self.reads.append(window)
+        return self.inner.projection_inputs(window)
+
+
+class OtherStr(str):
+    """Equal to a canonical window, and not the same object as one."""
+
+
+# Everything a caller can pass that is not one of the two named windows. Cased,
+# padded and near-miss spellings are included deliberately: this validator
+# accepts the two names, it does not repair them.
+UNACCEPTED_WINDOWS = (
+    None,
+    123,
+    0,
+    -1,
+    True,
+    Decimal("1"),
+    b"five_hour",
+    ["five_hour"],
+    ("five_hour",),
+    {"five_hour": 1},
+    object(),
+    "",
+    " ",
+    "\t",
+    "five_hour ",
+    " five_hour",
+    "Five_Hour",
+    "FIVE_HOUR",
+    "fivehour",
+    "five-hour",
+    "ten_minute",
+    "seven_days",
+)
+
+# Everything that is not an exact positive `int` epoch. `float` is the one that
+# matters most, because `time.time()` is how a caller naturally spells now.
+UNACCEPTED_EPOCHS = (
+    None,
+    True,
+    False,
+    0,
+    -1,
+    -BASE,
+    1.5,
+    float(BASE),
+    Decimal(BASE),
+    str(BASE),
+    "not-a-clock",
+    [BASE],
+    (BASE,),
+    object(),
+)
+
+
+class CallerInputTests(ViewTestCase):
+    """A malformed question is this module's refusal, raised before any read."""
+
+    def assert_canonical(self, view, window) -> None:
+        self.assertIs(type(view.window), str)
+        self.assertEqual(view.window, window)
+        self.assertIn(view.window, ("five_hour", "seven_day"))
+        self.assertIs(type(view.meter), str)
+
+    def test_an_unaccepted_window_refuses_before_any_read(self) -> None:
+        for value in UNACCEPTED_WINDOWS:
+            with self.subTest(window=value):
+                store = CountingStore(ExplodingStore())
+                with self.assertRaises(AllowanceViewError) as caught:
+                    project_window(
+                        store,
+                        window=value,
+                        now=BASE,
+                        human_complete_coverage_since_anchor=True,
+                    )
+                self.assertEqual(caught.exception.reason, REASON_INVALID_WINDOW)
+                self.assertEqual(store.reads, [])
+
+    def test_an_unaccepted_epoch_refuses_before_any_read(self) -> None:
+        for value in UNACCEPTED_EPOCHS:
+            with self.subTest(now=value):
+                store = CountingStore(ExplodingStore())
+                with self.assertRaises(AllowanceViewError) as caught:
+                    project_window(
+                        store,
+                        window="five_hour",
+                        now=value,
+                        human_complete_coverage_since_anchor=True,
+                    )
+                self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
+                self.assertEqual(store.reads, [])
+
+    def test_the_natural_spelling_of_now_is_a_caller_fault(self) -> None:
+        """`time.time()` is a float. The estimator refuses it; the store is fine."""
+        self.one_interval()
+        store = CountingStore(self.store)
+        with self.assertRaises(AllowanceViewError) as caught:
+            project_window(
+                store,
+                window="five_hour",
+                now=time.time(),
+                human_complete_coverage_since_anchor=True,
+            )
+        self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
+        self.assertEqual(store.reads, [])
+        healthy = self.project()
+        self.assertIs(healthy.source_healthy, True)
+        self.assertEqual(healthy.point_percentage, Decimal("30"))
+
+    def test_the_three_caller_inputs_are_checked_in_a_fixed_order(self) -> None:
+        """Assertion, then window, then clock, and all of them before the store."""
+        for window, now, human, expected in (
+            (None, None, 1, REASON_INVALID_COVERAGE_ASSERTION),
+            (None, None, True, REASON_INVALID_WINDOW),
+            ("five_hour", None, True, REASON_INVALID_EPOCH),
+        ):
+            with self.subTest(expected=expected):
+                with self.assertRaises(AllowanceViewError) as caught:
+                    project_window(
+                        ExplodingStore(),
+                        window=window,
+                        now=now,
+                        human_complete_coverage_since_anchor=human,
+                    )
+                self.assertEqual(caught.exception.reason, expected)
+
+    def test_an_unaccepted_clock_refuses_on_a_store_with_no_anchor_too(self) -> None:
+        """A no-anchor store returns early, so an unchecked clock would go unseen."""
+        empty = CountingStore(self.store)
+        with self.assertRaises(AllowanceViewError) as caught:
+            project_window(
+                empty,
+                window="five_hour",
+                now="not-a-clock",
+                human_complete_coverage_since_anchor=True,
+            )
+        self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
+        self.assertEqual(empty.reads, [])
+        self.assertEqual(self.project().reason, REASON_NO_ANCHOR)
+
+        self.one_interval()
+        populated = CountingStore(self.store)
+        with self.assertRaises(AllowanceViewError) as caught:
+            project_window(
+                populated,
+                window="five_hour",
+                now="not-a-clock",
+                human_complete_coverage_since_anchor=True,
+            )
+        self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
+        self.assertEqual(populated.reads, [])
+
+    def test_the_refusal_carries_the_lower_layer_detail(self) -> None:
+        with self.assertRaises(AllowanceViewError) as caught:
+            self.project(now="not-a-clock")
+        self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
+        self.assertIn("now", caught.exception.detail)
+        self.assertIn("not-a-clock", caught.exception.detail)
+        self.assertIsInstance(caught.exception.__cause__, AllowanceError)
+
+        with self.assertRaises(AllowanceViewError) as caught:
+            self.project(window="ten_minute")
+        self.assertEqual(caught.exception.reason, REASON_INVALID_WINDOW)
+        self.assertIn("ten_minute", caught.exception.detail)
+        self.assertIn("five_hour", caught.exception.detail)
+
+    def test_every_returned_view_carries_a_canonical_window_string(self) -> None:
+        """A `str` subclass goes in; this package's own `str` comes back out."""
+        for window in ("five_hour", "seven_day"):
+            with self.subTest(window=window):
+                asked = OtherStr(window)
+                self.assertIsNot(type(asked), str)
+                view = self.project(window=asked)
+                self.assert_canonical(view, window)
+                self.assertEqual(view.reason, REASON_NO_ANCHOR)
+
+        asked = OtherStr("five_hour")
+        self.one_interval()
+        available = self.project(window=asked)
+        self.assert_canonical(available, "five_hour")
+        self.assertEqual(available.health, HEALTH_PROVISIONAL)
+
+        readable = self.project(window=asked, human=False)
+        self.assert_canonical(readable, "five_hour")
+        self.assertIs(readable.source_healthy, True)
+        self.assertEqual(readable.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+
+        self.path.write_text("{not json", encoding="utf-8")
+        unhealthy = self.project(window=asked)
+        self.assert_canonical(unhealthy, "five_hour")
+        self.assertIs(unhealthy.source_healthy, False)
+        self.assertEqual(unhealthy.reason, REASON_MALFORMED_STORE)
+
+    def test_a_valid_epoch_still_projects_exactly_what_it_did(self) -> None:
+        """Validating the clock changed the refusals, not any accepted number."""
+        from ai_dev_flow.claude_allowance import estimate_current
+
+        self.one_interval()
+        inputs = self.store.projection_inputs("five_hour")
+        expected = estimate_current(
+            inputs.profile,
+            inputs.anchor,
+            now=BASE + 180,
+            workload_units=inputs.workload_units,
+            complete_coverage_since_anchor=True,
+        )
+        view = self.project()
+        self.assertEqual(view.health, expected.health)
+        self.assertEqual(view.reason, expected.reason)
+        self.assertEqual(
+            view.point_percentage.as_tuple(), expected.point_percentage.as_tuple()
+        )
+        self.assertEqual(view.resets_at, expected.resets_at)
+        self.assertEqual(view.interval_count, expected.interval_count)
+        self.assertIs(view.source_healthy, True)
+
+    def test_a_healthy_store_is_never_unhealthy_for_a_caller_argument(self) -> None:
+        self.one_interval()
+        for kwargs in (
+            {"now": "not-a-clock"},
+            {"now": float(BASE + 180)},
+            {"now": True},
+            {"now": 0},
+            {"now": -1},
+            {"window": "ten_minute"},
+            {"window": None},
+            {"window": 123},
+            {"window": ["five_hour"]},
+        ):
+            with self.subTest(argument=repr(kwargs)):
+                with self.assertRaises(AllowanceViewError):
+                    self.project(**kwargs)
+                healthy = self.project()
+                self.assertIs(healthy.source_healthy, True)
+                self.assertEqual(healthy.point_percentage, Decimal("30"))
+
+    def test_a_genuine_source_failure_is_still_a_source_failure(self) -> None:
+        """The category narrowed; it did not disappear."""
+        self.one_interval()
+        self.path.write_text("{not json", encoding="utf-8")
+        view = self.project()
+        self.assertIsInstance(view, AllowanceWindowView)
+        self.assertIs(view.source_healthy, False)
+        self.assertEqual(view.reason, REASON_MALFORMED_STORE)
+        self.assertIsNone(view.point_percentage)
+
+    def test_readable_unavailability_is_still_a_healthy_source(self) -> None:
+        self.one_interval()
+        view = self.project(human=False)
+        self.assertIs(view.source_healthy, True)
+        self.assertEqual(view.reason, REASON_CURRENT_COVERAGE_INCOMPLETE)
+        self.assertIsNone(view.point_percentage)
+
+    def test_the_manual_reading_path_gained_no_caller_validation(self) -> None:
+        """Only the projection's inputs are checked. The writer is unchanged."""
+        with self.assertRaises(AllowanceError) as caught:
+            record_usage_reading(
+                self.store,
+                observed_at="not-a-clock",
+                five_hour=(RESET, Decimal("10")),
+                human_complete_coverage=True,
+            )
+        self.assertNotIsInstance(caught.exception, AllowanceViewError)
+        self.assertEqual(caught.exception.reason, REASON_INVALID_EPOCH)
+        self.assertFalse(self.path.exists())
+
+        record_usage_reading(
+            self.store,
+            observed_at=BASE,
+            five_hour=(RESET, Decimal("10")),
+            human_complete_coverage=True,
+        )
+        self.assertEqual(len(self.payload()["observations"]), 1)
 
 
 # --------------------------------------------------------------------------
