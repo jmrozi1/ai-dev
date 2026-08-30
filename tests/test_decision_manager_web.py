@@ -935,6 +935,25 @@ class AllowancePayloadTests(unittest.TestCase):
         self.assertEqual(entries[0]["used"], "≈12% used")
         self.assertEqual(entries[1]["used"], "70–71% used")
 
+    def test_each_window_is_visibly_named_as_itself_and_never_as_the_other(self) -> None:
+        """The label is the only five-hour/seven-day identity a human ever sees.
+
+        The canonical `window` value reaches the DOM as an unrendered `data-window`
+        attribute, so the id assertions above cannot catch an inverted label. Bind each
+        window to the string that is drawn for it, and prove the page really draws that
+        string: otherwise seven-day consumption can be presented as five-hour headroom
+        with every other assertion in this suite still green.
+        """
+        page, _, _ = rendered([a_decision()])
+        self.assertEqual(
+            [(entry["window"], entry["label"]) for entry in allowance_of(page)],
+            [(WINDOW_FIVE_HOUR, "5h"), (WINDOW_SEVEN_DAY, "7d")],
+        )
+        block = script_of(page).split("function renderAllowance", 1)[1].split(
+            "function renderRows", 1
+        )[0]
+        self.assertIn("textContent = entry.label", block)
+
     def test_the_drawn_order_is_fixed_regardless_of_caller_order(self) -> None:
         forward = build_allowance((a_window(WINDOW_FIVE_HOUR), a_window(WINDOW_SEVEN_DAY)))
         backward = build_allowance((a_window(WINDOW_SEVEN_DAY), a_window(WINDOW_FIVE_HOUR)))
