@@ -26,7 +26,15 @@ from __future__ import annotations
 # and the one inline stylesheet, so no other script can run and no external
 # request can be made.
 #
-# Fourth, a fixture submission is presentation, not success. It removes the
+# Fourth, allowance is shown, never computed. Two finished `AllowanceWindowView`
+# values arrive from the caller; this module opens no store, calls no projection,
+# reads no clock, and asserts no human exclusivity. It rounds to whole percentage
+# points at the moment of drawing -- outward for a calibrated range, nearest for a
+# provisional point -- and an unavailable window gets its reason rather than a
+# zero, because a confident zero would be read as "none used" when the truth is
+# "not known".
+#
+# Fifth, a fixture submission is presentation, not success. It removes the
 # selected item from the page's own memory and moves on. Nothing is stored,
 # nothing is transmitted, no endpoint exists to receive it, and the page never
 # claims otherwise. Real response routing is a later seam.
@@ -36,9 +44,16 @@ import hashlib
 import http.server
 import json
 import re
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
-from typing import Any, Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
+from .claude_allowance import (
+    HEALTH_UNAVAILABLE,
+    WINDOW_FIVE_HOUR,
+    WINDOW_SEVEN_DAY,
+)
+from .claude_allowance_view import AllowanceWindowView
 from .decision_queue import (
     QUEUE_STATES,
     STATE_WAITING,
@@ -50,6 +65,7 @@ __all__ = [
     "LOOPBACK_HOST",
     "PAGE_PATH",
     "RenderError",
+    "build_allowance",
     "build_payload",
     "make_server",
     "render_page",
@@ -80,6 +96,7 @@ _JSON_HTML_ESCAPES = (
     ("\u2029", "\\u2029"),
 )
 
+REASON_INVALID_ALLOWANCE = "invalid-allowance"
 REASON_INVALID_VIEW = "invalid-view"
 REASON_INVALID_DETAIL = "invalid-detail"
 REASON_DETAIL_MISSING = "detail-missing"
@@ -98,12 +115,128 @@ class RenderError(Exception):
 
 
 # --------------------------------------------------------------------------
+# Allowance
+# --------------------------------------------------------------------------
+
+
+# The order both windows are drawn in. Fixed here so the page cannot present one
+# window's figure under the other's name, and stated once rather than at each use.
+_ALLOWANCE_ORDER = (WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY)
+
+# Short names for the two accepted windows. Presentation only: the payload also
+# carries the canonical window identifier, so nothing downstream has to read a
+# label to know which window it is looking at.
+_WINDOW_LABELS = {WINDOW_FIVE_HOUR: "5h", WINDOW_SEVEN_DAY: "7d"}
+
+
+def _whole_percent(value: Decimal, rounding: str) -> str:
+    """One whole percentage point, rounded exactly as the caller asked.
+
+    Formatting, not arithmetic. The accepted view keeps the estimator's full
+    `Decimal` because rounding is one-way, so the coarse figure is produced here,
+    at the moment of drawing, and never written back anywhere.
+    """
+    return str(value.quantize(Decimal("1"), rounding=rounding))
+
+
+def _used_label(view: AllowanceWindowView) -> Optional[str]:
+    """What this window may honestly say it has used, or nothing at all.
+
+    Three shapes, decided by the accepted view rather than by this module. An
+    unavailable view gets no number -- not a zero, which would read as "none used"
+    when the truth is "not known". A calibrated view keeps its range and widens it
+    outward, so the displayed band always contains the projected one. A provisional
+    point carries the estimate marker, because a single interval is one slope and
+    not a measurement.
+    """
+    if view.health == HEALTH_UNAVAILABLE:
+        return None
+    if view.lower_percentage is not None and view.upper_percentage is not None:
+        # Outward on both ends, and the range form is kept even when the two
+        # endpoints round to the same whole number: collapsing it would state a
+        # point the projection never claimed.
+        return "{0}–{1}% used".format(
+            _whole_percent(view.lower_percentage, ROUND_FLOOR),
+            _whole_percent(view.upper_percentage, ROUND_CEILING),
+        )
+    if view.point_percentage is not None:
+        return "≈{0}% used".format(_whole_percent(view.point_percentage, ROUND_HALF_UP))
+    return None
+
+
+def build_allowance(allowance: Sequence[AllowanceWindowView]) -> "list":
+    """Reduce exactly the two accepted window views to what the page draws.
+
+    Every value here was decided by `claude_allowance_view`. This module opens no
+    store, calls no projection, reads no clock, and derives no health -- it is
+    handed two finished views and refuses anything it cannot name, because a page
+    that guessed which window it was showing would be worse than one that refused
+    to draw.
+    """
+    if not isinstance(allowance, (tuple, list)):
+        raise RenderError(
+            REASON_INVALID_ALLOWANCE,
+            "rendering consumes a sequence of accepted AllowanceWindowView values, "
+            "got {0!r}".format(type(allowance).__name__),
+        )
+    if len(allowance) != len(_ALLOWANCE_ORDER):
+        raise RenderError(
+            REASON_INVALID_ALLOWANCE,
+            "exactly {0} window views are required, got {1}".format(
+                len(_ALLOWANCE_ORDER), len(allowance)
+            ),
+        )
+
+    by_window = {}
+    for entry in allowance:
+        if type(entry) is not AllowanceWindowView:
+            raise RenderError(
+                REASON_INVALID_ALLOWANCE,
+                "each allowance entry must be an accepted AllowanceWindowView, "
+                "got {0!r}".format(type(entry).__name__),
+            )
+        if entry.window in by_window:
+            raise RenderError(
+                REASON_INVALID_ALLOWANCE,
+                "two views describe the window '{0}'".format(entry.window),
+            )
+        by_window[entry.window] = entry
+
+    missing = [window for window in _ALLOWANCE_ORDER if window not in by_window]
+    if missing:
+        raise RenderError(
+            REASON_INVALID_ALLOWANCE,
+            "no view supplied for {0}".format(", ".join(missing)),
+        )
+
+    return [
+        {
+            "window": window,
+            "label": _WINDOW_LABELS[window],
+            # `None` is the whole point: the page prints the reason instead, and
+            # there is no number for it to mistake for a measured zero.
+            "used": _used_label(by_window[window]),
+            "health": by_window[window].health,
+            "reason": by_window[window].reason,
+            "sourceHealthy": by_window[window].source_healthy,
+            # Carried exactly. Turning an epoch into a wall-clock time needs a
+            # clock and a locale, and this surface owns neither.
+            "resetsAt": by_window[window].resets_at,
+        }
+        for window in _ALLOWANCE_ORDER
+    ]
+
+
+# --------------------------------------------------------------------------
 # Payload
 # --------------------------------------------------------------------------
 
 
 def build_payload(
-    view: QueueView, details: Mapping[str, SelectedDetail]
+    view: QueueView,
+    details: Mapping[str, SelectedDetail],
+    *,
+    allowance: Sequence[AllowanceWindowView],
 ) -> "dict":
     """Reduce accepted projection objects to the exact data the page draws.
 
@@ -151,6 +284,7 @@ def build_payload(
     return {
         "states": list(QUEUE_STATES),
         "defaultFilters": [STATE_WAITING],
+        "allowance": build_allowance(allowance),
         "rows": [
             {
                 "itemId": row.item_id,
@@ -253,6 +387,7 @@ def render_page(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
     *,
+    allowance: Sequence[AllowanceWindowView],
     template_path: Optional[Path] = None,
 ) -> str:
     """The complete page: template, its policy, and this view's data."""
@@ -264,7 +399,7 @@ def render_page(
                 "the template must contain exactly one {0}".format(placeholder),
             )
 
-    payload = serialize_payload(build_payload(view, details))
+    payload = serialize_payload(build_payload(view, details, allowance=allowance))
     # The policy is computed before the payload lands, so hostile fixture text can
     # never change which code the policy admits.
     page = template.replace(CSP_PLACEHOLDER, _policy(template))
@@ -318,6 +453,7 @@ def make_server(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
     *,
+    allowance: Sequence[AllowanceWindowView],
     host: str = LOOPBACK_HOST,
     port: int = 0,
     template_path: Optional[Path] = None,
@@ -334,7 +470,7 @@ def make_server(
             "this surface binds loopback only; '{0}' would answer off-host".format(host),
         )
 
-    page = render_page(view, details, template_path=template_path)
+    page = render_page(view, details, allowance=allowance, template_path=template_path)
     handler = type("_BoundPageHandler", (_PageHandler,), {"page": page})
     return http.server.HTTPServer((host, port), handler)
 

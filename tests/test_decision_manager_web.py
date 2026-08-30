@@ -8,6 +8,7 @@ human-relayed step.
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 from typing import Dict
 from html.parser import HTMLParser
@@ -23,11 +24,20 @@ from ai_dev_flow.decision_manager_web import (
     LOOPBACK_HOST,
     PAGE_PATH,
     RenderError,
+    build_allowance,
     build_payload,
     make_server,
     render_page,
     serialize_payload,
 )
+from ai_dev_flow.claude_allowance import (
+    HEALTH_CALIBRATED,
+    HEALTH_PROVISIONAL,
+    HEALTH_UNAVAILABLE,
+    WINDOW_FIVE_HOUR,
+    WINDOW_SEVEN_DAY,
+)
+from ai_dev_flow.claude_allowance_view import AllowanceWindowView
 from ai_dev_flow.decision_queue import (
     QUEUE_STATES,
     STATE_DISCONNECTED,
@@ -79,14 +89,82 @@ def an_agent(**overrides) -> OperationalAgent:
     )
 
 
-def rendered(decisions=(), agents=(), *, filters=QUEUE_STATES):
+HOSTILE_REASON = '</script><img src=x onerror="alert(3)">'
+
+
+def a_window(window=WINDOW_FIVE_HOUR, **overrides) -> AllowanceWindowView:
+    """One accepted view. Provisional point by default; every field overridable."""
+    base = dict(
+        window=window,
+        meter="claude-usage-percent",
+        health=HEALTH_PROVISIONAL,
+        reason="provisional-single-interval",
+        point_percentage=Decimal("30"),
+        lower_percentage=None,
+        upper_percentage=None,
+        bounded=False,
+        resets_at=1_700_000_000,
+        newest_calibration_at=1_699_999_000,
+        interval_count=1,
+        source_healthy=True,
+    )
+    base.update(overrides)
+    return AllowanceWindowView(**base)
+
+
+def a_range(window=WINDOW_FIVE_HOUR, lower="41.2", upper="46.8", **overrides):
+    return a_window(
+        window,
+        health=HEALTH_CALIBRATED,
+        reason="calibrated-interval-range",
+        point_percentage=None,
+        lower_percentage=Decimal(lower),
+        upper_percentage=Decimal(upper),
+        interval_count=2,
+        **overrides
+    )
+
+
+def unavailable(window=WINDOW_FIVE_HOUR, reason="current-coverage-incomplete",
+                *, source_healthy=True, **overrides):
+    return a_window(
+        window,
+        health=HEALTH_UNAVAILABLE,
+        reason=reason,
+        point_percentage=None,
+        lower_percentage=None,
+        upper_percentage=None,
+        resets_at=None,
+        newest_calibration_at=None,
+        interval_count=0,
+        source_healthy=source_healthy,
+        **overrides
+    )
+
+
+def an_allowance(five_hour=None, seven_day=None):
+    """The two accepted views a caller hands the page."""
+    return (
+        a_window(WINDOW_FIVE_HOUR) if five_hour is None else five_hour,
+        a_window(WINDOW_SEVEN_DAY) if seven_day is None else seven_day,
+    )
+
+
+def rendered(decisions=(), agents=(), *, filters=QUEUE_STATES, allowance=None):
     """One page plus the view and details it was built from."""
     queue = build_queue(list(decisions), list(agents))
     view = queue.view(filters=filters)
     details: Dict[str, SelectedDetail] = {}
     for row in view.rows:
         details[row.item_id] = queue.view(filters=filters, selected_id=row.item_id).detail
-    return render_page(view, details), view, details
+    page = render_page(
+        view, details, allowance=an_allowance() if allowance is None else allowance
+    )
+    return page, view, details
+
+
+def allowance_of(page: str):
+    return payload_of(page)["allowance"]
 
 
 def payload_of(page: str) -> dict:
@@ -191,24 +269,24 @@ class SerializationTests(unittest.TestCase):
 
     def test_serialization_is_deterministic(self) -> None:
         _, view, details = rendered([a_decision()], [an_agent()])
-        first = serialize_payload(build_payload(view, details))
-        second = serialize_payload(build_payload(view, details))
+        first = serialize_payload(build_payload(view, details, allowance=an_allowance()))
+        second = serialize_payload(build_payload(view, details, allowance=an_allowance()))
         self.assertEqual(first, second)
 
     def test_a_foreign_view_or_detail_is_refused(self) -> None:
         _, view, details = rendered([a_decision()])
         with self.assertRaises(RenderError) as caught:
-            build_payload(object(), details)
+            build_payload(object(), details, allowance=an_allowance())
         self.assertEqual(caught.exception.reason, web.REASON_INVALID_VIEW)
 
         with self.assertRaises(RenderError) as caught:
-            build_payload(view, {list(details)[0]: object()})
+            build_payload(view, {list(details)[0]: object()}, allowance=an_allowance())
         self.assertEqual(caught.exception.reason, web.REASON_INVALID_DETAIL)
 
     def test_a_row_without_detail_is_refused_rather_than_fetched_or_invented(self) -> None:
         _, view, _ = rendered([a_decision()])
         with self.assertRaises(RenderError) as caught:
-            build_payload(view, {})
+            build_payload(view, {}, allowance=an_allowance())
         self.assertEqual(caught.exception.reason, web.REASON_DETAIL_MISSING)
 
     def test_a_detail_for_an_absent_row_is_refused(self) -> None:
@@ -216,14 +294,18 @@ class SerializationTests(unittest.TestCase):
         stray = dict(details)
         stray["not-a-row"] = SelectedDetail(item_id="not-a-row", state=STATE_WAITING)
         with self.assertRaises(RenderError) as caught:
-            build_payload(view, stray)
+            build_payload(view, stray, allowance=an_allowance())
         self.assertEqual(caught.exception.reason, web.REASON_DETAIL_UNKNOWN)
 
     def test_a_mislabelled_detail_is_refused(self) -> None:
         _, view, details = rendered([a_decision()])
         only = list(details)[0]
         with self.assertRaises(RenderError) as caught:
-            build_payload(view, {only: SelectedDetail(item_id="other", state=STATE_WAITING)})
+            build_payload(
+                view,
+                {only: SelectedDetail(item_id="other", state=STATE_WAITING)},
+                allowance=an_allowance(),
+            )
         self.assertEqual(caught.exception.reason, web.REASON_INVALID_DETAIL)
 
 
@@ -235,7 +317,7 @@ class SerializationTests(unittest.TestCase):
 class ServerSurfaceTests(unittest.TestCase):
     def setUp(self) -> None:
         _, view, details = rendered([a_decision()], [an_agent()])
-        self.server = make_server(view, details, port=0)
+        self.server = make_server(view, details, allowance=an_allowance(), port=0)
         self.addCleanup(self.server.server_close)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -260,7 +342,7 @@ class ServerSurfaceTests(unittest.TestCase):
         for host in ("0.0.0.0", "::", "10.0.0.5", "example.invalid"):
             with self.subTest(host=host):
                 with self.assertRaises(RenderError) as caught:
-                    make_server(view, details, host=host, port=0)
+                    make_server(view, details, allowance=an_allowance(), host=host, port=0)
                 self.assertEqual(caught.exception.reason, web.REASON_NOT_LOOPBACK)
 
     def test_the_page_is_served_at_exactly_one_path(self) -> None:
@@ -323,10 +405,12 @@ class PageStructureTests(unittest.TestCase):
         self.assertIn("<summary>Details</summary>", self.page)
 
     def test_the_forbidden_controls_are_absent(self) -> None:
+        # `allowance` is deliberately not forbidden here any more: this rail puts a
+        # read-only usage summary on the page. What stays forbidden is anything that
+        # would act -- a control, a router, or an inspector.
         forbidden = ("Accept", "Reject", "Approve", "Deny", "Ask for context", "Defer",
                      "Retry", "Snooze", "Escalate", "Session inspector", "Transcript",
-                     "Console", "Sort", "Search", "Next page", "Previous page",
-                     "allowance", "Allowance")
+                     "Console", "Sort", "Search", "Next page", "Previous page")
         for label in forbidden:
             with self.subTest(label=label):
                 self.assertNotIn(label, self.page)
@@ -386,7 +470,7 @@ class PageStructureTests(unittest.TestCase):
         broken.write_text("<html><style>a{}</style><script>1</script></html>", encoding="utf-8")
         self.addCleanup(broken.unlink)
         with self.assertRaises(RenderError) as caught:
-            render_page(view, details, template_path=broken)
+            render_page(view, details, allowance=an_allowance(), template_path=broken)
         self.assertEqual(caught.exception.reason, web.REASON_TEMPLATE_MALFORMED)
 
 
@@ -541,8 +625,14 @@ class OperationalComposerTests(unittest.TestCase):
         paragraphs = [
             element for element, tag in self.ancestry.tags.items() if tag == "p"
         ]
-        self.assertEqual(sorted(paragraphs),
-                         ["explanation", "queue-empty", "response-failure", "response-hint"])
+        # `allowance` is the top aggregate band in the queue column, not a
+        # substitute for the composer: it is outside the detail pane entirely and
+        # says nothing about the selected row.
+        self.assertEqual(
+            sorted(paragraphs),
+            ["allowance", "explanation", "queue-empty", "response-failure", "response-hint"],
+        )
+        self.assertNotIn("detail", self.ancestry.ancestors["allowance"])
         self.assertEqual(self.page.count("<button"), 1)
         self.assertEqual(self.page.count("<textarea"), 1)
         for substitute in ("No response", "not available", "read-only", "cannot respond",
@@ -698,8 +788,9 @@ class SurfacePurityTests(unittest.TestCase):
     def test_the_module_imports_only_the_standard_library_and_the_projection(self) -> None:
         self.assertEqual(
             self._imported_modules(),
-            {"__future__", "base64", "hashlib", "http.server", "json", "re", "pathlib",
-             "typing", ".decision_queue"},
+            {"__future__", "base64", "hashlib", "http.server", "json", "re", "decimal",
+             "pathlib", "typing", ".decision_queue", ".claude_allowance",
+             ".claude_allowance_view"},
         )
 
     def test_the_module_never_reaches_the_control_plane_a_session_or_a_provider(self) -> None:
@@ -729,9 +820,236 @@ class SurfacePurityTests(unittest.TestCase):
         for surface in ("time.", "datetime", "elapsed_seconds(", "monotonic"):
             self.assertNotIn(surface, self.source, surface)
 
-    def test_no_allowance_transcript_or_provider_surface_exists(self) -> None:
-        for surface in ("allowance", "transcript", "anthropic", "provider", "token"):
+    def test_no_transcript_or_provider_surface_exists(self) -> None:
+        """Allowance is now shown; a provider, transcript or token route still is not."""
+        for surface in ("transcript", "anthropic", "token", "rate_limit", "api_key"):
             self.assertNotIn(surface, self.page.lower(), surface)
+
+    def test_the_page_never_reaches_the_allowance_source_itself(self) -> None:
+        """Presentation consumes finished views; it never becomes a second opinion."""
+        for surface in ("project_window", "AllowanceStore", "projection_inputs",
+                        "estimate_current", "record_usage_reading",
+                        "human_exclusive_since", "latest_observation"):
+            self.assertNotIn(surface, self.source, surface)
+        self.assertNotIn("claude_allowance_store", self._imported_modules())
+
+
+# --------------------------------------------------------------------------
+# Allowance display
+# --------------------------------------------------------------------------
+
+
+class AllowanceInputTests(unittest.TestCase):
+    """Two accepted views, named exactly. Anything ambiguous is refused, not guessed."""
+
+    def setUp(self) -> None:
+        _, self.view, self.details = rendered([a_decision()])
+
+    def _refused(self, allowance):
+        with self.assertRaises(RenderError) as caught:
+            build_payload(self.view, self.details, allowance=allowance)
+        self.assertEqual(caught.exception.reason, web.REASON_INVALID_ALLOWANCE)
+        return caught.exception
+
+    def test_a_non_sequence_is_refused(self) -> None:
+        self._refused(object())
+        self._refused(None)
+
+    def test_a_missing_or_extra_window_is_refused(self) -> None:
+        self._refused(())
+        self._refused((a_window(WINDOW_FIVE_HOUR),))
+        self._refused(an_allowance() + (a_window(WINDOW_FIVE_HOUR),))
+
+    def test_a_foreign_object_is_never_treated_as_a_view(self) -> None:
+        self._refused((a_window(WINDOW_FIVE_HOUR), object()))
+
+    def test_a_duplicate_window_is_refused_rather_than_deduplicated(self) -> None:
+        exception = self._refused((a_window(WINDOW_FIVE_HOUR), a_window(WINDOW_FIVE_HOUR)))
+        self.assertIn(WINDOW_FIVE_HOUR, exception.detail)
+
+    def test_an_unknown_window_is_refused_rather_than_relabelled(self) -> None:
+        exception = self._refused((a_window(WINDOW_FIVE_HOUR), a_window("monthly")))
+        self.assertIn(WINDOW_SEVEN_DAY, exception.detail)
+
+    def test_the_allowance_argument_has_no_default(self) -> None:
+        """A caller that cannot supply the views must say so, not silently omit them."""
+        with self.assertRaises(TypeError):
+            build_payload(self.view, self.details)
+
+
+class AllowancePrecisionTests(unittest.TestCase):
+    """Whole percentage points, and never finer than the projection supports."""
+
+    def _used(self, view):
+        return build_allowance((view, a_window(WINDOW_SEVEN_DAY)))[0]["used"]
+
+    def test_a_provisional_point_is_marked_and_rounded_half_up(self) -> None:
+        self.assertEqual(self._used(a_window(point_percentage=Decimal("30"))), "≈30% used")
+        self.assertEqual(self._used(a_window(point_percentage=Decimal("30.5"))), "≈31% used")
+        self.assertEqual(self._used(a_window(point_percentage=Decimal("30.4"))), "≈30% used")
+        self.assertEqual(self._used(a_window(point_percentage=Decimal("29.5"))), "≈30% used")
+
+    def test_a_repeating_decimal_never_reaches_the_page(self) -> None:
+        used = self._used(a_window(point_percentage=Decimal("17") + Decimal(7) / Decimal(3)))
+        self.assertEqual(used, "≈19% used")
+        self.assertNotIn("3333", used)
+
+    def test_a_calibrated_range_widens_outward(self) -> None:
+        self.assertEqual(self._used(a_range(lower="41.2", upper="46.8")), "41–47% used")
+        self.assertEqual(self._used(a_range(lower="41.0", upper="46.0")), "41–46% used")
+
+    def test_the_range_form_survives_coinciding_endpoints(self) -> None:
+        """A band that rounds to one number is still a band, not a measurement."""
+        used = self._used(a_range(lower="41", upper="41"))
+        self.assertEqual(used, "41–41% used")
+        self.assertNotEqual(used, "≈41% used")
+
+    def test_a_clamped_projection_is_shown_without_claiming_confirmation(self) -> None:
+        used = self._used(a_window(point_percentage=Decimal("100"), bounded=True))
+        self.assertEqual(used, "≈100% used")
+        self.assertNotIn("exhausted", used.lower())
+
+    def test_an_unavailable_window_carries_no_number_at_all(self) -> None:
+        for view in (unavailable(), unavailable(source_healthy=False, reason="malformed-store")):
+            with self.subTest(reason=view.reason):
+                self.assertIsNone(self._used(view))
+
+    def test_rounding_is_presentation_only_and_never_written_back(self) -> None:
+        view = a_window(point_percentage=Decimal("17") + Decimal(7) / Decimal(3))
+        build_allowance((view, a_window(WINDOW_SEVEN_DAY)))
+        self.assertEqual(view.point_percentage, Decimal("17") + Decimal(7) / Decimal(3))
+        self.assertGreater(len(str(view.point_percentage).split(".")[1]), 6)
+
+
+class AllowancePayloadTests(unittest.TestCase):
+    def test_both_windows_stay_independently_attributable(self) -> None:
+        entries = build_allowance(
+            an_allowance(
+                five_hour=a_window(WINDOW_FIVE_HOUR, point_percentage=Decimal("12")),
+                seven_day=a_range(WINDOW_SEVEN_DAY, lower="70.1", upper="70.2"),
+            )
+        )
+        self.assertEqual(
+            [entry["window"] for entry in entries], [WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY]
+        )
+        self.assertEqual(entries[0]["used"], "≈12% used")
+        self.assertEqual(entries[1]["used"], "70–71% used")
+
+    def test_the_drawn_order_is_fixed_regardless_of_caller_order(self) -> None:
+        forward = build_allowance((a_window(WINDOW_FIVE_HOUR), a_window(WINDOW_SEVEN_DAY)))
+        backward = build_allowance((a_window(WINDOW_SEVEN_DAY), a_window(WINDOW_FIVE_HOUR)))
+        self.assertEqual(
+            [entry["window"] for entry in forward],
+            [entry["window"] for entry in backward],
+        )
+
+    def test_one_window_may_be_unavailable_while_the_other_is_not(self) -> None:
+        entries = build_allowance(
+            an_allowance(
+                five_hour=unavailable(WINDOW_FIVE_HOUR), seven_day=a_window(WINDOW_SEVEN_DAY)
+            )
+        )
+        self.assertIsNone(entries[0]["used"])
+        self.assertEqual(entries[0]["reason"], "current-coverage-incomplete")
+        self.assertIsNotNone(entries[1]["used"])
+
+    def test_health_and_source_health_are_carried_not_derived(self) -> None:
+        entries = build_allowance(
+            an_allowance(
+                five_hour=unavailable(
+                    WINDOW_FIVE_HOUR, reason="malformed-store", source_healthy=False
+                )
+            )
+        )
+        self.assertEqual(entries[0]["health"], HEALTH_UNAVAILABLE)
+        self.assertIs(entries[0]["sourceHealthy"], False)
+        self.assertIs(entries[1]["sourceHealthy"], True)
+        # A healthy store can still be unavailable: it read fine and simply has no
+        # coverage to project from. Deriving source health from availability here
+        # would silently accuse that store of a fault it does not have.
+        healthy = build_allowance(an_allowance(five_hour=unavailable(WINDOW_FIVE_HOUR)))
+        self.assertEqual(healthy[0]["health"], HEALTH_UNAVAILABLE)
+        self.assertIs(healthy[0]["sourceHealthy"], True)
+
+    def test_the_reset_epoch_is_carried_exactly_or_stays_absent(self) -> None:
+        entries = build_allowance(
+            an_allowance(
+                five_hour=a_window(WINDOW_FIVE_HOUR, resets_at=1700000000),
+                seven_day=unavailable(WINDOW_SEVEN_DAY),
+            )
+        )
+        self.assertEqual(entries[0]["resetsAt"], 1700000000)
+        self.assertIsNone(entries[1]["resetsAt"])
+
+    def test_no_unavailable_window_is_ever_rendered_as_zero(self) -> None:
+        page, _, _ = rendered(
+            [a_decision()],
+            allowance=an_allowance(
+                five_hour=unavailable(WINDOW_FIVE_HOUR),
+                seven_day=unavailable(WINDOW_SEVEN_DAY),
+            ),
+        )
+        for entry in allowance_of(page):
+            self.assertIsNone(entry["used"])
+        # Scoped to the data the page actually draws from: the stylesheet legitimately
+        # contains lengths such as `100%`, which are not allowance figures.
+        block = page.split('id="queue-payload">', 1)[1].split("</script>", 1)[0]
+        for forbidden in ('"used":0', '"used":"0', "0% used", "% used"):
+            self.assertNotIn(forbidden, block, forbidden)
+
+
+class AllowancePlacementTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.page, _, _ = rendered([a_decision()], [an_agent()])
+
+    def test_the_summary_sits_in_the_top_aggregate_band_above_the_queue(self) -> None:
+        self.assertLess(self.page.index('class="filters"'), self.page.index('id="allowance"'))
+        self.assertLess(self.page.index('id="allowance"'), self.page.index('id="rows"'))
+
+    def test_the_summary_never_enters_the_decision_detail_pane(self) -> None:
+        self.assertLess(self.page.index('id="allowance"'), self.page.index('id="detail"'))
+
+    def test_the_queue_keeps_its_existing_shape(self) -> None:
+        """Allowance is context. It adds no control, no navigation, and no new block."""
+        self.assertEqual(self.page.count("<textarea"), 1)
+        self.assertEqual(self.page.count("<button"), 1)
+        self.assertEqual(self.page.count("<input"), len(QUEUE_STATES))
+        self.assertEqual(self.page.count("<details"), 1)
+        self.assertNotIn("<select", self.page)
+        self.assertEqual(self.page.count("<style"), 1)
+        self.assertEqual(policy_of(self.page).count("'sha256-"), 2)
+
+    def test_each_window_declares_its_own_identity_in_the_dom(self) -> None:
+        script = script_of(self.page)
+        for attribute in ("data-window", "data-health", "data-source-healthy"):
+            self.assertIn(attribute, script, attribute)
+
+    def test_the_summary_is_drawn_once_and_not_from_the_queue_loop(self) -> None:
+        script = script_of(self.page)
+        block = script.split("function renderAllowance", 1)[1].split("function renderRows", 1)[0]
+        for absent in ("items", "filters", "selectedId", "elapsed"):
+            self.assertNotIn(absent, block, absent)
+
+
+class AllowanceHostileDataTests(unittest.TestCase):
+    def test_a_hostile_reason_cannot_end_the_block_or_become_markup(self) -> None:
+        page, _, _ = rendered(
+            [a_decision()],
+            allowance=an_allowance(
+                five_hour=unavailable(WINDOW_FIVE_HOUR, reason=HOSTILE_REASON)
+            ),
+        )
+        block = page.split('id="queue-payload">', 1)[1].split("</script>", 1)[0]
+        self.assertNotIn("</script>", block)
+        self.assertNotIn("<img", block)
+        self.assertEqual(allowance_of(page)[0]["reason"], HOSTILE_REASON)
+
+    def test_a_hostile_reason_is_inserted_as_text_never_as_markup(self) -> None:
+        script = script_of(rendered([a_decision()])[0])
+        block = script.split("function renderAllowance", 1)[1].split("function renderRows", 1)[0]
+        self.assertIn("textContent", block)
+        for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
+            self.assertNotIn(unsafe, block, unsafe)
 
 
 if __name__ == "__main__":

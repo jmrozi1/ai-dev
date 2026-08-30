@@ -61,6 +61,20 @@ body {
 }
 .filters legend { padding: 0; font-weight: 600; }
 .filters label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.allowance {
+  display: flex;
+  gap: 18px;
+  align-items: baseline;
+  margin: 0;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+}
+.allowance-window { display: inline-flex; gap: 6px; align-items: baseline; }
+.allowance-label { font-weight: 600; color: var(--ink); }
+.allowance-used { font-variant-numeric: tabular-nums; }
+.allowance-unavailable { font-style: italic; }
 .rows {
   list-style: none;
   margin: 0;
@@ -140,6 +154,7 @@ details summary { cursor: pointer; font-weight: 600; }
       <label for="filter-running"><input type="checkbox" id="filter-running" data-state="running"> Running</label>
       <label for="filter-disconnected"><input type="checkbox" id="filter-disconnected" data-state="disconnected"> Disconnected</label>
     </fieldset>
+    <p class="allowance" id="allowance" aria-label="Claude usage"></p>
     <ul class="rows" id="rows" role="listbox" aria-label="Decision queue" tabindex="0"></ul>
     <p class="quiet" id="queue-empty" hidden>Nothing is waiting.</p>
   </aside>
@@ -191,6 +206,7 @@ details summary { cursor: pointer; font-weight: 600; }
   var sendEl = document.getElementById("send");
   var detailsEl = document.getElementById("details");
   var evidenceEl = document.getElementById("evidence");
+  var allowanceEl = document.getElementById("allowance");
 
   function visible() {
     return items.filter(function (item) { return filters[item.state]; });
@@ -206,6 +222,32 @@ details summary { cursor: pointer; font-weight: 600; }
   function clearFailure() {
     failureEl.hidden = true;
     failureEl.textContent = "";
+  }
+
+  // Static context, drawn once. Every field was decided by the accepted
+  // allowance view: nothing here rounds, compares, totals, or falls back to a
+  // zero, and a window with no number prints the reason it has none.
+  function renderAllowance() {
+    payload.allowance.forEach(function (entry) {
+      var group = document.createElement("span");
+      group.className = "allowance-window";
+      group.setAttribute("data-window", entry.window);
+      group.setAttribute("data-health", entry.health);
+      group.setAttribute("data-source-healthy", entry.sourceHealthy ? "true" : "false");
+
+      var name = document.createElement("span");
+      name.className = "allowance-label";
+      name.textContent = entry.label;
+
+      var value = document.createElement("span");
+      var known = entry.used !== null && entry.used !== undefined;
+      value.className = known ? "allowance-used" : "allowance-unavailable";
+      value.textContent = known ? entry.used : entry.reason;
+
+      group.appendChild(name);
+      group.appendChild(value);
+      allowanceEl.appendChild(group);
+    });
   }
 
   function renderRows(list) {
@@ -345,6 +387,7 @@ details summary { cursor: pointer; font-weight: 600; }
     submit();
   });
 
+  renderAllowance();
   render();
 })();
 </script>
