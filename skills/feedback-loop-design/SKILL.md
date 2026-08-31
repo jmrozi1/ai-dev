@@ -116,9 +116,35 @@ than outside it, but it still proves the declaration incomplete. Disclose the
 omission plainly instead of relabelling the extra failure unrelated or widening
 the original claim after seeing the result.
 
+A pass that claims a semantic invariant holds across several partitions -- corpus
+members, input classes, rendered viewports, locales, or any other set the claim
+enumerates -- owes that proof per partition rather than in aggregate. Enumerate the
+partitions the claim covers before paying the outer-loop cost, so the asserted set
+is fixed before any result is seen rather than described afterwards from whatever
+the pass happened to reach.
+
+Prove the oracle, not the redness. A deliberate-breakage control establishes kill
+power only when the failure it produces is the named semantic assertion for the
+partition in question. A suite that merely turns red can do so through an
+unrelated structural, parsing, or setup failure that would have fired whatever the
+invariant said, which leaves the claimed coverage unproven for every partition the
+control never actually reached. State which assertion is expected to fail, and
+confirm that it is the one that did.
+
+Layered defenses can hide a missing oracle. When an aggregate guard and a
+per-partition guard both stand over the same behavior, removing one leaves the
+other to fail the pass while the intended oracle is never exercised. Remove the
+coupled defenses together inside the isolated control, so the assertion whose
+load-bearing status is in question is the one left to catch the breakage.
+
+Controls are isolated, never canonical. Run deliberate breakage in a disposable
+copy, or restore byte-exact afterwards and show that it was restored. Proving kill
+power is never a reason to leave the canonical worktree mutated.
+
 Keep this proportional. A pass that claims no exact set owes no enumeration, and
 nothing here asks for a dependency analyzer, a mutation harness, a registry of
-controls, or any scoring of declarations.
+controls, or any scoring of declarations. Routine fast validation that claims no
+partition or corpus coverage owes no per-partition control at all.
 
 ## Size The Execution Rail To The Next Branch Point
 

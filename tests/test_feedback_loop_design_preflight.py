@@ -237,6 +237,73 @@ class FeedbackLoopDesignPreflightTests(unittest.TestCase):
             with self.subTest(invented=invented):
                 self.assertNotIn("\n" + invented, self.raw)
 
+    # Semantic kill-path proof for claimed corpus and partition coverage
+
+    def test_a_partitioned_claim_is_enumerated_before_the_outer_loop_cost(self) -> None:
+        section = self._section()
+        self.assertIn("owes that proof per partition rather than in aggregate", section)
+        self.assertIn(
+            "enumerate the partitions the claim covers before paying the outer-loop cost",
+            section,
+        )
+        self.assertIn(
+            "fixed before any result is seen rather than described afterwards", section
+        )
+
+    def test_kill_power_requires_the_named_assertion_not_mere_redness(self) -> None:
+        section = self._section()
+        self.assertIn("prove the oracle, not the redness", section)
+        self.assertIn(
+            "only when the failure it produces is the named semantic assertion for the "
+            "partition in question",
+            section,
+        )
+        self.assertIn("state which assertion is expected to fail", section)
+
+    def test_an_incidental_failure_is_distinguished_from_the_semantic_kill(self) -> None:
+        """A suite turning red is not evidence the claimed invariant was exercised."""
+        section = self._section()
+        self.assertIn(
+            "unrelated structural, parsing, or setup failure that would have fired whatever "
+            "the invariant said",
+            section,
+        )
+        self.assertIn(
+            "leaves the claimed coverage unproven for every partition the control never "
+            "actually reached",
+            section,
+        )
+
+    def test_coupled_defenses_are_removed_together_so_the_oracle_is_exercised(self) -> None:
+        section = self._section()
+        self.assertIn("layered defenses can hide a missing oracle", section)
+        self.assertIn(
+            "removing one leaves the other to fail the pass while the intended oracle is "
+            "never exercised",
+            section,
+        )
+        self.assertIn("remove the coupled defenses together inside the isolated control", section)
+
+    def test_controls_are_isolated_or_restored_byte_exact(self) -> None:
+        section = self._section()
+        self.assertIn("controls are isolated, never canonical", section)
+        self.assertIn(
+            "run deliberate breakage in a disposable copy, or restore byte-exact afterwards",
+            section,
+        )
+        self.assertIn(
+            "never a reason to leave the canonical worktree mutated", section
+        )
+
+    def test_routine_unpartitioned_validation_is_exempt(self) -> None:
+        """The discipline is proportional: no partition claim, no per-partition control."""
+        section = self._section()
+        self.assertIn(
+            "routine fast validation that claims no partition or corpus coverage owes no "
+            "per-partition control at all",
+            section,
+        )
+
     # Preserved activation and existing rules
 
     def test_the_positive_activation_boundary_survives(self) -> None:
