@@ -23,6 +23,7 @@ from ai_dev_flow.control_plane import (
     render_status,
     resolve_coordination_repo,
     resolve_current_head,
+    validate_decision_record,
     validate_evidence_projection,
     validate_identifier,
 )
@@ -33,6 +34,27 @@ SAFE_EVIDENCE = {
     "provenance": {"source": "provider-adapter", "collectedAt": "2026-08-24T15:00:00Z", "turnId": "turn-7"},
     "sourceHealth": {"status": "partial", "detail": "one source unavailable"},
     "observations": [{"kind": "terminal-action", "count": 17, "status": "completed"}],
+}
+
+
+SAFE_DECISION = {
+    "schemaVersion": 1,
+    "decisionId": "runtime-boundary-choice",
+    "project": "ai-dev",
+    "ticket": "issue-51",
+    "rail": "control-plane-surface",
+    "raisedAt": "2026-08-24T15:00:00Z",
+    "title": "Choose the runtime launch boundary",
+    "explanation": "Two compositions are viable and only a person can pick between them.",
+    "evidence": [{"label": "focused suite", "locator": "tests.test_control_plane"}],
+    "blocker": {
+        "kind": "permission",
+        "whatFailed": "publishing the recovery ref",
+        "missingCapability": "push access to the coordination remote",
+        "humanChange": "grant push access, or publish the ref by hand",
+        "stateChanged": False,
+        "nextAction": "re-dispatch the rail once the ref exists",
+    },
 }
 
 
@@ -73,6 +95,9 @@ class ControlPlaneTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return publish(self.coordination, **arguments)  # type: ignore[arg-type]
+
+    def _rail_dir(self) -> Path:
+        return self.coordination / "ai-dev" / "issue-51" / "rails" / "control-plane-surface"
 
     # Ownership
 
@@ -365,6 +390,145 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(ControlPlaneError):
             self._publish(artifact="evidence", role="evidence", content="{not json")
         self.assertFalse((self.coordination / "ai-dev" / "issue-51" / "rails" / "control-plane-surface" / "evidence.json").exists())
+
+    # The durable human-attention record
+
+    def test_a_valid_record_is_stored_as_its_own_rail_scoped_artifact(self) -> None:
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nexecutor claim\n")
+        self._publish(artifact="decision", role="orchestrator", content=json.dumps(SAFE_DECISION))
+        rail_dir = self.coordination / "ai-dev" / "issue-51" / "rails" / "control-plane-surface"
+        stored = json.loads((rail_dir / "decision.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["decisionId"], "runtime-boundary-choice")
+        self.assertEqual(stored["blocker"]["kind"], "permission")
+        self.assertNotIn("executor claim", (rail_dir / "decision.json").read_text(encoding="utf-8"))
+        self.assertEqual(self._git(self.coordination, "status", "--porcelain"), "")
+
+    def test_only_the_orchestrator_may_raise_a_human_decision(self) -> None:
+        for role in ("executor", "evidence"):
+            with self.subTest(role=role), self.assertRaises(ControlPlaneError) as caught:
+                self._publish(artifact="decision", role=role, content=json.dumps(SAFE_DECISION))
+            self.assertIn("owned by 'orchestrator'", str(caught.exception))
+        self.assertFalse((self._rail_dir() / "decision.json").exists())
+
+    def test_a_record_is_rail_scoped_and_never_scope_level(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(
+                artifact="decision", role="orchestrator", rail=None,
+                content=json.dumps(SAFE_DECISION),
+            )
+        self.assertIn("requires a rail identifier", str(caught.exception))
+
+    def test_raw_content_keys_are_refused_in_a_decision(self) -> None:
+        for denied in ("prompt", "response", "output", "transcript", "logs", "telemetry"):
+            payload = dict(SAFE_DECISION)
+            payload[denied] = "anything"
+            with self.subTest(denied=denied), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(payload)
+            self.assertIn("excluded raw content key", str(caught.exception))
+
+    def test_a_non_allowlisted_decision_key_is_refused(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(dict(SAFE_DECISION, severity="high"))
+        self.assertIn("non-allowlisted", str(caught.exception))
+
+    def test_every_required_decision_field_is_required(self) -> None:
+        for field in ("decisionId", "project", "ticket", "rail", "raisedAt", "title", "explanation"):
+            payload = {key: value for key, value in SAFE_DECISION.items() if key != field}
+            with self.subTest(field=field), self.assertRaises(ControlPlaneError):
+                validate_decision_record(payload)
+
+    def test_the_schema_version_is_exact(self) -> None:
+        for version in (2, "1", True, None):
+            with self.subTest(version=version), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(dict(SAFE_DECISION, schemaVersion=version))
+            self.assertIn("schemaVersion must be exactly 1", str(caught.exception))
+
+    def test_decision_identity_and_routing_refuse_session_shaped_values(self) -> None:
+        for field in ("decisionId", "project", "ticket", "rail"):
+            payload = dict(SAFE_DECISION)
+            payload[field] = "1a2b3c4d0001400080000000000000ab"
+            with self.subTest(field=field), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(payload)
+            self.assertIn("session, agent, or process", str(caught.exception))
+
+    def test_the_raised_time_must_be_the_shape_the_lifecycle_parses(self) -> None:
+        for raised in ("yesterday", "2026-08-24", "2026-08-24T15:00:00+00:00"):
+            with self.subTest(raised=raised), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(dict(SAFE_DECISION, raisedAt=raised))
+            self.assertIn("UTC timestamp", str(caught.exception))
+
+    def test_unbounded_decision_text_is_refused(self) -> None:
+        for field, limit in (("title", 120), ("explanation", 2000)):
+            with self.subTest(field=field), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(dict(SAFE_DECISION, **{field: "x" * (limit + 1)}))
+            self.assertIn("bounded projection", str(caught.exception))
+
+    def test_evidence_stays_bounded_pointers(self) -> None:
+        too_many = dict(
+            SAFE_DECISION,
+            evidence=[{"label": f"e{index}", "locator": "l"} for index in range(9)],
+        )
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(too_many)
+        self.assertIn("at most 8", str(caught.exception))
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(
+                dict(SAFE_DECISION, evidence=[{"label": "e", "locator": "l", "output": "a log"}])
+            )
+        self.assertIn("excluded raw content key", str(caught.exception))
+
+    def test_a_blocker_is_complete_or_absent(self) -> None:
+        without = {key: value for key, value in SAFE_DECISION.items() if key != "blocker"}
+        self.assertEqual(validate_decision_record(without), without)
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(dict(SAFE_DECISION, blocker={"kind": "permission"}))
+        self.assertIn("missing required key(s)", str(caught.exception))
+
+    def test_a_blocker_names_a_known_kind_and_an_explicit_state_answer(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(
+                dict(SAFE_DECISION, blocker=dict(SAFE_DECISION["blocker"], kind="vibes"))
+            )
+        self.assertIn("blocker kind must be one of", str(caught.exception))
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(
+                dict(SAFE_DECISION, blocker=dict(SAFE_DECISION["blocker"], stateChanged="maybe"))
+            )
+        self.assertIn("must be true or false", str(caught.exception))
+
+    def test_malformed_decision_json_is_refused_without_writing(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="decision", role="orchestrator", content="{not json")
+        self.assertIn("Human-decision record is not valid JSON", str(caught.exception))
+        self.assertFalse((self._rail_dir() / "decision.json").exists())
+
+    def test_a_rail_lists_its_decision_only_once_one_exists(self) -> None:
+        self._publish(artifact="state", role="orchestrator", rail=None, content="# Accepted\n")
+        self._publish()
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+        self.assertIn(
+            "- control-plane-surface: ready; artifacts: rail, handoff",
+            render_status(self.coordination, project="ai-dev", ticket="issue-51"),
+        )
+        self._publish(artifact="decision", role="orchestrator", content=json.dumps(SAFE_DECISION))
+        self.assertIn(
+            "- control-plane-surface: ready; artifacts: rail, handoff, decision",
+            render_status(self.coordination, project="ai-dev", ticket="issue-51"),
+        )
+
+    def test_the_new_artifact_leaves_provider_evidence_intake_unchanged(self) -> None:
+        self._publish(artifact="evidence", role="evidence", content=json.dumps(SAFE_EVIDENCE))
+        self._publish(artifact="decision", role="orchestrator", content=json.dumps(SAFE_DECISION))
+        self.assertEqual(
+            json.loads((self._rail_dir() / "evidence.json").read_text(encoding="utf-8")),
+            SAFE_EVIDENCE,
+        )
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="evidence", role="evidence", content="{not json")
+        self.assertIn("Provider evidence is not valid JSON", str(caught.exception))
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_evidence_projection(dict(SAFE_EVIDENCE, decisionId="borrowed"))
+        self.assertIn("non-allowlisted", str(caught.exception))
 
     # Isolation
 

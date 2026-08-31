@@ -33,6 +33,7 @@ ARTIFACT_OWNERS: dict[str, str] = {
     "state": "orchestrator",
     "rail": "orchestrator",
     "handoff": "executor",
+    "decision": "orchestrator",
     "evidence": "evidence",
 }
 
@@ -40,10 +41,16 @@ ARTIFACT_FILENAMES: dict[str, str] = {
     "state": "state.md",
     "rail": "rail.md",
     "handoff": "handoff.md",
+    "decision": "decision.json",
     "evidence": "evidence.json",
 }
 
-RAIL_SCOPED_ARTIFACTS = frozenset({"rail", "handoff", "evidence"})
+RAIL_SCOPED_ARTIFACTS = frozenset({"rail", "handoff", "decision", "evidence"})
+
+# The order a rail's artifacts are listed in. Named separately from the owner and
+# filename maps because listing is presentation, and a reader should not have to
+# guess that a dict's insertion order is load-bearing.
+LISTED_RAIL_ARTIFACTS = ("rail", "handoff", "decision", "evidence")
 
 _SLUG = re.compile(r"^[a-z0-9][a-z0-9-]{2,63}$")
 _HEX_ONLY = re.compile(r"^[0-9a-f-]+$")
@@ -64,6 +71,49 @@ EVIDENCE_DENIED_KEYS = frozenset({
     "output", "stdout", "stderr", "transcript", "transcripts", "log", "logs",
     "telemetry", "toolResult", "toolResults", "diagnostics", "content",
 })
+
+
+# The durable human-attention record. Until this artifact existed, "a person is
+# needed here" was something a reader had to infer from a rail being blocked, from
+# an error string, or from prose that happened to end in a question mark. Every one
+# of those inferences manufactures an interruption nobody raised, so the fact is
+# now published explicitly, by the only role that can raise it, or it does not
+# exist. `session_lifecycle.RailFacts.pending_human_decision` already stated the
+# rule; this is the artifact that finally supplies it.
+#
+# Its bounds are deliberately no looser than `decision_queue`'s, so a record that
+# validates here always constructs a `PendingDecision` -- the failure shows up at
+# publication, where an orchestrator can fix it, rather than at render time.
+DECISION_SCHEMA_VERSION = 1
+
+MAX_DECISION_IDENTITY = 80
+MAX_DECISION_RAIL = 200
+MAX_DECISION_TITLE = 120
+MAX_DECISION_EXPLANATION = 2000
+MAX_DECISION_TIMESTAMP = 80
+MAX_DECISION_EVIDENCE_REFERENCES = 8
+MAX_DECISION_EVIDENCE_LABEL = 80
+MAX_DECISION_EVIDENCE_LOCATOR = 200
+MAX_DECISION_BLOCKER_STRING = 240
+
+DECISION_ALLOWED_KEYS = frozenset({
+    "schemaVersion", "decisionId", "project", "ticket", "rail", "raisedAt",
+    "title", "explanation", "evidence", "blocker",
+})
+DECISION_EVIDENCE_ALLOWED_KEYS = frozenset({"label", "locator"})
+
+# D8's blocker shape: the five things a human needs in order to clear a
+# permission, configuration, capability, credential, or environment obstacle
+# without first reconstructing what happened. All five or none -- a half-described
+# blocker is the kind of item that sits in a queue being re-read and never acted on.
+DECISION_BLOCKER_ALLOWED_KEYS = frozenset({
+    "kind", "whatFailed", "missingCapability", "humanChange", "stateChanged", "nextAction",
+})
+DECISION_BLOCKER_KINDS = frozenset({
+    "permission", "configuration", "capability", "credential", "environment",
+})
+
+_DECISION_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 
 
 CONTROL_PLANE_CONFIG_KEY = "controlPlane"
@@ -221,30 +271,47 @@ def require_owner(artifact: str, role: str) -> None:
         )
 
 
-def _bounded_string(value: Any, *, field: str) -> str:
+def _bounded_string(
+    value: Any,
+    *,
+    field: str,
+    subject: str = "Provider evidence",
+    limit: int = MAX_EVIDENCE_STRING,
+) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ControlPlaneError(f"Provider evidence field '{field}' must be a non-empty string.")
-    if len(value) > MAX_EVIDENCE_STRING:
+        raise ControlPlaneError(f"{subject} field '{field}' must be a non-empty string.")
+    if len(value) > limit:
         raise ControlPlaneError(
-            f"Provider evidence field '{field}' exceeds {MAX_EVIDENCE_STRING} characters; "
+            f"{subject} field '{field}' exceeds {limit} characters; "
             "publish a bounded projection, not raw content."
         )
     return value
 
 
-def _reject_unknown(payload: dict[str, Any], allowed: Iterable[str], *, where: str) -> None:
+def _reject_unknown(
+    payload: dict[str, Any],
+    allowed: Iterable[str],
+    *,
+    where: str,
+    subject: str = "Provider evidence",
+) -> None:
+    """Refuse anything outside the allowlist, and name raw-content keys specifically.
+
+    Both intakes share it: the denial list is a property of what may enter Git at
+    all, not of which artifact happens to be arriving.
+    """
     allowed_set = set(allowed)
     denied = sorted(set(payload) & EVIDENCE_DENIED_KEYS)
     if denied:
         raise ControlPlaneError(
-            f"Provider evidence {where} contains excluded raw content key(s): {', '.join(denied)}. "
+            f"{subject} {where} contains excluded raw content key(s): {', '.join(denied)}. "
             "Raw prompts, responses, commands, tool results, transcripts, logs, and telemetry "
             "never enter the control plane."
         )
     unknown = sorted(set(payload) - allowed_set)
     if unknown:
         raise ControlPlaneError(
-            f"Provider evidence {where} contains non-allowlisted key(s): {', '.join(unknown)}."
+            f"{subject} {where} contains non-allowlisted key(s): {', '.join(unknown)}."
         )
 
 
@@ -301,6 +368,123 @@ def validate_evidence_projection(payload: Any) -> dict[str, Any]:
                 raise ControlPlaneError(f"Provider evidence observation {index} {numeric} must be numeric.")
             if isinstance(observation.get(numeric), bool):
                 raise ControlPlaneError(f"Provider evidence observation {index} {numeric} must be numeric.")
+    return payload
+
+
+def _decision_evidence(entries: Any) -> list[dict[str, Any]]:
+    """Bounded pointers to evidence, never the evidence itself."""
+    if entries is None:
+        return []
+    if not isinstance(entries, list):
+        raise ControlPlaneError("Human-decision record evidence must be a list.")
+    if len(entries) > MAX_DECISION_EVIDENCE_REFERENCES:
+        raise ControlPlaneError(
+            f"Human-decision record carries {len(entries)} evidence references; the bounded "
+            f"record accepts at most {MAX_DECISION_EVIDENCE_REFERENCES}."
+        )
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise ControlPlaneError(f"Human-decision record evidence {index} must be an object.")
+        _reject_unknown(
+            entry, DECISION_EVIDENCE_ALLOWED_KEYS,
+            where=f"evidence {index}", subject="Human-decision record",
+        )
+        _bounded_string(
+            entry.get("label"), field=f"evidence {index} label",
+            subject="Human-decision record", limit=MAX_DECISION_EVIDENCE_LABEL,
+        )
+        _bounded_string(
+            entry.get("locator"), field=f"evidence {index} locator",
+            subject="Human-decision record", limit=MAX_DECISION_EVIDENCE_LOCATOR,
+        )
+    return entries
+
+
+def _decision_blocker(blocker: Any) -> dict[str, Any] | None:
+    """The D8 blocker block: absent, or complete. There is no partial version."""
+    if blocker is None:
+        return None
+    if not isinstance(blocker, dict):
+        raise ControlPlaneError("Human-decision record blocker must be an object.")
+    _reject_unknown(
+        blocker, DECISION_BLOCKER_ALLOWED_KEYS,
+        where="blocker", subject="Human-decision record",
+    )
+    missing = sorted(DECISION_BLOCKER_ALLOWED_KEYS - set(blocker))
+    if missing:
+        raise ControlPlaneError(
+            f"Human-decision record blocker is missing required key(s): {', '.join(missing)}. "
+            "A partly described blocker cannot be cleared without asking again."
+        )
+    if blocker.get("kind") not in DECISION_BLOCKER_KINDS:
+        raise ControlPlaneError(
+            "Human-decision record blocker kind must be one of "
+            f"{', '.join(sorted(DECISION_BLOCKER_KINDS))}."
+        )
+    # An explicit boolean, because "the worktree may have changed" is the one
+    # answer a person cannot act on.
+    if not isinstance(blocker.get("stateChanged"), bool):
+        raise ControlPlaneError(
+            "Human-decision record blocker stateChanged must be true or false."
+        )
+    for field in ("whatFailed", "missingCapability", "humanChange", "nextAction"):
+        _bounded_string(
+            blocker.get(field), field=f"blocker.{field}",
+            subject="Human-decision record", limit=MAX_DECISION_BLOCKER_STRING,
+        )
+    return blocker
+
+
+def validate_decision_record(payload: Any) -> dict[str, Any]:
+    """Validate the explicit human-attention record an orchestrator published.
+
+    Strict for the same reason the evidence intake is strict, and then some: this
+    record is the sole thing in the system permitted to say a person is needed, so
+    an unbounded or unattributed one would put an interruption in front of a human
+    on the strength of text nobody vouched for.
+    """
+    subject = "Human-decision record"
+    if not isinstance(payload, dict):
+        raise ControlPlaneError(f"{subject} must be a JSON object.")
+    _reject_unknown(payload, DECISION_ALLOWED_KEYS, where="root", subject=subject)
+
+    version = payload.get("schemaVersion")
+    if isinstance(version, bool) or version != DECISION_SCHEMA_VERSION:
+        raise ControlPlaneError(
+            f"{subject} schemaVersion must be exactly {DECISION_SCHEMA_VERSION}."
+        )
+
+    # Identity and routing use the control plane's own identifier shape, so a
+    # session, agent, or process id cannot become a decision's name.
+    validate_identifier(_bounded_string(
+        payload.get("decisionId"), field="decisionId", subject=subject,
+        limit=MAX_DECISION_IDENTITY,
+    ), label="decision identity")
+    for field in ("project", "ticket", "rail"):
+        validate_identifier(_bounded_string(
+            payload.get(field), field=field, subject=subject,
+            limit=MAX_DECISION_RAIL,
+        ), label=f"decision {field}")
+
+    raised_at = _bounded_string(
+        payload.get("raisedAt"), field="raisedAt", subject=subject,
+        limit=MAX_DECISION_TIMESTAMP,
+    )
+    # The exact shape `session_lifecycle` parses, so the age a screen displays is
+    # derived by the accepted helper rather than by a second timestamp reader.
+    if not _DECISION_TIMESTAMP.match(raised_at):
+        raise ControlPlaneError(
+            f"{subject} raisedAt must be a UTC timestamp like 2026-08-26T00:00:00Z; "
+            f"got '{raised_at}'."
+        )
+
+    _bounded_string(payload.get("title"), field="title", subject=subject, limit=MAX_DECISION_TITLE)
+    _bounded_string(
+        payload.get("explanation"), field="explanation", subject=subject,
+        limit=MAX_DECISION_EXPLANATION,
+    )
+    _decision_evidence(payload.get("evidence"))
+    _decision_blocker(payload.get("blocker"))
     return payload
 
 
@@ -564,12 +748,16 @@ def publish(
     require_owner(artifact, role)
     target = artifact_path(repo_root, project=project, ticket=ticket, artifact=artifact, rail=rail)
 
-    if artifact == "evidence":
+    if artifact in ("evidence", "decision"):
+        subject = "Provider evidence" if artifact == "evidence" else "Human-decision record"
         try:
             payload = json.loads(content)
         except json.JSONDecodeError as exc:
-            raise ControlPlaneError(f"Provider evidence is not valid JSON: {exc.msg}") from exc
-        validate_evidence_projection(payload)
+            raise ControlPlaneError(f"{subject} is not valid JSON: {exc.msg}") from exc
+        if artifact == "evidence":
+            validate_evidence_projection(payload)
+        else:
+            validate_decision_record(payload)
         content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
 
     current_head = ensure_publishable(repo_root)
@@ -856,7 +1044,7 @@ def collect_rail_states(source: ReadSource, *, project: str, ticket: str) -> lis
                 "create a rail; publish the authorization or remove the directory."
             )
         status, depends_on, resource, role = _parse_rail_header(authorization, rail_id=rail_id)
-        artifacts = [name for name in ("rail", "handoff", "evidence") if source.exists(relative(name))]
+        artifacts = [name for name in LISTED_RAIL_ARTIFACTS if source.exists(relative(name))]
         proposed = _parse_handoff_status(source.read(relative("handoff")))
         states.append(
             RailState(rail_id, status, artifacts, depends_on, resource, proposed, role)
