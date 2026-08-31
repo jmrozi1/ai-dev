@@ -14,7 +14,7 @@ from __future__ import annotations
 # them, and hands that to the accepted checkpoint-35 composition path. It computes no
 # percentage, decides no availability, orders no rows, and draws nothing.
 #
-# Four boundaries hold it honest.
+# Seven boundaries hold it honest.
 #
 # First, each input is resolved exactly once per run, in `resolve_run`, and then
 # reused. There is one `resolve_repo_root` call, one `AllowanceStore` construction,
@@ -39,71 +39,114 @@ from __future__ import annotations
 # mechanism by which outside Claude use revokes coverage under D4: there is nothing
 # here that could preserve a stale claim.
 #
-# Fourth, the queue is not this module's to invent. `render_manager_page` and
-# `make_manager_server` both need a `QueueView`, and no production builder of
-# `PendingDecision` or `OperationalAgent` exists anywhere in this repository yet.
-# `QueueView` carries no source-health concept, so an empty queue and an unwired one
-# are indistinguishable on the page -- exactly the defect class this ticket already
-# rejected when it refused to show unavailable allowance as zero. So the queue comes
-# from this module's caller, and `main` refuses to serve rather than presenting an
-# empty queue as though the manager were watching durable state.
+# Fourth, the queue is acquired, never invented. `queue_source.load_queue` is now the
+# one boundary that turns durable authority into queue inputs, and this module calls
+# it exactly once per run and adds nothing to it. It repeats none of that module's
+# freshness, cross-checking, or reconciliation work, and it never turns a
+# `QueueSourceError` into an empty page: `QueueView` carries no source-health concept,
+# so a refusal drawn as zero rows would be indistinguishable from a genuinely quiet
+# queue -- the exact defect this ticket rejected when it refused to show unavailable
+# allowance as zero. A successful empty queue is served, because `load_queue` having
+# returned is what makes the emptiness a fact rather than a silence.
+#
+# Fifth, the scope that queue is read from is stated, never guessed. The coordination
+# repository, project, ticket, and binding-store root are four required inputs with no
+# default, no environment fallback, and no config lookup, for the same reason the
+# exclusivity claim has none: a manager that quietly picked a repository would answer
+# confidently about a scope nobody named.
+#
+# Sixth, one run stays one instant. The queue's UTC timestamp is derived from the epoch
+# `resolve_run` already read, so there is still exactly one clock read on the path and
+# the age beside a row is the age at the same instant as the allowance beside it.
+#
+# Seventh, `SessionRegistry` stays controller-local and deliberately non-durable. A fresh
+# process owns no handles, so durable bindings it did not start project through the
+# accepted lifecycle as Disconnected. Adopting one by matching a recorded pid would be
+# this module inventing ownership it cannot have.
 #
 # The loopback rule is deliberately not restated here. `make_manager_server` and the
 # accepted server beneath it own it, this module passes no host at all, and so the
 # one place that decides what this surface binds stays the only place.
 
 import argparse
+from dataclasses import dataclass
+from datetime import datetime, timezone
 import http.server
 import re
 import sys
 import time
 from pathlib import Path
-from typing import List, Mapping, Optional
+from typing import Callable, Dict, List, Mapping, Optional, Tuple
 
 from .claude_allowance_store import AllowanceStore, allowance_store_path
-from .decision_manager import ManagerRun, make_manager_server, render_manager_page
-from .decision_queue import QueueView, SelectedDetail
+from .claude_allowance_view import AllowanceViewError
+from .decision_manager import (
+    ManagerRun,
+    ManagerRunError,
+    make_manager_server,
+    render_manager_page,
+)
+from .decision_manager_web import serve_forever
+from .decision_queue import QUEUE_STATES, DecisionQueue, QueueView, SelectedDetail
+from .queue_source import QueueSourceError, load_queue
 from .repository import resolve_repo_root
+from .session_binding import BindingStore
+from .session_lifecycle import SessionRegistry
 
 __all__ = [
+    "BINDING_ROOT_FLAG",
     "CLAIM_NONE_FLAG",
     "CLAIM_SINCE_FLAG",
+    "CONTROL_PLANE_FLAG",
     "LaunchError",
+    "PROJECT_FLAG",
+    "QueueSourceContext",
     "REASON_CLAIM_AMBIGUOUS",
     "REASON_CLAIM_UNSTATED",
     "REASON_INVALID_CLAIM",
-    "REASON_NO_QUEUE_SOURCE",
+    "REASON_SOURCE_UNSTATED",
+    "TICKET_FLAG",
     "launch_manager_server",
+    "load_run_queue",
     "main",
     "render_launch_page",
     "resolve_run",
 ]
 
 # This module's own refusals, and only its own. A repository that cannot be
-# resolved already raises `RepositoryError` with its own message, and re-raising it
-# under a second name here would give one fact two spellings that could drift.
+# resolved already raises `RepositoryError` with its own message, and a queue that
+# cannot be sourced already raises `QueueSourceError` with one of its own stable
+# reasons; re-raising either under a second name here would give one fact two
+# spellings that could drift.
 REASON_CLAIM_UNSTATED = "exclusivity-claim-unstated"
 REASON_CLAIM_AMBIGUOUS = "exclusivity-claim-ambiguous"
 REASON_INVALID_CLAIM = "invalid-exclusivity-claim"
-REASON_NO_QUEUE_SOURCE = "no-queue-source"
+REASON_SOURCE_UNSTATED = "queue-source-unstated"
 
 # The two ways a human may state the claim, and there is no third. One says the
 # exact instant exclusivity began; the other says out loud that none is claimed.
 CLAIM_SINCE_FLAG = "--human-exclusive-since"
 CLAIM_NONE_FLAG = "--no-human-exclusivity"
 
+# The four things that say which durable scope this manager is about. Every one is
+# required: there is no environment variable, no config file, and no discovery step
+# behind them, so a run either names its scope or does not start.
+CONTROL_PLANE_FLAG = "--control-plane"
+PROJECT_FLAG = "--project"
+TICKET_FLAG = "--ticket"
+BINDING_ROOT_FLAG = "--binding-root"
+
+# The shape `session_lifecycle` parses. Written out because that module exposes a
+# parser and no formatter, and something has to produce the text it accepts. The
+# suite pins the two together by round-tripping this through the accepted parser, so
+# a drift here fails rather than silently producing an unreadable instant.
+_QUEUE_TIMESTAMP = "%Y-%m-%dT%H:%M:%SZ"
+
 # Exactly an integer literal. This is a text-to-integer parse, not a second opinion
 # on what a valid epoch is: whether the resulting integer is an acceptable instant
 # stays the accepted projection's decision, applied in one place, so a positive
 # rule here could not drift from the one the estimator enforces.
 _INTEGER_TEXT = re.compile(r"\A-?[0-9]+\Z")
-
-_NO_QUEUE_SOURCE_DETAIL = (
-    "no production builder of PendingDecision or OperationalAgent exists yet, so "
-    "this entry point cannot obtain a truthful QueueView; an empty queue would be "
-    "indistinguishable from an unwired one. Pass a view and its details to "
-    "launch_manager_server or render_launch_page instead."
-)
 
 
 class LaunchError(Exception):
@@ -113,6 +156,26 @@ class LaunchError(Exception):
         super().__init__("{0}: {1}".format(reason, detail))
         self.reason = reason
         self.detail = detail
+
+
+@dataclass(frozen=True)
+class QueueSourceContext:
+    """The durable scope one run reads its queue from, stated in full.
+
+    Frozen and without defaults, for the reason the exclusivity claim has none: a
+    field that could be filled in is a field a run could fail to state and still
+    start, and a manager that started against a scope nobody named would answer
+    confidently about the wrong work. Omitting any of the four is a `TypeError`
+    here and a stated refusal at the command line.
+
+    These are addresses, not authority. What may be read from them, how fresh it
+    must be, and when a read must refuse are all `queue_source`'s decisions.
+    """
+
+    control_plane: Path
+    project: str
+    ticket: str
+    binding_root: Path
 
 
 # --------------------------------------------------------------------------
@@ -151,6 +214,82 @@ def resolve_run(
         now=now,
         human_exclusive_since=human_exclusive_since,
     )
+
+
+# --------------------------------------------------------------------------
+# The durable queue boundary
+# --------------------------------------------------------------------------
+
+
+def _queue_instant(now: int) -> str:
+    """This run's own epoch, in the text the accepted lifecycle reads.
+
+    A conversion, not a reading. The instant was already taken once in
+    `resolve_run`, and the queue is deliberately given that same one so a row's age
+    and the allowance beside it describe the same moment. Reading a clock here
+    instead would be the second instant `ManagerRun` exists to rule out.
+    """
+    return datetime.fromtimestamp(now, timezone.utc).strftime(_QUEUE_TIMESTAMP)
+
+
+def _projected(queue: DecisionQueue) -> Tuple[QueueView, Dict[str, SelectedDetail]]:
+    """The complete queue and every visible row's detail, both from the queue itself.
+
+    All three states, because the accepted payload carries every current row so its
+    toggles work without a round trip, while `decision_manager_web` keeps Waiting as
+    the default filter. Choosing what is visible is still not this module's call.
+
+    Each detail is obtained by asking the queue to select that row, which is the
+    accepted projection deciding what a detail contains. Building one from an item's
+    fields here would be a second copy of a rule that already exists, and the two
+    copies would be free to disagree about what an operational row may say.
+    """
+    view = queue.view(filters=QUEUE_STATES)
+    details: Dict[str, SelectedDetail] = {}
+    for row in view.rows:
+        details[row.item_id] = queue.view(
+            filters=QUEUE_STATES, selected_id=row.item_id
+        ).detail
+    return view, details
+
+
+def load_run_queue(
+    run: ManagerRun,
+    source: QueueSourceContext,
+    *,
+    registry: SessionRegistry,
+    expected_head: Optional[str] = None,
+    alive: Optional[Callable] = None,
+) -> Tuple[QueueView, Dict[str, SelectedDetail]]:
+    """One acquisition for one run: the accepted source, then the accepted projection.
+
+    Exactly one `load_queue` call, against the stated scope and this run's instant.
+    Everything that makes the result trustworthy -- remote freshness, the decision
+    and rail cross-check, binding and lifecycle reconciliation, and the refusal
+    reasons -- belongs to that call and is not repeated, second-guessed, or softened
+    here. A `QueueSourceError` propagates with its reason intact.
+
+    `registry` is the caller's because ownership cannot be discovered. The registry
+    a controller holds is the only thing that knows which processes it actually
+    started, so a caller that owns none passes an empty one and the accepted
+    lifecycle reports the durable bindings it did not start as disconnected.
+    `alive` is passed straight through for the same reason and defaults to the
+    accepted prober; neither is a liveness rule of this module's own.
+
+    An empty return is a fact rather than a silence: `load_queue` returned, so the
+    scope was read and had nothing in it.
+    """
+    queue = load_queue(
+        Path(source.control_plane),
+        project=source.project,
+        ticket=source.ticket,
+        registry=registry,
+        now=_queue_instant(run.now),
+        store=BindingStore(source.binding_root),
+        expected_head=expected_head,
+        alive=alive,
+    )
+    return _projected(queue)
 
 
 # --------------------------------------------------------------------------
@@ -256,30 +395,76 @@ def _stated_claim(arguments: argparse.Namespace) -> Optional[int]:
     return _exact_claim_instant(arguments.since)
 
 
+def _stated_source(arguments: argparse.Namespace) -> QueueSourceContext:
+    """The scope exactly as the human named it, or a refusal naming what is missing.
+
+    Every one of the four is required and none has a fallback. Argparse could mark
+    them required and exit on its own, but a stated reason is the point: a run that
+    did not name its scope should say so in the same vocabulary as every other
+    refusal here, rather than in the parser's.
+    """
+    missing = [
+        flag
+        for flag, value in (
+            (CONTROL_PLANE_FLAG, arguments.control_plane),
+            (PROJECT_FLAG, arguments.project),
+            (TICKET_FLAG, arguments.ticket),
+            (BINDING_ROOT_FLAG, arguments.binding_root),
+        )
+        if value is None
+    ]
+    if missing:
+        raise LaunchError(
+            REASON_SOURCE_UNSTATED,
+            "state {0}; this manager reads no default scope and no configuration "
+            "file, so a queue it cannot name is a queue it will not read".format(
+                ", ".join(missing)
+            ),
+        )
+    return QueueSourceContext(
+        control_plane=Path(arguments.control_plane),
+        project=arguments.project,
+        ticket=arguments.ticket,
+        binding_root=Path(arguments.binding_root),
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="decision-manager-launch",
-        description="Resolve one manager run's runtime inputs.",
+        description="Serve one manager run against one stated durable scope.",
     )
     parser.add_argument(CLAIM_SINCE_FLAG, dest="since", default=None)
     parser.add_argument(CLAIM_NONE_FLAG, dest="none_claimed", action="store_true")
+    parser.add_argument(CONTROL_PLANE_FLAG, dest="control_plane", default=None)
+    parser.add_argument(PROJECT_FLAG, dest="project", default=None)
+    parser.add_argument(TICKET_FLAG, dest="ticket", default=None)
+    parser.add_argument(BINDING_ROOT_FLAG, dest="binding_root", default=None)
     return parser
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """Resolve one run from a stated claim, then refuse to serve without a queue.
+    """One stated claim, one stated scope, one run, one queue, one served page.
 
-    Everything this rail owns happens and is reported: the claim is required in one
-    of its two directions, and the store, instant, and claim are resolved exactly
-    once into one `ManagerRun`. What does not happen is a page, because there is no
-    truthful queue to draw beside the allowance and inventing one here would be the
-    defect this ticket already rejected. The refusal names that gap exactly rather
-    than showing an unwired source as an empty one.
+    The order is the whole design. The claim and the scope must both be stated
+    before anything is read; the run fixes the store and the instant once; the queue
+    is acquired once against that same instant; and only a queue that was actually
+    returned reaches a server. A source refusal exits before any server exists, with
+    the reason `queue_source` raised, because a refusal rendered as an empty page is
+    the one outcome this entry point must never produce.
+
+    A genuinely empty queue is served. That is the difference this rail bought: the
+    scope was read, and it had nothing in it.
+
+    What is printed is bounded launch information -- paths, the instant, counts, and
+    the address actually bound. No decision body, evidence, binding, or session
+    identity is printed, because a terminal is not the surface those belong on.
     """
     arguments = _build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
 
     try:
         claim = _stated_claim(arguments)
+        source = _stated_source(arguments)
         run = resolve_run(human_exclusive_since=claim)
     except LaunchError as exc:
         print("decision-manager-launch: {0}".format(exc), file=sys.stderr)
@@ -294,12 +479,35 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     )
     print(
-        "decision-manager-launch: {0}: {1}".format(
-            REASON_NO_QUEUE_SOURCE, _NO_QUEUE_SOURCE_DETAIL
-        ),
-        file=sys.stderr,
+        "queue source: {0}/{1} in {2}".format(
+            source.project, source.ticket, source.control_plane
+        )
     )
-    return 2
+
+    try:
+        view, details = load_run_queue(run, source, registry=SessionRegistry())
+    except QueueSourceError as exc:
+        print("decision-manager-launch: {0}".format(exc), file=sys.stderr)
+        return 2
+
+    print("queue rows: {0}".format(len(view.rows)))
+
+    try:
+        server = make_manager_server(run, view, details)
+    except (AllowanceViewError, ManagerRunError) as exc:
+        # The accepted projection's refusal, reported rather than raised through a
+        # traceback. Its reason is preserved exactly; restating the rule that
+        # produced it here would be a second copy of the estimator's judgement.
+        print("decision-manager-launch: {0}".format(exc), file=sys.stderr)
+        return 3
+
+    host, port = server.server_address[:2]
+    print("manager: http://{0}:{1}/".format(host, port))
+    try:
+        serve_forever(server)
+    finally:
+        server.server_close()
+    return 0
 
 
 if __name__ == "__main__":

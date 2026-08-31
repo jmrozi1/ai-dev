@@ -18,17 +18,24 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict
 import ast
+import collections
 import contextlib
 import inspect
 import io
+import json
 import subprocess
 import tempfile
+import types
 import unittest
 import unittest.mock
 
 from ai_dev_flow import decision_manager as manager
 from ai_dev_flow import decision_manager_launch as launch
-from ai_dev_flow.claude_allowance import WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY
+from ai_dev_flow.claude_allowance import (
+    REASON_INVALID_EPOCH,
+    WINDOW_FIVE_HOUR,
+    WINDOW_SEVEN_DAY,
+)
 from ai_dev_flow.claude_allowance_store import (
     ALLOWANCE_DIRECTORY,
     ALLOWANCE_STORE_NAME,
@@ -37,19 +44,42 @@ from ai_dev_flow.claude_allowance_store import (
 from ai_dev_flow.claude_allowance_view import project_window
 from ai_dev_flow.decision_manager import ManagerRun
 from ai_dev_flow.decision_manager_launch import (
+    BINDING_ROOT_FLAG,
     CLAIM_NONE_FLAG,
     CLAIM_SINCE_FLAG,
+    CONTROL_PLANE_FLAG,
+    PROJECT_FLAG,
     REASON_CLAIM_AMBIGUOUS,
     REASON_CLAIM_UNSTATED,
     REASON_INVALID_CLAIM,
-    REASON_NO_QUEUE_SOURCE,
+    REASON_SOURCE_UNSTATED,
+    TICKET_FLAG,
     LaunchError,
+    QueueSourceContext,
     launch_manager_server,
+    load_run_queue,
     main,
     render_launch_page,
     resolve_run,
 )
-from ai_dev_flow.decision_manager_web import LOOPBACK_HOST
+from ai_dev_flow.decision_manager_web import LOOPBACK_HOST, build_payload
+from ai_dev_flow import queue_source
+from ai_dev_flow.queue_source import QueueSourceError
+from ai_dev_flow.session_binding import (
+    BINDING_STATE_BOUND,
+    BINDING_STATE_UNBOUND,
+    BindingStore,
+    RailIteration,
+    build_record,
+)
+from ai_dev_flow.session_lifecycle import (
+    STATE_DISCONNECTED,
+    STATE_RUNNING,
+    STATE_WAITING,
+    OwnedSession,
+    SessionRegistry,
+    elapsed_seconds,
+)
 from ai_dev_flow.decision_queue import (
     QUEUE_STATES,
     EvidenceReference,
@@ -62,6 +92,54 @@ PROJECT = "ai-dev"
 TICKET = "issue-55"
 
 SINCE = 1_700_000_000
+
+# One blocked rail that can carry a decision, and one running rail that can carry a
+# binding. Named after real Issue #55 rails so the fixture reads like the scope it
+# stands in for.
+BLOCKED_RAIL = "issue-55-durable-queue-source-adapter"
+LIVE_RAIL = "issue-55-agent-sdk-worker-integration"
+
+SESSION = "1a2b3c4d-0001-4000-8000-00000000000a"
+OTHER_SESSION = "1a2b3c4d-0002-4000-8000-00000000000b"
+
+RESERVED_AT = "2026-08-31T11:30:00Z"
+STARTED_AT = "2026-08-31T11:40:00Z"
+
+# An arbitrary fixed instant. Its only job is to be recognisable when a second clock
+# read would have produced a different one.
+FIXED_EPOCH = 1_772_000_000
+
+# Where the accepted template parks this view's data. Read rather than re-derived, so
+# these tests assert against the payload the page actually ships.
+PAYLOAD_OPEN = '<script type="application/json" id="queue-payload">'
+PAYLOAD_CLOSE = "</script>"
+
+_Launch = collections.namedtuple("_Launch", "code out err served")
+
+
+def a_record(**overrides) -> dict:
+    """One durable decision record, exactly as an orchestrator publishes it."""
+    payload = {
+        "schemaVersion": 1,
+        "decisionId": "queue-source-worktree-conflict",
+        "project": PROJECT,
+        "ticket": TICKET,
+        "rail": BLOCKED_RAIL,
+        "raisedAt": "2026-08-31T11:00:00Z",
+        "title": "Decide the disposition of two untracked launcher files",
+        "explanation": "The canonical worktree carries launcher work this rail does not own.",
+        "evidence": [{"label": "worktree status", "locator": "git status --porcelain"}],
+        "blocker": {
+            "kind": "environment",
+            "whatFailed": "starting-identity verification",
+            "missingCapability": "an exclusively held product worktree",
+            "humanChange": "decide the disposition of the two untracked paths",
+            "stateChanged": False,
+            "nextAction": "re-dispatch the rail to a fresh executor session",
+        },
+    }
+    payload.update(overrides)
+    return payload
 
 MODULE_SOURCE = Path(launch.__file__).read_text(encoding="utf-8")
 MODULE_TREE = ast.parse(MODULE_SOURCE)
@@ -275,17 +353,15 @@ class CommandLineClaimTests(LaunchTestCase):
         self.assertEqual(code, 1)
         self.assertIn(REASON_CLAIM_AMBIGUOUS, err)
 
-    def test_explicit_no_claim_is_accepted_and_reported_as_none(self) -> None:
-        with self.rooted():
-            code, out, _ = self.run_main([CLAIM_NONE_FLAG])
-        self.assertEqual(code, 2)
-        self.assertIn("none claimed", out)
-
-    def test_explicit_epoch_is_accepted_and_reported_exactly(self) -> None:
-        with self.rooted():
-            code, out, _ = self.run_main([CLAIM_SINCE_FLAG, str(SINCE)])
-        self.assertEqual(code, 2)
-        self.assertIn("since {0}".format(SINCE), out)
+    def test_a_stated_claim_is_accepted_and_the_run_stops_on_the_scope_instead(self) -> None:
+        """The claim is judged first, so a good claim reaches the next question."""
+        for stated in ([CLAIM_NONE_FLAG], [CLAIM_SINCE_FLAG, str(SINCE)]):
+            with self.subTest(stated=stated), self.rooted():
+                code, _, err = self.run_main(stated)
+            self.assertEqual(code, 1)
+            self.assertIn(REASON_SOURCE_UNSTATED, err)
+            for claim_reason in (REASON_CLAIM_UNSTATED, REASON_INVALID_CLAIM):
+                self.assertNotIn(claim_reason, err)
 
     def test_non_integer_claim_text_is_refused(self) -> None:
         for text in ("", " ", "later", "1.0", "1e3", "0x10", "1_700", "+7", "7 "):
@@ -486,12 +562,21 @@ class LoopbackTests(LaunchTestCase):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, MODULE_CODE)
 
-    def test_nothing_is_served_or_scheduled_by_this_module(self) -> None:
-        for forbidden in (
-            "serve_forever", "Thread", "Timer", "sleep", "schedule", "while True",
-        ):
+    def test_nothing_is_scheduled_or_looped_by_this_module(self) -> None:
+        """Serving is now the entry point's job; scheduling still is not.
+
+        The accepted server's ordinary request handling is the only loop allowed on
+        this path. A timer, a thread, or a hand-rolled loop would be the periodic
+        refresh this surface deliberately does not have.
+        """
+        for forbidden in ("Thread", "Timer", "sleep", "schedule", "while True"):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, MODULE_CODE)
+
+    def test_serving_goes_through_the_accepted_helper(self) -> None:
+        """One place decides how this surface is served, and it is not this module."""
+        self.assertIn("serve_forever(server)", MODULE_CODE)
+        self.assertNotIn("server.serve_forever", MODULE_CODE)
 
 
 # --------------------------------------------------------------------------
@@ -551,50 +636,509 @@ class NoDurableStateTests(LaunchTestCase):
 # --------------------------------------------------------------------------
 
 
-class QueueSourceTests(LaunchTestCase):
+class CallerSuppliedQueueTests(LaunchTestCase):
+    """The two callable helpers still take the caller's queue, unchanged."""
+
     def test_the_rendered_page_carries_the_callers_queue(self) -> None:
         view, details = a_queue([a_decision(decision_id="d-9", title="Pick the seam")])
         with self.rooted():
             page = render_launch_page(view, details, human_exclusive_since=None)
         self.assertIn("Pick the seam", page)
 
+    def test_the_launch_helper_still_takes_the_callers_queue(self) -> None:
+        view, details = a_queue([a_decision(decision_id="d-8", title="Pick the port")])
+        with self.rooted():
+            server = launch_manager_server(view, details, human_exclusive_since=None)
+        self.addCleanup(server.server_close)
+        self.assertIn("Pick the port", server.RequestHandlerClass.page)
+
     def test_this_module_builds_no_queue_of_its_own(self) -> None:
+        """Acquiring a queue is not the same as constructing one."""
         for forbidden in (
             "build_queue", "PendingDecision(", "OperationalAgent(", "DecisionQueue(",
+            "QueueRow(", "SelectedDetail(",
         ):
             with self.subTest(forbidden=forbidden):
                 self.assertNotIn(forbidden, MODULE_CODE)
 
-    def test_the_entry_point_refuses_to_serve_without_a_queue(self) -> None:
-        """An unwired source is stated, never drawn as an empty but authoritative one."""
-        with self.rooted():
-            code, out, err = self.run_main([CLAIM_NONE_FLAG])
-        self.assertEqual(code, 2)
-        self.assertIn(REASON_NO_QUEUE_SOURCE, err)
-        self.assertNotIn("queue-payload", out)
-
-    def test_the_entry_point_still_proves_the_inputs_it_resolved(self) -> None:
-        with self.rooted():
-            _, out, _ = self.run_main([CLAIM_SINCE_FLAG, str(SINCE)])
-        self.assertIn(ALLOWANCE_STORE_NAME, out)
-        self.assertIn("run instant:", out)
-
-    def test_no_production_builder_of_queue_items_exists_yet(self) -> None:
-        """The premise of the refusal above, kept honest.
-
-        When a durable-state-to-queue projection is finally written this test fails,
-        which is exactly the moment `main` must stop refusing and start using it.
-        """
+    def test_the_accepted_adapter_is_the_only_production_builder(self) -> None:
+        """Exactly one module turns durable state into queue items, and it is not this one."""
         repo_root = Path(launch.__file__).parents[1]
-        offenders = []
+        builders = []
         for source in sorted(repo_root.rglob("*.py")):
             relative = source.relative_to(repo_root)
             if relative.parts[0] in ("tests", ".git"):
                 continue
             text = source.read_text(encoding="utf-8", errors="replace")
             if "PendingDecision(" in text or "OperationalAgent(" in text:
-                offenders.append(str(relative))
-        self.assertEqual(offenders, [])
+                builders.append(relative.as_posix())
+        self.assertEqual(builders, ["ai_dev_flow/queue_source.py"])
+
+
+# --------------------------------------------------------------------------
+# The entry point reads one real durable scope
+# --------------------------------------------------------------------------
+
+
+class SourcedLaunchTestCase(LaunchTestCase):
+    """A real coordination repository and a real binding store. No process, no network."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self._sources = tempfile.TemporaryDirectory(prefix="launch-source-")
+        self.addCleanup(self._sources.cleanup)
+        self.sources = Path(self._sources.name).resolve()
+        self.coordination = self._init_coordination()
+        self.scope = self.coordination / PROJECT / TICKET
+        self.write(self.scope / "state.md", "# Control Plane State\n")
+        self.binding_root = self.sources / "controller-state"
+        self.store = BindingStore(self.binding_root)
+        self.registry = SessionRegistry()
+
+    # -- fixtures ---------------------------------------------------------
+
+    def _git(self, *args: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(self.coordination), *args],
+            check=True, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return completed.stdout.strip()
+
+    def _init_coordination(self) -> Path:
+        self.coordination = self.sources / "coordination"
+        self.coordination.mkdir(parents=True)
+        self._git("init", "-q")
+        self._git("config", "user.name", "Launch Tests")
+        self._git("config", "user.email", "launch-tests@example.com")
+        (self.coordination / "README.md").write_text("coordination\n", encoding="utf-8")
+        self._git("add", "README.md")
+        self._git("commit", "-q", "-m", "initial commit")
+        return self.coordination
+
+    def write(self, path: Path, text: str) -> Path:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def authorize(self, rail_id: str, status: str = "ready", *, handoff=None) -> Path:
+        path = self.write(
+            self.scope / "rails" / rail_id / "rail.md",
+            "# Rail: {0}\n\nStatus: {1}\nRole: executor\nDepends on: none\n"
+            "Shared resource: none\n\n## Goal\n\nbounded work\n".format(rail_id, status),
+        )
+        if handoff is not None:
+            self.write(self.scope / "rails" / rail_id / "handoff.md", handoff)
+        return path
+
+    def decide(self, rail_id: str = BLOCKED_RAIL, payload=None, *, raw=None) -> Path:
+        target = self.scope / "rails" / rail_id / "decision.json"
+        if raw is not None:
+            return self.write(target, raw)
+        body = a_record() if payload is None else payload
+        return self.write(target, json.dumps(body, indent=2, sort_keys=True) + "\n")
+
+    def blob(self, rail_id: str) -> str:
+        return self._git(
+            "hash-object", "--", str(self.scope / "rails" / rail_id / "rail.md")
+        )
+
+    def bind(self, rail_id: str = LIVE_RAIL, *, session_id: str = SESSION, blob=None,
+             state: str = BINDING_STATE_BOUND):
+        iteration = RailIteration(
+            rail=rail_id, blob=blob if blob is not None else self.blob(rail_id)
+        )
+        process: dict = {}
+        if state == BINDING_STATE_BOUND:
+            process = {
+                "pid": 4242, "pid_domain": "test-host",
+                "started_at": STARTED_AT, "bound_at": STARTED_AT,
+            }
+        record = build_record(
+            project=PROJECT, ticket=TICKET,
+            workspace_key="github:jmrozi1/ai-dev#55",
+            worktree_id="worktree-55",
+            workspace_path=str(self.sources / "workspace-55"),
+            rail=rail_id, role="executor", iteration=iteration,
+            session_id=session_id, launched_at_head="c" * 40,
+            reserved_at=RESERVED_AT, state=state, **process,
+        )
+        self.store.write_new(record)
+        return record
+
+    def own(self, record, *, pgid: int = 4242) -> OwnedSession:
+        return self.registry.add(
+            OwnedSession(
+                session_id=record.session_id,
+                handle=types.SimpleNamespace(pid=record.pid, pgid=pgid),
+                pid=record.pid, pid_domain=record.pid_domain, pgid=pgid,
+                started_at=record.started_at, iteration=record.iteration,
+                workspace_path=record.workspace_path, role=record.role,
+            )
+        )
+
+    # -- invocation -------------------------------------------------------
+
+    def source_argv(self, **overrides) -> list:
+        stated = {
+            CONTROL_PLANE_FLAG: str(self.coordination),
+            PROJECT_FLAG: PROJECT,
+            TICKET_FLAG: TICKET,
+            BINDING_ROOT_FLAG: str(self.binding_root),
+        }
+        stated.update(overrides)
+        argv = []
+        for flag, value in stated.items():
+            if value is not None:
+                argv.extend([flag, value])
+        return argv
+
+    def context(self) -> QueueSourceContext:
+        return QueueSourceContext(
+            control_plane=self.coordination, project=PROJECT, ticket=TICKET,
+            binding_root=self.binding_root,
+        )
+
+    def a_run(self):
+        with self.rooted():
+            return resolve_run(human_exclusive_since=None)
+
+    def launch(self, argv=None, *, claim=(CLAIM_NONE_FLAG,)):
+        """Run the entry point to completion, capturing the server it would serve."""
+        served = []
+        stated = list(claim) + (self.source_argv() if argv is None else list(argv))
+        with self.rooted(), unittest.mock.patch.object(
+            launch, "serve_forever", served.append
+        ):
+            code, out, err = self.run_main(stated)
+        for server in served:
+            self.addCleanup(server.server_close)
+        return _Launch(code, out, err, served)
+
+    def payload_of(self, served) -> dict:
+        """The exact payload the accepted renderer put on the page it serves."""
+        page = served.RequestHandlerClass.page
+        opening = page.index(PAYLOAD_OPEN) + len(PAYLOAD_OPEN)
+        closing = page.index(PAYLOAD_CLOSE, opening)
+        return json.loads(page[opening:closing])
+
+
+class SourcedEntryPointTests(SourcedLaunchTestCase):
+    def test_an_authoritatively_empty_scope_is_served_rather_than_refused(self) -> None:
+        """The whole point of the rail: a proven-empty queue is a page, not a stop."""
+        result = self.launch()
+
+        self.assertEqual(result.code, 0)
+        self.assertEqual(len(result.served), 1)
+        self.assertEqual(self.payload_of(result.served[0])["rows"], [])
+        self.assertIn("queue rows: 0", result.out)
+
+    def test_a_durable_decision_reaches_the_page_as_the_projected_waiting_row(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+
+        result = self.launch()
+        payload = self.payload_of(result.served[0])
+
+        self.assertEqual(result.code, 0)
+        self.assertEqual(len(payload["rows"]), 1)
+        row = payload["rows"][0]
+        self.assertEqual(row["state"], STATE_WAITING)
+        self.assertEqual(row["title"], a_record()["title"])
+        detail = payload["details"][row["itemId"]]
+        self.assertEqual(detail["explanation"], a_record()["explanation"])
+        self.assertEqual(
+            [entry["label"] for entry in detail["evidence"]], ["worktree status"]
+        )
+
+    def test_a_durable_binding_this_process_never_started_reads_as_disconnected(self) -> None:
+        """A fresh registry owns nothing, so the accepted lifecycle says so."""
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        result = self.launch()
+        payload = self.payload_of(result.served[0])
+
+        self.assertEqual([row["state"] for row in payload["rows"]], [STATE_DISCONNECTED])
+
+    def test_an_owned_live_session_reaches_the_view_as_running(self) -> None:
+        """Running needs an injected registry that actually owns the handle."""
+        self.authorize(LIVE_RAIL, "running")
+        record = self.bind(LIVE_RAIL)
+        self.own(record)
+
+        view, details = load_run_queue(
+            self.a_run(), self.context(), registry=self.registry,
+            alive=lambda pgid: True,
+        )
+
+        self.assertEqual([row.state for row in view.rows], [STATE_RUNNING])
+        self.assertIsNone(details[view.rows[0].item_id].explanation)
+
+    def test_the_page_carries_all_three_states_while_waiting_stays_the_default(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        payload = self.payload_of(self.launch().served[0])
+
+        self.assertEqual(payload["states"], list(QUEUE_STATES))
+        self.assertEqual(
+            sorted(row["state"] for row in payload["rows"]),
+            sorted([STATE_DISCONNECTED, STATE_WAITING]),
+        )
+        # Membership is the page's job, and Waiting is still what it opens on.
+        self.assertEqual(payload["defaultFilters"], [STATE_WAITING])
+
+    def test_every_visible_row_carries_the_detail_the_queue_projected(self) -> None:
+        """The renderer refuses a missing detail, so this also proves none is skipped."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        run = self.a_run()
+
+        view, details = load_run_queue(run, self.context(), registry=self.registry)
+
+        self.assertEqual(sorted(details), sorted(row.item_id for row in view.rows))
+        payload = build_payload(
+            view, details, allowance=manager.project_allowance(run)
+        )
+        self.assertEqual(sorted(payload["details"]), sorted(details))
+
+    def test_a_stated_claim_is_reported_exactly_as_stated(self) -> None:
+        for stated, expected in (
+            ((CLAIM_NONE_FLAG,), "none claimed"),
+            ((CLAIM_SINCE_FLAG, str(SINCE)), "since {0}".format(SINCE)),
+        ):
+            with self.subTest(stated=stated):
+                result = self.launch(claim=stated)
+                self.assertEqual(result.code, 0)
+                self.assertIn(expected, result.out)
+
+    def test_nothing_bounded_out_of_the_launcher_leaks_a_decision_body(self) -> None:
+        """A terminal is not where evidence, bindings, or session identity belong."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        result = self.launch()
+
+        for secret in (
+            a_record()["explanation"], "git status --porcelain", SESSION, "4242",
+        ):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, result.out)
+
+
+class SourceRefusalTests(SourcedLaunchTestCase):
+    """A refusal exits before a server exists. It is never drawn as an empty queue."""
+
+    def _refused(self, expected_reason: str) -> None:
+        result = self.launch()
+        self.assertEqual(result.code, 2)
+        self.assertEqual(result.served, [])
+        self.assertIn(expected_reason, result.err)
+        self.assertNotIn("manager: http://", result.out)
+
+    def test_an_unreadable_scope_refuses(self) -> None:
+        (self.scope / "state.md").unlink()
+        self._refused(queue_source.REASON_SCOPE_UNKNOWN)
+
+    def test_a_rail_with_no_authorization_refuses(self) -> None:
+        (self.scope / "rails" / BLOCKED_RAIL).mkdir(parents=True)
+        self.write(self.scope / "rails" / BLOCKED_RAIL / "handoff.md", "# Handoff\n")
+        self._refused(queue_source.REASON_SOURCE_UNREADABLE)
+
+    def test_a_decision_contradicting_its_rail_refuses(self) -> None:
+        self.authorize(BLOCKED_RAIL, "ready")
+        self.decide()
+        self._refused(queue_source.REASON_DECISION_RAIL_CONTRADICTS)
+
+    def test_an_invalid_decision_record_refuses(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(raw="{ not json")
+        self._refused(queue_source.REASON_DECISION_INVALID)
+
+    def test_a_lifecycle_refusal_refuses(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL, blob="f" * 40)
+        self._refused(queue_source.REASON_LIFECYCLE_REFUSED)
+
+    def test_two_bindings_claiming_one_rail_refuse_as_conflicting(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL, session_id=SESSION)
+        self.bind(LIVE_RAIL, session_id=OTHER_SESSION)
+        self._refused(queue_source.REASON_CONFLICTING_ITEMS)
+
+    def test_a_moved_source_refuses_when_the_caller_pinned_one(self) -> None:
+        with self.assertRaises(QueueSourceError) as caught:
+            load_run_queue(
+                self.a_run(), self.context(), registry=self.registry,
+                expected_head="0" * 40,
+            )
+        self.assertEqual(caught.exception.reason, queue_source.REASON_SOURCE_STALE)
+
+    def test_a_refusal_is_never_downgraded_into_a_served_empty_page(self) -> None:
+        """The one outcome this entry point must never produce."""
+        (self.scope / "state.md").unlink()
+
+        result = self.launch()
+
+        self.assertNotEqual(result.code, 0)
+        self.assertEqual(result.served, [])
+
+    def test_the_launcher_translates_no_source_reason_into_one_of_its_own(self) -> None:
+        for forbidden in (
+            "REASON_SOURCE_UNREADABLE", "REASON_CONFLICTING_ITEMS", "no-queue-source",
+            "except Exception", "pass\n",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, MODULE_CODE)
+
+
+class StatedScopeTests(SourcedLaunchTestCase):
+    """Silence names no scope, here or anywhere behind here."""
+
+    def test_every_source_input_is_required(self) -> None:
+        for flag in (CONTROL_PLANE_FLAG, PROJECT_FLAG, TICKET_FLAG, BINDING_ROOT_FLAG):
+            with self.subTest(flag=flag):
+                result = self.launch(self.source_argv(**{flag: None}))
+                self.assertEqual(result.code, 1)
+                self.assertIn(REASON_SOURCE_UNSTATED, result.err)
+                self.assertIn(flag, result.err)
+                self.assertEqual(result.served, [])
+
+    def test_stating_no_scope_at_all_is_refused(self) -> None:
+        result = self.launch([])
+        self.assertEqual(result.code, 1)
+        self.assertIn(REASON_SOURCE_UNSTATED, result.err)
+
+    def test_the_context_value_gives_no_field_a_default(self) -> None:
+        stated = {
+            "control_plane": self.coordination, "project": PROJECT,
+            "ticket": TICKET, "binding_root": self.binding_root,
+        }
+        for omitted in sorted(stated):
+            partial = {key: value for key, value in stated.items() if key != omitted}
+            with self.subTest(omitted=omitted), self.assertRaises(TypeError):
+                QueueSourceContext(**partial)
+
+    def test_the_scope_is_never_read_from_the_environment_or_a_config_file(self) -> None:
+        for forbidden in (
+            "environ", "getenv", "config.json", ".ai-dev", "workflow.json",
+            "discover", "cache", "controlPlane",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, MODULE_CODE)
+
+    def test_a_stated_scope_that_does_not_exist_refuses_rather_than_reads_empty(self) -> None:
+        result = self.launch(self.source_argv(**{TICKET_FLAG: "issue-56"}))
+
+        self.assertEqual(result.code, 2)
+        self.assertIn(queue_source.REASON_SCOPE_UNKNOWN, result.err)
+        self.assertEqual(result.served, [])
+
+
+class OneRunOneInstantTests(SourcedLaunchTestCase):
+    def _capturing_load(self, calls):
+        real = launch.load_queue
+
+        def capturing(repo_root, **kwargs):
+            calls.append(kwargs)
+            return real(repo_root, **kwargs)
+
+        return unittest.mock.patch.object(launch, "load_queue", capturing)
+
+    def test_one_launch_acquires_the_queue_exactly_once(self) -> None:
+        calls = []
+        with self._capturing_load(calls):
+            result = self.launch()
+
+        self.assertEqual(result.code, 0)
+        self.assertEqual(len(calls), 1)
+
+    def test_one_launch_reads_exactly_one_clock(self) -> None:
+        reads = []
+        with self.counted_clock(reads):
+            self.launch()
+        self.assertEqual(len(reads), 1)
+
+    def test_the_queue_instant_is_the_runs_own_epoch(self) -> None:
+        """A second clock read would be visible here as a different instant."""
+        calls = []
+        with unittest.mock.patch.object(launch.time, "time", lambda: FIXED_EPOCH), \
+                self._capturing_load(calls):
+            result = self.launch()
+
+        self.assertIn("run instant: {0}".format(FIXED_EPOCH), result.out)
+        self.assertEqual(calls[0]["now"], launch._queue_instant(FIXED_EPOCH))
+
+    def test_the_queue_instant_is_the_shape_the_accepted_lifecycle_parses(self) -> None:
+        """Pins the format to the accepted parser rather than to a second literal."""
+        self.assertEqual(
+            elapsed_seconds(
+                launch._queue_instant(FIXED_EPOCH),
+                launch._queue_instant(FIXED_EPOCH + 3600),
+            ),
+            3600,
+        )
+
+    def test_the_binding_store_is_built_from_the_stated_root(self) -> None:
+        calls = []
+        with self._capturing_load(calls):
+            self.launch()
+
+        self.assertEqual(calls[0]["store"].root, BindingStore(self.binding_root).root)
+
+    def test_the_stated_scope_reaches_the_adapter_untouched(self) -> None:
+        calls = []
+        with self._capturing_load(calls):
+            self.launch()
+
+        self.assertEqual(calls[0]["project"], PROJECT)
+        self.assertEqual(calls[0]["ticket"], TICKET)
+
+
+class NoProcessAdoptionTests(SourcedLaunchTestCase):
+    def test_a_fresh_registry_never_adopts_a_durable_binding(self) -> None:
+        """A standalone launch owns no handle, whatever a record says its pid was."""
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        payload = self.payload_of(self.launch().served[0])
+
+        self.assertEqual([row["state"] for row in payload["rows"]], [STATE_DISCONNECTED])
+
+    def test_the_module_reconstructs_no_ownership(self) -> None:
+        for forbidden in (
+            "OwnedSession", "getpid", "pid_domain", "pgid", "psutil", "kill(",
+            "process_group_alive",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, MODULE_CODE)
+
+    def test_the_standalone_entry_point_builds_one_empty_registry(self) -> None:
+        self.assertEqual(MODULE_CODE.count("SessionRegistry()"), 1)
+
+
+class AcceptedAllowanceFailureTests(SourcedLaunchTestCase):
+    def test_an_unusable_epoch_is_reported_with_the_accepted_reason(self) -> None:
+        """The estimator's judgement, surfaced rather than duplicated or raised."""
+        result = self.launch(claim=(CLAIM_SINCE_FLAG, "-5"))
+
+        self.assertEqual(result.code, 3)
+        self.assertEqual(result.served, [])
+        self.assertIn(REASON_INVALID_EPOCH, result.err)
+        self.assertNotIn("Traceback", result.err)
+
+    def test_the_launcher_states_no_epoch_rule_of_its_own(self) -> None:
+        for forbidden in ("> 0", ">= 0", "must be positive", "negative"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, MODULE_CODE)
 
 
 # --------------------------------------------------------------------------
@@ -614,9 +1158,11 @@ class NoAddedAuthorityTests(LaunchTestCase):
             modules,
             {
                 "argparse", "http.server", "re", "sys", "time",
-                "__future__", "pathlib", "typing",
-                ".claude_allowance_store", ".decision_manager", ".decision_queue",
-                ".repository",
+                "__future__", "dataclasses", "datetime", "pathlib", "typing",
+                ".claude_allowance_store", ".claude_allowance_view",
+                ".decision_manager", ".decision_manager_web", ".decision_queue",
+                ".queue_source", ".repository", ".session_binding",
+                ".session_lifecycle",
             },
         )
 
