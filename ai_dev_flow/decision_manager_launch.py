@@ -1,57 +1,56 @@
-"""Resolves one manager run's real runtime inputs and drives the accepted composition.
-
-`decision_manager` composes a run but constructs nothing: its own docstring is
-explicit that `now` and `store` are the caller's, deliberately, because a clock or
-a repository read inside it would be a second instant and a second authority that
-no caller could pin. That module is therefore unusable until something owns those
-reads. This module is that something, and it owns exactly them.
-
-It is the caller half, and nothing more. It resolves four values once per run --
-the repository root, the accepted allowance store beneath it, one current epoch,
-and one explicitly stated exclusivity claim -- builds exactly one `ManagerRun` from
-them, and hands that to the accepted checkpoint-35 composition path. It computes no
-percentage, decides no availability, orders no rows, and draws nothing.
-
-Four boundaries hold it honest.
-
-First, each input is resolved exactly once per run, in `resolve_run`, and then
-reused. There is one `resolve_repo_root` call, one `AllowanceStore` construction,
-and one clock read on the way to one frozen `ManagerRun`. A second store or a later
-instant between construction and use is the incoherence `ManagerRun` exists to make
-unrepresentable, and re-resolving either here would hand that incoherence straight
-back.
-
-Second, the exclusivity claim has no default anywhere on the path. Accepted
-decision D4 makes silence mean "unavailable", never "covered", so the claim is a
-required keyword argument with no default at all: omitting it is a `TypeError`
-rather than a quiet `None`, and silence is not something this module can represent.
-`None` is a caller saying out loud that the human affirmed nothing, and it is
-carried through to `ManagerRun` exactly as given -- never substituted, widened, or
-filled in. The command line enforces the same rule where a human states it, by
-requiring exactly one of the two flags and refusing when neither is given.
-
-Third, nothing about the claim is durable. This module opens no file for writing,
-reads no environment variable, keeps no module-level mutable state, and holds no
-cache. The claim exists for the length of one call and there is no restart across
-which it could survive, so a new run needs a new statement. That is the whole
-mechanism by which outside Claude use revokes coverage under D4: there is nothing
-here that could preserve a stale claim.
-
-Fourth, the queue is not this module's to invent. `render_manager_page` and
-`make_manager_server` both need a `QueueView`, and no production builder of
-`PendingDecision` or `OperationalAgent` exists anywhere in this repository yet.
-`QueueView` carries no source-health concept, so an empty queue and an unwired one
-are indistinguishable on the page -- exactly the defect class this ticket already
-rejected when it refused to show unavailable allowance as zero. So the queue comes
-from this module's caller, and `main` refuses to serve rather than presenting an
-empty queue as though the manager were watching durable state.
-
-The loopback rule is deliberately not restated here. `make_manager_server` and the
-accepted server beneath it own it, this module passes no host at all, and so the
-one place that decides what this surface binds stays the only place.
-"""
+"""Resolves one manager run's real runtime inputs and drives the accepted composition."""
 
 from __future__ import annotations
+
+# `decision_manager` composes a run but constructs nothing: its own docstring is
+# explicit that `now` and `store` are the caller's, deliberately, because a clock or
+# a repository read inside it would be a second instant and a second authority that
+# no caller could pin. That module is therefore unusable until something owns those
+# reads. This module is that something, and it owns exactly them.
+#
+# It is the caller half, and nothing more. It resolves four values once per run --
+# the repository root, the accepted allowance store beneath it, one current epoch,
+# and one explicitly stated exclusivity claim -- builds exactly one `ManagerRun` from
+# them, and hands that to the accepted checkpoint-35 composition path. It computes no
+# percentage, decides no availability, orders no rows, and draws nothing.
+#
+# Four boundaries hold it honest.
+#
+# First, each input is resolved exactly once per run, in `resolve_run`, and then
+# reused. There is one `resolve_repo_root` call, one `AllowanceStore` construction,
+# and one clock read on the way to one frozen `ManagerRun`. A second store or a later
+# instant between construction and use is the incoherence `ManagerRun` exists to make
+# unrepresentable, and re-resolving either here would hand that incoherence straight
+# back.
+#
+# Second, the exclusivity claim has no default anywhere on the path. Accepted
+# decision D4 makes silence mean "unavailable", never "covered", so the claim is a
+# required keyword argument with no default at all: omitting it is a `TypeError`
+# rather than a quiet `None`, and silence is not something this module can represent.
+# `None` is a caller saying out loud that the human affirmed nothing, and it is
+# carried through to `ManagerRun` exactly as given -- never substituted, widened, or
+# filled in. The command line enforces the same rule where a human states it, by
+# requiring exactly one of the two flags and refusing when neither is given.
+#
+# Third, nothing about the claim is durable. This module opens no file for writing,
+# reads no environment variable, keeps no module-level mutable state, and holds no
+# cache. The claim exists for the length of one call and there is no restart across
+# which it could survive, so a new run needs a new statement. That is the whole
+# mechanism by which outside Claude use revokes coverage under D4: there is nothing
+# here that could preserve a stale claim.
+#
+# Fourth, the queue is not this module's to invent. `render_manager_page` and
+# `make_manager_server` both need a `QueueView`, and no production builder of
+# `PendingDecision` or `OperationalAgent` exists anywhere in this repository yet.
+# `QueueView` carries no source-health concept, so an empty queue and an unwired one
+# are indistinguishable on the page -- exactly the defect class this ticket already
+# rejected when it refused to show unavailable allowance as zero. So the queue comes
+# from this module's caller, and `main` refuses to serve rather than presenting an
+# empty queue as though the manager were watching durable state.
+#
+# The loopback rule is deliberately not restated here. `make_manager_server` and the
+# accepted server beneath it own it, this module passes no host at all, and so the
+# one place that decides what this surface binds stays the only place.
 
 import argparse
 import http.server
