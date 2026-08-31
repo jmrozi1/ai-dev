@@ -75,7 +75,7 @@ When creating a ticket:
 - Initialize `Skill Candidates` and `Skills` explicitly, normally with `- None.`.
   These sections are durable process-investment accounting surfaces, not new
   normalized JSON fields.
-- `ready-for-execution` is the orchestrator-owned durable signal that a ticket is
+- `readiness:ready` is the orchestrator-owned durable signal that a ticket is
   sufficiently refined to be considered for execution. Include it during ticket
   creation only when the creation/refinement work itself already satisfies the
   orchestrator readiness contract. Checkpoints alone do not imply readiness;
