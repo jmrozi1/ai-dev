@@ -29,15 +29,15 @@ dependency.
 
 ## Own Ticket Readiness
 
-Use the ticket label `ready-for-execution` as the durable signal that a work item
-is sufficiently refined to be considered for execution. Readiness is eligibility
+Use the ticket label `readiness:ready` as the durable signal that a work item is
+sufficiently refined to be considered for execution. Readiness is eligibility
 for orchestration, not executor authorization.
 
-Apply `ready-for-execution` only when the current requirements and completion
-target are clear enough to execute without inventing material product intent,
-material product/scope/architecture decisions are resolved, and the named
-checkpoint roadmap is usable. The presence of checkpoints alone is not
-sufficient evidence of readiness.
+Apply `readiness:ready` only when the current requirements and completion target
+are clear enough to execute without inventing material product intent, material
+product/scope/architecture decisions are resolved, and the named checkpoint
+roadmap is usable. The presence of checkpoints alone is not sufficient evidence
+of readiness.
 
 Prefer this explicit readiness signal when discovering candidate work rather than
 re-reading arbitrary ticket bodies to infer whether refinement is complete. A
@@ -47,10 +47,10 @@ current orchestration state. Reconcile those conditions from fresh durable state
 before selecting work or authorizing a rail.
 
 If later evidence exposes a material ambiguity or decision that invalidates the
-ticket's execution readiness, remove `ready-for-execution` until the ticket is
-refined again. An authorized rail remains the separate, narrower authority for a
-specific executor to act; ticket readiness never substitutes for rail
-authorization.
+ticket's execution readiness, remove or replace `readiness:ready` with the
+applicable non-ready state until the ticket is refined again. An authorized rail
+remains the separate, narrower authority for a specific executor to act; ticket
+readiness never substitutes for rail authorization.
 
 ## Delegate Bounded Work
 
