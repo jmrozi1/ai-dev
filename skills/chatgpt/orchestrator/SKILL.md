@@ -27,6 +27,31 @@ RDD as an additional capability because it owns that distinct responsibility.
 This is task-driven composition, not a hard-coded orchestrator-to-RDD
 dependency.
 
+## Own Ticket Readiness
+
+Use the ticket label `ready-for-execution` as the durable signal that a work item
+is sufficiently refined to be considered for execution. Readiness is eligibility
+for orchestration, not executor authorization.
+
+Apply `ready-for-execution` only when the current requirements and completion
+target are clear enough to execute without inventing material product intent,
+material product/scope/architecture decisions are resolved, and the named
+checkpoint roadmap is usable. The presence of checkpoints alone is not
+sufficient evidence of readiness.
+
+Prefer this explicit readiness signal when discovering candidate work rather than
+re-reading arbitrary ticket bodies to infer whether refinement is complete. A
+ready ticket may still be held because of dependencies, conflicting active rails,
+shared-resource contention, priority, human-attention constraints, or other
+current orchestration state. Reconcile those conditions from fresh durable state
+before selecting work or authorizing a rail.
+
+If later evidence exposes a material ambiguity or decision that invalidates the
+ticket's execution readiness, remove `ready-for-execution` until the ticket is
+refined again. An authorized rail remains the separate, narrower authority for a
+specific executor to act; ticket readiness never substitutes for rail
+authorization.
+
 ## Delegate Bounded Work
 
 Prefer a bounded delegation with a clear outcome over repeated one-off
