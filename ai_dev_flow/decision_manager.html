@@ -75,6 +75,7 @@ body {
 .allowance-label { font-weight: 600; color: var(--ink); }
 .allowance-used { font-variant-numeric: tabular-nums; }
 .allowance-unavailable { font-style: italic; }
+.allowance-reset { font-size: 12px; opacity: 0.8; white-space: nowrap; }
 .rows {
   list-style: none;
   margin: 0;
@@ -246,6 +247,29 @@ details summary { cursor: pointer; font-weight: 600; }
 
       group.appendChild(name);
       group.appendChild(value);
+
+      // Secondary context, drawn from the epoch the accepted view already
+      // supplied. No clock is read here and no countdown is drawn: this page is
+      // static, so a relative "in 2h" would silently rot on screen. A missing
+      // resetsAt means the accepted view stated no reset, and none is invented.
+      if (entry.resetsAt !== null && entry.resetsAt !== undefined) {
+        var resetAt = new Date(entry.resetsAt * 1000);
+        var reset = document.createElement("time");
+        reset.className = "allowance-reset";
+        // The exact instant, machine-readable, derived only from resetsAt.
+        reset.setAttribute("datetime", resetAt.toISOString());
+        // Weekday and calendar date on purpose: a seven-day reset must not be
+        // readable as a time later today.
+        reset.textContent = "resets " + resetAt.toLocaleString(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit"
+        });
+        group.appendChild(reset);
+      }
+
       allowanceEl.appendChild(group);
     });
   }

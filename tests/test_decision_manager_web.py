@@ -176,6 +176,17 @@ def script_of(page: str) -> str:
     return page.rsplit("<script>", 1)[1].split("</script>", 1)[0]
 
 
+def reset_block(page: str) -> str:
+    """Just the allowance draw, so a check cannot pass on unrelated script."""
+    script = script_of(page)
+    return script.split("function renderAllowance", 1)[1].split("function renderRows", 1)[0]
+
+
+def code_only(block: str) -> str:
+    """The block without // prose, so a comment neither satisfies nor breaks a check."""
+    return " ".join(line.split("//", 1)[0] for line in block.splitlines())
+
+
 def style_of(page: str) -> str:
     return page.split("<style>", 1)[1].split("</style>", 1)[0]
 
@@ -759,9 +770,22 @@ class SurfacePurityTests(unittest.TestCase):
 
     def test_the_page_declares_no_timer_clock_or_retry(self) -> None:
         script = script_of(self.page)
-        for surface in ("setTimeout", "setInterval", "requestAnimationFrame", "Date(",
+        for surface in ("setTimeout", "setInterval", "requestAnimationFrame",
                         "Date.now", "performance.now", "retry", "reload("):
             self.assertNotIn(surface, script, surface)
+
+    def test_the_only_date_use_converts_the_supplied_epoch_and_reads_no_clock(self) -> None:
+        """new Date(epoch) converts a fact the payload already carried.
+
+        new Date() with no argument would be the clock read that the blanket
+        "Date(" ban used to stand in for. Pinning the exact argument says more
+        than that ban did: it forbids reading a clock AND forbids the supplied
+        epoch being swapped for anything else.
+        """
+        script = script_of(self.page)
+        uses = [seg.split(")", 1)[0] for seg in script.split("new Date(")[1:]]
+        self.assertEqual(uses, ["entry.resetsAt * 1000"])
+        self.assertNotIn("new Date()", script)
 
     def _imported_modules(self):
         """What the module imports, read from the AST rather than from its prose."""
@@ -1069,6 +1093,76 @@ class AllowanceHostileDataTests(unittest.TestCase):
         self.assertIn("textContent", block)
         for unsafe in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write"):
             self.assertNotIn(unsafe, block, unsafe)
+
+
+class AllowanceResetRenderingTests(unittest.TestCase):
+    """Reset timing: drawn from the accepted epoch, absolutely, and only when stated."""
+
+    def setUp(self) -> None:
+        self.page, _, _ = rendered([a_decision()], [an_agent()])
+        self.block = reset_block(self.page)
+        self.code = code_only(self.block)
+
+    def test_a_known_reset_draws_exactly_one_semantic_time_element(self) -> None:
+        self.assertEqual(self.code.count('createElement("time")'), 1)
+        self.assertIn('reset.className = "allowance-reset"', self.code)
+
+    def test_the_machine_readable_instant_is_exact_utc_from_the_supplied_epoch(self) -> None:
+        self.assertIn("new Date(entry.resetsAt * 1000)", self.code)
+        self.assertIn('setAttribute("datetime", resetAt.toISOString())', self.code)
+
+    def test_the_datetime_attribute_is_never_localised_or_re_derived(self) -> None:
+        """The exact instant survives only if nothing reshapes it on the way out."""
+        call = self.code.split('setAttribute("datetime",', 1)[1].split(")", 1)[0]
+        self.assertIn("toISOString", call)
+        for wrong in ("toLocale", "slice", "substring", "replace", "split"):
+            self.assertNotIn(wrong, call, wrong)
+
+    def test_the_visible_label_is_absolute_local_with_calendar_context(self) -> None:
+        label = self.code.split("toLocaleString(", 1)[1].split("});", 1)[0]
+        for field in ("weekday", "month", "day", "hour", "minute"):
+            self.assertIn(field, label, field)
+
+    def test_a_seven_day_reset_cannot_read_as_a_time_later_today(self) -> None:
+        """Strip the date fields and a 7d reset renders as a bare clock time."""
+        label = self.code.split("toLocaleString(", 1)[1].split("});", 1)[0]
+        self.assertIn("month", label)
+        self.assertIn("day", label)
+
+    def test_an_absent_reset_renders_nothing_and_invents_no_time(self) -> None:
+        self.assertIn("entry.resetsAt !== null && entry.resetsAt !== undefined", self.code)
+        self.assertNotIn("else", self.code)
+
+    def test_no_countdown_timer_or_relative_phrasing_is_introduced(self) -> None:
+        for banned in ("setInterval", "setTimeout", "requestAnimationFrame",
+                       "Date.now", "performance.now", "ago", "remaining",
+                       "countdown", "fromNow", "elapsed"):
+            self.assertNotIn(banned, self.code, banned)
+
+    def test_the_label_states_only_that_this_is_a_reset(self) -> None:
+        self.assertIn('"resets "', self.code)
+
+    def test_a_reset_renders_independently_of_the_usage_value(self) -> None:
+        """An unavailable window still states when it resets; neither field masks the other."""
+        self.assertIn("value.textContent = known ? entry.used : entry.reason;", self.code)
+        reset_only = self.code.split("if (entry.resetsAt", 1)[1]
+        for coupled in ("known", "entry.used", "entry.reason"):
+            self.assertNotIn(coupled, reset_only, coupled)
+
+    def test_the_reset_stays_secondary_and_adds_no_new_structure(self) -> None:
+        for heavy in ('createElement("div")', 'createElement("section")',
+                      'createElement("h2")', 'createElement("button")',
+                      "badge", "card", "panel", "dashboard"):
+            self.assertNotIn(heavy, self.code, heavy)
+        self.assertIn(".allowance-reset", style_of(self.page))
+
+    def test_python_supplies_the_epoch_and_formats_no_reset_itself(self) -> None:
+        """One carry, and no second reset authority or formatter on the Python side."""
+        source = Path(web.__file__).read_text(encoding="utf-8")
+        self.assertEqual(source.count("resets_at"), 1)
+        self.assertEqual(source.count("resetsAt"), 1)
+        for formatter in ("strftime", "isoformat", "datetime", "toISOString"):
+            self.assertNotIn(formatter, source, formatter)
 
 
 if __name__ == "__main__":
