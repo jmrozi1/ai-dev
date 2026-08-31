@@ -787,6 +787,25 @@ class SurfacePurityTests(unittest.TestCase):
         self.assertEqual(uses, ["entry.resetsAt * 1000"])
         self.assertNotIn("new Date()", script)
 
+    def test_every_date_token_is_that_one_conversion_and_nothing_else(self) -> None:
+        """The pin above says the one construction is right; this says there is no other.
+
+        Pinning `new Date(` alone leaves every spelling that does not use it --
+        `Date()`, `Date.parse(Date())`, parenless `new Date` -- free to read the
+        current clock. So account for the word `Date` itself: every occurrence
+        in the production script must sit at the offset the one allowed
+        supplied-epoch conversion puts it at, and there must be exactly one.
+        """
+        script = script_of(self.page)
+        allowed = "new Date(entry.resetsAt * 1000)"
+        found = [m.start() for m in re.finditer("Date", script)]
+        accounted = [
+            m.start() + allowed.index("Date")
+            for m in re.finditer(re.escape(allowed), script)
+        ]
+        self.assertEqual(found, accounted)
+        self.assertEqual(len(accounted), 1)
+
     def _imported_modules(self):
         """What the module imports, read from the AST rather than from its prose."""
         names = set()
@@ -1155,6 +1174,26 @@ class AllowanceResetRenderingTests(unittest.TestCase):
                       "badge", "card", "panel", "dashboard"):
             self.assertNotIn(heavy, self.code, heavy)
         self.assertIn(".allowance-reset", style_of(self.page))
+
+    def test_the_strip_wraps_rather_than_overflowing_the_narrowest_column(self) -> None:
+        """Two absolute reset labels do not fit the declared minimum queue width.
+
+        Each reset is `white-space: nowrap` by design, so at `minmax(320px, ...)`
+        the strip cannot narrow its own content. Wrapping is the only fit left
+        that keeps the wording; a sideways scroll or an ellipsis would hide the
+        second window's reset instead of showing it.
+        """
+        style = style_of(self.page)
+        self.assertIn("minmax(320px", style)
+        reset = style.split(".allowance-reset", 1)[1].split("}", 1)[0]
+        self.assertIn("white-space: nowrap", reset)
+
+        strip = style.split(".allowance {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: flex", strip)
+        self.assertIn("flex-wrap: wrap", strip)
+        for hidden in ("overflow-x", "overflow:", "text-overflow", "ellipsis",
+                       "scroll", "nowrap", "max-width", "transform", "zoom"):
+            self.assertNotIn(hidden, strip, hidden)
 
     def test_python_supplies_the_epoch_and_formats_no_reset_itself(self) -> None:
         """One carry, and no second reset authority or formatter on the Python side."""
