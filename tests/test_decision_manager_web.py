@@ -1195,6 +1195,25 @@ class AllowanceResetRenderingTests(unittest.TestCase):
                        "scroll", "nowrap", "max-width", "transform", "zoom"):
             self.assertNotIn(hidden, strip, hidden)
 
+    def test_the_filters_wrap_rather_than_overflowing_the_narrowest_column(self) -> None:
+        """The sibling strip must fit the same declared minimum the allowance strip does.
+
+        A real browser at `minmax(320px, ...)` laid the unwrapped fieldset out at
+        its ~350px min-content width, so it overran the queue column and painted
+        into the detail pane beside it. Wrapping is the same fit the allowance
+        strip already uses; a sideways scroll, an ellipsis, or a transform would
+        hide a filter the human is meant to be able to reach.
+        """
+        style = style_of(self.page)
+        self.assertIn("minmax(320px", style)
+
+        strip = style.split(".filters {", 1)[1].split("}", 1)[0]
+        self.assertIn("display: flex", strip)
+        self.assertIn("flex-wrap: wrap", strip)
+        for hidden in ("overflow-x", "overflow:", "text-overflow", "ellipsis",
+                       "scroll", "nowrap", "max-width", "transform", "zoom"):
+            self.assertNotIn(hidden, strip, hidden)
+
     def test_python_supplies_the_epoch_and_formats_no_reset_itself(self) -> None:
         """One carry, and no second reset authority or formatter on the Python side."""
         source = Path(web.__file__).read_text(encoding="utf-8")
