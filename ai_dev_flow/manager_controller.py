@@ -45,9 +45,18 @@ from __future__ import annotations
 # queue is acquired are all `decision_manager_launch`'s decisions, and this module
 # calls them instead of keeping a second copy that could drift.
 #
-# Sixth, one run stays one run. The queue is acquired once against the run's own
-# instant and the occupancy is reduced once for the page that is rendered once.
-# Nothing refreshes, and a later instant is a later run.
+# Sixth, one run stays one run, and exactly one figure on it does not. The queue is
+# acquired once against the run's own instant, the allowance is projected once, and
+# a later instant is still a later run: nothing refreshes, nothing polls, and no
+# endpoint exists that could ask for a newer one. Live agent occupancy is the sole
+# exception, because it is the sole figure whose subject changes underneath the
+# page -- an agent that was running when the server was built may be stopped
+# before anyone loads it. So `serve` hands the accepted server this controller's
+# way of taking that reading rather than a taken one, and the reading happens while
+# a request is being answered. It is the same reduction, from the same store and
+# the same registry, through the same single production home; only the instant
+# moves, to the one instant at which the answer can be true for the person reading
+# it.
 #
 # `dispatch` is the seam checkpoint 45 left open. `launch` was always the honest
 # way to put a handle in this controller's registry, but the accepted production
@@ -69,7 +78,7 @@ from .claude_allowance_view import AllowanceViewError
 from .decision_manager import (
     ManagerRun,
     ManagerRunError,
-    make_manager_server,
+    make_live_manager_server,
     render_manager_page,
 )
 from .decision_manager_launch import (
@@ -296,17 +305,34 @@ class ManagerController:
         port: int = 0,
         template_path: Optional[Path] = None,
     ) -> http.server.HTTPServer:
-        """A loopback server holding this controller's page, rendered once.
+        """A loopback server that reduces this controller's occupancy per request.
+
+        Checkpoint 46 established this reading from the right halves and then froze
+        it into the page at construction. A frozen live count is wrong the moment
+        anything starts or stops, and in the supported dispatch it was wrong at
+        every instant a client could reach the page at all, because the session it
+        counted had already been stopped by then. So the reading is not passed here
+        as a value: what is passed is this controller's own way of taking it, and
+        the accepted server calls it while it answers.
+
+        It is still this controller's reduction, from this controller's exact store
+        and exact registry, through the one production home of
+        `reconcile_agent_slots`. Only the instant moves -- from when the server was
+        built to when a client asked -- and that instant is the only one at which
+        the answer can be true.
+
+        Everything else stays a projection of this one run. The queue and the
+        details are the caller's, taken once; a later instant is still a later run.
 
         No host is passed, for the reason the accepted launcher passes none: the
         accepted server owns the loopback rule and stays the only place that
         decides what this surface binds.
         """
-        return make_manager_server(
+        return make_live_manager_server(
             run,
             view,
             details,
-            agents=self.agent_count(alive=alive),
+            agents=lambda: self.agent_count(alive=alive),
             port=port,
             template_path=template_path,
         )

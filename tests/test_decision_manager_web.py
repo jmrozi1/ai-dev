@@ -13,7 +13,9 @@ from pathlib import Path
 from typing import Dict
 from html.parser import HTMLParser
 import ast
+import contextlib
 import http.client
+import io
 import json
 import re
 import threading
@@ -26,9 +28,11 @@ from ai_dev_flow.decision_manager_web import (
     RenderError,
     build_allowance,
     build_payload,
+    make_live_server,
     make_server,
     render_page,
     serialize_payload,
+    start_serving,
 )
 from ai_dev_flow.claude_allowance import (
     HEALTH_CALIBRATED,
@@ -383,6 +387,165 @@ class ServerSurfaceTests(unittest.TestCase):
         self.assertIsInstance(self.server.RequestHandlerClass.page, str)
         for attribute in ("queue", "view", "details", "store", "control_plane"):
             self.assertFalse(hasattr(self.server.RequestHandlerClass, attribute), attribute)
+
+
+class LiveServerSurfaceTests(unittest.TestCase):
+    """The one figure this server draws when it is asked, rather than when it was built."""
+
+    def setUp(self) -> None:
+        _, self.view, self.details = rendered([a_decision()], [an_agent()])
+        # Construction takes one; then one full slot, then an empty one that
+        # stays empty. Nothing here sleeps or waits: the occupancy simply changed
+        # between two requests, which is the only thing being tested.
+        self.readings = [
+            {"permitted": 6, "current": 1, "reason": None},
+            {"permitted": 6, "current": 1, "reason": None},
+            {"permitted": 6, "current": 0, "reason": None},
+        ]
+        self.taken = []
+
+        def reading():
+            value = self.readings[min(len(self.taken), len(self.readings) - 1)]
+            self.taken.append(value)
+            return value
+
+        self.server = make_live_server(
+            self.view, self.details, allowance=an_allowance(), agents=reading, port=0
+        )
+        self.addCleanup(self.server.server_close)
+        self.serving = start_serving(self.server)
+        self.addCleanup(self.serving.stop)
+        self.port = self.server.server_address[1]
+
+    def fetch(self) -> dict:
+        connection = http.client.HTTPConnection(LOOPBACK_HOST, self.port, timeout=5)
+        try:
+            connection.request("GET", PAGE_PATH)
+            body = connection.getresponse().read().decode("utf-8")
+        finally:
+            connection.close()
+        return payload_of(body)
+
+    def test_the_reading_source_is_consulted_once_per_request(self) -> None:
+        """Construction takes one, and then every client takes its own."""
+        self.assertEqual(len(self.taken), 1)
+        self.fetch()
+        self.assertEqual(len(self.taken), 2)
+        self.fetch()
+        self.assertEqual(len(self.taken), 3)
+
+    def test_a_later_client_is_told_the_later_truth(self) -> None:
+        """The accuracy property: what changed between two fetches reaches the second."""
+        self.assertEqual(self.fetch()["agents"], {"current": 1, "permitted": 6, "reason": None})
+        self.assertEqual(self.fetch()["agents"], {"current": 0, "permitted": 6, "reason": None})
+
+    def test_everything_but_the_reading_is_projected_once(self) -> None:
+        """A queue row and an allowance window describe state that outlives the render."""
+        first, second = self.fetch(), self.fetch()
+        for key in ("rows", "details", "allowance", "states", "defaultFilters"):
+            with self.subTest(key=key):
+                self.assertEqual(first[key], second[key])
+        self.assertNotEqual(first["agents"], second["agents"])
+
+    def test_it_holds_a_renderer_not_a_queue(self) -> None:
+        """Still no evidence on the handler: one document, and how to draw it."""
+        for attribute in ("queue", "view", "details", "store", "control_plane"):
+            self.assertFalse(hasattr(self.server.RequestHandlerClass, attribute), attribute)
+        self.assertTrue(callable(self.server.RequestHandlerClass.document))
+
+    def test_it_still_answers_exactly_one_path_and_refuses_every_mutation(self) -> None:
+        connection = http.client.HTTPConnection(LOOPBACK_HOST, self.port, timeout=5)
+        try:
+            connection.request("GET", "/queue.json")
+            self.assertEqual(connection.getresponse().status, 404)
+        finally:
+            connection.close()
+        for method in ("POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"):
+            with self.subTest(method=method):
+                connection = http.client.HTTPConnection(LOOPBACK_HOST, self.port, timeout=5)
+                try:
+                    connection.request(method, PAGE_PATH)
+                    self.assertEqual(connection.getresponse().status, 405)
+                finally:
+                    connection.close()
+
+    def test_a_non_loopback_bind_is_refused_here_too(self) -> None:
+        for host in ("0.0.0.0", "::", "10.0.0.5"):
+            with self.subTest(host=host):
+                with self.assertRaises(RenderError) as caught:
+                    make_live_server(
+                        self.view, self.details, allowance=an_allowance(),
+                        agents=lambda: self.readings[0], host=host, port=0,
+                    )
+                self.assertEqual(caught.exception.reason, web.REASON_NOT_LOOPBACK)
+
+    def test_an_unusable_reading_is_refused_at_construction(self) -> None:
+        """The same construction contract the frozen server already has."""
+        with self.assertRaises(RenderError) as caught:
+            make_live_server(
+                self.view, self.details, allowance=an_allowance(),
+                agents=lambda: {"permitted": 6, "current": None, "reason": None}, port=0,
+            )
+        self.assertEqual(caught.exception.reason, web.REASON_INVALID_AGENTS)
+
+    def test_a_failing_reading_source_is_never_answered_with_a_stale_number(self) -> None:
+        """A source that breaks must not be papered over with the last good count."""
+        broken = []
+
+        def reading():
+            if broken:
+                raise RuntimeError("the store could not be read")
+            broken.append(True)
+            return {"permitted": 6, "current": 1, "reason": None}
+
+        server = make_live_server(
+            self.view, self.details, allowance=an_allowance(), agents=reading, port=0
+        )
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+        port = server.server_address[1]
+
+        connection = http.client.HTTPConnection(LOOPBACK_HOST, port, timeout=5)
+        self.addCleanup(connection.close)
+        # The accepted socket loop reports the failure on stderr; that is its
+        # behavior, not this test's subject, so it is captured rather than printed.
+        with contextlib.redirect_stderr(io.StringIO()):
+            connection.request("GET", PAGE_PATH)
+            with self.assertRaises(Exception):
+                response = connection.getresponse()
+                if response.status == 200:
+                    raise AssertionError(
+                        "a stale page was served for a reading that could not be taken"
+                    )
+                raise ConnectionError(response.status)
+
+
+class ServingTests(unittest.TestCase):
+    """Starting and stopping the accepted socket loop, and nothing more."""
+
+    def setUp(self) -> None:
+        _, view, details = rendered([a_decision()])
+        self.server = make_server(view, details, allowance=an_allowance(), port=0)
+        self.addCleanup(self.server.server_close)
+
+    def test_it_answers_from_the_moment_it_is_started(self) -> None:
+        serving = start_serving(self.server)
+        self.addCleanup(serving.stop)
+        self.assertTrue(serving.answering())
+        connection = http.client.HTTPConnection(
+            LOOPBACK_HOST, self.server.server_address[1], timeout=5
+        )
+        try:
+            connection.request("GET", PAGE_PATH)
+            self.assertEqual(connection.getresponse().status, 200)
+        finally:
+            connection.close()
+
+    def test_stopping_ends_the_loop_and_does_not_return_before_it_has(self) -> None:
+        serving = start_serving(self.server)
+        serving.stop()
+        self.assertFalse(serving.answering())
 
 
 # --------------------------------------------------------------------------
@@ -832,7 +995,7 @@ class SurfacePurityTests(unittest.TestCase):
         self.assertEqual(
             self._imported_modules(),
             {"__future__", "base64", "hashlib", "http.server", "json", "re", "decimal",
-             "pathlib", "typing", ".decision_queue", ".claude_allowance",
+             "pathlib", "threading", "typing", ".decision_queue", ".claude_allowance",
              ".claude_allowance_view"},
         )
 

@@ -38,12 +38,25 @@ from __future__ import annotations
 # selected item from the page's own memory and moves on. Nothing is stored,
 # nothing is transmitted, no endpoint exists to receive it, and the page never
 # claims otherwise. Real response routing is a later seam.
+#
+# Sixth, a figure whose truth expires is drawn when it is asked for, not when the
+# server was built. Everything a run projects once -- the queue, the details, the
+# allowance windows -- stays projected once, because those describe state that
+# outlives the render. Live agent occupancy does not: it is true only of the
+# instant it was reduced, and a page holding a frozen copy of it answers "how many
+# agents are running" with a number about some earlier moment. `make_live_server`
+# is that one exception and nothing wider. It takes a reading source, calls it
+# while it answers a request, and renders the page around whatever that source
+# returns. This module still computes no occupancy, holds no store, and can check
+# nothing it draws -- it consumes the same reduced `current`/`permitted`/`reason`
+# it always did, one request later.
 
 import base64
 import hashlib
 import http.server
 import json
 import re
+import threading
 from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence, Tuple
@@ -65,11 +78,14 @@ __all__ = [
     "LOOPBACK_HOST",
     "PAGE_PATH",
     "RenderError",
+    "Serving",
     "build_allowance",
     "build_payload",
+    "make_live_server",
     "make_server",
     "render_page",
     "serialize_payload",
+    "start_serving",
 ]
 
 # The only interface this module will bind. Not a default a caller can widen:
@@ -485,11 +501,22 @@ class _PageHandler(http.server.BaseHTTPRequestHandler):
     server_version = "ai-dev-decision-queue"
     sys_version = ""
 
+    @classmethod
+    def document(cls) -> str:
+        """The one document this request is answered with.
+
+        The frozen server binds `page` and this returns it unchanged. A live
+        server overrides this with its own renderer instead, which is the only
+        way a subclass may differ: there is still exactly one document, one path,
+        and no endpoint that could answer anything else.
+        """
+        return cls.page
+
     def do_GET(self) -> None:  # noqa: N802 - required by BaseHTTPRequestHandler
         if self.path.split("?", 1)[0] != PAGE_PATH:
             self.send_error(404, "Not found")
             return
-        body = self.page.encode("utf-8")
+        body = self.document().encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
@@ -532,17 +559,123 @@ def make_server(
     queue, refreshes nothing, and cannot answer a question the page did not
     already have the answer to.
     """
+    _require_loopback(host)
+    page = render_page(
+        view, details, allowance=allowance, agents=agents, template_path=template_path
+    )
+    handler = type("_BoundPageHandler", (_PageHandler,), {"page": page})
+    return http.server.HTTPServer((host, port), handler)
+
+
+def make_live_server(
+    view: QueueView,
+    details: Mapping[str, SelectedDetail],
+    *,
+    allowance: Sequence[AllowanceWindowView],
+    agents: Any,
+    host: str = LOOPBACK_HOST,
+    port: int = 0,
+    template_path: Optional[Path] = None,
+) -> http.server.HTTPServer:
+    """A loopback server that draws this view's page once per request.
+
+    Identical to `make_server` in every way but one: `agents` is a reading source
+    rather than a reading. It is called with no arguments each time a client asks,
+    and the page is rendered around whatever it returns, so the occupancy a client
+    reads is the occupancy at the instant that client asked. Everything else on the
+    page is this run's and is projected exactly once by the caller, because a queue
+    row and an allowance window describe state that outlives the render while a
+    live agent count does not.
+
+    The reading source belongs to the caller and so does every failure it can have.
+    This module states no policy for one: if the source raises, the request is not
+    answered, which is the honest outcome. Inventing a refusal vocabulary here
+    would be a second rule about evidence this module is deliberately unable to see,
+    and answering with the last good number would be exactly the frozen count this
+    server exists to stop serving.
+
+    One render happens here, at construction, and is discarded. A malformed
+    template, an unknown detail, or an unusable reading is refused when the server
+    is built rather than at the first request, so this stays the same construction
+    contract `make_server` already has.
+    """
+    _require_loopback(host)
+
+    def document() -> str:
+        return render_page(
+            view,
+            details,
+            allowance=allowance,
+            agents=agents(),
+            template_path=template_path,
+        )
+
+    document()
+    handler = type(
+        "_LivePageHandler", (_PageHandler,), {"document": staticmethod(document)}
+    )
+    return http.server.HTTPServer((host, port), handler)
+
+
+def _require_loopback(host: str) -> None:
+    """The one place this module decides what it will bind."""
     if host not in ("127.0.0.1", "::1", "localhost"):
         raise RenderError(
             REASON_NOT_LOOPBACK,
             "this surface binds loopback only; '{0}' would answer off-host".format(host),
         )
 
-    page = render_page(
-        view, details, allowance=allowance, agents=agents, template_path=template_path
-    )
-    handler = type("_BoundPageHandler", (_PageHandler,), {"page": page})
-    return http.server.HTTPServer((host, port), handler)
+
+class Serving:
+    """One already-bound server answering in the background, and how to end it.
+
+    This is not a second service. It is the same single server the caller already
+    constructed, answering from the moment it is started instead of only after
+    whatever the calling process does next has finished. That distinction is the
+    whole point: a manager page that becomes reachable only once the work it
+    describes is over can never report that work truthfully.
+
+    Nothing is polled, scheduled, timed, or retried here. `serve_forever` blocks on
+    the accepted socket loop and ends only when `shutdown` is called, which is the
+    stdlib's own contract for running this server alongside other work.
+    """
+
+    def __init__(self, server: http.server.HTTPServer, thread: threading.Thread) -> None:
+        self._server = server
+        self._thread = thread
+
+    def answering(self) -> bool:
+        """Whether this surface is actually able to answer a client right now."""
+        return self._thread.is_alive()
+
+    def wait(self) -> None:  # pragma: no cover - blocking
+        """Block until this surface stops answering."""
+        self._thread.join()
+
+    def stop(self) -> None:
+        """Stop answering, and do not return until the loop has really ended."""
+        self._server.shutdown()
+        self._thread.join()
+
+
+def start_serving(server: http.server.HTTPServer) -> Serving:
+    """Begin answering on an already-bound loopback server, and return the handle.
+
+    The socket is already listening when the server object exists, so a client can
+    connect before this returns; what this adds is the loop that answers. It is
+    started before the caller does anything else so that the page is reachable
+    while that work is still in progress rather than only after it.
+    """
+    started = threading.Event()
+
+    def answer() -> None:
+        started.set()
+        server.serve_forever()
+
+    thread = threading.Thread(target=answer, name="ai-dev-manager-surface")
+    thread.start()
+    started.wait()
+    return Serving(server, thread)
 
 
 def serve_forever(server: http.server.HTTPServer) -> None:  # pragma: no cover - blocking

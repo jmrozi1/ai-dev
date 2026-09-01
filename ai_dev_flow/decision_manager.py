@@ -61,7 +61,12 @@ from typing import Mapping, Optional, Tuple
 from .claude_allowance import WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY
 from .claude_allowance_store import AllowanceStore
 from .claude_allowance_view import AllowanceWindowView, project_window
-from .decision_manager_web import LOOPBACK_HOST, make_server, render_page
+from .decision_manager_web import (
+    LOOPBACK_HOST,
+    make_live_server,
+    make_server,
+    render_page,
+)
 from .decision_queue import QueueView, SelectedDetail
 
 __all__ = [
@@ -69,6 +74,7 @@ __all__ = [
     "ManagerRun",
     "ManagerRunError",
     "REASON_INVALID_RUN",
+    "make_live_manager_server",
     "make_manager_server",
     "project_allowance",
     "render_manager_page",
@@ -235,6 +241,43 @@ def make_manager_server(
     spelling of the loopback rule would be the worse trade.
     """
     return make_server(
+        view,
+        details,
+        allowance=project_allowance(run),
+        agents=agents,
+        host=host,
+        port=port,
+        template_path=template_path,
+    )
+
+
+def make_live_manager_server(
+    run: ManagerRun,
+    view: QueueView,
+    details: Mapping[str, SelectedDetail],
+    *,
+    agents,
+    host: str = LOOPBACK_HOST,
+    port: int = 0,
+    template_path: Optional[Path] = None,
+) -> http.server.HTTPServer:
+    """One manager run's page, with its agent count drawn when a client asks.
+
+    The run is still projected exactly once, here: this run's allowance windows,
+    this run's queue, this run's details. `agents` is the one value that is not a
+    projection of this run at all but a reading of what is running right now, so it
+    is the one value taken as a source and consulted per request. That is the whole
+    difference from `make_manager_server`, and it exists because those two kinds of
+    fact expire differently -- an allowance window projected at this run's instant
+    stays true of that instant, while a count of running agents is only ever true
+    of the instant it was taken.
+
+    Which reading source is correct is emphatically not decided here. This module
+    holds no store, no registry, and no ownership evidence; it passes the caller's
+    source through to the accepted server unexamined, exactly as it passes the
+    caller's finished reading through today.
+    """
+    return make_live_server(
         view,
         details,
         allowance=project_allowance(run),

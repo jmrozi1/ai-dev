@@ -27,22 +27,35 @@ from __future__ import annotations
 # a later process to claim. This process counts what it started; a binding it did
 # not start stays unprovable and the page prints that reason.
 #
-# Third, the live window is a real window and it is drawn from inside. A dispatched
-# session is a slot occupant from the moment it binds until the moment it is
-# stopped, and the accepted invocation offers exactly that instant through
-# `while_running`. The page is rendered there, so the reading it carries was
-# established while a controller-owned agent genuinely occupied a slot.
+# Third, the page is reachable across the live window, not merely rendered inside
+# it. Checkpoint 46 rendered the page from within `while_running`, which really did
+# establish the count from a genuinely running session -- and then stopped that
+# session before the server began answering, so the only number anyone could ever
+# fetch described a slot that was already empty. The order here is the whole fix:
+# the surface is bound and answering first, and the dispatch happens behind it. A
+# dispatched session occupies a slot from the moment it binds until the moment it
+# is stopped, and for that entire window a real client can ask this page what is
+# running and be told the truth.
 #
-# Fourth, one run stays one run. The queue is acquired once, the occupancy is
-# reduced for one page, and the page is rendered once and then served unchanged.
-# There is no timer, no watcher, no refresh, and no second instant: the figure a
-# viewer sees is the one this run established at the instant of its dispatch, on
-# exactly the terms the accepted server already states for every other figure on
-# that page. A later instant is a later run.
+# Fourth, one run stays one run, and one figure on it is not a projection of this
+# run at all. The queue is acquired once and the allowance is projected once,
+# because both describe state that outlives the render; there is no timer, no
+# watcher, no refresh, and no endpoint that could ask for newer ones. Live
+# occupancy is the single exception, and it has to be: it is true only of the
+# instant it was reduced, and the whole subject of this rail is that it was being
+# read at an instant nobody could observe. So it is reduced while a request is
+# being answered, from the same controller, the same store, and the same registry.
 #
-# Fifth, this adds no daemon, no service, no IPC, no polling loop, and no
-# scheduler, priority model, fairness policy, or autoscaler. It performs one
-# dispatch, draws one page, and serves it until the human stops it.
+# Fifth, this adds no second service, no IPC, no polling loop, and no scheduler,
+# priority model, fairness policy, or autoscaler. There is exactly one server, the
+# accepted one, bound once and answering the one path it has always answered. What
+# changed is when it starts answering: `start_serving` runs the accepted socket
+# loop so that it spans this process's dispatch instead of beginning after it. That
+# loop blocks on the socket and ends when it is shut down -- it asks nothing, polls
+# nothing, schedules nothing, and knows nothing about agents, ownership, or
+# occupancy. A page that only becomes reachable once the work it describes is over
+# cannot describe that work, which is the defect this closes and not a trade
+# available to make differently.
 #
 # Sixth, it decides nothing a gate already decides. Both gates, the authorization
 # predicate, the reservation, the ceiling, the refusal reasons, the stop, and every
@@ -83,7 +96,7 @@ from .decision_manager_launch import (
     resolve_run,
     stated_run_inputs,
 )
-from .decision_manager_web import serve_forever
+from .decision_manager_web import Serving, start_serving
 from .manager_controller import ManagerController
 from .orchestrator_invocation import InvocationOutcome, InvocationRefused
 from .orchestrator_trigger import (
@@ -112,6 +125,7 @@ __all__ = [
     "DispatchInputs",
     "DispatchedRun",
     "EXPECTED_SKILL_FLAG",
+    "LiveSurface",
     "MAX_BUDGET_FLAG",
     "MAX_TURNS_FLAG",
     "ORCHESTRATOR_RAIL_FLAG",
@@ -119,13 +133,15 @@ __all__ = [
     "PROMPT_FILE_FLAG",
     "REASON_INVALID_RUNTIME",
     "REASON_RUNTIME_UNSTATED",
+    "REASON_SURFACE_UNREACHABLE",
     "REASON_TICKET_UNSTATED",
     "TICKET_ID_FLAG",
     "TICKET_PROVIDER_FLAG",
     "TICKET_REPOSITORY_FLAG",
-    "dispatch_and_serve",
+    "dispatch_behind",
     "main",
     "observe_scope",
+    "open_surface",
     "prove_workspace",
     "stated_dispatch_inputs",
 ]
@@ -136,6 +152,12 @@ __all__ = [
 REASON_RUNTIME_UNSTATED = "runtime-policy-unstated"
 REASON_INVALID_RUNTIME = "invalid-runtime-policy"
 REASON_TICKET_UNSTATED = "ticket-reference-unstated"
+
+# A dispatch behind a page nobody can reach is exactly the defect this module was
+# reopened to close, so it is refused rather than performed and reported on. This
+# is a structural precondition, not a runtime condition a supported run can meet
+# by accident: `open_surface` returns a surface that is already answering.
+REASON_SURFACE_UNREACHABLE = "surface-unreachable"
 
 # The rail whose standing authorization a dispatch is decided against. Stated,
 # because which rail may spend a session is a human's durable decision and not
@@ -186,15 +208,33 @@ class DispatchInputs:
 
 
 @dataclass(frozen=True)
-class DispatchedRun:
-    """What one dispatch-and-draw run produced, in identity terms only.
+class LiveSurface:
+    """The manager page, bound and already answering, before anything runs behind it.
 
-    `reading` is the occupancy this run established while its own session was
-    still running, which is the same reading the served page carries.
+    Both halves are here because both are needed and neither is optional. `server`
+    is the accepted loopback server, which is listening from the moment it is
+    constructed; `serving` is the accepted socket loop answering on it, which is
+    what turns a listening socket into a page a person can actually read. A
+    dispatch performed behind only the first of those is checkpoint 46's defect.
+    """
+
+    server: http.server.HTTPServer
+    serving: Serving
+
+
+@dataclass(frozen=True)
+class DispatchedRun:
+    """What one dispatch performed behind a live surface produced.
+
+    `reading` is this process's own record of the occupancy while its session was
+    running. It is not what the page serves -- the page reduces its own reading
+    when a client asks -- and it is deliberately kept separate: one is what this
+    run observed at the accepted observation point, the other is what a reader was
+    told at the instant they read. They agree while the session runs, and the
+    second is the one that has to keep being true afterwards.
     """
 
     outcome: InvocationOutcome
-    server: http.server.HTTPServer
     reading: Mapping
 
 
@@ -274,13 +314,50 @@ def observe_scope(
 
 
 # --------------------------------------------------------------------------
-# The composition: one controller, one dispatch, one page drawn while it runs
+# The composition: one controller, one page already answering, one dispatch behind it
 # --------------------------------------------------------------------------
 
 
-def dispatch_and_serve(
+def open_surface(
     controller: ManagerController,
     run: ManagerRun,
+    *,
+    alive: Optional[Callable] = None,
+    port: int = 0,
+    template_path: Optional[Path] = None,
+) -> LiveSurface:
+    """This run's page, answering, before anything is dispatched behind it.
+
+    The ordering is the entire product change on this rail, so it is a function
+    with a name rather than three statements inside a larger one: the surface opens
+    first, and everything after it happens while a reader can already look.
+
+    What is taken once is taken here. The queue and its details are this run's,
+    acquired through this controller's own registry so that a row and the aggregate
+    rest on one piece of ownership evidence rather than two that could disagree
+    about who owns what. They are this run's snapshot of durable state, taken at
+    this run's instant, exactly as the allowance windows beside them are: acquiring
+    the queue again per request would fetch the coordination remote per request,
+    which is the polling loop this surface is not permitted to become.
+
+    What is deliberately not taken here is the occupancy. `controller.serve` hands
+    the accepted server this controller's way of reducing it, and that reduction
+    happens while a request is being answered, because it is the one figure on the
+    page whose subject can end between the render and the reading.
+
+    Nothing is dispatched from here and nothing may be. This function's whole
+    responsibility is that the page exists and answers before a session does.
+    """
+    view, details = controller.queue(run, alive=alive)
+    server = controller.serve(
+        run, view, details, alive=alive, port=port, template_path=template_path
+    )
+    return LiveSurface(server=server, serving=start_serving(server))
+
+
+def dispatch_behind(
+    controller: ManagerController,
+    surface: LiveSurface,
     *,
     snapshot: ScopeSnapshot,
     proposal: Optional[WakeProposal],
@@ -288,41 +365,52 @@ def dispatch_and_serve(
     observation: ControlPlaneObservation,
     inputs: DispatchInputs,
     alive: Optional[Callable] = None,
-    port: int = 0,
-    template_path: Optional[Path] = None,
     launch_kwargs: Optional[Mapping] = None,
     stop_kwargs: Optional[Mapping] = None,
     ledger: Any = None,
 ) -> DispatchedRun:
-    """One gated dispatch, with this run's page drawn while its session runs.
+    """One gated dispatch, performed while the surface above it already answers.
 
-    The whole seam is the order. The dispatch goes through the controller, so it is
-    admitted against that controller's exact store, exact registry, and reconciled
-    occupancy. The page is drawn inside `while_running`, which is the one instant at
-    which the session this process just started is bound, owned, and occupying a
-    slot -- so the aggregate the page carries is an established live count rather
-    than a count of nothing.
+    The dispatch goes through the controller, so it is admitted against that
+    controller's exact store, exact registry, and reconciled occupancy -- unchanged
+    from checkpoint 46, which got that part right. What changed is that the page
+    counting this session is reachable for the whole time the session holds its
+    slot, so the count is not merely established but observable while it is true.
+
+    The surface is required, and required to be answering, because a dispatch
+    behind an unreachable page is precisely the shape that made checkpoint 46's
+    count false at every instant anyone could fetch it. Checking it here makes that
+    ordering a precondition rather than a convention a later edit could quietly
+    reverse.
 
     Nothing about the dispatch's lifecycle changes. The accepted invocation still
     stops the session and terminalizes its binding as soon as the observation
-    returns; this does not hold a session open to keep a page warm, because an idle
-    worker kept alive for a viewer is allowance spent on nothing.
+    returns; no session is held open to keep a page warm, because an idle worker
+    kept alive for a viewer is allowance spent on nothing -- and it is not needed,
+    since the page reduces a fresh reading for whoever asks next and will report
+    the empty slot as honestly as it reported the full one.
+
+    `while_running` is still used and still means what it meant: the one instant at
+    which this process can record what it itself had running. That record is this
+    run's own, printed as run information; it is not the number the page serves.
 
     `ledger` is passed straight through and defaults to nothing, exactly as the
     accepted invocation defines it. Allowance accounting for this dispatch is a
     separate decision and is deliberately not made here.
     """
-    drawn: dict = {}
-
-    def draw(launched) -> None:
-        # Inside the live window. The queue and the aggregate are read through the
-        # same controller and therefore rest on the same ownership evidence, so a
-        # row drawn Running and a count that includes it cannot disagree.
-        view, details = controller.queue(run, alive=alive)
-        drawn["reading"] = controller.agent_count(alive=alive)
-        drawn["server"] = controller.serve(
-            run, view, details, alive=alive, port=port, template_path=template_path
+    if not surface.serving.answering():
+        raise DispatchError(
+            REASON_SURFACE_UNREACHABLE,
+            "the manager surface is not answering yet; a dispatch performed behind "
+            "a page no client can reach can only ever be counted after it ended",
         )
+
+    observed: dict = {}
+
+    def observe(launched) -> None:
+        # Inside the live window: the process started, the handle is in this
+        # controller's own registry, and the binding is nonterminal.
+        observed["reading"] = controller.agent_count(alive=alive)
 
     outcome = controller.dispatch(
         snapshot,
@@ -337,11 +425,9 @@ def dispatch_and_serve(
         launch_kwargs=launch_kwargs,
         stop_kwargs=stop_kwargs,
         ledger=ledger,
-        while_running=draw,
+        while_running=observe,
     )
-    return DispatchedRun(
-        outcome=outcome, server=drawn["server"], reading=drawn["reading"]
-    )
+    return DispatchedRun(outcome=outcome, reading=observed["reading"])
 
 
 # --------------------------------------------------------------------------
@@ -515,13 +601,19 @@ def _describe(reading: Mapping) -> str:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    """One stated run, one gated dispatch, and the page it drew while running.
+    """One stated run, one page already answering, and one gated dispatch behind it.
 
     The order is the whole design. Every input is stated before anything is read;
     exactly one controller is constructed and owns the only store and the only
-    registry below it; the durable scope is read once; and the dispatch and the page
-    are the same controller's, so the count beside the queue is a count of the
-    session this process itself just started.
+    registry below it; the durable scope is read once; the page is bound and starts
+    answering; and only then is a session dispatched through that same controller.
+    So the count beside the queue is a count of the session this process itself
+    started, and it is readable for the whole time that session holds its slot.
+
+    It keeps being readable afterwards, and keeps being true. The page reduces its
+    own reading when a client asks, so once the dispatch has stopped its session
+    the next fetch reports the empty slot rather than continuing to assert the full
+    one. Nothing is held open to keep a number alive.
 
     A run with nothing material awake still serves. That is not a degraded mode: the
     scope was read and had no material wake in it, and the aggregate then reports an
@@ -531,7 +623,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     this entry point must never produce.
 
     What is printed is bounded run information -- paths, the instant, counts, the
-    reading actually drawn, and the address actually bound. No decision body,
+    reading this process observed, and the address actually bound. No decision body,
     evidence, prompt, binding, or session identity is printed.
     """
     stated = list(sys.argv[1:] if argv is None else argv)
@@ -569,35 +661,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     print("control-plane head: {0}".format(snapshot.head))
 
+    # Before the dispatch, on purpose. Everything below this line happens while a
+    # real client can already fetch this page and be told what is running.
     try:
-        dispatched = dispatch_and_serve(
-            controller,
-            run,
-            snapshot=snapshot,
-            proposal=proposal,
-            packet=packet,
-            observation=observation,
-            inputs=inputs,
-        )
-        server = dispatched.server
-        print("dispatched session role: {0}".format(dispatched.outcome.role))
-        print("live occupancy: {0}".format(_describe(dispatched.reading)))
-    except InvocationRefused as exc:
-        # A gate said no. That is a fact about this head, not a failure of the
-        # manager, so the page is still served -- and it reports what this
-        # controller can actually prove, which is that it started nothing.
-        print("no dispatch this run: {0}".format(exc))
-        try:
-            view, details = controller.queue(run)
-            reading = controller.agent_count()
-            print("live occupancy: {0}".format(_describe(reading)))
-            server = controller.serve(run, view, details)
-        except QueueSourceError as refusal:
-            print("manager-dispatch: {0}".format(refusal), file=sys.stderr)
-            return 2
-        except (AllowanceViewError, ManagerRunError) as refusal:
-            print("manager-dispatch: {0}".format(refusal), file=sys.stderr)
-            return 3
+        surface = open_surface(controller, run)
     except QueueSourceError as exc:
         print("manager-dispatch: {0}".format(exc), file=sys.stderr)
         return 2
@@ -605,12 +672,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("manager-dispatch: {0}".format(exc), file=sys.stderr)
         return 3
 
-    host, port = server.server_address[:2]
+    host, port = surface.server.server_address[:2]
     print("manager: http://{0}:{1}/".format(host, port))
     try:
-        serve_forever(server)
+        try:
+            dispatched = dispatch_behind(
+                controller,
+                surface,
+                snapshot=snapshot,
+                proposal=proposal,
+                packet=packet,
+                observation=observation,
+                inputs=inputs,
+            )
+            print("dispatched session role: {0}".format(dispatched.outcome.role))
+            print("live occupancy: {0}".format(_describe(dispatched.reading)))
+        except InvocationRefused as exc:
+            # A gate said no. That is a fact about this head, not a failure of the
+            # manager, so the page keeps answering -- and it reports what this
+            # controller can actually prove, which is that it started nothing.
+            print("no dispatch this run: {0}".format(exc))
+            print("live occupancy: {0}".format(_describe(controller.agent_count())))
+        surface.serving.wait()
     finally:
-        server.server_close()
+        surface.serving.stop()
+        surface.server.server_close()
     return 0
 
 

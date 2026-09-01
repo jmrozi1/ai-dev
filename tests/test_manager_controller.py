@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import http.client
 import io
 import json
 import unittest
@@ -15,6 +16,7 @@ from ai_dev_flow import manager_controller as controller_module
 from ai_dev_flow.claude_allowance_store import AllowanceStore
 from ai_dev_flow.decision_manager import ManagerRun
 from ai_dev_flow.decision_manager_launch import QueueSourceContext
+from ai_dev_flow.decision_manager_web import LOOPBACK_HOST, PAGE_PATH, start_serving
 from ai_dev_flow.manager_controller import (
     REASON_OWNERSHIP_UNPROVABLE,
     ManagerController,
@@ -47,6 +49,16 @@ def payload_in(page: str) -> dict:
     opening = page.index(PAYLOAD_OPEN) + len(PAYLOAD_OPEN)
     closing = page.index(PAYLOAD_CLOSE, opening)
     return json.loads(page[opening:closing])
+
+
+def fetched(port: int) -> str:
+    """One real HTTP request, from a real client, over a real loopback socket."""
+    connection = http.client.HTTPConnection(LOOPBACK_HOST, port, timeout=5)
+    try:
+        connection.request("GET", PAGE_PATH)
+        return connection.getresponse().read().decode("utf-8")
+    finally:
+        connection.close()
 
 
 # --------------------------------------------------------------------------
@@ -156,6 +168,49 @@ class ControllerLaunchOwnershipTests(LifecycleTestBase):
         self.assertEqual(controller.owned_session_ids(), ())
         self.assertEqual(
             controller.agent_count(alive=ALWAYS_ALIVE),
+            {"permitted": 6, "current": 0, "reason": None},
+        )
+
+    def test_a_real_client_reads_a_live_count_and_then_reads_the_truth_after_it(self) -> None:
+        """The serve-time property, both halves, through one server and one client.
+
+        While the session this controller started is genuinely running, a real
+        HTTP client is told `1 / 6` -- and the durable binding really is nonterminal
+        at that instant. After the accepted lifecycle stops it, the very same server
+        tells the next client the slot is free. Nothing is slept on and nothing is
+        held open: the occupancy simply changed, and the page followed it.
+        """
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        view, details = a_queue()
+
+        server = controller.serve(self._run(), view, details, alive=ALWAYS_ALIVE)
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+        port = server.server_address[1]
+
+        live = payload_in(fetched(port))["agents"]
+        self.assertEqual(live, {"permitted": 6, "current": 1, "reason": None})
+        self.assertFalse(self.store.read(outcome.binding.session_id).is_terminal)
+        self.assertEqual(controller.agent_count(alive=ALWAYS_ALIVE)["current"], 1)
+
+        probes = []
+
+        def alive(pgid):
+            probes.append(pgid)
+            return len(probes) == 1
+
+        controller.stop(
+            outcome.binding,
+            stop=lambda handle: {"process_group_gone": True, "graceful": True,
+                                 "exit_code": 0},
+            alive=alive,
+        )
+
+        self.assertTrue(self.store.read(outcome.binding.session_id).is_terminal)
+        self.assertEqual(
+            payload_in(fetched(port))["agents"],
             {"permitted": 6, "current": 0, "reason": None},
         )
 
@@ -289,7 +344,7 @@ class ControllerEntryPointTests(SourcedLaunchTestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(
-            payload_in(served[0].RequestHandlerClass.page)["agents"],
+            payload_in(served[0].RequestHandlerClass.document())["agents"],
             {"permitted": 6, "current": 0, "reason": None},
         )
         self.assertIn("live occupancy: 0 / 6", out)
@@ -302,7 +357,7 @@ class ControllerEntryPointTests(SourcedLaunchTestCase):
 
         self.assertEqual(code, 0)
         self.assertEqual(
-            payload_in(served[0].RequestHandlerClass.page)["agents"],
+            payload_in(served[0].RequestHandlerClass.document())["agents"],
             {"permitted": 6, "current": None, "reason": REASON_OWNERSHIP_UNPROVABLE},
         )
         self.assertIn("not established ({0})".format(REASON_OWNERSHIP_UNPROVABLE), out)
