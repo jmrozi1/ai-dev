@@ -131,6 +131,7 @@ class WorkerTestBase(unittest.TestCase):
             "reserved_at": "2026-08-26T12:00:00Z",
         }
         arguments.update(overrides)
+        arguments.setdefault("ceiling", 6)
         return reserve_binding(self.store, **arguments)
 
     def _request_kwargs(self, **overrides):

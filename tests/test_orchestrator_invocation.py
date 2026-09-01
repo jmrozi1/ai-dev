@@ -13,6 +13,7 @@ import unittest
 import uuid
 from unittest import mock
 
+from ai_dev_flow.authorization import AgentSlots
 from ai_dev_flow import orchestrator_invocation as invocation
 from ai_dev_flow import orchestrator_trigger as trigger
 from ai_dev_flow import session_lifecycle, workspaces
@@ -397,6 +398,7 @@ class InvocationTestBase(unittest.TestCase):
                 "stop": stop,
             },
             "stop_kwargs": {"stop": stop, "alive": alive},
+            "slots": AgentSlots(ceiling=6),
         }
         arguments.update(overrides)
         return invocation.invoke_orchestrator(snapshot, proposal, packet, observation, **arguments)
@@ -791,6 +793,7 @@ class ContinuationRefusalTests(InvocationTestBase):
             session_id=session_id,
             launched_at_head=HEAD,
             reserved_at=self.clock,
+            ceiling=6,
         )
         return reserved
 
@@ -1489,6 +1492,7 @@ class LedgerSeamPurityTests(LedgerWiringTestBase):
         "reference",
         "request_kwargs",
         "package_root",
+        "slots",
         "bindings",
         "in_flight_session_ids",
         "markers",

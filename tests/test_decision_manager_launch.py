@@ -1159,6 +1159,7 @@ class NoAddedAuthorityTests(LaunchTestCase):
             {
                 "argparse", "http.server", "re", "sys", "time",
                 "__future__", "dataclasses", "datetime", "pathlib", "typing",
+                ".authorization",
                 ".claude_allowance_store", ".claude_allowance_view",
                 ".decision_manager", ".decision_manager_web", ".decision_queue",
                 ".queue_source", ".repository", ".session_binding",

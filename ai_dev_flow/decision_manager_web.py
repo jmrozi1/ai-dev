@@ -232,11 +232,73 @@ def build_allowance(allowance: Sequence[AllowanceWindowView]) -> "list":
 # --------------------------------------------------------------------------
 
 
+REASON_INVALID_AGENTS = "invalid-agent-count"
+
+# Exactly the fields one agent-count reading carries. The reading arrives already
+# reduced, because deciding it needs the authorization predicate and the
+# controller's own ownership, and this surface reaches neither.
+AGENT_FIELDS = ("current", "permitted")
+
+
+def build_agents(reading) -> "dict":
+    """The manager-wide agent count, shown only when it was actually established.
+
+    `None` means no reading was supplied and the page draws nothing at all, which
+    is the same absence an unsupplied allowance window uses.
+
+    A `current` of `None` prints its reason instead of a number, for exactly the
+    reason an unavailable allowance window does: a confident figure would be read
+    as "this many are running" when the truth is "the controller cannot prove how
+    many are". Nothing here counts, reconciles, or derives one -- the admission
+    predicate already decided all of it, and this module cannot reach the bindings
+    or the ownership it would take to check.
+    """
+    if reading is None:
+        return None
+    if not isinstance(reading, Mapping):
+        raise RenderError(
+            REASON_INVALID_AGENTS,
+            "the agent count consumes a reduced reading, got {0!r}".format(
+                type(reading).__name__
+            ),
+        )
+    unknown = [key for key in reading if key not in AGENT_FIELDS + ("reason",)]
+    if unknown:
+        raise RenderError(
+            REASON_INVALID_AGENTS,
+            "the agent count published {0}, which this page does not draw".format(
+                ", ".join(sorted(unknown))
+            ),
+        )
+    permitted = reading.get("permitted")
+    if type(permitted) is not int or permitted < 1:
+        raise RenderError(
+            REASON_INVALID_AGENTS,
+            "permitted must be a positive whole number of agents, got {0!r}".format(permitted),
+        )
+    current = reading.get("current")
+    if current is not None and (type(current) is not int or current < 0):
+        raise RenderError(
+            REASON_INVALID_AGENTS,
+            "current must be a non-negative whole number or null, got {0!r}".format(current),
+        )
+    reason = reading.get("reason")
+    if current is None and (type(reason) is not str or not reason.strip()):
+        # A missing count with no reason is the confident blank this surface
+        # refuses everywhere else.
+        raise RenderError(
+            REASON_INVALID_AGENTS,
+            "an unestablished agent count must carry its reason, got {0!r}".format(reason),
+        )
+    return {"permitted": permitted, "current": current, "reason": reason}
+
+
 def build_payload(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
     *,
     allowance: Sequence[AllowanceWindowView],
+    agents=None,
 ) -> "dict":
     """Reduce accepted projection objects to the exact data the page draws.
 
@@ -285,6 +347,8 @@ def build_payload(
         "states": list(QUEUE_STATES),
         "defaultFilters": [STATE_WAITING],
         "allowance": build_allowance(allowance),
+        # Absent unless a caller supplied a reading, exactly like the roster.
+        "agents": build_agents(agents),
         "rows": [
             {
                 "itemId": row.item_id,
@@ -388,6 +452,7 @@ def render_page(
     details: Mapping[str, SelectedDetail],
     *,
     allowance: Sequence[AllowanceWindowView],
+    agents=None,
     template_path: Optional[Path] = None,
 ) -> str:
     """The complete page: template, its policy, and this view's data."""
@@ -399,7 +464,9 @@ def render_page(
                 "the template must contain exactly one {0}".format(placeholder),
             )
 
-    payload = serialize_payload(build_payload(view, details, allowance=allowance))
+    payload = serialize_payload(
+        build_payload(view, details, allowance=allowance, agents=agents)
+    )
     # The policy is computed before the payload lands, so hostile fixture text can
     # never change which code the policy admits.
     page = template.replace(CSP_PLACEHOLDER, _policy(template))
@@ -454,6 +521,7 @@ def make_server(
     details: Mapping[str, SelectedDetail],
     *,
     allowance: Sequence[AllowanceWindowView],
+    agents=None,
     host: str = LOOPBACK_HOST,
     port: int = 0,
     template_path: Optional[Path] = None,
@@ -470,7 +538,9 @@ def make_server(
             "this surface binds loopback only; '{0}' would answer off-host".format(host),
         )
 
-    page = render_page(view, details, allowance=allowance, template_path=template_path)
+    page = render_page(
+        view, details, allowance=allowance, agents=agents, template_path=template_path
+    )
     handler = type("_BoundPageHandler", (_PageHandler,), {"page": page})
     return http.server.HTTPServer((host, port), handler)
 

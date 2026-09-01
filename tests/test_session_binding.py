@@ -102,6 +102,7 @@ class SessionBindingTestBase(unittest.TestCase):
             "reserved_at": "2026-08-26T12:00:00Z",
         }
         arguments.update(overrides)
+        arguments.setdefault("ceiling", 6)
         return reserve_binding(self.store, **arguments)  # type: ignore[arg-type]
 
     def _attach(self, session_id: str = SESSION_ONE, **overrides: object):
@@ -609,6 +610,64 @@ class SessionBindingTests(SessionBindingTestBase):
         payload = record.to_dict()
         for forbidden in ("transcript", "transcriptPath", "tab", "terminal", "cwd", "focus"):
             self.assertNotIn(forbidden, payload)
+
+
+class ReservationCeilingTests(SessionBindingTestBase):
+    """The commit-point half of the ceiling: a reservation cannot slip past it."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.reference = self._reference()
+        self.workspace, self.worktree_id = self._add_workspace("workspace-55", self.reference)
+
+    def _fill(self, count: int) -> None:
+        for index in range(count):
+            self._reserve(
+                session_id="0000000{0}-0000-4000-8000-000000000000".format(index),
+                rail="issue-55-filler-{0}".format(index),
+                iteration=RailIteration(rail="issue-55-filler-{0}".format(index), blob=BLOB_A),
+                ceiling=99,
+            )
+
+    def test_a_reservation_at_the_ceiling_is_refused_and_writes_nothing(self) -> None:
+        self._fill(6)
+        before = sorted(path.name for path in self.store.record_files())
+        with self.assertRaises(session_binding.SessionBindingError) as caught:
+            self._reserve(ceiling=6)
+        self.assertEqual(caught.exception.reason, session_binding.REASON_CONCURRENCY_CEILING)
+        self.assertEqual(sorted(path.name for path in self.store.record_files()), before)
+
+    def test_reservations_alone_can_reach_the_ceiling(self) -> None:
+        """A reserved record has no process yet, and must still hold its slot."""
+        self._fill(6)
+        occupied = [record for record in self.store.records() if not record.is_terminal]
+        self.assertEqual(len(occupied), 6)
+        self.assertTrue(all(record.is_reserved for record in occupied))
+        with self.assertRaises(session_binding.SessionBindingError):
+            self._reserve(ceiling=6)
+
+    def test_a_reservation_below_the_ceiling_still_succeeds(self) -> None:
+        self._fill(5)
+        record = self._reserve(ceiling=6)
+        self.assertTrue(record.is_reserved)
+        self.assertEqual(len([r for r in self.store.records() if not r.is_terminal]), 6)
+
+    def test_a_terminal_record_frees_its_slot(self) -> None:
+        self._fill(6)
+        session_binding.unbind_session(self.store, "00000000-0000-4000-8000-000000000000")
+        record = self._reserve(ceiling=6)
+        self.assertTrue(record.is_reserved)
+
+    def test_a_malformed_ceiling_is_refused_at_the_commit_point(self) -> None:
+        for bad in (0, -1, True, "6", None):
+            with self.subTest(ceiling=bad):
+                with self.assertRaises(session_binding.SessionBindingError) as caught:
+                    self._reserve(
+                        session_id="00000000-0000-4000-8000-0000000000ff", ceiling=bad
+                    )
+                self.assertEqual(
+                    caught.exception.reason, session_binding.REASON_CONCURRENCY_CEILING
+                )
 
 
 if __name__ == "__main__":

@@ -191,6 +191,7 @@ def render_manager_page(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
     *,
+    agents=None,
     template_path: Optional[Path] = None,
 ) -> str:
     """One manager run's complete page: this run's allowance beside this queue.
@@ -203,6 +204,7 @@ def render_manager_page(
         view,
         details,
         allowance=project_allowance(run),
+        agents=agents,
         template_path=template_path,
     )
 
@@ -212,6 +214,7 @@ def make_manager_server(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
     *,
+    agents=None,
     host: str = LOOPBACK_HOST,
     port: int = 0,
     template_path: Optional[Path] = None,
@@ -235,6 +238,7 @@ def make_manager_server(
         view,
         details,
         allowance=project_allowance(run),
+        agents=agents,
         host=host,
         port=port,
         template_path=template_path,

@@ -1223,5 +1223,68 @@ class AllowanceResetRenderingTests(unittest.TestCase):
             self.assertNotIn(formatter, source, formatter)
 
 
+class AgentCountDisplayTests(unittest.TestCase):
+    """current / permitted in the aggregate strip: a number, or the reason there is none."""
+
+    def reading(self, **overrides):
+        arguments = {"permitted": 6, "current": 3, "reason": None}
+        arguments.update(overrides)
+        return arguments
+
+    def test_no_reading_draws_nothing_at_all(self) -> None:
+        self.assertIsNone(web.build_agents(None))
+
+    def test_an_established_count_carries_both_halves(self) -> None:
+        drawn = web.build_agents(self.reading())
+        self.assertEqual(drawn["current"], 3)
+        self.assertEqual(drawn["permitted"], 6)
+        self.assertIsNone(drawn["reason"])
+
+    def test_an_unestablished_count_is_a_reason_not_a_zero(self) -> None:
+        drawn = web.build_agents(
+            self.reading(current=None, reason="ownership-unprovable")
+        )
+        self.assertIsNone(drawn["current"])
+        self.assertEqual(drawn["reason"], "ownership-unprovable")
+        self.assertEqual(drawn["permitted"], 6)
+
+    def test_an_unestablished_count_without_a_reason_is_refused(self) -> None:
+        for reason in (None, "", "   "):
+            with self.subTest(reason=reason):
+                with self.assertRaises(web.RenderError) as caught:
+                    web.build_agents(self.reading(current=None, reason=reason))
+                self.assertEqual(caught.exception.reason, web.REASON_INVALID_AGENTS)
+
+    def test_a_malformed_reading_is_refused_rather_than_drawn(self) -> None:
+        for bad in (
+            {"permitted": 0, "current": 0},
+            {"permitted": -1, "current": 0},
+            {"permitted": "6", "current": 0},
+            {"permitted": 6, "current": -1},
+            {"permitted": 6, "current": "3"},
+            {"permitted": 6, "current": 3, "extra": 1},
+        ):
+            with self.subTest(bad=bad):
+                with self.assertRaises(web.RenderError) as caught:
+                    web.build_agents(bad)
+                self.assertEqual(caught.exception.reason, web.REASON_INVALID_AGENTS)
+
+    def test_zero_running_agents_is_a_real_count_not_an_absence(self) -> None:
+        drawn = web.build_agents(self.reading(current=0))
+        self.assertEqual(drawn["current"], 0)
+        self.assertIsNone(drawn["reason"])
+
+    def test_the_page_draws_the_count_inside_the_existing_strip(self) -> None:
+        template = Path(web.__file__).with_name(web.TEMPLATE_NAME).read_text(encoding="utf-8")
+        script = template.split("<script>", 1)[1]
+        self.assertIn('data-window", "agents"', script)
+        self.assertIn("allowanceEl.appendChild(agents)", script)
+        # One repeated treatment, not a second container of its own.
+        self.assertIn('agents.className = "allowance-window"', script)
+        for invented in ("agents-panel", "agent-card", "agent-badge", "agents-strip"):
+            with self.subTest(invented=invented):
+                self.assertNotIn(invented, template)
+
+
 if __name__ == "__main__":
     unittest.main()

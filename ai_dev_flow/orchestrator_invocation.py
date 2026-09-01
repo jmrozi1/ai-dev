@@ -189,6 +189,7 @@ def _require_standing_authorization(
     orchestrator_rail: str,
     bindings: Iterable,
     in_flight_session_ids: Sequence,
+    slots,
 ):
     """The dedicated rail must be running, reconciled, and pass the accepted predicate."""
     rail = snapshot.rail(orchestrator_rail)
@@ -232,6 +233,7 @@ def _require_standing_authorization(
         role=ORCHESTRATOR_ROLE,
         expected_head=packet.head,
         rail_blob=rail.authorization_blob,
+        slots=slots,
         bindings=tuple(bindings),
         in_flight_session_ids=tuple(in_flight_session_ids),
     )
@@ -283,6 +285,7 @@ def invoke_orchestrator(
     reference: Any,
     request_kwargs: Mapping,
     package_root: Any,
+    slots,
     bindings: Iterable = (),
     in_flight_session_ids: Sequence = (),
     markers: Sequence = (),
@@ -314,6 +317,7 @@ def invoke_orchestrator(
         packet,
         observation,
         orchestrator_rail=orchestrator_rail,
+        slots=slots,
         bindings=bindings,
         in_flight_session_ids=in_flight_session_ids,
     )

@@ -106,6 +106,7 @@ REASON_WORKSPACE_IDENTITY_UNPROVEN = "workspace-identity-unproven"
 REASON_WORKTREE_IDENTITY_MISMATCH = "worktree-identity-mismatch"
 REASON_DUPLICATE_SESSION_ID = "duplicate-session-id"
 REASON_DUPLICATE_RAIL_ITERATION = "duplicate-rail-iteration"
+REASON_CONCURRENCY_CEILING = "concurrency-ceiling-reached"
 REASON_MALFORMED_RECORD = "malformed-record"
 REASON_UNREADABLE_RECORD = "unreadable-record"
 REASON_STORE_WRITE_FAILED = "store-write-failed"
@@ -644,6 +645,7 @@ def reserve_binding(
     session_id: str,
     launched_at_head: str,
     reserved_at: str,
+    ceiling: int,
 ) -> BindingRecord:
     """Phase one: claim the assignment and the preassigned session id, before launch.
 
@@ -693,6 +695,29 @@ def reserve_binding(
             "rail {0} at iteration {1} is already held by session {2} ({3}); unbind it "
             "before rebinding with a new session id.".format(
                 record.rail, record.iteration.blob, held[0].session_id, held[0].state
+            ),
+        )
+
+    # Re-read at the commit point, not carried from the authorization that led
+    # here. `authorize` decided against occupancy as it stood then; between that
+    # decision and this write another reservation may have taken the last slot, and
+    # a reservation is exactly what would still be invisible as a process. Counting
+    # nonterminal records here can only overstate occupancy, never understate it,
+    # which is the safe direction for a hard limit.
+    if type(ceiling) is not int or ceiling < 1:
+        raise SessionBindingError(
+            REASON_CONCURRENCY_CEILING,
+            "the configured concurrency ceiling must be a positive whole number of "
+            "agents, got {0!r}.".format(ceiling),
+        )
+    occupied = [other for other in store.records() if not other.is_terminal]
+    if len(occupied) >= ceiling:
+        raise SessionBindingError(
+            REASON_CONCURRENCY_CEILING,
+            "{0} of {1} permitted managed agents already hold bindings ({2}); "
+            "reserving another would admit one past the ceiling.".format(
+                len(occupied), ceiling,
+                ", ".join(sorted(other.session_id for other in occupied)),
             ),
         )
 

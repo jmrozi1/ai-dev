@@ -231,6 +231,32 @@ details summary { cursor: pointer; font-weight: 600; }
   // allowance view: nothing here rounds, compares, totals, or falls back to a
   // zero, and a window with no number prints the reason it has none.
   function renderAllowance() {
+    // The manager-wide agent count sits first in the same strip, drawn as one
+    // more name/value pair in the treatment this strip already repeats. Absent
+    // when no reading was supplied, and printing its reason rather than a number
+    // when the controller could not prove how many agents it owns.
+    if (payload.agents !== null && payload.agents !== undefined) {
+      var agents = document.createElement("span");
+      agents.className = "allowance-window";
+      agents.setAttribute("data-window", "agents");
+
+      var agentsName = document.createElement("span");
+      agentsName.className = "allowance-label";
+      agentsName.textContent = "Agents";
+
+      var agentsValue = document.createElement("span");
+      var counted = payload.agents.current !== null
+        && payload.agents.current !== undefined;
+      agentsValue.className = counted ? "allowance-used" : "allowance-unavailable";
+      agentsValue.textContent = counted
+        ? payload.agents.current + " / " + payload.agents.permitted
+        : payload.agents.reason;
+
+      agents.appendChild(agentsName);
+      agents.appendChild(agentsValue);
+      allowanceEl.appendChild(agents);
+    }
+
     payload.allowance.forEach(function (entry) {
       var group = document.createElement("span");
       group.className = "allowance-window";

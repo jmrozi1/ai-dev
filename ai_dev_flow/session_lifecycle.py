@@ -231,6 +231,39 @@ def require_owned(
     return owned
 
 
+def ownership_evidence(
+    registry: SessionRegistry,
+    bindings: Sequence[BindingRecord],
+    *,
+    alive=None,
+) -> Mapping[str, bool]:
+    """Which bound sessions this controller can actually prove it still owns.
+
+    One entry per nonterminal bound binding: `True` only when this controller holds
+    a matching handle whose process group is still there, which is the same proof
+    `require_owned` demands before any action. Anything less is `False` -- a missing
+    handle after restart, a handle that disagrees with its record, or a process
+    group that is gone.
+
+    `False` deliberately does not mean "not running". It means this controller
+    cannot prove what that session is doing, which is the Disconnected reading, and
+    the admission reconciler treats it as an unprovable total rather than as a free
+    slot. Reserved records are absent from the result because no handle exists for
+    them yet; they occupy a slot on their durable record alone.
+    """
+    evidence = {}
+    for record in bindings:
+        if record.is_terminal or record.is_reserved:
+            continue
+        try:
+            require_owned(registry, record, alive=alive)
+        except LifecycleError:
+            evidence[record.session_id] = False
+        else:
+            evidence[record.session_id] = True
+    return evidence
+
+
 # ---------------------------------------------------------------------------
 # Authorization gate
 # ---------------------------------------------------------------------------
@@ -346,6 +379,9 @@ def launch_session(
         session_id=session_id,
         launched_at_head=assignment.head,
         reserved_at=clock(),
+        # The ceiling the authorization was decided against, carried rather than
+        # re-read, so the commit-point guard cannot enforce a different policy.
+        ceiling=decision.ceiling,
     )
 
     # Built here, while the record is still reserved. Nothing has been spawned yet,

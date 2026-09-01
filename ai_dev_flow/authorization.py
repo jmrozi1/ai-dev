@@ -72,6 +72,12 @@ REASON_INVOCATION_IN_FLIGHT = "invocation-in-flight"
 # A launch this controller already started and has not yet attached a process to.
 REASON_BINDING_NOT_READY = "binding-not-ready"
 
+# Accepted decision D6. The ceiling is a hard admission limit across every managed
+# role, never a target, and never a per-role quota.
+REASON_INVALID_CEILING = "invalid-concurrency-ceiling"
+REASON_CONCURRENCY_UNPROVABLE = "concurrency-count-unprovable"
+REASON_CONCURRENCY_CEILING = "concurrency-ceiling-reached"
+
 REASON_LAUNCH_AUTHORIZED = "launch-authorized"
 REASON_CONTINUATION_AUTHORIZED = "continuation-authorized"
 
@@ -127,6 +133,83 @@ class ControlPlaneObservation:
     foreign_resource_holders: Mapping[str, Tuple[str, ...]] = field(default_factory=dict)
 
 
+# The human-owned default. Changing it is a human concurrency decision, so it is a
+# value a caller states rather than something derived from load, history, or the
+# context-rotation threshold that happens to share the number.
+CONCURRENCY_CEILING_DEFAULT = 6
+
+
+@dataclass(frozen=True)
+class AgentSlots:
+    """Manager-wide occupancy at one instant, already reconciled by the caller.
+
+    `occupants` are the sessions proved to hold a slot; `unprovable` are the ones
+    whose ownership could not be established at all. They are separate on purpose:
+    an unprovable session is never quietly dropped from the total, because
+    subtracting it optimistically is precisely how a seventh agent gets admitted.
+    """
+
+    ceiling: int
+    occupants: Tuple[str, ...] = ()
+    unprovable: Tuple[str, ...] = ()
+
+    @property
+    def occupied(self) -> int:
+        return len(self.occupants)
+
+    @property
+    def provable(self) -> bool:
+        return not self.unprovable
+
+
+def reconcile_agent_slots(
+    bindings: Iterable[BindingRecord],
+    *,
+    ownership: Mapping[str, bool],
+    ceiling: int = CONCURRENCY_CEILING_DEFAULT,
+) -> AgentSlots:
+    """Reconcile durable bindings against controller-proved ownership into occupancy.
+
+    Every nonterminal binding occupies a slot, across every project, ticket, rail
+    and role: the ceiling counts managed agents, not rails, and separate per-role
+    quotas are exactly what the accepted decision forbids.
+
+    A reservation occupies a slot on durable evidence alone. That is not an
+    inference about liveness -- it is a launch this controller has already
+    committed to, and refusing to count it is what would let a reserved launch and
+    a fresh one both pass the same ceiling.
+
+    A bound record needs ownership proved by the controller that holds the handle.
+    Absent or negative evidence makes the total unprovable rather than smaller;
+    duplicates do the same. Nothing here reads a clock, a transcript, a status
+    file, or a pid: whether a handle is live was decided by the caller that owns
+    it, and this function only reconciles what it was told.
+    """
+    seen = set()
+    occupants = []
+    unprovable = []
+    for record in bindings:
+        if record.is_terminal:
+            continue
+        session = record.session_id
+        if session in seen:
+            unprovable.append(session)
+            continue
+        seen.add(session)
+        if record.is_reserved:
+            occupants.append(session)
+            continue
+        if ownership.get(session) is True:
+            occupants.append(session)
+        else:
+            unprovable.append(session)
+    return AgentSlots(
+        ceiling=ceiling,
+        occupants=tuple(sorted(occupants)),
+        unprovable=tuple(sorted(unprovable)),
+    )
+
+
 @dataclass(frozen=True)
 class AuthorizationDecision:
     """One authorize-or-refuse answer with exactly one stable reason."""
@@ -142,6 +225,9 @@ class AuthorizationDecision:
     iteration: Optional[RailIteration] = None
     session_id: Optional[str] = None
     head: Optional[str] = None
+    # The exact ceiling this decision was made against, so the reservation that
+    # follows enforces the same policy value rather than reading its own.
+    ceiling: Optional[int] = None
 
     def __bool__(self) -> bool:
         return self.authorized
@@ -179,6 +265,7 @@ def authorize(
     role: str,
     expected_head: str,
     rail_blob: str,
+    slots: AgentSlots,
     bindings: Iterable[BindingRecord] = (),
     in_flight_session_ids: Sequence[str] = (),
 ) -> AuthorizationDecision:
@@ -188,6 +275,11 @@ def authorize(
     the caller to state it -- rather than reading whatever the rail says now --
     is what makes an authorization that was read at one iteration unusable once
     the orchestrator rewrites the rail.
+
+    `slots` is required and has no default. A caller that cannot state manager-wide
+    occupancy gets a `TypeError` rather than a quiet empty set, because a default
+    would silently authorize a seventh agent whenever a caller forgot to reconcile
+    one -- and the ceiling is worth nothing if it can be bypassed by omission.
     """
     iteration = RailIteration(rail=rail, blob=rail_blob)
 
@@ -199,6 +291,13 @@ def authorize(
         return refuse(
             REASON_INVALID_ROLE,
             "role '{0}' is not one of {1}.".format(role, ", ".join(BINDING_ROLES)),
+        )
+
+    if type(slots.ceiling) is not int or slots.ceiling < 1:
+        return refuse(
+            REASON_INVALID_CEILING,
+            "the configured concurrency ceiling must be a positive whole number of "
+            "agents, got {0!r}.".format(slots.ceiling),
         )
 
     if observation.project != project or observation.ticket != ticket:
@@ -352,6 +451,21 @@ def authorize(
         )
 
     if not live:
+        if slots.unprovable:
+            return refuse(
+                REASON_CONCURRENCY_UNPROVABLE,
+                "manager-wide agent count is not established: ownership is unprovable "
+                "for {0}. A launch is refused rather than admitted against a total that "
+                "may already be at the ceiling.".format(", ".join(slots.unprovable)),
+            )
+        if slots.occupied >= slots.ceiling:
+            return refuse(
+                REASON_CONCURRENCY_CEILING,
+                "{0} of {1} permitted managed agents are already running ({2}); the "
+                "ceiling is a hard admission limit.".format(
+                    slots.occupied, slots.ceiling, ", ".join(slots.occupants)
+                ),
+            )
         return AuthorizationDecision(
             authorized=True,
             reason=REASON_LAUNCH_AUTHORIZED,
@@ -365,6 +479,7 @@ def authorize(
             action=ACTION_LAUNCH,
             iteration=iteration,
             head=observation.head,
+            ceiling=slots.ceiling,
         )
 
     held = live[0]
@@ -403,6 +518,26 @@ def authorize(
             "session {0} already has an invocation in flight.".format(held.session_id),
         )
 
+    if slots.unprovable:
+        # A continuation is evaluated against the same reconciled evidence a launch
+        # is. An unknown total is not something a resume may step around.
+        return refuse(
+            REASON_CONCURRENCY_UNPROVABLE,
+            "manager-wide agent count is not established: ownership is unprovable "
+            "for {0}.".format(", ".join(slots.unprovable)),
+        )
+    if held.session_id not in slots.occupants and slots.occupied >= slots.ceiling:
+        # Only a continuation that would actually add an agent is refused. A session
+        # already counted among the occupants increases nothing, and refusing it at
+        # the ceiling would strand precisely the work the ceiling already admitted.
+        return refuse(
+            REASON_CONCURRENCY_CEILING,
+            "{0} of {1} permitted managed agents are already running and session {2} "
+            "is not among them.".format(
+                slots.occupied, slots.ceiling, held.session_id
+            ),
+        )
+
     return AuthorizationDecision(
         authorized=True,
         reason=REASON_CONTINUATION_AUTHORIZED,
@@ -417,4 +552,5 @@ def authorize(
         iteration=iteration,
         session_id=held.session_id,
         head=observation.head,
+        ceiling=slots.ceiling,
     )

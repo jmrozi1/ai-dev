@@ -10,6 +10,9 @@ from unittest.mock import patch
 
 from ai_dev_flow import authorization
 from ai_dev_flow.authorization import (
+    AgentSlots,
+    CONCURRENCY_CEILING_DEFAULT,
+    reconcile_agent_slots,
     ACTION_CONTINUE,
     ACTION_LAUNCH,
     OBSERVATION_PARTIAL,
@@ -125,6 +128,9 @@ def decide(observed: ControlPlaneObservation, **overrides: object):
         "rail_blob": BLOB,
         "bindings": (),
         "in_flight_session_ids": (),
+        # Room to admit, so every pre-existing case still exercises the reason it
+        # was written for rather than the ceiling.
+        "slots": AgentSlots(ceiling=authorization.CONCURRENCY_CEILING_DEFAULT),
     }
     arguments.update(overrides)
     return authorize(observed, **arguments)  # type: ignore[arg-type]
@@ -578,6 +584,175 @@ class AuthorizationPurityTests(unittest.TestCase):
             self.assertTrue(decision.detail.strip(), msg=decision.reason)
             seen.add(decision.reason)
         self.assertEqual(len(seen), len(refusals))
+
+
+class ConcurrencyAdmissionTests(unittest.TestCase):
+    """Accepted decision D6: a hard manager-wide admission ceiling."""
+
+    def slots(self, **overrides):
+        arguments = {"ceiling": CONCURRENCY_CEILING_DEFAULT}
+        arguments.update(overrides)
+        return AgentSlots(**arguments)
+
+    def occupied(self, count, ceiling=CONCURRENCY_CEILING_DEFAULT):
+        return AgentSlots(
+            ceiling=ceiling,
+            occupants=tuple("session-{0}".format(index) for index in range(count)),
+        )
+
+    def test_the_default_ceiling_is_six(self) -> None:
+        self.assertEqual(CONCURRENCY_CEILING_DEFAULT, 6)
+        self.assertEqual(reconcile_agent_slots((), ownership={}).ceiling, 6)
+
+    def test_a_valid_explicit_ceiling_is_honored(self) -> None:
+        at_two = decide(observation(), slots=self.occupied(2, ceiling=2))
+        self.assertFalse(at_two.authorized)
+        self.assertEqual(at_two.reason, authorization.REASON_CONCURRENCY_CEILING)
+        below = decide(observation(), slots=self.occupied(1, ceiling=2))
+        self.assertTrue(below.authorized)
+        self.assertEqual(below.ceiling, 2)
+
+    def test_a_malformed_ceiling_is_a_caller_fault(self) -> None:
+        for bad in (0, -1, True, "6", 1.5, None):
+            with self.subTest(ceiling=bad):
+                decision = decide(observation(), slots=AgentSlots(ceiling=bad))
+                self.assertFalse(decision.authorized)
+                self.assertEqual(decision.reason, authorization.REASON_INVALID_CEILING)
+
+    def test_every_managed_role_occupies_the_same_ceiling(self) -> None:
+        records = tuple(
+            binding(session_id="0000000{0}-0000-4000-8000-000000000000".format(index), role=role)
+            for index, role in enumerate(("executor", "reviewer", "orchestrator"))
+        )
+        slots = reconcile_agent_slots(
+            records, ownership={record.session_id: True for record in records}
+        )
+        self.assertEqual(slots.occupied, 3)
+        self.assertEqual(slots.unprovable, ())
+
+    def test_a_launch_is_admitted_below_the_ceiling(self) -> None:
+        decision = decide(observation(), slots=self.occupied(5))
+        self.assertTrue(decision.authorized)
+        self.assertEqual(decision.action, ACTION_LAUNCH)
+
+    def test_a_launch_is_refused_at_the_ceiling_and_names_no_action(self) -> None:
+        decision = decide(observation(), slots=self.occupied(6))
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_CONCURRENCY_CEILING)
+        # The predicate is pure, so refusing here refuses before any reservation,
+        # process, or provider action can exist.
+        self.assertIsNone(decision.action)
+        self.assertIsNone(decision.session_id)
+
+    def test_an_unprovable_count_refuses_a_launch_and_a_continuation_alike(self) -> None:
+        unknown = self.slots(occupants=("a",), unprovable=("b",))
+        launch = decide(observation(), slots=unknown)
+        continuation = decide(observation(), bindings=(binding(),), slots=unknown)
+        for decision in (launch, continuation):
+            self.assertFalse(decision.authorized)
+            self.assertEqual(decision.reason, authorization.REASON_CONCURRENCY_UNPROVABLE)
+            self.assertIsNone(decision.action)
+
+    def test_continuing_a_session_already_counted_is_admitted_at_the_ceiling(self) -> None:
+        full = AgentSlots(
+            ceiling=6,
+            occupants=tuple(["session-{0}".format(index) for index in range(5)] + [SESSION]),
+        )
+        decision = decide(observation(), bindings=(binding(),), slots=full)
+        self.assertTrue(decision.authorized, msg=decision.reason)
+        self.assertEqual(decision.action, ACTION_CONTINUE)
+        self.assertEqual(decision.session_id, SESSION)
+
+    def test_continuing_a_session_not_among_the_occupants_is_refused_when_full(self) -> None:
+        decision = decide(observation(), bindings=(binding(),), slots=self.occupied(6))
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, authorization.REASON_CONCURRENCY_CEILING)
+
+    def test_a_reservation_occupies_a_slot_without_any_ownership_evidence(self) -> None:
+        slots = reconcile_agent_slots((reserved(),), ownership={})
+        self.assertEqual(slots.occupants, (SESSION,))
+        self.assertEqual(slots.unprovable, ())
+
+    def test_unprovable_ownership_never_frees_a_slot(self) -> None:
+        record = binding()
+        for ownership in ({}, {SESSION: False}, {SESSION: None}, {SESSION: "yes"}):
+            with self.subTest(ownership=ownership):
+                slots = reconcile_agent_slots((record,), ownership=ownership)
+                self.assertEqual(slots.unprovable, (SESSION,))
+                self.assertEqual(slots.occupants, ())
+                self.assertFalse(slots.provable)
+
+    def test_a_duplicated_session_is_unprovable_rather_than_counted_once(self) -> None:
+        record = binding()
+        slots = reconcile_agent_slots((record, record), ownership={SESSION: True})
+        self.assertIn(SESSION, slots.unprovable)
+        self.assertFalse(slots.provable)
+
+    def test_terminal_bindings_occupy_nothing(self) -> None:
+        slots = reconcile_agent_slots((binding(state=BINDING_STATE_UNBOUND),), ownership={})
+        self.assertEqual(slots.occupants, ())
+        self.assertEqual(slots.unprovable, ())
+
+    def test_existing_reasons_still_refuse_with_room_to_admit(self) -> None:
+        room = self.slots()
+        for observed, expected in (
+            (observation(rails=(rail_state(status="ready"),)),
+             authorization.REASON_RAIL_NOT_DISPATCHED),
+            (observation(rails=(rail_state(depends_on=("issue-55-absent-rail",)),)),
+             authorization.REASON_DEPENDENCY_UNSATISFIED),
+            (observation(foreign_resource_holders={RESOURCE: ("elsewhere",)}),
+             authorization.REASON_RESOURCE_CONTENDED),
+            (observation(workspace=None),
+             authorization.REASON_WORKSPACE_IDENTITY_AMBIGUOUS),
+        ):
+            with self.subTest(expected=expected):
+                decision = decide(observed, slots=room)
+                self.assertFalse(decision.authorized)
+                self.assertEqual(decision.reason, expected)
+
+    def test_the_ceiling_does_not_mask_an_earlier_refusal(self) -> None:
+        """A full manager still reports why the rail itself was unusable."""
+        decision = decide(observation(rails=(rail_state(status="ready"),)),
+                          slots=self.occupied(6))
+        self.assertEqual(decision.reason, authorization.REASON_RAIL_NOT_DISPATCHED)
+
+    def test_admission_introduces_no_scheduler_or_trigger_machinery(self) -> None:
+        source = Path(authorization.__file__).read_text(encoding="utf-8").lower()
+        for forbidden in ("scheduler", "priority", "fairness", "autoscal", "retry",
+                          "score", "elapsed", "sleep", "backoff"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, source)
+
+    def test_admission_is_not_coupled_to_compaction_or_rotation(self) -> None:
+        """Coupling, not vocabulary.
+
+        The module may say out loud that the rotation threshold shares the number
+        six by coincidence; what it may not do is import, reference, or branch on
+        it. So this reads identifiers and imports rather than prose, which is the
+        difference between naming a boundary and depending across it.
+        """
+        import ast
+
+        tree = ast.parse(Path(authorization.__file__).read_text(encoding="utf-8"))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Name):
+                names.add(node.id.lower())
+            elif isinstance(node, ast.Attribute):
+                names.add(node.attr.lower())
+            elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                names.add(node.name.lower())
+            elif isinstance(node, ast.arg):
+                names.add(node.arg.lower())
+            elif isinstance(node, ast.Import):
+                names.update(alias.name.lower() for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                names.add((node.module or "").lower())
+                names.update(alias.name.lower() for alias in node.names)
+        for forbidden in ("compaction", "rotation", "rotate", "threshold", "compact"):
+            with self.subTest(forbidden=forbidden):
+                offenders = sorted(name for name in names if forbidden in name)
+                self.assertEqual(offenders, [], offenders)
 
 
 if __name__ == "__main__":

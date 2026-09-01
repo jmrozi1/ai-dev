@@ -91,7 +91,8 @@ from .decision_queue import QUEUE_STATES, DecisionQueue, QueueView, SelectedDeta
 from .queue_source import QueueSourceError, load_queue
 from .repository import resolve_repo_root
 from .session_binding import BindingStore
-from .session_lifecycle import SessionRegistry
+from .authorization import CONCURRENCY_CEILING_DEFAULT, reconcile_agent_slots
+from .session_lifecycle import SessionRegistry, ownership_evidence
 
 __all__ = [
     "BINDING_ROOT_FLAG",
@@ -111,6 +112,7 @@ __all__ = [
     "main",
     "render_launch_page",
     "resolve_run",
+    "run_agent_count",
 ]
 
 # This module's own refusals, and only its own. A repository that cannot be
@@ -297,12 +299,43 @@ def load_run_queue(
 # --------------------------------------------------------------------------
 
 
+def run_agent_count(
+    store: BindingStore,
+    registry: SessionRegistry,
+    *,
+    ceiling: int = CONCURRENCY_CEILING_DEFAULT,
+    alive: Optional[Callable] = None,
+) -> "dict":
+    """Reduce this run's occupancy to the reading the page draws, or to its reason.
+
+    This is the boundary that may hold both halves of the evidence: the durable
+    store and the controller's own registry. The page cannot, which is why the
+    reduction happens here and travels down as plain values.
+
+    A process that started none of the running agents owns no handles, so it
+    proves nothing about them and the reading says so. That is the honest answer
+    for a fresh renderer, and it is deliberately not the same as reporting zero.
+    """
+    records = store.records()
+    slots = reconcile_agent_slots(
+        records,
+        ownership=ownership_evidence(registry, records, alive=alive),
+        ceiling=ceiling,
+    )
+    return {
+        "permitted": slots.ceiling,
+        "current": slots.occupied if slots.provable else None,
+        "reason": None if slots.provable else "ownership-unprovable",
+    }
+
+
 def render_launch_page(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
     *,
     human_exclusive_since: Optional[int],
     cwd: Optional[Path] = None,
+    agents: Optional[Mapping] = None,
     template_path: Optional[Path] = None,
 ) -> str:
     """This run's page: inputs resolved once here, queue supplied by the caller.
@@ -313,7 +346,7 @@ def render_launch_page(
     source as an answered one.
     """
     run = resolve_run(human_exclusive_since=human_exclusive_since, cwd=cwd)
-    return render_manager_page(run, view, details, template_path=template_path)
+    return render_manager_page(run, view, details, agents=agents, template_path=template_path)
 
 
 def launch_manager_server(
@@ -323,6 +356,7 @@ def launch_manager_server(
     human_exclusive_since: Optional[int],
     cwd: Optional[Path] = None,
     port: int = 0,
+    agents: Optional[Mapping] = None,
     template_path: Optional[Path] = None,
 ) -> http.server.HTTPServer:
     """A loopback server for one run, rendered once at construction.
@@ -340,6 +374,7 @@ def launch_manager_server(
         run,
         view,
         details,
+        agents=agents,
         port=port,
         template_path=template_path,
     )

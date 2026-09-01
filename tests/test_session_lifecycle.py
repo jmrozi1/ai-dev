@@ -162,6 +162,8 @@ class LifecycleTestBase(unittest.TestCase):
             "authorized": True, "reason": "ok", "detail": "",
             "project": "ai-dev", "ticket": "issue-55", "rail": RAIL, "role": "executor",
             "action": action, "iteration": self.iteration, "head": HEAD,
+            # Every pre-existing case authorizes one agent with room to spare.
+            "ceiling": 6,
         }
         arguments.update(overrides)
         return AuthorizationDecision(**arguments)
