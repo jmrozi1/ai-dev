@@ -1124,6 +1124,27 @@ class NoProcessAdoptionTests(SourcedLaunchTestCase):
     def test_the_standalone_entry_point_builds_one_empty_registry(self) -> None:
         self.assertEqual(MODULE_CODE.count("SessionRegistry()"), 1)
 
+    def test_the_standalone_surface_serves_no_live_occupancy(self) -> None:
+        """A count needs ownership behind it, and this process has none, so it
+        draws none and says so rather than presenting a figure it cannot stand
+        behind."""
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        result = self.launch()
+
+        self.assertIsNone(self.payload_of(result.served[0])["agents"])
+        self.assertIn("live occupancy: not served", result.out)
+        self.assertIn("manager_controller", result.out)
+
+    def test_the_module_reduces_no_agent_count_of_its_own(self) -> None:
+        for forbidden in (
+            "reconcile_agent_slots", "ownership_evidence", "run_agent_count",
+            "permitted", "agents=",
+        ):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, MODULE_CODE)
+
 
 class AcceptedAllowanceFailureTests(SourcedLaunchTestCase):
     def test_an_unusable_epoch_is_reported_with_the_accepted_reason(self) -> None:
@@ -1159,7 +1180,6 @@ class NoAddedAuthorityTests(LaunchTestCase):
             {
                 "argparse", "http.server", "re", "sys", "time",
                 "__future__", "dataclasses", "datetime", "pathlib", "typing",
-                ".authorization",
                 ".claude_allowance_store", ".claude_allowance_view",
                 ".decision_manager", ".decision_manager_web", ".decision_queue",
                 ".queue_source", ".repository", ".session_binding",

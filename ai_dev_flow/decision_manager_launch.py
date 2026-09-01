@@ -64,6 +64,13 @@ from __future__ import annotations
 # accepted lifecycle as Disconnected. Adopting one by matching a recorded pid would be
 # this module inventing ownership it cannot have.
 #
+# That is also why this entry point draws no manager-wide agent count and passes no
+# `agents` reading to the page. A count is only as good as the ownership behind it,
+# and a process that started none of the running agents has none, so the honest
+# surface for one is the controller that owns the handles -- `manager_controller`.
+# This remains the diagnostic, read-only view of a stated scope, and it says so
+# rather than presenting an occupancy figure it cannot stand behind.
+#
 # The loopback rule is deliberately not restated here. `make_manager_server` and the
 # accepted server beneath it own it, this module passes no host at all, and so the
 # one place that decides what this surface binds stays the only place.
@@ -91,8 +98,7 @@ from .decision_queue import QUEUE_STATES, DecisionQueue, QueueView, SelectedDeta
 from .queue_source import QueueSourceError, load_queue
 from .repository import resolve_repo_root
 from .session_binding import BindingStore
-from .authorization import CONCURRENCY_CEILING_DEFAULT, reconcile_agent_slots
-from .session_lifecycle import SessionRegistry, ownership_evidence
+from .session_lifecycle import SessionRegistry
 
 __all__ = [
     "BINDING_ROOT_FLAG",
@@ -112,7 +118,7 @@ __all__ = [
     "main",
     "render_launch_page",
     "resolve_run",
-    "run_agent_count",
+    "stated_run_inputs",
 ]
 
 # This module's own refusals, and only its own. A repository that cannot be
@@ -299,43 +305,12 @@ def load_run_queue(
 # --------------------------------------------------------------------------
 
 
-def run_agent_count(
-    store: BindingStore,
-    registry: SessionRegistry,
-    *,
-    ceiling: int = CONCURRENCY_CEILING_DEFAULT,
-    alive: Optional[Callable] = None,
-) -> "dict":
-    """Reduce this run's occupancy to the reading the page draws, or to its reason.
-
-    This is the boundary that may hold both halves of the evidence: the durable
-    store and the controller's own registry. The page cannot, which is why the
-    reduction happens here and travels down as plain values.
-
-    A process that started none of the running agents owns no handles, so it
-    proves nothing about them and the reading says so. That is the honest answer
-    for a fresh renderer, and it is deliberately not the same as reporting zero.
-    """
-    records = store.records()
-    slots = reconcile_agent_slots(
-        records,
-        ownership=ownership_evidence(registry, records, alive=alive),
-        ceiling=ceiling,
-    )
-    return {
-        "permitted": slots.ceiling,
-        "current": slots.occupied if slots.provable else None,
-        "reason": None if slots.provable else "ownership-unprovable",
-    }
-
-
 def render_launch_page(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
     *,
     human_exclusive_since: Optional[int],
     cwd: Optional[Path] = None,
-    agents: Optional[Mapping] = None,
     template_path: Optional[Path] = None,
 ) -> str:
     """This run's page: inputs resolved once here, queue supplied by the caller.
@@ -346,7 +321,7 @@ def render_launch_page(
     source as an answered one.
     """
     run = resolve_run(human_exclusive_since=human_exclusive_since, cwd=cwd)
-    return render_manager_page(run, view, details, agents=agents, template_path=template_path)
+    return render_manager_page(run, view, details, template_path=template_path)
 
 
 def launch_manager_server(
@@ -356,7 +331,6 @@ def launch_manager_server(
     human_exclusive_since: Optional[int],
     cwd: Optional[Path] = None,
     port: int = 0,
-    agents: Optional[Mapping] = None,
     template_path: Optional[Path] = None,
 ) -> http.server.HTTPServer:
     """A loopback server for one run, rendered once at construction.
@@ -374,7 +348,6 @@ def launch_manager_server(
         run,
         view,
         details,
-        agents=agents,
         port=port,
         template_path=template_path,
     )
@@ -478,6 +451,18 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def stated_run_inputs(argv: List[str]) -> Tuple[Optional[int], QueueSourceContext]:
+    """One run's stated claim and stated scope, parsed exactly once.
+
+    Public because the controller-owned surface must start from the same two
+    statements this entry point does. A second parser there would be a second place
+    that decides what silence means and which flags are required, and the two would
+    be free to drift; this is the one place, and it is called rather than copied.
+    """
+    arguments = _build_parser().parse_args(list(argv))
+    return _stated_claim(arguments), _stated_source(arguments)
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     """One stated claim, one stated scope, one run, one queue, one served page.
 
@@ -494,12 +479,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     What is printed is bounded launch information -- paths, the instant, counts, and
     the address actually bound. No decision body, evidence, binding, or session
     identity is printed, because a terminal is not the surface those belong on.
-    """
-    arguments = _build_parser().parse_args(list(sys.argv[1:] if argv is None else argv))
 
+    This is a diagnostic view and says so. It owns no session handles, so it serves
+    no live occupancy: `manager_controller.main` is the controller-owned surface
+    that does.
+    """
     try:
-        claim = _stated_claim(arguments)
-        source = _stated_source(arguments)
+        claim, source = stated_run_inputs(list(sys.argv[1:] if argv is None else argv))
         run = resolve_run(human_exclusive_since=claim)
     except LaunchError as exc:
         print("decision-manager-launch: {0}".format(exc), file=sys.stderr)
@@ -517,6 +503,10 @@ def main(argv: Optional[List[str]] = None) -> int:
         "queue source: {0}/{1} in {2}".format(
             source.project, source.ticket, source.control_plane
         )
+    )
+    print(
+        "live occupancy: not served; this process owns no session handles, so "
+        "`manager_controller` is the surface that draws one"
     )
 
     try:

@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -669,6 +670,325 @@ class ReservationCeilingTests(SessionBindingTestBase):
                     caught.exception.reason, session_binding.REASON_CONCURRENCY_CEILING
                 )
 
+
+
+# --------------------------------------------------------------------------
+# Cross-process reservation atomicity
+# --------------------------------------------------------------------------
+
+
+# Where `ai_dev_flow` is importable from, so a second controller process reaches
+# exactly the tree under test rather than an installed copy.
+PACKAGE_PARENT = Path(session_binding.__file__).parents[1]
+
+CHILD_SESSION = "1a2b3c4d-0009-4000-8000-00000000000f"
+CHILD_RAIL = "issue-55-second-controller"
+
+# What a second controller process runs. A real process, not a thread and not a
+# stubbed store: the boundary being proved is a filesystem one, and only a second
+# process proves it is not merely process-local state agreeing with itself.
+SECOND_CONTROLLER = """
+import json
+import sys
+
+spec = json.loads(sys.argv[2])
+sys.path.insert(0, sys.argv[1])
+
+from ai_dev_flow import session_binding
+from ai_dev_flow.session_binding import BindingStore, RailIteration, reserve_binding
+from ai_dev_flow.tickets import TicketReference
+
+if spec["without_lock"]:
+    # The deliberate-breakage control only. This is checkpoint 44's store: it
+    # counted occupancy and then created a record with no boundary between them.
+    BindingStore._acquire = lambda self, operation: "no-lock"
+    BindingStore._release = lambda self, generation: None
+
+store = BindingStore(spec["root"])
+try:
+    record = reserve_binding(
+        store,
+        project=spec["project"],
+        ticket=spec["ticket"],
+        reference=TicketReference(**spec["reference"]),
+        workspace_path=spec["workspace_path"],
+        worktree_id=spec["worktree_id"],
+        rail=spec["rail"],
+        role="executor",
+        iteration=RailIteration(rail=spec["rail"], blob=spec["blob"]),
+        session_id=spec["session_id"],
+        launched_at_head=spec["head"],
+        reserved_at="2026-08-26T12:00:00Z",
+        ceiling=spec["ceiling"],
+    )
+except session_binding.SessionBindingError as exc:
+    print(json.dumps({"outcome": "refused", "reason": exc.reason}))
+else:
+    print(json.dumps({"outcome": "reserved", "session": record.session_id}))
+"""
+
+
+class CrossProcessReservationTests(SessionBindingTestBase):
+    """Two controller processes, one binding store: the ceiling must still hold.
+
+    The reviewed failure was not a duplicate session id. It was two controllers
+    each counting five of six permitted agents and then each creating a *different*
+    record, which exclusive per-session-id creation does not stop. Every test here
+    drives a real second process against the same store root, so a boundary that
+    existed only inside one interpreter could not pass.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.reference = self._reference()
+        self.workspace, self.worktree_id = self._add_workspace("workspace-55", self.reference)
+
+    def _fill(self, count: int) -> None:
+        for index in range(count):
+            rail = "issue-55-filler-{0}".format(index)
+            self._reserve(
+                session_id="0000000{0}-0000-4000-8000-000000000000".format(index),
+                rail=rail,
+                iteration=RailIteration(rail=rail, blob=BLOB_A),
+                ceiling=99,
+            )
+
+    def _nonterminal(self) -> int:
+        return len([record for record in self.store.records() if not record.is_terminal])
+
+    def _second_controller(self, *, without_lock: bool = False) -> dict:
+        """One real second controller, attempting one reservation of its own."""
+        spec = {
+            "root": str(self.store.root),
+            "project": "ai-dev",
+            "ticket": "issue-55",
+            "reference": {
+                "provider": "github", "ticket_id": "55", "repository": "owner/repo",
+            },
+            "workspace_path": str(self.workspace),
+            "worktree_id": self.worktree_id,
+            "rail": CHILD_RAIL,
+            "blob": BLOB_B,
+            "session_id": CHILD_SESSION,
+            "head": HEAD,
+            "ceiling": 6,
+            "without_lock": without_lock,
+        }
+        completed = subprocess.run(
+            [sys.executable, "-c", SECOND_CONTROLLER, str(PACKAGE_PARENT), json.dumps(spec)],
+            check=False, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout.strip().splitlines()[-1])
+
+    def _interleaved_at_the_commit_window(self, *, without_lock: bool) -> dict:
+        """Run the second controller exactly where checkpoint 44 lost the race.
+
+        The hook is the creation itself, so the second process runs after this
+        controller has already counted occupancy and before it creates anything --
+        the exact window checkpoint 44 left open. Deterministic by construction:
+        the child runs to completion before the parent resumes, so no timing,
+        sleep, or scheduling luck decides the result.
+        """
+        written = self.store.write_new
+        observed = []
+
+        def write_after_a_second_controller(record):
+            if not observed:
+                observed.append(self._second_controller(without_lock=without_lock))
+            return written(record)
+
+        self.store.write_new = write_after_a_second_controller
+        try:
+            try:
+                self._reserve(ceiling=6)
+                parent = "reserved"
+            except SessionBindingError as exc:
+                parent = exc.reason
+        finally:
+            del self.store.write_new
+        return {"child": observed[0] if observed else None, "parent": parent}
+
+    def test_a_second_controller_cannot_slip_a_seventh_reservation_through(self) -> None:
+        """The reviewed failure, reproduced as a real race and refused."""
+        self._fill(5)
+
+        outcome = self._interleaved_at_the_commit_window(without_lock=False)
+
+        self.assertEqual(
+            outcome["child"],
+            {"outcome": "refused", "reason": session_binding.REASON_STORE_LOCKED},
+        )
+        self.assertEqual(outcome["parent"], "reserved")
+        self.assertEqual(self._nonterminal(), 6)
+
+    def test_the_same_interleaving_admits_a_seventh_without_the_boundary(self) -> None:
+        """Kill power: with checkpoint 44's unguarded commit, seven really land.
+
+        Isolated and deliberate. Both processes are put back to the unguarded
+        count-then-create, because the test above is worth nothing unless this one
+        shows the failure it claims to catch.
+        """
+        self._fill(5)
+
+        with patch.object(BindingStore, "_acquire", lambda self, operation: "no-lock"):
+            with patch.object(BindingStore, "_release", lambda self, generation: None):
+                outcome = self._interleaved_at_the_commit_window(without_lock=True)
+
+        self.assertEqual(outcome["child"]["outcome"], "reserved")
+        self.assertEqual(outcome["parent"], "reserved")
+        self.assertEqual(self._nonterminal(), 7)
+
+    def test_a_reservation_taken_before_the_lock_is_counted_inside_it(self) -> None:
+        """The other order: the second controller commits first and is then seen."""
+        self._fill(5)
+        acquire = BindingStore._acquire
+        observed = []
+
+        def acquire_after_a_second_controller(store, operation):
+            if not observed:
+                observed.append(self._second_controller())
+            return acquire(store, operation)
+
+        with patch.object(BindingStore, "_acquire", acquire_after_a_second_controller):
+            with self.assertRaises(SessionBindingError) as caught:
+                self._reserve(ceiling=6)
+
+        self.assertEqual(observed[0], {"outcome": "reserved", "session": CHILD_SESSION})
+        self.assertEqual(caught.exception.reason, session_binding.REASON_CONCURRENCY_CEILING)
+        self.assertEqual(self._nonterminal(), 6)
+
+
+class ReservationLockTests(SessionBindingTestBase):
+    """The boundary itself: fail closed, own one generation, leave nothing behind."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.reference = self._reference()
+        self.workspace, self.worktree_id = self._add_workspace("workspace-55", self.reference)
+
+    def _lock_payload(self, generation: str) -> str:
+        return json.dumps({
+            "version": 1, "generation": generation, "pid": 1,
+            "acquiredAt": "2026-08-26T12:00:00+0000", "operation": "reserve_binding",
+        })
+
+    def test_a_completed_reservation_leaves_no_lock_behind(self) -> None:
+        self._reserve(ceiling=6)
+        self.assertFalse(self.store.lock_path.exists())
+
+    def test_a_refused_reservation_leaves_no_lock_behind(self) -> None:
+        for index in range(6):
+            rail = "issue-55-filler-{0}".format(index)
+            self._reserve(
+                session_id="0000000{0}-0000-4000-8000-000000000000".format(index),
+                rail=rail, iteration=RailIteration(rail=rail, blob=BLOB_A), ceiling=99,
+            )
+        with self.assertRaises(SessionBindingError):
+            self._reserve(ceiling=6)
+        self.assertFalse(self.store.lock_path.exists())
+
+    def test_a_held_lock_refuses_the_reservation_and_changes_nothing(self) -> None:
+        held = self.store._acquire("reserve_binding")
+        try:
+            with self.assertRaises(SessionBindingError) as caught:
+                self._reserve(ceiling=6)
+        finally:
+            self.store._release(held)
+        self.assertEqual(caught.exception.reason, session_binding.REASON_STORE_LOCKED)
+        self.assertEqual(self.store.record_files(), [])
+
+    def test_an_abandoned_lock_fails_closed_rather_than_being_broken(self) -> None:
+        """No owner can be proven, so nothing is assumed about one."""
+        self.store.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.lock_path.write_text(self._lock_payload("abandoned"), encoding="utf-8")
+
+        with self.assertRaises(SessionBindingError) as caught:
+            self._reserve(ceiling=6)
+
+        self.assertEqual(caught.exception.reason, session_binding.REASON_STORE_LOCKED)
+        self.assertEqual(self.store.record_files(), [])
+        self.assertTrue(self.store.lock_path.exists())
+
+    def test_an_old_lock_is_not_aged_out(self) -> None:
+        """Nothing here treats a timestamp as evidence that an owner is gone."""
+        self.store.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.lock_path.write_text(self._lock_payload("ancient"), encoding="utf-8")
+        os.utime(self.store.lock_path, (0, 0))
+
+        with self.assertRaises(SessionBindingError) as caught:
+            self._reserve(ceiling=6)
+
+        self.assertEqual(caught.exception.reason, session_binding.REASON_STORE_LOCKED)
+        self.assertTrue(self.store.lock_path.exists())
+
+    def test_a_malformed_lock_is_refused_exactly_as_a_held_one_is(self) -> None:
+        self.store.lock_path.parent.mkdir(parents=True, exist_ok=True)
+        self.store.lock_path.write_text("not json at all", encoding="utf-8")
+
+        with self.assertRaises(SessionBindingError) as caught:
+            self._reserve(ceiling=6)
+
+        self.assertEqual(caught.exception.reason, session_binding.REASON_STORE_LOCKED)
+        self.assertEqual(self.store.record_files(), [])
+
+    def test_a_replaced_lock_is_never_released_by_the_previous_holder(self) -> None:
+        held = self.store._acquire("reserve_binding")
+        self.store.lock_path.write_text(self._lock_payload("someone-else"), encoding="utf-8")
+
+        with self.assertRaises(SessionBindingError) as caught:
+            self.store._release(held)
+
+        self.assertEqual(caught.exception.reason, session_binding.REASON_LOCK_LOST)
+        self.assertTrue(self.store.lock_path.exists())
+
+    def test_a_vanished_lock_is_reported_rather_than_ignored(self) -> None:
+        held = self.store._acquire("reserve_binding")
+        os.unlink(str(self.store.lock_path))
+
+        with self.assertRaises(SessionBindingError) as caught:
+            self.store._release(held)
+
+        self.assertEqual(caught.exception.reason, session_binding.REASON_LOCK_LOST)
+
+    def test_the_lock_is_never_mistaken_for_a_binding(self) -> None:
+        """A lock kept inside the bindings directory would make every held lock a
+        store-wide read refusal, because an unparseable record is refused there."""
+        self.assertNotEqual(self.store.lock_path.parent, self.store.bindings_directory)
+
+        held = self.store._acquire("reserve_binding")
+        try:
+            self.assertEqual(self.store.record_files(), [])
+            self.assertEqual(self.store.records(), [])
+        finally:
+            self.store._release(held)
+
+    def test_the_boundary_covers_the_decision_and_not_only_the_file_creation(self) -> None:
+        """The occupancy count and the creation happen under one held generation."""
+        observed = []
+        counted = self.store.records
+        written = self.store.write_new
+
+        def records_under_the_lock():
+            observed.append(("count", self.store.lock_path.exists()))
+            return counted()
+
+        def write_under_the_lock(record):
+            observed.append(("create", self.store.lock_path.exists()))
+            return written(record)
+
+        self.store.records = records_under_the_lock
+        self.store.write_new = write_under_the_lock
+        try:
+            self._reserve(ceiling=6)
+        finally:
+            del self.store.records
+            del self.store.write_new
+
+        self.assertIn(("count", True), observed)
+        self.assertIn(("create", True), observed)
+        self.assertFalse(self.store.lock_path.exists())
 
 if __name__ == "__main__":
     unittest.main()

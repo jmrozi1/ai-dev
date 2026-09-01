@@ -22,7 +22,12 @@ from __future__ import annotations
 #
 # The store is controller-local state. It is not product state and it is not
 # control-plane state, so it never participates in the publication, ownership, or
-# freshness rules that belong to `control_plane`.
+# freshness rules that belong to `control_plane`. Controller-local is not
+# single-process, though: more than one process may hold a store at one root, and
+# reserving is a read-decide-write over every record rather than over one file. So
+# the reservation commit takes the same exclusive-create boundary the allowance
+# store already uses -- without it, two controllers each counting the last free slot
+# would each create a different session id and admit one agent past the ceiling.
 
 from dataclasses import dataclass, replace
 import errno
@@ -31,6 +36,7 @@ import os
 from pathlib import Path
 import re
 import socket
+import time
 from typing import Any, List, Optional
 import uuid
 
@@ -87,6 +93,11 @@ _ASSIGNMENT_KEYS = (
 _RECORD_KEYS = _ASSIGNMENT_KEYS + PROCESS_FIELD_NAMES
 _ITERATION_KEYS = ("rail", "blob")
 
+# Exactly what one held reservation-commit lock records. The shape is the accepted
+# allowance-store lock's, deliberately, so there is one lock record to understand
+# rather than two spellings of the same thing.
+_LOCK_KEYS = ("version", "generation", "pid", "acquiredAt", "operation")
+
 
 class SessionBindingError(Exception):
     """A fail-closed binding refusal carrying one stable machine-readable reason."""
@@ -110,6 +121,9 @@ REASON_CONCURRENCY_CEILING = "concurrency-ceiling-reached"
 REASON_MALFORMED_RECORD = "malformed-record"
 REASON_UNREADABLE_RECORD = "unreadable-record"
 REASON_STORE_WRITE_FAILED = "store-write-failed"
+REASON_STORE_LOCKED = "store-locked"
+REASON_LOCK_MALFORMED = "store-lock-malformed"
+REASON_LOCK_LOST = "store-lock-lost"
 REASON_UNKNOWN_SESSION = "unknown-session"
 REASON_ALREADY_UNBOUND = "already-unbound"
 REASON_NOT_RESERVED = "not-reserved"
@@ -493,6 +507,118 @@ class BindingStore:
     def bindings_directory(self) -> Path:
         return self.root / BINDINGS_DIRECTORY_NAME
 
+    @property
+    def lock_path(self) -> Path:
+        """Where the reservation-commit lock lives: beside the records, never among them.
+
+        `records()` refuses any file in the bindings directory it cannot parse as a
+        binding, so a lock kept inside it would turn every held lock into a
+        store-wide read failure.
+        """
+        return self.root / "{0}.lock".format(BINDINGS_DIRECTORY_NAME)
+
+    # -- exclusive boundary -----------------------------------------------
+
+    def _acquire(self, operation: str) -> str:
+        """Take exclusive ownership of one count-then-create decision.
+
+        This is the accepted `claude_allowance_store` boundary applied to the store
+        that needed it. `write_new` is atomic per session id, which stops two
+        controllers from creating the *same* binding; it does nothing about two
+        controllers that each counted the same occupancy and then created
+        *different* bindings, which is exactly how a seventh agent gets past a
+        ceiling of six. Exclusive creation of one lock file is the boundary that
+        does, because the decision and the creation then happen inside it.
+
+        An existing lock is never read, aged out, or broken here, and no ownership
+        is inferred from its recorded pid or timestamp: held and malformed are the
+        same answer -- refuse -- because a lock whose owner cannot be proven is
+        exactly when guessing is most expensive. The refusal leaves the store
+        byte-unchanged, so the caller may retry with the same preassigned session
+        id safely.
+        """
+        generation = os.urandom(16).hex()
+        payload = json.dumps(
+            {"version": 1, "generation": generation, "pid": os.getpid(),
+             "acquiredAt": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "operation": operation},
+            indent=2, sort_keys=True,
+        ) + "\n"
+        try:
+            self.lock_path.parent.mkdir(parents=True, exist_ok=True)
+            descriptor = os.open(
+                str(self.lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600
+            )
+        except OSError as exc:
+            if exc.errno == errno.EEXIST:
+                raise SessionBindingError(
+                    REASON_STORE_LOCKED,
+                    "{0} is held by another controller; retry with the same "
+                    "preassigned session id".format(self.lock_path),
+                ) from exc
+            raise SessionBindingError(
+                REASON_STORE_WRITE_FAILED,
+                "cannot create {0}: {1}".format(self.lock_path, exc),
+            ) from exc
+        try:
+            with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except OSError as exc:
+            # Close before unlinking. If `os.fdopen` itself failed the descriptor is
+            # still open, and on Windows an open handle refuses the unlink -- which
+            # would leave a lock file no owner is behind and lock the store shut.
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+            try:
+                os.unlink(str(self.lock_path))
+            except OSError:
+                pass
+            raise SessionBindingError(
+                REASON_STORE_WRITE_FAILED,
+                "cannot write {0}: {1}".format(self.lock_path, exc),
+            ) from exc
+        return generation
+
+    def _release(self, generation: str) -> None:
+        """Release only the generation this call acquired."""
+        try:
+            text = self.lock_path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            raise SessionBindingError(
+                REASON_LOCK_LOST, "{0} vanished before release".format(self.lock_path)
+            ) from None
+        except OSError as exc:
+            raise SessionBindingError(
+                REASON_UNREADABLE_RECORD,
+                "cannot read {0}: {1}".format(self.lock_path, exc),
+            ) from exc
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise SessionBindingError(
+                REASON_LOCK_MALFORMED,
+                "{0} is invalid JSON: {1}".format(self.lock_path, exc.msg),
+            ) from exc
+        if not isinstance(payload, dict) or set(payload) != set(_LOCK_KEYS):
+            raise SessionBindingError(
+                REASON_LOCK_MALFORMED, "{0} is not a lock record".format(self.lock_path)
+            )
+        if payload.get("generation") != generation:
+            raise SessionBindingError(
+                REASON_LOCK_LOST,
+                "{0} was replaced since this call acquired it".format(self.lock_path),
+            )
+        try:
+            os.unlink(str(self.lock_path))
+        except OSError as exc:
+            raise SessionBindingError(
+                REASON_STORE_WRITE_FAILED,
+                "cannot release {0}: {1}".format(self.lock_path, exc),
+            ) from exc
+
     def path_for(self, session_id: str) -> Path:
         return self.bindings_directory / "{0}.json".format(validate_session_id(session_id))
 
@@ -677,51 +803,65 @@ def reserve_binding(
         state=BINDING_STATE_RESERVED,
     )
 
-    existing = store.read(record.session_id)
-    if existing is not None:
-        raise SessionBindingError(
-            REASON_DUPLICATE_SESSION_ID,
-            "session {0} is already {1} on rail {2}.".format(
-                record.session_id, existing.state, existing.rail
-            ),
-        )
-
-    held = find_binding_for_iteration(
-        store, project=record.project, ticket=record.ticket, iteration=record.iteration
-    )
-    if held:
-        raise SessionBindingError(
-            REASON_DUPLICATE_RAIL_ITERATION,
-            "rail {0} at iteration {1} is already held by session {2} ({3}); unbind it "
-            "before rebinding with a new session id.".format(
-                record.rail, record.iteration.blob, held[0].session_id, held[0].state
-            ),
-        )
-
-    # Re-read at the commit point, not carried from the authorization that led
-    # here. `authorize` decided against occupancy as it stood then; between that
-    # decision and this write another reservation may have taken the last slot, and
-    # a reservation is exactly what would still be invisible as a process. Counting
-    # nonterminal records here can only overstate occupancy, never understate it,
-    # which is the safe direction for a hard limit.
+    # Checked before the lock, so a malformed ceiling costs neither a lock nor a
+    # write. Whether the ceiling is a usable number is a caller fault that no amount
+    # of exclusivity would change.
     if type(ceiling) is not int or ceiling < 1:
         raise SessionBindingError(
             REASON_CONCURRENCY_CEILING,
             "the configured concurrency ceiling must be a positive whole number of "
             "agents, got {0!r}.".format(ceiling),
         )
-    occupied = [other for other in store.records() if not other.is_terminal]
-    if len(occupied) >= ceiling:
-        raise SessionBindingError(
-            REASON_CONCURRENCY_CEILING,
-            "{0} of {1} permitted managed agents already hold bindings ({2}); "
-            "reserving another would admit one past the ceiling.".format(
-                len(occupied), ceiling,
-                ", ".join(sorted(other.session_id for other in occupied)),
-            ),
-        )
 
-    store.write_new(record)
+    # Everything from here to the creation is one decision, and it is taken under
+    # the store's exclusive boundary. Counting nonterminal records and then creating
+    # a new one is a read-decide-write, and atomic per-session-id creation does not
+    # serialize it: two controllers that each counted five of six permitted agents
+    # would each create a different session id and leave seven. The lock is what
+    # makes the count the reserving controller acted on still true when it writes.
+    generation = store._acquire("reserve_binding")
+    try:
+        existing = store.read(record.session_id)
+        if existing is not None:
+            raise SessionBindingError(
+                REASON_DUPLICATE_SESSION_ID,
+                "session {0} is already {1} on rail {2}.".format(
+                    record.session_id, existing.state, existing.rail
+                ),
+            )
+
+        held = find_binding_for_iteration(
+            store, project=record.project, ticket=record.ticket, iteration=record.iteration
+        )
+        if held:
+            raise SessionBindingError(
+                REASON_DUPLICATE_RAIL_ITERATION,
+                "rail {0} at iteration {1} is already held by session {2} ({3}); unbind it "
+                "before rebinding with a new session id.".format(
+                    record.rail, record.iteration.blob, held[0].session_id, held[0].state
+                ),
+            )
+
+        # Re-read at the commit point, not carried from the authorization that led
+        # here. `authorize` decided against occupancy as it stood then; between that
+        # decision and this write another reservation may have taken the last slot, and
+        # a reservation is exactly what would still be invisible as a process. Counting
+        # nonterminal records here can only overstate occupancy, never understate it,
+        # which is the safe direction for a hard limit.
+        occupied = [other for other in store.records() if not other.is_terminal]
+        if len(occupied) >= ceiling:
+            raise SessionBindingError(
+                REASON_CONCURRENCY_CEILING,
+                "{0} of {1} permitted managed agents already hold bindings ({2}); "
+                "reserving another would admit one past the ceiling.".format(
+                    len(occupied), ceiling,
+                    ", ".join(sorted(other.session_id for other in occupied)),
+                ),
+            )
+
+        store.write_new(record)
+    finally:
+        store._release(generation)
     return record
 
 
