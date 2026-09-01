@@ -34,6 +34,14 @@ from ai_dev_flow.decision_manager_web import (
     serialize_payload,
     start_serving,
 )
+from ai_dev_flow.attention_projection import (
+    ACTIVITIES,
+    ACTIVITY_BLOCKED,
+    ACTIVITY_DISCONNECTED_RECOVERY,
+    ACTIVITY_EXECUTOR_WORKING,
+    OWNER_AGENT,
+    OWNER_HUMAN,
+)
 from ai_dev_flow.claude_allowance import (
     HEALTH_CALIBRATED,
     HEALTH_PROVISIONAL,
@@ -72,6 +80,8 @@ def a_decision(**overrides) -> PendingDecision:
         raised_at="raised-1", title="Choose the credential route",
         explanation="The requirements do not say which credential the worker uses.",
         elapsed_seconds=7200,
+        activity=ACTIVITY_BLOCKED,
+        attention_owner=OWNER_HUMAN,
         evidence=(EvidenceReference(label="review", locator="rails/one/handoff.md"),),
     )
     base.update(overrides)
@@ -82,7 +92,15 @@ def an_agent(**overrides) -> OperationalAgent:
     rail = overrides.pop("rail", "issue-55-rail-two")
     state = overrides.pop("state", STATE_RUNNING)
     elapsed = overrides.pop("elapsed_seconds", 300)
-    base = dict(project=PROJECT, ticket=TICKET, rail=rail, title="Implement the seam")
+    activity = overrides.pop(
+        "activity",
+        ACTIVITY_EXECUTOR_WORKING if state == STATE_RUNNING
+        else ACTIVITY_DISCONNECTED_RECOVERY,
+    )
+    base = dict(
+        project=PROJECT, ticket=TICKET, rail=rail, title="Implement the seam",
+        activity=activity, attention_owner=OWNER_AGENT,
+    )
     base.update(overrides)
     return OperationalAgent(
         projection=SessionProjection(
@@ -253,8 +271,15 @@ class SerializationTests(unittest.TestCase):
             set(payload["rows"][0]),
             {"itemId", "state", "title", "project", "ticket", "elapsedSeconds"},
         )
-        self.assertEqual(set(payload["details"][payload["rows"][0]["itemId"]]),
-                         {"state", "explanation", "evidence"})
+        self.assertEqual(
+            set(payload["details"][payload["rows"][0]["itemId"]]),
+            {"state", "activity", "attentionOwner", "explanation", "evidence"},
+        )
+        # The row field set above is the dense contract, and neither of the two
+        # new facts appears in it: activity and attention owner reach a person
+        # through the filters and the detail pane, never as a row field.
+        self.assertNotIn("activity", set(payload["rows"][0]))
+        self.assertNotIn("attentionOwner", set(payload["rows"][0]))
         self.assertEqual(payload["defaultFilters"], [STATE_WAITING])
         self.assertEqual(payload["states"], list(QUEUE_STATES))
 
@@ -307,7 +332,10 @@ class SerializationTests(unittest.TestCase):
     def test_a_detail_for_an_absent_row_is_refused(self) -> None:
         _, view, details = rendered([a_decision()])
         stray = dict(details)
-        stray["not-a-row"] = SelectedDetail(item_id="not-a-row", state=STATE_WAITING)
+        stray["not-a-row"] = SelectedDetail(
+            item_id="not-a-row", state=STATE_WAITING,
+            activity=ACTIVITY_BLOCKED, attention_owner=OWNER_HUMAN,
+        )
         with self.assertRaises(RenderError) as caught:
             build_payload(view, stray, allowance=an_allowance())
         self.assertEqual(caught.exception.reason, web.REASON_DETAIL_UNKNOWN)
@@ -318,7 +346,10 @@ class SerializationTests(unittest.TestCase):
         with self.assertRaises(RenderError) as caught:
             build_payload(
                 view,
-                {only: SelectedDetail(item_id="other", state=STATE_WAITING)},
+                {only: SelectedDetail(
+                    item_id="other", state=STATE_WAITING,
+                    activity=ACTIVITY_BLOCKED, attention_owner=OWNER_HUMAN,
+                )},
                 allowance=an_allowance(),
             )
         self.assertEqual(caught.exception.reason, web.REASON_INVALID_DETAIL)
@@ -551,6 +582,59 @@ class ServingTests(unittest.TestCase):
 # --------------------------------------------------------------------------
 # Page structure: what is present, and what must never be
 # --------------------------------------------------------------------------
+
+
+class ActivityAndAttentionPresentationTests(unittest.TestCase):
+    """The two checkpoint-7 facts are drawn in Details, and nowhere near a row."""
+
+    def setUp(self) -> None:
+        self.page, self.view, _ = rendered([a_decision()], [an_agent()])
+        self.payload = payload_of(self.page)
+
+    def test_both_facts_reach_the_payload_for_every_row(self) -> None:
+        for row in self.payload["rows"]:
+            detail = self.payload["details"][row["itemId"]]
+            with self.subTest(item=row["itemId"]):
+                self.assertIn(detail["activity"], list(ACTIVITIES))
+                self.assertIn(detail["attentionOwner"], [OWNER_HUMAN, OWNER_AGENT])
+
+    def test_the_waiting_row_is_human_owned_and_the_operational_row_is_not(self) -> None:
+        owners = {
+            row["state"]: self.payload["details"][row["itemId"]]["attentionOwner"]
+            for row in self.payload["rows"]
+        }
+        self.assertEqual(owners[STATE_WAITING], OWNER_HUMAN)
+        self.assertEqual(owners[STATE_RUNNING], OWNER_AGENT)
+
+    def test_no_row_in_the_payload_carries_either_fact(self) -> None:
+        for row in self.payload["rows"]:
+            self.assertNotIn("activity", row)
+            self.assertNotIn("attentionOwner", row)
+
+    def test_the_facts_are_drawn_inside_the_existing_details_disclosure(self) -> None:
+        details_block = self.page.split("<details id=\"details\">", 1)[1].split(
+            "</details>", 1
+        )[0]
+        self.assertIn('id="facts"', details_block)
+        self.assertIn('id="evidence"', details_block)
+        # The disclosure is the only place the list is placed in the document.
+        self.assertEqual(self.page.count('id="facts"'), 1)
+
+    def test_the_page_adds_no_card_circle_inspector_console_or_sort_control(self) -> None:
+        for forbidden in ("card", "circle", "inspector", "console"):
+            self.assertNotIn(forbidden, self.page.lower(), forbidden)
+        # A sort control would be a second ordering rule beside the projection's.
+        # The word itself appears in a comment about not sorting, so the check is
+        # on controls and handles rather than on the substring.
+        for forbidden in ("<select", 'id="sort', "data-sort", "sortBy", "sortOrder"):
+            self.assertNotIn(forbidden, self.page, forbidden)
+
+    def test_the_page_draws_the_two_facts_apart_rather_than_combining_them(self) -> None:
+        """Neither is used to choose, colour, or hide the other anywhere in the script."""
+        script = self.page.split('<script>', 1)[1]
+        for combination in ("detail.activity ===", "detail.attentionOwner ===",
+                            "activity ==", "attentionOwner =="):
+            self.assertNotIn(combination, script, combination)
 
 
 class PageStructureTests(unittest.TestCase):

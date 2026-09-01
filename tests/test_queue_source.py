@@ -1,16 +1,31 @@
 from __future__ import annotations
 
+import ast
 import json
 import subprocess
 import tempfile
 import types
 import unittest
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
 from unittest.mock import patch
 
 from ai_dev_flow import queue_source
+from ai_dev_flow.attention_projection import (
+    ACTIVITY_BLOCKED,
+    ACTIVITY_CONTEXT_ROTATION,
+    ACTIVITY_DISCONNECTED_RECOVERY,
+    ACTIVITY_EXECUTOR_WORKING,
+    ACTIVITY_MANAGER_LIFECYCLE,
+    ACTIVITY_ORCHESTRATOR_RECONCILING,
+    ACTIVITY_REVIEWER_WORKING,
+    OWNER_AGENT,
+    OWNER_HUMAN,
+)
+from ai_dev_flow.authorization import reconcile_agent_slots
 from ai_dev_flow.decision_queue import (
     DEFAULT_FILTERS,
+    QUEUE_STATES,
     KIND_AGENT,
     KIND_DECISION,
     DecisionQueue,
@@ -20,6 +35,7 @@ from ai_dev_flow.decision_queue import (
 from ai_dev_flow.queue_source import QueueSourceError, load_queue
 from ai_dev_flow.session_binding import (
     BINDING_STATE_BOUND,
+    BINDING_STATE_RESERVED,
     BINDING_STATE_UNBOUND,
     BindingStore,
     RailIteration,
@@ -31,6 +47,7 @@ from ai_dev_flow.session_lifecycle import (
     STATE_WAITING,
     OwnedSession,
     SessionRegistry,
+    ownership_evidence,
 )
 
 
@@ -49,6 +66,9 @@ RESERVED_AT = "2026-08-31T11:30:00Z"
 STARTED_AT = "2026-08-31T11:40:00Z"
 DECISION_AGE = 3600
 SESSION_AGE = 1200
+
+# The three accepted states, named once so a filter list is not retyped.
+QUEUE_STATES_ALL = QUEUE_STATES
 
 
 def decision_payload(**overrides: object) -> dict:
@@ -152,12 +172,14 @@ class QueueSourceTestBase(unittest.TestCase):
         state: str = BINDING_STATE_BOUND,
         project: str = PROJECT,
         ticket: str = TICKET,
+        role: str = "executor",
+        pid: int = 4242,
     ):
         iteration = RailIteration(rail=rail_id, blob=blob if blob is not None else self.blob(rail_id))
         process: dict = {}
         if state == BINDING_STATE_BOUND:
             process = {
-                "pid": 4242, "pid_domain": "test-host",
+                "pid": pid, "pid_domain": "test-host",
                 "started_at": STARTED_AT, "bound_at": STARTED_AT,
             }
         record = build_record(
@@ -165,7 +187,7 @@ class QueueSourceTestBase(unittest.TestCase):
             workspace_key="github:jmrozi1/ai-dev#55",
             worktree_id="worktree-55",
             workspace_path=str(self.tmp_path / "workspace-55"),
-            rail=rail_id, role="executor", iteration=iteration,
+            rail=rail_id, role=role, iteration=iteration,
             session_id=session_id, launched_at_head=HEAD, reserved_at=RESERVED_AT,
             state=state, **process,
         )
@@ -361,6 +383,7 @@ class OperationalDerivationTests(QueueSourceTestBase):
             OperationalAgent(
                 project=PROJECT, ticket=TICKET, rail=BLOCKED_RAIL,
                 title=BLOCKED_RAIL, projection=projection,
+                activity=ACTIVITY_BLOCKED, attention_owner=OWNER_AGENT,
             )
         self.assertEqual(caught.exception.reason, "operational-cannot-wait")
 
@@ -557,15 +580,19 @@ class SourceFailureBoundaryTests(QueueSourceTestBase):
         self.assertEqual(exception.reason, queue_source.REASON_LIFECYCLE_REFUSED)
         self.assertIn("unexplained rather than waiting", exception.detail)
 
-    def test_two_bindings_claiming_one_rail_refuse_as_conflicting(self) -> None:
+    def test_two_sessions_this_controller_can_prove_are_live_fail_closed(self) -> None:
+        """Contradictory ownership evidence is never merged into one plausible row."""
         self.authorize(LIVE_RAIL, "running")
-        self.bind(LIVE_RAIL, session_id=SESSION)
-        self.bind(LIVE_RAIL, session_id=OTHER_SESSION)
+        self.own(self.bind(LIVE_RAIL, session_id=SESSION))
+        self.own(self.bind(LIVE_RAIL, session_id=OTHER_SESSION), pgid=4243)
 
         exception = self.refusal()
 
-        self.assertEqual(exception.reason, queue_source.REASON_CONFLICTING_ITEMS)
-        self.assertIn("appears twice", exception.detail)
+        self.assertEqual(exception.reason, queue_source.REASON_OWNERSHIP_CONTRADICTORY)
+        self.assertIn("contradictory evidence", exception.detail)
+        # Both are named, so the refusal is actionable rather than merely stern.
+        self.assertIn(SESSION, exception.detail)
+        self.assertIn(OTHER_SESSION, exception.detail)
 
 
 class PurityTests(QueueSourceTestBase):
@@ -664,7 +691,396 @@ class ProjectionAuthorityTests(QueueSourceTestBase):
         view = self.load().view(filters=(STATE_RUNNING,))
 
         self.assertIsNone(view.detail.explanation)
-        self.assertEqual(view.detail.evidence, ())
+        # Its evidence is transport, not a human-decision reference: session
+        # identity is allowed here and nowhere else, and it is bounded.
+        self.assertEqual([entry.label for entry in view.detail.evidence], ["live session"])
+        self.assertIn(SESSION, view.detail.evidence[0].locator)
+        self.assertLessEqual(len(view.detail.evidence), 8)
+
+
+# --------------------------------------------------------------------------
+# Named checkpoint 7: the row is the durable rail, and activity is not ownership
+# --------------------------------------------------------------------------
+
+
+class RailCentricIdentityTests(QueueSourceTestBase):
+    """The visible operational item is the work, never the transport carrying it."""
+
+    def a_transport_resident(self, session_id: str = OTHER_SESSION) -> OwnedSession:
+        """A live worker this controller owns that no durable binding names.
+
+        This is the `ai-dev-55-web` shape: the hidden transport may hold a session
+        and may launch agents, but it is not itself a rail, a work item, or any
+        kind of product authority.
+        """
+        return self.registry.add(
+            OwnedSession(
+                session_id=session_id,
+                handle=types.SimpleNamespace(pid=9001, pgid=9001),
+                pid=9001, pid_domain="test-host", pgid=9001,
+                started_at=STARTED_AT,
+                iteration=RailIteration(rail=LIVE_RAIL, blob=UNRELATED_BLOB),
+                workspace_path=str(self.tmp_path / "workspace-55"),
+                role="executor",
+            )
+        )
+
+    def test_a_transport_resident_on_no_running_rail_produces_no_row(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.a_transport_resident()
+
+        queue = self.load()
+
+        self.assertEqual(queue.items, ())
+        self.assertEqual(queue.view(filters=QUEUE_STATES_ALL).rows, ())
+
+    def test_a_transport_resident_beside_real_work_adds_no_second_row(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+        self.a_transport_resident()
+
+        view = self.load().view(filters=QUEUE_STATES_ALL)
+
+        self.assertEqual(len(view.rows), 1)
+        self.assertEqual(view.rows[0].title, LIVE_RAIL)
+        for text in _every_string(view.rows):
+            self.assertNotIn(OTHER_SESSION, text)
+
+    def test_an_idle_resident_alone_never_creates_a_waiting_row(self) -> None:
+        """Waiting still comes from a published record and from nothing else."""
+        self.authorize(LIVE_RAIL, "running")
+        self.a_transport_resident()
+
+        self.assertEqual(self.load().view().rows, ())
+
+    def test_one_running_rail_projects_exactly_one_running_work_item(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        view = self.load().view(filters=QUEUE_STATES_ALL)
+
+        self.assertEqual(len(view.rows), 1)
+        self.assertEqual(view.rows[0].state, STATE_RUNNING)
+        self.assertEqual(view.rows[0].title, LIVE_RAIL)
+
+    def test_rotating_the_session_keeps_one_item_with_one_unchanged_identity(self) -> None:
+        """A replaced worker is the same work. The row must not split or renumber."""
+        self.authorize(LIVE_RAIL, "running")
+        first = self.bind(LIVE_RAIL, session_id=SESSION)
+        self.own(first)
+        before = self.load().view(filters=QUEUE_STATES_ALL)
+
+        # The replacement arrives while the old record is still nonterminal: this
+        # is the window the old per-binding projection turned into a second row.
+        self.own(self.bind(LIVE_RAIL, session_id=OTHER_SESSION, pid=4343), pgid=4343)
+        self.registry.remove(SESSION)
+        after = self.load().view(filters=QUEUE_STATES_ALL)
+
+        self.assertEqual(len(before.rows), 1)
+        self.assertEqual(len(after.rows), 1)
+        self.assertEqual(after.rows[0].item_id, before.rows[0].item_id)
+        self.assertEqual(after.rows[0].state, STATE_RUNNING)
+        self.assertEqual(
+            self.load().items[0].activity, ACTIVITY_CONTEXT_ROTATION
+        )
+
+    def test_the_item_identity_survives_every_transport_fact_changing(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL, session_id=SESSION))
+        original = self.load().view(filters=QUEUE_STATES_ALL).rows[0].item_id
+
+        self.registry.remove(SESSION)
+        self._replace_state(SESSION, BINDING_STATE_UNBOUND)
+        self.own(self.bind(LIVE_RAIL, session_id=OTHER_SESSION, pid=4343), pgid=4343)
+
+        rows = self.load().view(filters=QUEUE_STATES_ALL).rows
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].item_id, original)
+
+    def test_session_id_worker_target_and_pid_never_reach_a_row(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        view = self.load().view(filters=QUEUE_STATES_ALL)
+
+        for secret in (SESSION, "4242", "test-host"):
+            for text in _every_string(view.rows):
+                self.assertNotIn(secret, text, secret)
+
+    def test_session_id_and_pid_appear_only_in_bounded_details(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        view = self.load().view(filters=(STATE_RUNNING,))
+
+        self.assertEqual(len(view.detail.evidence), 1)
+        locator = view.detail.evidence[0].locator
+        self.assertIn(SESSION, locator)
+        self.assertIn("pid 4242", locator)
+        self.assertIn("test-host", locator)
+        self.assertLessEqual(len(view.detail.evidence), 8)
+
+    # -- helpers ---------------------------------------------------------
+
+    def _replace_state(self, session_id: str, state: str) -> None:
+        """Rewrite one durable record's state through the store's own file layout."""
+        path = self.store.bindings_directory / "{0}.json".format(session_id)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["state"] = state
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+class ActivityAndAttentionTests(QueueSourceTestBase):
+    """Two facts, read from two durable sources, and neither derived from the other."""
+
+    def test_a_live_session_projects_its_role_and_agent_attention(self) -> None:
+        """Three roles on three rails, which is how legitimate concurrency looks."""
+        cases = {
+            "issue-55-role-executor-rail": ("executor", ACTIVITY_EXECUTOR_WORKING),
+            "issue-55-role-reviewer-rail": ("reviewer", ACTIVITY_REVIEWER_WORKING),
+            "issue-55-role-orchestrator-rail": (
+                "orchestrator", ACTIVITY_ORCHESTRATOR_RECONCILING
+            ),
+        }
+        for index, (rail, (role, _)) in enumerate(sorted(cases.items())):
+            self.authorize(rail, "running")
+            session = "1a2b3c4d-01{0:02d}-4000-8000-00000000000a".format(index)
+            self.own(
+                self.bind(rail, session_id=session, role=role, pid=5000 + index),
+                pgid=5000 + index,
+            )
+
+        items = {entry.rail: entry for entry in self.load().items}
+
+        self.assertEqual(len(items), len(cases))
+        for rail, (_, activity) in cases.items():
+            with self.subTest(rail=rail):
+                self.assertEqual(items[rail].activity, activity)
+                self.assertEqual(items[rail].attention_owner, OWNER_AGENT)
+
+    def test_a_reservation_alone_reads_as_manager_lifecycle_not_a_lost_session(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL, state=BINDING_STATE_RESERVED)
+
+        item = self.load().items[0]
+
+        self.assertEqual(item.activity, ACTIVITY_MANAGER_LIFECYCLE)
+        self.assertEqual(item.state, STATE_DISCONNECTED)
+
+    def test_unprovable_ownership_stays_visible_as_recovery(self) -> None:
+        """Neither vanishing nor reading as idle: the rail stays on the screen."""
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        queue = self.load()
+        item = queue.items[0]
+
+        self.assertEqual(item.state, STATE_DISCONNECTED)
+        self.assertEqual(item.activity, ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertEqual(
+            len(queue.view(filters=(STATE_DISCONNECTED,)).rows), 1
+        )
+
+    def test_activity_changes_while_the_attention_owner_does_not(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+        record = self.bind(BLOCKED_RAIL)
+        self.own(record)
+
+        parked = self.load().items[0]
+        self.registry.remove(record.session_id)
+        lost = self.load().items[0]
+
+        self.assertEqual(parked.activity, ACTIVITY_BLOCKED)
+        self.assertEqual(lost.activity, ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertEqual(parked.attention_owner, OWNER_HUMAN)
+        self.assertEqual(lost.attention_owner, OWNER_HUMAN)
+        # The same durable item throughout: only what it is doing moved.
+        self.assertEqual(parked.item_id, lost.item_id)
+        self.assertEqual(parked.state, lost.state)
+
+    def test_the_attention_owner_changes_while_the_activity_does_not(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+        self.bind(BLOCKED_RAIL, session_id=SESSION)
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL, session_id=OTHER_SESSION)
+
+        items = {entry.rail: entry for entry in self.load().items}
+
+        self.assertEqual(
+            items[BLOCKED_RAIL].activity, items[LIVE_RAIL].activity
+        )
+        self.assertEqual(items[BLOCKED_RAIL].activity, ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertEqual(items[BLOCKED_RAIL].attention_owner, OWNER_HUMAN)
+        self.assertEqual(items[LIVE_RAIL].attention_owner, OWNER_AGENT)
+
+    def test_the_detail_pane_carries_both_facts_and_a_row_carries_neither(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        view = self.load().view(filters=(STATE_RUNNING,))
+
+        self.assertEqual(view.detail.activity, ACTIVITY_EXECUTOR_WORKING)
+        self.assertEqual(view.detail.attention_owner, OWNER_AGENT)
+        for field in ("activity", "attention_owner"):
+            self.assertFalse(hasattr(view.rows[0], field), field)
+
+
+class WaitingIsTheHumanOwnedSetTests(QueueSourceTestBase):
+    def test_the_default_view_is_exactly_the_human_owned_items(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        queue = self.load()
+        waiting = {row.item_id for row in queue.view().rows}
+        human = {
+            entry.item_id for entry in queue.items
+            if entry.attention_owner == OWNER_HUMAN
+        }
+
+        self.assertEqual(waiting, human)
+        self.assertEqual(len(waiting), 1)
+        # And nothing human-owned hides behind an operational filter.
+        for combination in ((STATE_RUNNING,), (STATE_DISCONNECTED,),
+                            (STATE_RUNNING, STATE_DISCONNECTED)):
+            with self.subTest(filters=combination):
+                for row in queue.view(filters=combination).rows:
+                    self.assertNotIn(row.item_id, human)
+
+    def test_no_operational_evidence_of_any_shape_creates_a_waiting_row(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL, session_id=SESSION))
+        self.bind(LIVE_RAIL, session_id=OTHER_SESSION, state=BINDING_STATE_RESERVED)
+
+        self.assertEqual(self.load().view().rows, ())
+
+    def test_a_queue_whose_waiting_set_left_the_human_owned_set_is_refused(self) -> None:
+        """The set property is checked over the assembled queue, not merely implied."""
+        with self.assertRaises(QueueError) as caught:
+            OperationalAgent(
+                project=PROJECT, ticket=TICKET, rail=LIVE_RAIL, title=LIVE_RAIL,
+                projection=_a_running_projection(LIVE_RAIL),
+                activity=ACTIVITY_EXECUTOR_WORKING, attention_owner=OWNER_HUMAN,
+            )
+        self.assertEqual(
+            caught.exception.reason, "waiting-is-not-the-human-owned-set"
+        )
+
+
+class CheckpointSixPreservationTests(QueueSourceTestBase):
+    """One ownership proof feeds both the rows and the accepted concurrency ceiling."""
+
+    def test_rows_and_the_admission_reconciler_read_the_same_ownership_evidence(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        record = self.bind(LIVE_RAIL)
+        self.own(record)
+
+        item = self.load().items[0]
+        slots = reconcile_agent_slots(
+            self.store.records(),
+            ownership=ownership_evidence(
+                self.registry, self.store.records(), alive=lambda pgid: True
+            ),
+        )
+
+        self.assertEqual(item.state, STATE_RUNNING)
+        self.assertEqual(slots.occupants, (SESSION,))
+        self.assertTrue(slots.provable)
+        self.assertEqual(slots.ceiling, 6)
+
+    def test_an_unprovable_session_is_disconnected_and_still_occupies_no_free_slot(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        item = self.load().items[0]
+        slots = reconcile_agent_slots(
+            self.store.records(),
+            ownership=ownership_evidence(
+                self.registry, self.store.records(), alive=lambda pgid: True
+            ),
+        )
+
+        self.assertEqual(item.state, STATE_DISCONNECTED)
+        self.assertFalse(slots.provable)
+
+    def test_the_seam_constructs_no_second_store_registry_or_ownership_system(self) -> None:
+        source = Path(queue_source.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        constructed = {
+            node.func.id for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        for forbidden in ("BindingStore", "SessionRegistry", "OwnedSession",
+                          "Thread", "Timer", "Popen"):
+            self.assertNotIn(forbidden, constructed, forbidden)
+        for forbidden in ("getpid", "process_group_alive", "psutil", "kill(",
+                          "adopt", "time.sleep", "while True"):
+            self.assertNotIn(forbidden, source, forbidden)
+
+
+class DenseRowContractTests(QueueSourceTestBase):
+    def test_the_row_contract_is_unchanged_by_the_new_facts(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide()
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        queue = self.load()
+
+        # Waiting only, by default.
+        self.assertEqual(queue.view().filters, DEFAULT_FILTERS)
+        # Three independent filters, any nonempty combination.
+        for combination in (
+            (STATE_WAITING,), (STATE_RUNNING,), (STATE_DISCONNECTED,),
+            (STATE_WAITING, STATE_RUNNING), QUEUE_STATES_ALL,
+        ):
+            with self.subTest(filters=combination):
+                view = queue.view(filters=combination)
+                self.assertEqual(view.filters, tuple(
+                    state for state in QUEUE_STATES_ALL if state in combination
+                ))
+                # Oldest first, and no second ordering rule anywhere.
+                ages = [row.elapsed_seconds for row in view.rows]
+                self.assertEqual(ages, sorted(ages, reverse=True))
+        # No sort control, no persistent sort label, no per-row marker.
+        self.assertEqual(
+            {f.name for f in dataclass_fields(type(queue.view().rows[0]))},
+            {"item_id", "state", "title", "project", "ticket", "elapsed_seconds"},
+        )
+
+
+def _a_running_projection(rail: str):
+    from ai_dev_flow.session_lifecycle import SessionProjection
+
+    return SessionProjection(
+        state=STATE_RUNNING, reason="owned-process-live", detail="pid 1 is live.",
+        session_id=SESSION, rail=rail, elapsed_seconds=1,
+    )
+
+
+def _every_string(value, seen=None):
+    """Every string reachable from a value, so a leak cannot hide in a nested field."""
+    seen = [] if seen is None else seen
+    if id(value) in seen:
+        return []
+    seen.append(id(value))
+    if isinstance(value, str):
+        return [value]
+    found = []
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            found.extend(_every_string(item, seen))
+    elif hasattr(value, "__dict__"):
+        for item in vars(value).values():
+            found.extend(_every_string(item, seen))
+    elif hasattr(value, "__dataclass_fields__"):
+        for name in value.__dataclass_fields__:
+            found.extend(_every_string(getattr(value, name), seen))
+    return found
+
 
 
 if __name__ == "__main__":

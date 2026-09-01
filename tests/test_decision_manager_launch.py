@@ -80,6 +80,7 @@ from ai_dev_flow.session_lifecycle import (
     SessionRegistry,
     elapsed_seconds,
 )
+from ai_dev_flow.attention_projection import ACTIVITY_BLOCKED, OWNER_HUMAN
 from ai_dev_flow.decision_queue import (
     QUEUE_STATES,
     EvidenceReference,
@@ -184,6 +185,8 @@ def a_decision(**overrides) -> PendingDecision:
         raised_at="raised-1", title="Choose the credential route",
         explanation="The requirements do not say which credential the worker uses.",
         elapsed_seconds=7200,
+        activity=ACTIVITY_BLOCKED,
+        attention_owner=OWNER_HUMAN,
         evidence=(EvidenceReference(label="review", locator="rails/one/handoff.md"),),
     )
     base.update(overrides)
@@ -968,11 +971,25 @@ class SourceRefusalTests(SourcedLaunchTestCase):
         self.bind(LIVE_RAIL, blob="f" * 40)
         self._refused(queue_source.REASON_LIFECYCLE_REFUSED)
 
-    def test_two_bindings_claiming_one_rail_refuse_as_conflicting(self) -> None:
+    def test_two_bindings_on_one_rail_serve_one_work_item_rather_than_two_rows(self) -> None:
+        """The rail is the work item, so a replaced session does not become a second row.
+
+        This entry point owns no handles, so neither session is provable and the
+        one item it serves is Disconnected. The contradictory-ownership refusal is
+        deliberately unreachable from here: it needs two sessions a controller can
+        prove are live, and a diagnostic view that started none can prove nothing.
+        """
         self.authorize(LIVE_RAIL, "running")
         self.bind(LIVE_RAIL, session_id=SESSION)
         self.bind(LIVE_RAIL, session_id=OTHER_SESSION)
-        self._refused(queue_source.REASON_CONFLICTING_ITEMS)
+
+        result = self.launch()
+
+        self.assertEqual(result.code, 0)
+        self.assertIn("queue rows: 1", result.out)
+        # Neither session id reaches the terminal, and neither names the item.
+        for secret in (SESSION, OTHER_SESSION):
+            self.assertNotIn(secret, result.out)
 
     def test_a_moved_source_refuses_when_the_caller_pinned_one(self) -> None:
         with self.assertRaises(QueueSourceError) as caught:

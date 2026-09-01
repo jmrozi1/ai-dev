@@ -35,12 +35,33 @@ from __future__ import annotations
 # Fourth, this reads and refuses. It writes nothing, persists nothing, authorizes
 # nothing, makes no provider or network call, and creates no second authority.
 # `DecisionQueue` remains the only thing that orders, filters, selects, or details.
+#
+# Fifth, the visible unit of operational work is the durable rail, not the binding.
+# This module used to emit one row per live binding, which made the screen a
+# picture of transport: a Claude session id, a resident worker name, a pid. Rotate
+# the worker and the same piece of work grew a second row; leave an idle transport
+# resident lying around and it got a row for existing. The rail is what a person
+# tracks, so the rail is the row, and the sessions underneath it are reconciled
+# into two independent facts -- what the work is doing, and who owes it attention --
+# by the pure `attention_projection` model. Session identity survives only as
+# bounded Details evidence.
+#
+# Sixth, ownership is proved exactly once, by exactly the accepted primitive.
+# `session_lifecycle.ownership_evidence` is the same proof the accepted concurrency
+# reconciler consumes for the ceiling, so a row drawn Running and a count that
+# includes it rest on one piece of evidence rather than two that could disagree.
+# There is no second registry, no second store, no pid lookup, and no cache.
 
 from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple
 
+from .attention_projection import (
+    AttentionError,
+    project_attention,
+    session_evidence,
+)
 from .control_plane import (
     ControlPlaneError,
     RailState,
@@ -64,12 +85,14 @@ from .decision_queue import (
 from .session_binding import BindingStore, SessionBindingError
 from .session_lifecycle import (
     RAIL_STATUS_BLOCKED,
+    STATE_RUNNING,
     STATE_WAITING,
     LifecycleError,
     RailFacts,
     SessionRegistry,
     elapsed_seconds,
     observe_session,
+    ownership_evidence,
 )
 
 __all__ = [
@@ -83,6 +106,7 @@ __all__ = [
     "REASON_DECISION_RAIL_UNKNOWN",
     "REASON_DECISION_SCOPE_MISMATCH",
     "REASON_LIFECYCLE_REFUSED",
+    "REASON_OWNERSHIP_CONTRADICTORY",
     "REASON_RAIL_UNRECONCILED",
     "REASON_SCOPE_UNKNOWN",
     "REASON_SOURCE_STALE",
@@ -114,6 +138,7 @@ REASON_BINDING_UNREADABLE = "binding-unreadable"
 REASON_BINDING_RAIL_UNKNOWN = "binding-rail-unknown"
 REASON_LIFECYCLE_REFUSED = "lifecycle-refused"
 REASON_CONFLICTING_ITEMS = "conflicting-items"
+REASON_OWNERSHIP_CONTRADICTORY = "ownership-contradictory"
 
 
 @dataclass(frozen=True)
@@ -303,8 +328,22 @@ def read_decisions(
     return found
 
 
-def _pending_decision(decision: DurableDecision, *, now: str) -> PendingDecision:
-    """Carry the record's own fields across. Nothing here is derived except the age."""
+def _pending_decision(
+    decision: DurableDecision, *, now: str, activity: str, attention_owner: str
+) -> PendingDecision:
+    """Carry the record's own fields across. Nothing here is derived except the age.
+
+    Both `activity` and `attention_owner` arrive already projected, and both are
+    carried rather than restated. Two facts, two sources: the activity was computed
+    without knowing a decision was published, and the owner was computed without
+    knowing what the sessions are doing.
+
+    Passing the projected owner through matters more than it looks. `PendingDecision`
+    refuses anything but `human`, so a projection that ever stopped reading the
+    durable record would refuse here rather than quietly agreeing with itself. A
+    literal `human` written at this call site would make that check compare the
+    module to itself and prove nothing.
+    """
     payload = decision.payload
     try:
         age = elapsed_seconds(payload["raisedAt"], now)
@@ -324,6 +363,8 @@ def _pending_decision(decision: DurableDecision, *, now: str) -> PendingDecision
             title=payload["title"],
             explanation=payload["explanation"],
             elapsed_seconds=age,
+            activity=activity,
+            attention_owner=attention_owner,
             evidence=evidence,
         )
     except QueueError as exc:
@@ -355,7 +396,63 @@ def _binding_records(store: Optional[BindingStore], *, project: str, ticket: str
     ]
 
 
-def _operational_agents(
+def _rail_facts(
+    source: ReadSource,
+    state: RailState,
+    decision: Optional[DurableDecision],
+    *,
+    project: str,
+    ticket: str,
+) -> RailFacts:
+    """One rail's authorization as the accepted lifecycle wants to be told it."""
+    blob = rail_blob_sha(source, project=project, ticket=ticket, rail=state.identifier)
+    if blob is None:
+        raise QueueSourceError(
+            REASON_SOURCE_UNREADABLE,
+            "rail {0} has no readable authorization blob, so the iteration a session "
+            "is bound to cannot be checked.".format(state.identifier),
+        )
+    return RailFacts(
+        identifier=state.identifier,
+        status=state.status,
+        rail_blob=blob,
+        # The durable record, exactly as `RailFacts` documents it. A blocked rail
+        # without one reaches the lifecycle unexplained, and the lifecycle refuses
+        # it -- which is the intended outcome, not a gap.
+        pending_human_decision=decision.decision_id if decision is not None else None,
+    )
+
+
+def _rail_state(rails: Dict[str, RailState], record, *, project: str, ticket: str) -> RailState:
+    state = rails.get(record.rail)
+    if state is None:
+        raise QueueSourceError(
+            REASON_BINDING_RAIL_UNKNOWN,
+            "session {0} is bound to rail {1}, which {2} does not authorize.".format(
+                record.session_id, record.rail, scope_relative(project, ticket)
+            ),
+        )
+    _require_reconciled(state)
+    return state
+
+
+def _primary(projections):
+    """Which session's lifecycle projection speaks for the whole work item.
+
+    A rail carries one work item, so one of its sessions has to supply the state
+    and the age the row shows. The live one does when there is one, because a rail
+    with a proven running session is running whatever else is lying around beside
+    it. Otherwise the oldest evidence speaks, so "this rail has been unprovable for
+    two hours" does not reset to "twenty seconds" because a replacement was
+    reserved a moment ago. Session id breaks ties, so the choice is deterministic
+    rather than dependent on directory order.
+    """
+    running = [entry for entry in projections if entry.state == STATE_RUNNING]
+    candidates = running if running else list(projections)
+    return sorted(candidates, key=lambda entry: (-entry.elapsed_seconds, entry.session_id))[0]
+
+
+def _work_items(
     source: ReadSource,
     rails: Dict[str, RailState],
     records,
@@ -366,62 +463,134 @@ def _operational_agents(
     ticket: str,
     now: str,
     alive: Optional[Callable],
-) -> Tuple[OperationalAgent, ...]:
-    """One row per live binding, projected by the accepted lifecycle and nothing else."""
-    agents = []
+) -> Tuple[Tuple[OperationalAgent, ...], Dict[str, Tuple[str, str]]]:
+    """One work item per durable rail, and the two facts each blocked rail projected.
+
+    This is the checkpoint-7 seam. It used to be "one row per live binding", which
+    made the row identity the transport rather than the work; it is now one item
+    per rail, with every nonterminal binding on that rail reconciled into the two
+    facts `attention_projection` returns and into bounded Details evidence.
+
+    Nothing about the accepted lifecycle is loosened on the way. Every nonterminal
+    binding is still put through `observe_session`, so an unauthorized rail, a
+    superseded iteration, a live session on a rail that is not running, and a
+    blocked rail with no published decision all still refuse exactly as before --
+    and they refuse for every binding, not merely for whichever one happens to
+    speak for the item.
+
+    Two returns rather than one, because a blocked rail's activity belongs to the
+    Waiting item the decision record produces, and that item is built elsewhere. A
+    rail carrying a decision contributes no operational item at all: the accepted
+    rule that the lifecycle's Waiting projection never becomes an operational row
+    is unchanged, and it is now expressed once per rail instead of once per binding.
+    """
+    grouped: Dict[str, list] = {}
     for record in sorted(records, key=lambda entry: entry.session_id):
-        state = rails.get(record.rail)
-        if state is None:
-            raise QueueSourceError(
-                REASON_BINDING_RAIL_UNKNOWN,
-                "session {0} is bound to rail {1}, which {2} does not authorize.".format(
-                    record.session_id, record.rail, scope_relative(project, ticket)
-                ),
-            )
-        _require_reconciled(state)
-        blob = rail_blob_sha(source, project=project, ticket=ticket, rail=record.rail)
-        if blob is None:
-            raise QueueSourceError(
-                REASON_SOURCE_UNREADABLE,
-                "rail {0} has no readable authorization blob, so the iteration a session "
-                "is bound to cannot be checked.".format(record.rail),
-            )
-        decision = decisions.get(record.rail)
-        facts = RailFacts(
-            identifier=state.identifier,
-            status=state.status,
-            rail_blob=blob,
-            # The durable record, exactly as `RailFacts` documents it. A blocked
-            # rail without one reaches the lifecycle unexplained, and the lifecycle
-            # refuses it -- which is the intended outcome, not a gap.
-            pending_human_decision=decision.decision_id if decision is not None else None,
-        )
+        grouped.setdefault(record.rail, []).append(record)
+
+    # One ownership proof for the whole read, from the accepted primitive that the
+    # concurrency reconciler uses. Not a second opinion about liveness: the same
+    # question, asked once, so the rows and the ceiling cannot disagree.
+    ownership = ownership_evidence(registry, list(records), alive=alive)
+
+    agents = []
+    attention_by_rail: Dict[str, Tuple[str, str]] = {}
+    for rail in sorted(set(grouped) | set(decisions)):
+        held = grouped.get(rail, [])
+        decision = decisions.get(rail)
+        if held:
+            state = _rail_state(rails, held[0], project=project, ticket=ticket)
+        else:
+            state = rails[rail]
+            _require_reconciled(state)
+
+        projections = []
+        if held:
+            facts = _rail_facts(source, state, decision, project=project, ticket=ticket)
+            for record in held:
+                if record.rail != rail:
+                    # Unreachable through `grouped`, and asserted rather than
+                    # assumed: the whole point of this seam is that one item speaks
+                    # for exactly one rail.
+                    raise QueueSourceError(
+                        REASON_BINDING_RAIL_UNKNOWN,
+                        "session {0} was grouped under rail {1} but names {2}.".format(
+                            record.session_id, rail, record.rail
+                        ),
+                    )
+                try:
+                    projections.append(
+                        observe_session(facts, record, registry, now=now, alive=alive)
+                    )
+                except LifecycleError as exc:
+                    raise _wrap(exc, REASON_LIFECYCLE_REFUSED) from exc
+
+        sessions = tuple(session_evidence(record, ownership) for record in held)
         try:
-            projection = observe_session(facts, record, registry, now=now, alive=alive)
-        except LifecycleError as exc:
-            raise _wrap(exc, REASON_LIFECYCLE_REFUSED) from exc
-        if projection.state == STATE_WAITING:
-            # The lifecycle's Waiting answers "is this session progressing". The
-            # row a person sees comes from the decision record instead, and turning
-            # this projection into an operational input is exactly what
-            # `OperationalAgent` refuses. Skipping it is that refusal honoured
-            # early, not a state being dropped.
+            attention = project_attention(
+                rail, status=state.status, has_decision=decision is not None, sessions=sessions
+            )
+        except AttentionError as exc:
+            raise _wrap(exc, REASON_OWNERSHIP_CONTRADICTORY) from exc
+        if decision is not None:
+            if attention is None:
+                # Stated rather than relied on. `load_queue` builds a Waiting item
+                # for every decision it read, so a decision with no projected
+                # attention would drop a human-owned row -- the one outcome this
+                # module exists to prevent.
+                raise QueueSourceError(
+                    REASON_LIFECYCLE_REFUSED,
+                    "rail {0} holds a published decision but projected no work "
+                    "item; a person would be owed an answer with nothing on the "
+                    "screen to answer it.".format(rail),
+                )
+            # The Waiting row is the decision record's, and it is the only row this
+            # rail gets. Both projected facts are recorded here because this is
+            # where the execution evidence was reconciled.
+            attention_by_rail[rail] = (attention.activity, attention.attention_owner)
             continue
+
+        if attention is None:
+            # No execution evidence and nobody waiting: a rail is not a row.
+            continue
+
+        parked = [entry for entry in projections if entry.state == STATE_WAITING]
+        if parked:
+            # A Waiting projection with no decision record cannot happen: the
+            # lifecycle refuses a blocked rail that records none. Refusing rather
+            # than skipping keeps that impossibility stated instead of assumed.
+            raise QueueSourceError(
+                REASON_LIFECYCLE_REFUSED,
+                "rail {0} projected a waiting session with no published decision "
+                "record; that is a state the lifecycle does not permit.".format(rail),
+            )
+
+        speaker = _primary(projections)
         try:
             agents.append(
                 OperationalAgent(
-                    project=record.project,
-                    ticket=record.ticket,
-                    rail=record.rail,
+                    project=project,
+                    ticket=ticket,
+                    rail=rail,
                     # The rail identifier is the only durable name this work has.
-                    # A friendlier title would have to be invented from prose.
-                    title=record.rail,
-                    projection=projection,
+                    # A friendlier title would have to be invented from prose, and
+                    # a session id or worker name would be the transport again.
+                    title=rail,
+                    projection=speaker,
+                    activity=attention.activity,
+                    # Carried, never restated: `OperationalAgent` refuses anything
+                    # but `agent`, so this is a cross-check against the projection
+                    # rather than this module agreeing with itself.
+                    attention_owner=attention.attention_owner,
+                    evidence=tuple(
+                        EvidenceReference(label=entry.label, locator=entry.locator)
+                        for entry in attention.sessions
+                    ),
                 )
             )
         except QueueError as exc:
             raise _wrap(exc, REASON_LIFECYCLE_REFUSED) from exc
-    return tuple(agents)
+    return tuple(agents), attention_by_rail
 
 
 # ---------------------------------------------------------------------------
@@ -461,12 +630,18 @@ def load_queue(
 
     decisions = read_decisions(source, rails, project=project, ticket=ticket)
     records = _binding_records(store, project=project, ticket=ticket)
-    agents = _operational_agents(
+    agents, attention = _work_items(
         source, rails, records, decisions, registry,
         project=project, ticket=ticket, now=now, alive=alive,
     )
     pending = tuple(
-        _pending_decision(decisions[identifier], now=now) for identifier in sorted(decisions)
+        _pending_decision(
+            decisions[identifier],
+            now=now,
+            activity=attention[identifier][0],
+            attention_owner=attention[identifier][1],
+        )
+        for identifier in sorted(decisions)
     )
 
     try:

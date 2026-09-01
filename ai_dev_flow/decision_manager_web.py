@@ -5,7 +5,7 @@ from __future__ import annotations
 # This is presentation. Every fact it shows was decided by `decision_queue`, and
 # nothing here re-derives one.
 #
-# Four boundaries hold it honest.
+# Seven boundaries hold it honest.
 #
 # First, it consumes accepted types only. A `QueueView` supplies the rows, their
 # order, and the filter set; `SelectedDetail` supplies the right pane. This module
@@ -26,7 +26,13 @@ from __future__ import annotations
 # and the one inline stylesheet, so no other script can run and no external
 # request can be made.
 #
-# Fourth, allowance is shown, never computed. Two finished `AllowanceWindowView`
+# Fourth, every fact drawn about a row's activity and about who owes it attention
+# arrived already projected, in the `SelectedDetail` the caller supplied. This
+# module derives neither, reconciles neither against the other, and has no row
+# field for either -- the dense row contract is unchanged, and the two facts reach
+# a person through the operational filters and the detail pane.
+#
+# Fifth, allowance is shown, never computed. Two finished `AllowanceWindowView`
 # values arrive from the caller; this module opens no store, calls no projection,
 # reads no clock, and asserts no human exclusivity. It rounds to whole percentage
 # points at the moment of drawing -- outward for a calibrated range, nearest for a
@@ -34,12 +40,12 @@ from __future__ import annotations
 # zero, because a confident zero would be read as "none used" when the truth is
 # "not known".
 #
-# Fifth, a fixture submission is presentation, not success. It removes the
+# Sixth, a fixture submission is presentation, not success. It removes the
 # selected item from the page's own memory and moves on. Nothing is stored,
 # nothing is transmitted, no endpoint exists to receive it, and the page never
 # claims otherwise. Real response routing is a later seam.
 #
-# Sixth, a figure whose truth expires is drawn when it is asked for, not when the
+# Seventh, a figure whose truth expires is drawn when it is asked for, not when the
 # server was built. Everything a run projects once -- the queue, the details, the
 # allowance windows -- stays projected once, because those describe state that
 # outlives the render. Live agent occupancy does not: it is true only of the
@@ -379,6 +385,12 @@ def build_payload(
         "details": {
             row_id: {
                 "state": details[row_id].state,
+                # Two facts the accepted projection decided, drawn in the detail
+                # pane and nowhere else. There is no row field for either, because
+                # richer activity belongs to the filters and this pane rather than
+                # to a badge on a dense row.
+                "activity": details[row_id].activity,
+                "attentionOwner": details[row_id].attention_owner,
                 "explanation": details[row_id].explanation,
                 "evidence": [
                     {"label": reference.label, "locator": reference.locator}

@@ -32,10 +32,30 @@ from __future__ import annotations
 # Fourth, this module is pure. It touches no file, no Git, no network, no
 # process, no provider, and no control-plane artifact. Everything it knows was
 # handed to it.
+#
+# Fifth, every item carries two further facts that arrive already projected: what
+# the work is currently doing, and who owes it attention. They are independent by
+# construction -- `attention_projection` computes each from its own durable
+# evidence and neither from the other -- and this module never derives, repairs or
+# reconciles one into the other. What it does enforce is the accepted equality:
+# the Waiting set is exactly the human-owned set, no more and no less. Waiting
+# still comes only from a published decision record, so that equality is a
+# cross-check between two independently produced facts rather than a rule that
+# manufactures either of them. A row shows neither: activity reaches a person
+# through the operational filters and the detail pane, because a dense row that can
+# carry one more badge is no longer a dense row.
 
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple
 
+from .attention_projection import (
+    OPERATIONAL_ACTIVITY_STATES,
+    OWNER_AGENT,
+    OWNER_HUMAN,
+    AttentionError,
+    require_activity,
+    require_attention_owner,
+)
 from .session_lifecycle import (
     STATE_DISCONNECTED,
     STATE_RUNNING,
@@ -90,6 +110,8 @@ REASON_TOO_MUCH_EVIDENCE = "evidence-unbounded"
 REASON_INVALID_EVIDENCE = "invalid-evidence"
 REASON_DUPLICATE_ITEM = "duplicate-item-identity"
 REASON_INVALID_FILTER = "invalid-filter"
+REASON_ACTIVITY_CONTRADICTS_STATE = "activity-contradicts-state"
+REASON_WAITING_NOT_HUMAN_OWNED = "waiting-is-not-the-human-owned-set"
 
 
 class QueueError(Exception):
@@ -137,6 +159,60 @@ def _elapsed(value: object, *, label: str = "elapsed_seconds") -> int:
     return value
 
 
+def _activity(value: object) -> str:
+    """Exactly one modeled activity, refused through this module's own exception.
+
+    The vocabulary belongs to `attention_projection`; only the spelling of the
+    refusal belongs here, so a caller of this module never has to catch two
+    exception types to learn that one field was wrong.
+    """
+    try:
+        return require_activity(value)
+    except AttentionError as exc:
+        raise QueueError(exc.reason, exc.detail) from exc
+
+
+def _owner(value: object) -> str:
+    """Exactly `human` or `agent`, refused the same way."""
+    try:
+        return require_attention_owner(value)
+    except AttentionError as exc:
+        raise QueueError(exc.reason, exc.detail) from exc
+
+
+def _references(value: object, *, label: str) -> Tuple["EvidenceReference", ...]:
+    """A bounded tuple of pointers, and never the thing pointed at.
+
+    One rule, applied to both kinds of item. A decision's published evidence and an
+    operational item's transport evidence are different facts about different
+    things, but the bound is the same bound and stating it twice would be two
+    bounds to keep in step.
+    """
+    if type(value) is not tuple:
+        raise QueueError(
+            REASON_INVALID_EVIDENCE,
+            "{0} must be a tuple of EvidenceReference, got {1!r}".format(
+                label, type(value).__name__
+            ),
+        )
+    if len(value) > MAX_EVIDENCE_REFERENCES:
+        raise QueueError(
+            REASON_TOO_MUCH_EVIDENCE,
+            "{0} references {1} entries, exceeding the bound of {2}".format(
+                label, len(value), MAX_EVIDENCE_REFERENCES
+            ),
+        )
+    for entry in value:
+        if type(entry) is not EvidenceReference:
+            raise QueueError(
+                REASON_INVALID_EVIDENCE,
+                "{0} entries must be EvidenceReference, got {1!r}".format(
+                    label, type(entry).__name__
+                ),
+            )
+    return value
+
+
 # The two item kinds. They are the first encoded component, so a decision and an
 # operational agent can never produce the same identity even when every other
 # durable fact matches.
@@ -181,7 +257,22 @@ class EvidenceReference:
 
 @dataclass(frozen=True)
 class PendingDecision:
-    """One genuine human decision an orchestrator published. The only source of Waiting."""
+    """One genuine human decision an orchestrator published. The only source of Waiting.
+
+    `activity` and `attention_owner` are required with no default, exactly as every
+    other durable fact here is. `attention_owner` can only ever be `human` -- and it
+    is still stated rather than assumed, because the caller that proved a decision
+    record exists is the same caller stating who owes the item attention, and a
+    field that filled itself in would make the two impossible to disagree and so
+    impossible to check.
+
+    `activity` is deliberately unconstrained by the state. A Waiting item's state
+    says a person must act; its activity says what the work itself is doing, and
+    those genuinely differ -- a rail can be awaiting a human decision while its
+    session is live, or while its execution ownership can no longer be proved at
+    all. Pinning one to the other here would be the derivation this checkpoint
+    exists to remove.
+    """
 
     decision_id: str
     project: str
@@ -191,6 +282,8 @@ class PendingDecision:
     title: str
     explanation: str
     elapsed_seconds: int
+    activity: str
+    attention_owner: str
     evidence: Tuple[EvidenceReference, ...] = ()
 
     def __post_init__(self) -> None:
@@ -206,28 +299,15 @@ class PendingDecision:
         _text(self.title, label="title", limit=MAX_TITLE)
         _text(self.explanation, label="explanation", limit=MAX_EXPLANATION)
         _elapsed(self.elapsed_seconds)
-        if type(self.evidence) is not tuple:
+        _activity(self.activity)
+        _owner(self.attention_owner)
+        if self.attention_owner != OWNER_HUMAN:
             raise QueueError(
-                REASON_INVALID_EVIDENCE,
-                "evidence must be a tuple of EvidenceReference, got {0!r}".format(
-                    type(self.evidence).__name__
-                ),
+                REASON_WAITING_NOT_HUMAN_OWNED,
+                "a published decision is human-owned by definition; '{0}' would put a "
+                "Waiting row outside the human-owned set".format(self.attention_owner),
             )
-        if len(self.evidence) > MAX_EVIDENCE_REFERENCES:
-            raise QueueError(
-                REASON_TOO_MUCH_EVIDENCE,
-                "{0} evidence references exceeds the bound of {1}".format(
-                    len(self.evidence), MAX_EVIDENCE_REFERENCES
-                ),
-            )
-        for entry in self.evidence:
-            if type(entry) is not EvidenceReference:
-                raise QueueError(
-                    REASON_INVALID_EVIDENCE,
-                    "evidence entries must be EvidenceReference, got {0!r}".format(
-                        type(entry).__name__
-                    ),
-                )
+        _references(self.evidence, label="evidence")
 
     @property
     def item_id(self) -> str:
@@ -240,13 +320,28 @@ class PendingDecision:
 
 @dataclass(frozen=True)
 class OperationalAgent:
-    """Work in progress. Visible only when someone asks for it, and never Waiting."""
+    """One durable rail's work in progress. Visible when asked for, and never Waiting.
+
+    The unit is the rail, not the session. `evidence` is where transport identity
+    lives -- session id, role, pid, pid domain -- as bounded Details data supplied
+    by the caller that reconciled it. A rail whose worker rotated keeps one item and
+    one identity; what changes is which session appears in that list, and `item_id`
+    already excludes every one of those fields.
+
+    `attention_owner` can only ever be `agent` here, and is still required rather
+    than assumed for the reason the decision side states its own: the equality
+    between Waiting and the human-owned set is only checkable when both sides are
+    stated independently.
+    """
 
     project: str
     ticket: str
     rail: str
     title: str
     projection: SessionProjection
+    activity: str
+    attention_owner: str
+    evidence: Tuple[EvidenceReference, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.project, label="project", limit=MAX_LABEL)
@@ -286,6 +381,28 @@ class OperationalAgent:
                 ),
             )
         _elapsed(self.projection.elapsed_seconds, label="projection elapsed_seconds")
+        _activity(self.activity)
+        _owner(self.attention_owner)
+        if self.attention_owner != OWNER_AGENT:
+            raise QueueError(
+                REASON_WAITING_NOT_HUMAN_OWNED,
+                "an operational item can never be Waiting, so it can never be "
+                "human-owned; got '{0}'".format(self.attention_owner),
+            )
+        # A subscript, not a lookup with a default: `_activity` already proved the
+        # value is a modeled activity, and the table names every one of them.
+        if state not in OPERATIONAL_ACTIVITY_STATES[self.activity]:
+            # Two facts read apart and then required to agree, the same way a
+            # decision record and its rail are. A running row claiming recovery, or
+            # a disconnected row claiming an executor is working, is a contradiction
+            # in the evidence rather than a row to draw.
+            raise QueueError(
+                REASON_ACTIVITY_CONTRADICTS_STATE,
+                "activity '{0}' cannot describe a '{1}' operational item".format(
+                    self.activity, state
+                ),
+            )
+        _references(self.evidence, label="transport evidence")
 
     @property
     def item_id(self) -> str:
@@ -322,10 +439,18 @@ class QueueRow:
 
 @dataclass(frozen=True)
 class SelectedDetail:
-    """The right pane's data. No title -- the row already said it."""
+    """The right pane's data. No title -- the row already said it.
+
+    `activity` and `attention_owner` live here rather than on `QueueRow` on
+    purpose. The accepted contract is that richer activity states reach a person
+    through the operational filters and this pane, never as a per-row badge, so
+    there is deliberately nowhere on a row to put either of them.
+    """
 
     item_id: str
     state: str
+    activity: str
+    attention_owner: str
     explanation: Optional[str] = None
     evidence: Tuple[EvidenceReference, ...] = ()
 
@@ -374,12 +499,23 @@ class DecisionQueue:
             return SelectedDetail(
                 item_id=entry.item_id,
                 state=entry.state,
+                activity=entry.activity,
+                attention_owner=entry.attention_owner,
                 explanation=entry.explanation,
                 evidence=entry.evidence,
             )
         # An operational item has no human-decision explanation, and inventing a
         # plausible one is how a screen starts asking for decisions nobody raised.
-        return SelectedDetail(item_id=entry.item_id, state=entry.state)
+        # Its evidence is a different kind entirely: the transport sessions behind
+        # this rail, bounded, carried here because Details is the one place session
+        # identity is allowed to be seen at all.
+        return SelectedDetail(
+            item_id=entry.item_id,
+            state=entry.state,
+            activity=entry.activity,
+            attention_owner=entry.attention_owner,
+            evidence=entry.evidence,
+        )
 
     def view(
         self,
@@ -476,4 +612,30 @@ def build_queue(
             )
         seen.add(entry.item_id)
 
+    _require_waiting_is_the_human_owned_set(items)
     return DecisionQueue(items)
+
+
+def _require_waiting_is_the_human_owned_set(items: Sequence) -> None:
+    """The accepted equality, checked over the assembled queue rather than assumed.
+
+    Each input type already refuses the owner the other kind carries, so this can
+    only fail if a future change loosens one of those. That is exactly why it is
+    here: the property the product owes a person is about the *set* the default
+    view shows, not about one item at a time, and a set property that is only ever
+    implied by two local rules is one refactor away from being nobody's.
+
+    Both directions are checked. A human-owned item outside Waiting would be a
+    decision reachable only through an operational filter, and a Waiting item that
+    is not human-owned would be an interruption nobody was asked for.
+    """
+    waiting = {entry.item_id for entry in items if entry.state == STATE_WAITING}
+    human = {entry.item_id for entry in items if entry.attention_owner == OWNER_HUMAN}
+    if waiting != human:
+        raise QueueError(
+            REASON_WAITING_NOT_HUMAN_OWNED,
+            "the Waiting set and the human-owned set must be identical; waiting-only "
+            "{0}, human-only {1}".format(
+                sorted(waiting - human), sorted(human - waiting)
+            ),
+        )

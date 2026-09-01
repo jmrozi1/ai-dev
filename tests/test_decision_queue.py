@@ -10,6 +10,13 @@ import ast
 import unittest
 
 from ai_dev_flow import decision_queue as queue_module
+from ai_dev_flow.attention_projection import (
+    ACTIVITY_BLOCKED,
+    ACTIVITY_DISCONNECTED_RECOVERY,
+    ACTIVITY_EXECUTOR_WORKING,
+    OWNER_AGENT,
+    OWNER_HUMAN,
+)
 from ai_dev_flow.decision_queue import (
     DEFAULT_FILTERS,
     MAX_EVIDENCE_REFERENCES,
@@ -49,6 +56,8 @@ def decision(**overrides) -> PendingDecision:
         title="Choose the credential route",
         explanation=EXPLANATION_SECRET,
         elapsed_seconds=100,
+        activity=ACTIVITY_BLOCKED,
+        attention_owner=OWNER_HUMAN,
         evidence=(EvidenceReference(label="review", locator=EVIDENCE_SECRET),),
     )
     base.update(overrides)
@@ -73,7 +82,14 @@ def agent(**overrides) -> OperationalAgent:
     proj = overrides.pop("projection", None)
     if proj is None:
         proj = projection(rail=rail)
-    base = dict(project=PROJECT, ticket=TICKET, rail=rail, title="Implement the seam")
+    base = dict(
+        project=PROJECT, ticket=TICKET, rail=rail, title="Implement the seam",
+        activity=(
+            ACTIVITY_EXECUTOR_WORKING if proj.state == STATE_RUNNING
+            else ACTIVITY_DISCONNECTED_RECOVERY
+        ),
+        attention_owner=OWNER_AGENT,
+    )
     base.update(overrides)
     return OperationalAgent(projection=proj, **base)
 
@@ -83,6 +99,7 @@ def decision_id_for(decision_id, *, project=PROJECT, ticket=TICKET, rail="issue-
     return PendingDecision(
         decision_id=decision_id, project=project, ticket=ticket, rail=rail,
         raised_at="raised-x", title="t", explanation="e", elapsed_seconds=0,
+        activity=ACTIVITY_BLOCKED, attention_owner=OWNER_HUMAN,
     ).item_id
 
 
@@ -94,6 +111,7 @@ def agent_id_for(rail, *, project=PROJECT, ticket=TICKET):
             state=STATE_RUNNING, reason="r", detail="d", session_id="s",
             rail=rail, elapsed_seconds=0,
         ),
+        activity=ACTIVITY_EXECUTOR_WORKING, attention_owner=OWNER_AGENT,
     ).item_id
 
 
@@ -225,15 +243,82 @@ class InputValidationTests(unittest.TestCase):
         with self.assertRaises(QueueError):
             build_queue([], [decision()])
 
+    def test_the_waiting_set_and_the_human_owned_set_are_required_to_be_identical(self) -> None:
+        """Defence in depth, exercised directly rather than left implied.
+
+        Each input type already refuses the other kind's owner, so the only way to
+        reach the set check today is to bypass construction -- which is exactly the
+        future this check exists for: one loosened local rule and the property the
+        product owes a person would be nobody's.
+        """
+        waiting_but_not_human = decision()
+        object.__setattr__(waiting_but_not_human, "attention_owner", OWNER_AGENT)
+        with self.assertRaises(QueueError) as caught:
+            build_queue([waiting_but_not_human])
+        self.assertEqual(caught.exception.reason, queue_module.REASON_WAITING_NOT_HUMAN_OWNED)
+        self.assertIn(waiting_but_not_human.item_id, caught.exception.detail)
+
+        human_but_not_waiting = agent()
+        object.__setattr__(human_but_not_waiting, "attention_owner", OWNER_HUMAN)
+        with self.assertRaises(QueueError) as caught:
+            build_queue([], [human_but_not_waiting])
+        self.assertEqual(caught.exception.reason, queue_module.REASON_WAITING_NOT_HUMAN_OWNED)
+
+    def test_a_matching_pair_of_owners_and_states_builds_normally(self) -> None:
+        queue = build_queue([decision()], [agent()])
+        self.assertEqual(
+            {entry.item_id for entry in queue.items if entry.state == STATE_WAITING},
+            {entry.item_id for entry in queue.items
+             if entry.attention_owner == OWNER_HUMAN},
+        )
+
+    def test_an_operational_activity_that_contradicts_its_state_is_refused(self) -> None:
+        with self.assertRaises(QueueError) as caught:
+            agent(activity=ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertEqual(
+            caught.exception.reason, queue_module.REASON_ACTIVITY_CONTRADICTS_STATE
+        )
+        with self.assertRaises(QueueError) as caught:
+            agent(projection=projection(state=STATE_DISCONNECTED),
+                  activity=ACTIVITY_EXECUTOR_WORKING)
+        self.assertEqual(
+            caught.exception.reason, queue_module.REASON_ACTIVITY_CONTRADICTS_STATE
+        )
+
+    def test_an_operational_item_may_never_claim_the_blocked_activity(self) -> None:
+        """`blocked` describes a Waiting row, and an operational row is never one."""
+        with self.assertRaises(QueueError) as caught:
+            agent(activity=ACTIVITY_BLOCKED)
+        self.assertEqual(
+            caught.exception.reason, queue_module.REASON_ACTIVITY_CONTRADICTS_STATE
+        )
+
+    def test_a_decision_may_carry_any_modeled_activity(self) -> None:
+        """Its state says who must act; its activity says what the work is doing."""
+        for activity in (ACTIVITY_BLOCKED, ACTIVITY_DISCONNECTED_RECOVERY,
+                         ACTIVITY_EXECUTOR_WORKING):
+            with self.subTest(activity=activity):
+                self.assertEqual(decision(activity=activity).activity, activity)
+
+    def test_transport_evidence_on_an_operational_item_is_bounded(self) -> None:
+        too_many = tuple(
+            EvidenceReference(label="live session", locator="s{0}".format(index))
+            for index in range(MAX_EVIDENCE_REFERENCES + 1)
+        )
+        with self.assertRaises(QueueError) as caught:
+            agent(evidence=too_many)
+        self.assertEqual(caught.exception.reason, queue_module.REASON_TOO_MUCH_EVIDENCE)
+
     def test_the_input_field_sets_have_nowhere_to_put_a_payload(self) -> None:
         self.assertEqual(
             {f.name for f in fields(PendingDecision)},
             {"decision_id", "project", "ticket", "rail", "raised_at", "title", "explanation",
-             "elapsed_seconds", "evidence"},
+             "elapsed_seconds", "activity", "attention_owner", "evidence"},
         )
         self.assertEqual(
             {f.name for f in fields(OperationalAgent)},
-            {"project", "ticket", "rail", "title", "projection"},
+            {"project", "ticket", "rail", "title", "projection", "activity",
+             "attention_owner", "evidence"},
         )
         self.assertEqual({f.name for f in fields(EvidenceReference)}, {"label", "locator"})
 
@@ -703,7 +788,7 @@ class SelectionAndDetailTests(unittest.TestCase):
     def test_the_detail_field_set_is_exactly_the_right_pane_data(self) -> None:
         self.assertEqual(
             {f.name for f in fields(SelectedDetail)},
-            {"item_id", "state", "explanation", "evidence"},
+            {"item_id", "state", "activity", "attention_owner", "explanation", "evidence"},
         )
 
 
@@ -752,7 +837,14 @@ class PurityTests(unittest.TestCase):
         self.tree = ast.parse(self.source)
 
     def test_the_module_imports_only_stdlib_typing_and_the_accepted_lifecycle(self) -> None:
-        allowed = {"dataclasses", "typing", "__future__", ".session_lifecycle"}
+        # `.attention_projection` is the checkpoint-7 model, and it is pure by the
+        # same standard this module is: no file, no clock, no process, no network.
+        # Its own suite pins that, so admitting it here does not widen what this
+        # module can reach.
+        allowed = {
+            "dataclasses", "typing", "__future__",
+            ".session_lifecycle", ".attention_projection",
+        }
         for node in ast.walk(self.tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
@@ -786,9 +878,13 @@ class PurityTests(unittest.TestCase):
             {
                 # its own constructors and helpers
                 "DecisionQueue", "QueueError", "QueueRow", "QueueView", "SelectedDetail",
-                "_detail", "_elapsed", "_identity", "_normalize_filters", "_text",
-                "_visible",
+                "_activity", "_detail", "_elapsed", "_identity", "_normalize_filters",
+                "_owner", "_references", "_require_waiting_is_the_human_owned_set",
+                "_text", "_visible",
                 "__init__", "super", "dataclass",
+                # the accepted vocabulary checks, which raise and return and do
+                # nothing else
+                "require_activity", "require_attention_owner",
                 # pure builtins
                 "add", "append", "format", "join", "len", "set", "sorted", "strip",
                 "tuple", "type",

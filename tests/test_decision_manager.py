@@ -55,6 +55,7 @@ from ai_dev_flow.decision_manager_web import (
     RenderError,
     build_allowance,
 )
+from ai_dev_flow.attention_projection import ACTIVITY_BLOCKED, OWNER_HUMAN
 from ai_dev_flow.decision_queue import (
     QUEUE_STATES,
     EvidenceReference,
@@ -95,6 +96,8 @@ def a_decision(**overrides) -> PendingDecision:
         raised_at="raised-1", title="Choose the credential route",
         explanation="The requirements do not say which credential the worker uses.",
         elapsed_seconds=7200,
+        activity=ACTIVITY_BLOCKED,
+        attention_owner=OWNER_HUMAN,
         evidence=(EvidenceReference(label="review", locator="rails/one/handoff.md"),),
     )
     base.update(overrides)
