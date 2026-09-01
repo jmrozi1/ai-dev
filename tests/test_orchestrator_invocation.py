@@ -1499,16 +1499,19 @@ class LedgerSeamPurityTests(LedgerWiringTestBase):
         "launch_kwargs",
         "stop_kwargs",
         "ledger",
+        "while_running",
     ]
 
-    def test_the_seam_is_one_optional_keyword_and_nothing_else_moved(self):
+    def test_each_seam_is_one_optional_keyword_and_nothing_else_moved(self):
         import inspect
 
         signature = inspect.signature(invocation.invoke_orchestrator)
         self.assertEqual(list(signature.parameters), self.EXPECTED_PARAMETERS)
-        parameter = signature.parameters["ledger"]
-        self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
-        self.assertIsNone(parameter.default)
+        for name in ("ledger", "while_running"):
+            with self.subTest(name=name):
+                parameter = signature.parameters[name]
+                self.assertEqual(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+                self.assertIsNone(parameter.default)
 
     def test_the_seam_consumes_a_ledger_and_never_builds_one(self):
         source = Path(invocation.__file__).with_suffix(".py").read_text(encoding="utf-8")
@@ -1524,6 +1527,98 @@ class LedgerSeamPurityTests(LedgerWiringTestBase):
         for required in ("next_identity", "record_completed", "record_failure"):
             with self.subTest(required=required):
                 self.assertIn(required, source)
+
+# --------------------------------------------------------------------------
+# The live window: the one instant a dispatch is observable as running
+# --------------------------------------------------------------------------
+
+
+class RunningObservationTests(InvocationTestBase):
+    """`while_running` exists so a caller can see the session while it is running.
+
+    Everything here is checked against the real store and the real registry this
+    invocation was handed, at the moment the callback runs, because "still running"
+    is a claim about durable state and held ownership rather than about ordering.
+    """
+
+    def _observed(self, **overrides):
+        seen = []
+
+        def observe(launched):
+            record = self.store.read(launched.binding.session_id)
+            seen.append(
+                {
+                    "state": record.state,
+                    "owned": self.registry.get(launched.binding.session_id) is not None,
+                    "session": launched.binding.session_id,
+                }
+            )
+
+        outcome = self._invoke(while_running=observe, **overrides)
+        return outcome, seen
+
+    def test_the_observer_sees_a_bound_record_this_registry_still_owns(self) -> None:
+        outcome, seen = self._observed()
+
+        self.assertEqual(
+            seen,
+            [{"state": BINDING_STATE_BOUND, "owned": True, "session": SESSION_ONE}],
+        )
+        # And it really was a window: by the time the dispatch returns the session
+        # is terminalized and the handle is gone, so a count drawn here would be a
+        # count of nothing.
+        self.assertEqual(outcome.binding_state, BINDING_STATE_UNBOUND)
+        self.assertEqual(self.store.read(SESSION_ONE).state, BINDING_STATE_UNBOUND)
+        self.assertIsNone(self.registry.get(SESSION_ONE))
+
+    def test_the_observer_runs_after_the_launch_and_before_the_stop(self) -> None:
+        order = []
+        real_launch = session_lifecycle.launch_session
+        real_stop = session_lifecycle.stop_session
+
+        def spy(name, target):
+            def wrapper(*args, **kwargs):
+                order.append(name)
+                return target(*args, **kwargs)
+
+            return wrapper
+
+        with mock.patch.object(invocation, "launch_session", spy("launch", real_launch)), \
+             mock.patch.object(invocation, "stop_session", spy("stop", real_stop)):
+            self._invoke(while_running=lambda launched: order.append("observe"))
+
+        self.assertEqual(order, ["launch", "observe", "stop"])
+
+    def test_an_observer_failure_stops_the_session_and_is_never_swallowed(self) -> None:
+        """Observing badly is no reason to leave a session running or report success."""
+
+        def observe(launched):
+            raise RuntimeError("the page could not be drawn")
+
+        with self.assertRaises(RuntimeError):
+            self._invoke(while_running=observe)
+
+        self.assertEqual(self.store.read(SESSION_ONE).state, BINDING_STATE_UNBOUND)
+        self.assertIsNone(self.registry.get(SESSION_ONE))
+
+    def test_the_observer_cannot_change_the_outcome_it_is_shown(self) -> None:
+        """It is an observation point. What it returns is discarded."""
+        outcome = self._invoke(while_running=lambda launched: "a fabricated answer")
+        without = None
+
+        self.store = BindingStore(self.tmp_path / "second-store")
+        self.registry = SessionRegistry()
+        without = self._invoke(session_ids=[SESSION_ONE])
+
+        self.assertEqual(fields(type(outcome)), fields(type(without)))
+        self.assertEqual(outcome, without)
+
+    def test_omitting_it_reaches_no_callback_at_all(self) -> None:
+        outcome = self._invoke()
+
+        self.assertEqual(outcome.session_id, SESSION_ONE)
+        self.assertEqual(outcome.binding_state, BINDING_STATE_UNBOUND)
+
 
 if __name__ == "__main__":
     unittest.main()

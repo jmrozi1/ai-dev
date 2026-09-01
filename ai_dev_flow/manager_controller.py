@@ -48,13 +48,23 @@ from __future__ import annotations
 # Sixth, one run stays one run. The queue is acquired once against the run's own
 # instant and the occupancy is reduced once for the page that is rendered once.
 # Nothing refreshes, and a later instant is a later run.
+#
+# `dispatch` is the seam checkpoint 45 left open. `launch` was always the honest
+# way to put a handle in this controller's registry, but the accepted production
+# dispatch is `invoke_orchestrator`, which owns both gates and takes its store and
+# registry from its caller. Handing it any others would admit an agent against one
+# store and draw the count from another, so this method exists to make that
+# impossible: the store, the registry, the reconciled occupancy, the durable
+# bindings, and the in-flight ids all come from this object, and none of them is a
+# parameter a caller could differ on. It adds no gate, no policy, and no state of
+# its own -- every refusal below it stays the accepted predicate's.
 
 import http.server
 from pathlib import Path
 import sys
 from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
-from .authorization import CONCURRENCY_CEILING_DEFAULT, reconcile_agent_slots
+from .authorization import AgentSlots, CONCURRENCY_CEILING_DEFAULT, reconcile_agent_slots
 from .claude_allowance_view import AllowanceViewError
 from .decision_manager import (
     ManagerRun,
@@ -71,6 +81,7 @@ from .decision_manager_launch import (
 )
 from .decision_manager_web import serve_forever
 from .decision_queue import QueueView, SelectedDetail
+from .orchestrator_invocation import InvocationOutcome, invoke_orchestrator
 from .queue_source import QueueSourceError
 from .session_binding import BindingRecord, BindingStore
 from .session_lifecycle import (
@@ -143,6 +154,49 @@ class ManagerController:
         """Stop a session this controller owns, through the accepted lifecycle."""
         return stop_session(self.store, self.registry, record, **kwargs)
 
+    def dispatch(
+        self,
+        snapshot,
+        proposal,
+        packet,
+        observation,
+        *,
+        orchestrator_rail: str,
+        alive: Optional[Callable] = None,
+        **kwargs: Any
+    ) -> InvocationOutcome:
+        """One gated dispatch, admitted against exactly what this controller draws.
+
+        A pass-through, like `launch`. Both gates, the authorization predicate, the
+        refusal reasons, the accounting, and the stop all stay in the accepted
+        invocation; what this adds is that the session it starts lands in the
+        registry this controller counts, in the store this controller counts,
+        against the occupancy this controller reconciled.
+
+        The store is read once here and the same records reach both the reduction
+        and the predicate, so admission cannot be decided against one reading of
+        the store while the ceiling was checked against another.
+
+        `while_running` reaches the accepted invocation unchanged as one of
+        `kwargs`. It is how the caller that owns this controller draws its page
+        while the session this dispatch started is still running, which is the only
+        instant at which a live count exists to draw.
+        """
+        records = self.store.records()
+        return invoke_orchestrator(
+            snapshot,
+            proposal,
+            packet,
+            observation,
+            orchestrator_rail=orchestrator_rail,
+            store=self.store,
+            registry=self.registry,
+            slots=self.occupancy(records, alive=alive),
+            bindings=records,
+            in_flight_session_ids=self.registry.in_flight(),
+            **kwargs
+        )
+
     def owned_session_ids(self) -> Tuple[str, ...]:
         """Exactly the sessions this controller holds a handle for. No inference."""
         return tuple(owned.session_id for owned in self.registry.sessions())
@@ -150,6 +204,24 @@ class ManagerController:
     # ----------------------------------------------------------------------
     # The reading the page draws
     # ----------------------------------------------------------------------
+
+    def occupancy(self, records, *, alive: Optional[Callable] = None) -> AgentSlots:
+        """This controller's manager-wide occupancy, reconciled from its own halves.
+
+        One reduction with one home. Admission and display both call it, so the
+        ceiling a dispatch is admitted against is by construction the ceiling the
+        page draws, reconciled from the same records and the same registry. The
+        reconciler still decides what those come to; nothing here counts.
+
+        The records are the caller's so one dispatch reads the store once and hands
+        the same list to both this and the predicate, rather than reading a store
+        twice and reconciling two different readings of it.
+        """
+        return reconcile_agent_slots(
+            records,
+            ownership=ownership_evidence(self.registry, records, alive=alive),
+            ceiling=self.ceiling,
+        )
 
     def agent_count(self, *, alive: Optional[Callable] = None) -> Dict[str, Any]:
         """Reduce this controller's occupancy to the reading the page draws.
@@ -164,12 +236,7 @@ class ManagerController:
         deliberately not zero: zero is an established count of nothing running, and
         the page draws the two differently.
         """
-        records = self.store.records()
-        slots = reconcile_agent_slots(
-            records,
-            ownership=ownership_evidence(self.registry, records, alive=alive),
-            ceiling=self.ceiling,
-        )
+        slots = self.occupancy(self.store.records(), alive=alive)
         return {
             "permitted": slots.ceiling,
             "current": slots.occupied if slots.provable else None,

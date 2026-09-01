@@ -49,9 +49,19 @@ from __future__ import annotations
 # over `stop_session` or the outcome would let `shutdown-incomplete` reach
 # `record_failure` and be written down as an invocation hole, which is a different
 # and false claim about what the provider consumed.
+#
+# One dispatch is observable exactly once, while it is running. Between the launch
+# landing and the stop there is an instant at which the caller's registry really
+# holds this session's handle and its binding is really nonterminal, and that is the
+# only instant at which anything can honestly report live occupancy. `while_running`
+# is that instant offered to the caller and nothing else: it is given the outcome,
+# asked for nothing back, and cannot authorize, extend, re-dispatch, or
+# terminalize anything. Without it the live window is unreachable from outside this call, and a
+# surface that draws its count after the dispatch returns can only ever draw a
+# stopped one.
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence, Tuple
 import uuid
 
 from .authorization import (
@@ -292,6 +302,7 @@ def invoke_orchestrator(
     launch_kwargs: Optional[Mapping] = None,
     stop_kwargs: Optional[Mapping] = None,
     ledger: Optional[AllowanceLedger] = None,
+    while_running: Optional[Callable] = None,
 ) -> InvocationOutcome:
     """Both gates, then exactly one fresh orchestrator session, stopped and unbound.
 
@@ -304,6 +315,13 @@ def invoke_orchestrator(
     at all when the refusal is proven to precede the provider. Accounting never
     weakens cleanup -- a launched session is stopped even when its recording fails --
     and never invents success: the outcome is returned only once both have.
+
+    When `while_running` is supplied it is called exactly once, after the session
+    has really started and before it is stopped, with the `LaunchOutcome`. It is an
+    observation point, not a second decision: its return value is discarded, and if
+    it raises, the session is stopped and the failure propagates rather than being
+    swallowed -- observing badly is no reason to leave a session running, and no
+    reason to report success. Omit it and nothing below changes at all.
     """
     if packet.role != ORCHESTRATOR_ROLE:
         raise InvocationRefused(
@@ -381,6 +399,17 @@ def invoke_orchestrator(
         except Exception:
             # The session really is running. Recording it badly is no reason to leave
             # it running, and no reason to report success either.
+            stop_session(store, registry, launched.binding, **dict(stop_kwargs or {}))
+            raise
+
+    if while_running is not None:
+        # The one instant this dispatch is live and provable: the process started,
+        # the handle is in the caller's own registry, and the binding is nonterminal.
+        # A caller holding both halves can reduce a real occupancy here and nowhere
+        # else. Exactly the ledger's failure rule above, for exactly the same reason.
+        try:
+            while_running(launched)
+        except Exception:
             stop_session(store, registry, launched.binding, **dict(stop_kwargs or {}))
             raise
 

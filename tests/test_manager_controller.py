@@ -168,6 +168,91 @@ class ControllerLaunchOwnershipTests(LifecycleTestBase):
         self.assertIsNotNone(self.store.read(outcome.binding.session_id))
 
 
+class ControllerDispatchTests(LifecycleTestBase):
+    """`dispatch` hands the accepted invocation this controller's own two halves.
+
+    The gates themselves are `orchestrator_invocation`'s and are tested there. What
+    is proved here is the only thing this method adds: the objects it passes are
+    this controller's, by identity, and the occupancy it states is reconciled from
+    those same objects.
+    """
+
+    def _controller(self) -> ManagerController:
+        source = QueueSourceContext(
+            control_plane=self.tmp_path / "coordination",
+            project="ai-dev",
+            ticket="issue-55",
+            binding_root=self.store.root,
+        )
+        return ManagerController(source, registry=self.registry)
+
+    def _dispatch(self, controller, **overrides):
+        seen = {}
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            seen["positional"] = args
+            return "an outcome"
+
+        with unittest.mock.patch.object(controller_module, "invoke_orchestrator", spy):
+            controller.dispatch(
+                "snapshot", "proposal", "packet", "observation",
+                orchestrator_rail="issue-55-orchestrator", **overrides
+            )
+        return seen
+
+    def test_the_dispatch_is_given_this_controller_s_exact_store_and_registry(self) -> None:
+        controller = self._controller()
+
+        seen = self._dispatch(controller)
+
+        self.assertIs(seen["store"], controller.store)
+        self.assertIs(seen["registry"], controller.registry)
+
+    def test_the_occupancy_stated_is_reconciled_from_those_same_two_halves(self) -> None:
+        """The ceiling a dispatch is admitted against is the one the page draws."""
+        controller = self._controller()
+
+        seen = self._dispatch(controller)
+
+        self.assertEqual(seen["slots"].ceiling, controller.ceiling)
+        self.assertEqual(seen["slots"], controller.occupancy(controller.store.records()))
+        self.assertEqual(seen["in_flight_session_ids"], controller.registry.in_flight())
+
+    def test_the_bindings_stated_are_the_records_the_count_was_reduced_from(self) -> None:
+        """One read of the store, so admission and the ceiling cannot disagree."""
+        controller = self._controller()
+
+        seen = self._dispatch(controller)
+
+        self.assertEqual(
+            [record.session_id for record in seen["bindings"]],
+            [record.session_id for record in controller.store.records()],
+        )
+
+    def test_the_observation_seam_reaches_the_accepted_invocation_unchanged(self) -> None:
+        drawn = []
+
+        def draw(launched):
+            drawn.append(launched)
+
+        controller = self._controller()
+
+        seen = self._dispatch(controller, while_running=draw)
+
+        self.assertIs(seen["while_running"], draw)
+
+    def test_it_supplies_no_authorization_decision_of_its_own(self) -> None:
+        """Adding a gate here would be a second place a launch could be permitted."""
+        controller = self._controller()
+
+        seen = self._dispatch(controller)
+
+        for forbidden in ("decision", "authorized", "authorize"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, seen)
+
+
 # --------------------------------------------------------------------------
 # The entry point reads one real durable scope
 # --------------------------------------------------------------------------
