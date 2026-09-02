@@ -66,7 +66,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Mapping, Optional, Tuple
 
 from .attention_projection import (
     AttentionError,
@@ -123,8 +123,11 @@ __all__ = [
     "REASON_SCOPE_UNKNOWN",
     "REASON_SOURCE_STALE",
     "REASON_SOURCE_UNREADABLE",
+    "QueueScope",
     "load_queue",
+    "project_queue",
     "read_decisions",
+    "resolve_queue_scope",
 ]
 
 
@@ -618,6 +621,121 @@ def _work_items(
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class QueueScope:
+    """The durable half of one queue read, resolved once and then held.
+
+    A queue read has two halves that expire at completely different rates, and
+    checkpoint 47 was right that they must not be re-acquired together. The durable
+    half is the control plane: which revision this read serves, which rails that
+    revision authorizes, and which decisions it publishes. Establishing it fetches
+    the coordination remote, and it describes state that outlives any one render --
+    so it is this run's projection, taken once, exactly as the allowance windows
+    beside it are.
+
+    The other half is what this controller can prove about its own sessions right
+    now, and that half is only ever true of the instant it was taken. Separating
+    them is what lets the second be re-observed per response without the first
+    becoming a polling loop: `project_queue` below re-reads nothing remote, takes no
+    lock, and spawns no fetch. It re-reads a local durable store and re-observes
+    liveness, which is precisely the state that can have changed since the last
+    response and precisely the state a person is reading the page to learn.
+
+    Frozen because it is evidence, not a workspace. Nothing below may adjust which
+    revision a response is being served from.
+    """
+
+    source: ReadSource
+    project: str
+    ticket: str
+    rails: Mapping[str, RailState]
+    decisions: Mapping[str, DurableDecision]
+
+    @property
+    def head(self) -> str:
+        """The exact revision every response built from this scope is served from."""
+        return self.source.head
+
+
+def resolve_queue_scope(
+    repo_root: Path,
+    *,
+    project: str,
+    ticket: str,
+    expected_head: Optional[str] = None,
+) -> QueueScope:
+    """Prove the durable authority for one run, once, or refuse and say why.
+
+    Every step here reaches outside this process: scope validation, remote freshness
+    resolution, the rail index, and the published decisions. Each refusal is exactly
+    the one `load_queue` has always raised, because this is that function's first
+    half moved behind a name rather than a second reading of the same sources.
+    """
+    try:
+        project = validate_identifier(project, label="project")
+        ticket = validate_identifier(ticket, label="ticket")
+    except ControlPlaneError as exc:
+        raise _wrap(exc, REASON_SCOPE_UNKNOWN) from exc
+
+    source = _resolve_source(Path(repo_root), expected_head=expected_head)
+    _require_scope(source, project=project, ticket=ticket)
+    rails = _rail_index(source, project=project, ticket=ticket)
+    decisions = read_decisions(source, rails, project=project, ticket=ticket)
+    return QueueScope(
+        source=source,
+        project=project,
+        ticket=ticket,
+        rails=rails,
+        decisions=decisions,
+    )
+
+
+def project_queue(
+    scope: QueueScope,
+    *,
+    registry: SessionRegistry,
+    now: str,
+    store: Optional[BindingStore] = None,
+    alive: Optional[Callable] = None,
+) -> DecisionQueue:
+    """One queue projected from an already-proven scope and a live observation.
+
+    The second half of `load_queue`, and the half that may be repeated. It re-reads
+    the durable bindings from the caller's store and re-observes liveness through
+    `_work_items`, whose single-snapshot semantics are unchanged and still govern
+    that read. Nothing here fetches a remote, so calling this again is a fresh
+    observation rather than a poll.
+
+    `alive` is the caller's, and a caller composing more than one consumer into one
+    response passes the same observation to all of them. `_work_items` still takes
+    its own snapshot over whatever it is given, which stays correct either way: a
+    snapshot of a snapshot answers each process group exactly once, from the outer
+    observation, so composing them narrows the instant rather than widening it.
+    """
+    records = _binding_records(store, project=scope.project, ticket=scope.ticket)
+    agents, attention = _work_items(
+        scope.source, dict(scope.rails), records, dict(scope.decisions), registry,
+        project=scope.project, ticket=scope.ticket, now=now, alive=alive,
+    )
+    pending = tuple(
+        _pending_decision(
+            scope.decisions[identifier],
+            now=now,
+            activity=attention[identifier][0],
+            attention_owner=attention[identifier][1],
+        )
+        for identifier in sorted(scope.decisions)
+    )
+
+    try:
+        return build_queue(decisions=pending, agents=agents)
+    except QueueError as exc:
+        # Reached only when two durable facts claim one identity. That is a
+        # contradiction in the sources, and it is refused here rather than
+        # projected, for the same reason everything else above is.
+        raise _wrap(exc, REASON_CONFLICTING_ITEMS) from exc
+
+
 def load_queue(
     repo_root: Path,
     *,
@@ -637,37 +755,14 @@ def load_queue(
     `now` is supplied rather than read, so this stays as deterministic as the
     projection it feeds -- the same sources and the same clock always produce the
     same queue, and age remains something to display rather than something to act on.
+
+    This is now exactly the two halves above, composed: one scope resolution
+    followed by one projection. A caller that reads a queue once still calls this
+    and is unaffected; a caller that renders repeatedly from one run holds the scope
+    and repeats only the projection, which is the whole difference between
+    re-observing what changed and re-fetching what did not.
     """
-    try:
-        project = validate_identifier(project, label="project")
-        ticket = validate_identifier(ticket, label="ticket")
-    except ControlPlaneError as exc:
-        raise _wrap(exc, REASON_SCOPE_UNKNOWN) from exc
-
-    source = _resolve_source(Path(repo_root), expected_head=expected_head)
-    _require_scope(source, project=project, ticket=ticket)
-    rails = _rail_index(source, project=project, ticket=ticket)
-
-    decisions = read_decisions(source, rails, project=project, ticket=ticket)
-    records = _binding_records(store, project=project, ticket=ticket)
-    agents, attention = _work_items(
-        source, rails, records, decisions, registry,
-        project=project, ticket=ticket, now=now, alive=alive,
+    scope = resolve_queue_scope(
+        repo_root, project=project, ticket=ticket, expected_head=expected_head
     )
-    pending = tuple(
-        _pending_decision(
-            decisions[identifier],
-            now=now,
-            activity=attention[identifier][0],
-            attention_owner=attention[identifier][1],
-        )
-        for identifier in sorted(decisions)
-    )
-
-    try:
-        return build_queue(decisions=pending, agents=agents)
-    except QueueError as exc:
-        # Reached only when two durable facts claim one identity. That is a
-        # contradiction in the sources, and it is refused here rather than
-        # projected, for the same reason everything else above is.
-        raise _wrap(exc, REASON_CONFLICTING_ITEMS) from exc
+    return project_queue(scope, registry=registry, now=now, store=store, alive=alive)

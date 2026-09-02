@@ -37,14 +37,18 @@ from __future__ import annotations
 # is stopped, and for that entire window a real client can ask this page what is
 # running and be told the truth.
 #
-# Fourth, one run stays one run, and one figure on it is not a projection of this
-# run at all. The queue is acquired once and the allowance is projected once,
-# because both describe state that outlives the render; there is no timer, no
-# watcher, no refresh, and no endpoint that could ask for newer ones. Live
-# occupancy is the single exception, and it has to be: it is true only of the
-# instant it was reduced, and the whole subject of this rail is that it was being
-# read at an instant nobody could observe. So it is reduced while a request is
-# being answered, from the same controller, the same store, and the same registry.
+# Fourth, one run stays one run, and what is not a projection of this run is
+# observed rather than projected. The durable control-plane scope is resolved once
+# and the allowance is projected once, because both describe state that outlives
+# the render; there is no timer, no watcher, no refresh, and no request that
+# reaches the coordination remote. What this run's sessions are doing is the
+# exception, and it has to be: it is true only of the instant it was observed, and
+# this process starts its session after the page is already answering, so a reading
+# taken before the dispatch describes a moment in which this controller owns
+# nothing. Both the rows and the occupancy are therefore observed while a request
+# is being answered, from the same controller, the same store, and the same
+# registry -- and from one observation, so a single response cannot draw a row from
+# one instant and the figure beside it from another.
 #
 # Fifth, this adds no second service, no IPC, no polling loop, and no scheduler,
 # priority model, fairness policy, or autoscaler. There is exactly one server, the
@@ -332,25 +336,33 @@ def open_surface(
     with a name rather than three statements inside a larger one: the surface opens
     first, and everything after it happens while a reader can already look.
 
-    What is taken once is taken here. The queue and its details are this run's,
-    acquired through this controller's own registry so that a row and the aggregate
-    rest on one piece of ownership evidence rather than two that could disagree
-    about who owns what. They are this run's snapshot of durable state, taken at
-    this run's instant, exactly as the allowance windows beside them are: acquiring
-    the queue again per request would fetch the coordination remote per request,
-    which is the polling loop this surface is not permitted to become.
+    What is taken once is taken here, and it is exactly the half that cannot change
+    under the page: this run's durable control-plane scope -- the revision being
+    served, the rails it authorizes, the decisions it publishes -- resolved through
+    this controller against the coordination remote. Resolving it again per request
+    would fetch that remote per request, which is the polling loop this surface is
+    not permitted to become.
 
-    What is deliberately not taken here is the occupancy. `controller.serve` hands
-    the accepted server this controller's way of reducing it, and that reduction
-    happens while a request is being answered, because it is the one figure on the
-    page whose subject can end between the render and the reading.
+    What is deliberately not taken here is anything whose subject is a running
+    session. That used to mean the occupancy alone, and it was half a fix. This
+    process dispatches *behind* this surface, so at the instant this function runs
+    the registry is empty by construction and always will be -- a queue acquired
+    here can only ever show rows for sessions this process has not started yet, and
+    would keep showing them for the entire life of the page. The live-session
+    reading was computable and, on this surface, permanently unreachable.
+
+    So the rows and the occupancy are both taken per request now, and both from one
+    observation, through `controller.serve_observed`. That is one change, not two:
+    they are two halves of the single question "what is this controller running",
+    and answering them at two instants is how one response comes to report a
+    session working in a row and nothing provable in the figure beside it.
 
     Nothing is dispatched from here and nothing may be. This function's whole
     responsibility is that the page exists and answers before a session does.
     """
-    view, details = controller.queue(run, alive=alive)
-    server = controller.serve(
-        run, view, details, alive=alive, port=port, template_path=template_path
+    scope = controller.queue_scope(run)
+    server = controller.serve_observed(
+        run, scope, alive=alive, port=port, template_path=template_path
     )
     return LiveSurface(server=server, serving=start_serving(server))
 

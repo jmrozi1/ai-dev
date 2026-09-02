@@ -56,7 +56,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import http.server
 from pathlib import Path
-from typing import Mapping, Optional, Tuple
+from typing import Any, Mapping, Optional, Tuple
 
 from .claude_allowance import WINDOW_FIVE_HOUR, WINDOW_SEVEN_DAY
 from .claude_allowance_store import AllowanceStore
@@ -64,6 +64,7 @@ from .claude_allowance_view import AllowanceWindowView, project_window
 from .decision_manager_web import (
     LOOPBACK_HOST,
     make_live_server,
+    make_observed_server,
     make_server,
     render_page,
 )
@@ -76,6 +77,7 @@ __all__ = [
     "REASON_INVALID_RUN",
     "make_live_manager_server",
     "make_manager_server",
+    "make_observed_manager_server",
     "project_allowance",
     "render_manager_page",
 ]
@@ -282,6 +284,39 @@ def make_live_manager_server(
         details,
         allowance=project_allowance(run),
         agents=agents,
+        host=host,
+        port=port,
+        template_path=template_path,
+    )
+
+
+def make_observed_manager_server(
+    run: ManagerRun,
+    observe: Any,
+    *,
+    host: str = LOOPBACK_HOST,
+    port: int = 0,
+    template_path: Optional[Path] = None,
+) -> http.server.HTTPServer:
+    """One manager run's page, with everything a session can change drawn per request.
+
+    The run is still projected exactly once, here: this run's allowance windows are
+    this run's, taken at this run's instant, and re-projecting them per request
+    would be the refresh loop this surface is not. What is deliberately not taken
+    once is anything whose subject is a running session -- the queue rows and the
+    occupancy alike -- because a row that reports a session working and a count that
+    reports nothing provable are the same question answered twice.
+
+    So this takes one observation source rather than a queue plus a count, and the
+    accepted server calls it once per request. Which evidence that observation
+    reduces, and over what instant, is emphatically not decided here: this module
+    holds no store, no registry and no ownership evidence, and passes the caller's
+    source through unexamined exactly as it passes the caller's finished reading
+    through today.
+    """
+    return make_observed_server(
+        observe,
+        allowance=project_allowance(run),
         host=host,
         port=port,
         template_path=template_path,

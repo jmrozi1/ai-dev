@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import contextlib
+import dataclasses
 import http.client
 import io
 import json
@@ -13,6 +14,20 @@ from pathlib import Path
 
 from ai_dev_flow import decision_manager_launch as launch
 from ai_dev_flow import manager_controller as controller_module
+from ai_dev_flow import queue_source as queue_source_module
+from ai_dev_flow.attention_projection import (
+    DISPOSITION_LIVE,
+    ACTIVITY_CONTEXT_ROTATION,
+    ACTIVITY_DISCONNECTED_RECOVERY,
+    ACTIVITY_EXECUTOR_WORKING,
+    ACTIVITY_ORCHESTRATOR_RECONCILING,
+    ACTIVITY_REVIEWER_WORKING,
+    OWNER_AGENT,
+    OWNER_HUMAN,
+    project_attention,
+    session_evidence,
+)
+from ai_dev_flow.authorization import CONCURRENCY_CEILING_DEFAULT
 from ai_dev_flow.claude_allowance_store import AllowanceStore
 from ai_dev_flow.decision_manager import ManagerRun
 from ai_dev_flow.decision_manager_launch import QueueSourceContext
@@ -22,10 +37,18 @@ from ai_dev_flow.manager_controller import (
     ManagerController,
     main,
 )
-from ai_dev_flow.session_binding import BINDING_STATE_RESERVED
-from ai_dev_flow.session_lifecycle import STATE_DISCONNECTED, STATE_RUNNING, SessionRegistry
+from ai_dev_flow.queue_source import REASON_OWNERSHIP_CONTRADICTORY, QueueSourceError
+from ai_dev_flow.session_binding import BINDING_STATE_RESERVED, BindingStore
+from ai_dev_flow.session_lifecycle import (
+    ownership_evidence,
+    STATE_DISCONNECTED,
+    STATE_RUNNING,
+    STATE_WAITING,
+    SessionRegistry,
+)
 
 from tests.test_decision_manager_launch import (
+    BLOCKED_RAIL,
     CLAIM_NONE_FLAG,
     _code_only,
     LIVE_RAIL,
@@ -43,6 +66,10 @@ MODULE_SOURCE = Path(controller_module.__file__).read_text(encoding="utf-8")
 MODULE_TREE = ast.parse(MODULE_SOURCE)
 MODULE_CODE = _code_only(MODULE_SOURCE)
 ALWAYS_ALIVE = lambda pgid: True  # noqa: E731 - a prober, not a policy
+
+# A second durable session on one rail: a replacement in flight, or -- when both
+# are provably live -- the contradiction the projection refuses.
+ROTATION_SESSION = "1a2b3c4d-0002-4000-8000-00000000000b"
 
 
 def payload_in(page: str) -> dict:
@@ -213,6 +240,39 @@ class ControllerLaunchOwnershipTests(LifecycleTestBase):
             payload_in(fetched(port))["agents"],
             {"permitted": 6, "current": 0, "reason": None},
         )
+
+    def test_a_genuinely_launched_session_is_the_evidence_executor_working_needs(self) -> None:
+        """The other end of the reachability proof: the launch, not the fixture.
+
+        `ProductionCompositionTests` drives the composition from a registry handle
+        to a real client's screen. This drives the step before it -- a genuine
+        `launch` through the accepted lifecycle, with the real store and the real
+        registry -- and shows the evidence it produces is exactly the evidence that
+        composition reduces to `executor-working`. The accepted chain is used
+        rather than restated: the same `ownership_evidence` the reconciler consumes,
+        the same `session_evidence` the queue source builds, and the same
+        `project_attention` that decides the activity.
+
+        So neither half rests on the other's fixture. Nothing between the launched
+        process handle and the rendered activity is stood in for.
+        """
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        record = self.store.read(outcome.binding.session_id)
+
+        ownership = ownership_evidence(
+            controller.registry, [record], alive=ALWAYS_ALIVE
+        )
+        evidence = session_evidence(record, ownership)
+        attention = project_attention(
+            record.rail, status="running", has_decision=False, sessions=(evidence,)
+        )
+
+        self.assertEqual(record.role, "executor")
+        self.assertIs(ownership[record.session_id], True)
+        self.assertEqual(evidence.disposition, DISPOSITION_LIVE)
+        self.assertEqual(attention.activity, ACTIVITY_EXECUTOR_WORKING)
+        self.assertEqual(attention.attention_owner, OWNER_AGENT)
 
     def test_the_controller_launches_into_the_store_it_counts(self) -> None:
         """One store, so the ceiling that admitted the work is the one drawn."""
@@ -608,3 +668,415 @@ class NoAddedAuthorityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+# One response is one liveness instant, and the live branch is reachable at all
+# --------------------------------------------------------------------------
+
+
+class ProductionCompositionTests(SourcedLaunchTestCase):
+    """The supported composition, driven end to end: scope, observe, serve, fetch.
+
+    Two facts converge here. The live-session activity branch was unreachable
+    because every production reader passed a registry that had nothing in it, and
+    one rendered response could draw its rows from one liveness instant and the
+    figure beside them from another. Neither is a model defect -- the accepted
+    projection has always answered both correctly when something asked it -- so
+    everything below drives `ManagerController`'s own methods and asserts what a
+    real client is actually told.
+
+    `own` puts a handle in this controller's real registry, which is exactly what
+    `launch` does and is asserted to do in `ControllerLaunchOwnershipTests`; the
+    composition under test between that handle and the reader's screen is entirely
+    production code.
+    """
+
+    class Phase:
+        """Liveness that changes at a stated point, not at a hoped-for one.
+
+        A prober scripted to answer `True` then `False` proves nothing on its own:
+        it depends on how many times the composition happens to ask, which is the
+        property under test. So the answer here is a state, and the state is
+        flipped by a real boundary the composition crosses between the two
+        readings -- the second read of the durable store, which is the aggregate's
+        read. Whatever the composition asks and whenever it asks it, the flip lands
+        between the rows and the figure beside them.
+        """
+
+        def __init__(self, live: bool = True) -> None:
+            self.live = live
+            self.probes = []
+
+        def __call__(self, pgid) -> bool:
+            self.probes.append(pgid)
+            return self.live
+
+    class FlippingStore(BindingStore):
+        """This controller's own store, which flips the phase between the halves."""
+
+        def __init__(self, root, phase, *, at: int = 2) -> None:
+            super().__init__(root)
+            self.phase = phase
+            self.at = at
+            self.reads = 0
+
+        def records(self):
+            self.reads += 1
+            if self.reads == self.at:
+                self.phase.live = False
+            return super().records()
+
+    # -- fixtures ---------------------------------------------------------
+
+    def controller(self, registry=None) -> ManagerController:
+        return ManagerController(
+            self.context(), registry=self.registry if registry is None else registry
+        )
+
+    def a_live_rail(self, rail=LIVE_RAIL, *, role="executor", session_id=SESSION):
+        self.authorize(rail, "running")
+        record = self.bind(rail, session_id=session_id)
+        if role != "executor":
+            record = self._as_role(record, role)
+        self.own(record)
+        return record
+
+    def _as_role(self, record, role):
+        """The same durable binding, published in another accepted role.
+
+        Roles are a durable fact about the work, so this rewrites the record the
+        store holds rather than teaching the projection a second way to learn one.
+        """
+        rewritten = dataclasses.replace(record, role=role)
+        path = self.store.path_for(record.session_id)
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["role"] = role
+        path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        self.registry.remove(record.session_id)
+        self.own(rewritten)
+        return rewritten
+
+    def observed(self, controller=None, *, alive=ALWAYS_ALIVE):
+        """One response's worth of observation, through the production methods."""
+        owner = self.controller() if controller is None else controller
+        run = self.a_run()
+        return owner.observe(owner.queue_scope(run), run, alive=alive)
+
+    def payload_over_http(self, controller, *, alive=ALWAYS_ALIVE) -> dict:
+        """A real client, a real loopback socket, and the production server."""
+        run = self.a_run()
+        server = controller.serve_observed(run, controller.queue_scope(run), alive=alive)
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+        return payload_in(fetched(server.server_address[1]))
+
+    # -- proof 1: the live branch reaches a real client -------------------
+
+    def test_a_live_owned_session_reaches_a_real_client_as_executor_working(self) -> None:
+        """The whole point of the rail, asserted over a socket rather than a seam.
+
+        Nothing in this path is a fixture standing in for the composition: the
+        scope is resolved from the real coordination repository, the rows are
+        projected through the accepted queue source, the aggregate is reduced by
+        the accepted reconciler, the page is rendered by the accepted renderer, and
+        the bytes are read back by a real HTTP client. Before this rail the same
+        client could not have been told this at all.
+        """
+        self.a_live_rail()
+
+        payload = self.payload_over_http(self.controller())
+
+        self.assertEqual([row["state"] for row in payload["rows"]], [STATE_RUNNING])
+        item_id = payload["rows"][0]["itemId"]
+        self.assertEqual(payload["details"][item_id]["activity"], ACTIVITY_EXECUTOR_WORKING)
+        self.assertEqual(payload["details"][item_id]["attentionOwner"], OWNER_AGENT)
+        self.assertEqual(
+            payload["agents"], {"permitted": 6, "current": 1, "reason": None}
+        )
+
+    def test_the_empty_registry_composition_is_what_used_to_prevent_it(self) -> None:
+        """Kill the ownership half and the live branch must go away again.
+
+        The store, the coordination repository and the durable record are identical.
+        Only the registry differs, so a row that still read `executor-working` here
+        would be a row that never needed ownership evidence at all.
+        """
+        self.a_live_rail()
+
+        payload = self.payload_over_http(self.controller(registry=SessionRegistry()))
+
+        self.assertEqual([row["state"] for row in payload["rows"]], [STATE_DISCONNECTED])
+        item_id = payload["rows"][0]["itemId"]
+        self.assertEqual(
+            payload["details"][item_id]["activity"], ACTIVITY_DISCONNECTED_RECOVERY
+        )
+        self.assertIsNone(payload["agents"]["current"])
+
+    # -- proof 2: the other live roles ------------------------------------
+
+    def test_reviewer_working_is_reachable_through_the_same_composition(self) -> None:
+        self.a_live_rail(role="reviewer")
+
+        payload = self.payload_over_http(self.controller())
+
+        item_id = payload["rows"][0]["itemId"]
+        self.assertEqual(payload["details"][item_id]["activity"], ACTIVITY_REVIEWER_WORKING)
+        self.assertEqual(payload["agents"]["current"], 1)
+
+    def test_orchestrator_reconciling_is_reachable_through_the_same_composition(self) -> None:
+        self.a_live_rail(role="orchestrator")
+
+        payload = self.payload_over_http(self.controller())
+
+        item_id = payload["rows"][0]["itemId"]
+        self.assertEqual(
+            payload["details"][item_id]["activity"], ACTIVITY_ORCHESTRATOR_RECONCILING
+        )
+
+    # -- proof 3: context rotation ----------------------------------------
+
+    def test_context_rotation_is_reachable_through_the_same_composition(self) -> None:
+        """A live session and a replacement reserved on one rail: one row, rotating."""
+        self.a_live_rail()
+        self.bind(LIVE_RAIL, session_id=ROTATION_SESSION, state=BINDING_STATE_RESERVED)
+
+        payload = self.payload_over_http(self.controller())
+
+        self.assertEqual(len(payload["rows"]), 1)
+        item_id = payload["rows"][0]["itemId"]
+        self.assertEqual(payload["rows"][0]["state"], STATE_RUNNING)
+        self.assertEqual(payload["details"][item_id]["activity"], ACTIVITY_CONTEXT_ROTATION)
+
+    # -- proof 4: contradictory ownership still fails closed --------------
+
+    def test_ownership_contradictory_refuses_the_whole_response(self) -> None:
+        """Two provably live sessions on one rail is refused, not rendered.
+
+        The refusal now lands while a response is being produced rather than while
+        a server is being constructed, so this asserts it at both boundaries: the
+        server cannot even be built, and the observation raises with the accepted
+        reason naming both sessions.
+        """
+        self.a_live_rail()
+        self.own(self.bind(LIVE_RAIL, session_id=ROTATION_SESSION))
+        controller = self.controller()
+        run = self.a_run()
+        scope = controller.queue_scope(run)
+
+        with self.assertRaises(QueueSourceError) as refused:
+            controller.observe(scope, run, alive=ALWAYS_ALIVE)
+
+        self.assertIn(REASON_OWNERSHIP_CONTRADICTORY, str(refused.exception))
+        self.assertIn(SESSION, str(refused.exception))
+        self.assertIn(ROTATION_SESSION, str(refused.exception))
+        with self.assertRaises(QueueSourceError):
+            controller.serve_observed(run, scope, alive=ALWAYS_ALIVE)
+
+    # -- proofs 5 and 6: honest emptiness, fail-closed unprovability -------
+
+    def test_an_empty_scope_still_reaches_a_client_as_an_established_zero(self) -> None:
+        payload = self.payload_over_http(self.controller())
+
+        self.assertEqual(payload["rows"], [])
+        self.assertEqual(payload["agents"], {"permitted": 6, "current": 0, "reason": None})
+
+    def test_ownership_unprovable_fails_closed_at_the_row_and_the_aggregate(self) -> None:
+        """A durable binding this controller did not start, both halves at once."""
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+
+        payload = self.payload_over_http(self.controller())
+
+        self.assertEqual([row["state"] for row in payload["rows"]], [STATE_DISCONNECTED])
+        self.assertEqual(
+            payload["agents"],
+            {"permitted": 6, "current": None, "reason": REASON_OWNERSHIP_UNPROVABLE},
+        )
+
+    # -- proofs 7, 8 and 9: the preserved checkpoint-49 architecture -------
+
+    def test_the_row_identity_is_the_durable_rail_and_never_the_transport(self) -> None:
+        self.a_live_rail()
+
+        payload = self.payload_over_http(self.controller())
+
+        row = payload["rows"][0]
+        self.assertEqual(row["title"], LIVE_RAIL)
+        self.assertEqual(row["itemId"], "5:agent|6:ai-dev|8:issue-55|{0}:{1}".format(
+            len(LIVE_RAIL), LIVE_RAIL
+        ))
+        for forbidden in (SESSION, "4242", "test-host"):
+            self.assertNotIn(forbidden, row["itemId"])
+            self.assertNotIn(forbidden, row["title"])
+
+    def test_waiting_is_still_exactly_the_human_owned_set(self) -> None:
+        """Non-vacuous: a live agent-owned row and a waiting human-owned one."""
+        self.a_live_rail()
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(BLOCKED_RAIL)
+
+        payload = self.payload_over_http(self.controller())
+
+        waiting = {
+            row["itemId"] for row in payload["rows"] if row["state"] == STATE_WAITING
+        }
+        human = {
+            item_id for item_id, detail in payload["details"].items()
+            if detail["attentionOwner"] == OWNER_HUMAN
+        }
+        self.assertTrue(waiting)
+        self.assertEqual(waiting, human)
+        self.assertEqual(len(payload["rows"]), 2)
+
+    def test_the_checkpoint_six_ceiling_is_unchanged_at_six(self) -> None:
+        self.a_live_rail()
+
+        payload = self.payload_over_http(self.controller())
+
+        self.assertEqual(payload["agents"]["permitted"], CONCURRENCY_CEILING_DEFAULT)
+        self.assertEqual(CONCURRENCY_CEILING_DEFAULT, 6)
+
+    # -- proof 10: one response cannot span two liveness instants ----------
+
+    def test_one_response_cannot_take_its_rows_and_its_figure_from_two_instants(self) -> None:
+        """The constructed changing-liveness case, at the exact seam it lands on.
+
+        The phase flips on the second read of the durable store, which is the read
+        the aggregate performs. Under the old composition the rows were projected
+        while the session was live and the figure was reduced after it was gone, so
+        one response said `executor-working` beside `ownership-unprovable`. The
+        observation is taken once now, so the flip cannot land inside a response:
+        both halves describe the instant the observation was taken.
+        """
+        self.a_live_rail()
+        phase = self.Phase()
+        controller = self.controller()
+        controller.store = self.FlippingStore(self.binding_root, phase)
+
+        seen = self.observed(controller, alive=phase)
+
+        self.assertGreaterEqual(controller.store.reads, 2)
+        self.assertFalse(phase.live, "the flip must really have happened")
+        self.assertEqual([row.state for row in seen.view.rows], [STATE_RUNNING])
+        self.assertEqual(seen.agents, {"permitted": 6, "current": 1, "reason": None})
+        self.assertEqual(len(phase.probes), 1)
+
+    def test_the_split_observation_composition_is_what_used_to_break_it(self) -> None:
+        """The same facts through the old two-call shape, kept as the control.
+
+        `queue` and `agent_count` are the accepted checkpoint-46 methods and are
+        unchanged; each still takes its own liveness reading, which is correct for
+        a caller making one call. Composed into one response they describe two
+        instants, and this states that plainly rather than leaving the new
+        composition's guarantee resting on an untested claim about the old one.
+        """
+        self.a_live_rail()
+        phase = self.Phase()
+        controller = self.controller()
+        controller.store = self.FlippingStore(self.binding_root, phase)
+        run = self.a_run()
+
+        view, _details = controller.queue(run, alive=phase)
+        reading = controller.agent_count(alive=phase)
+
+        self.assertEqual([row.state for row in view.rows], [STATE_RUNNING])
+        self.assertIsNone(reading["current"])
+        self.assertEqual(reading["reason"], REASON_OWNERSHIP_UNPROVABLE)
+
+    # -- proof 11: a later response re-observes ---------------------------
+
+    def test_a_later_response_observes_again_rather_than_reusing_the_last_one(self) -> None:
+        """No durable liveness cache: the second response is allowed to disagree."""
+        self.a_live_rail()
+        phase = self.Phase()
+        controller = self.controller()
+        run = self.a_run()
+        scope = controller.queue_scope(run)
+
+        first = controller.observe(scope, run, alive=phase)
+        phase.live = False
+        second = controller.observe(scope, run, alive=phase)
+
+        self.assertEqual([row.state for row in first.view.rows], [STATE_RUNNING])
+        self.assertEqual(first.agents["current"], 1)
+        self.assertEqual([row.state for row in second.view.rows], [STATE_DISCONNECTED])
+        self.assertIsNone(second.agents["current"])
+        self.assertEqual(len(phase.probes), 2)
+
+    def test_two_real_requests_to_one_server_re_observe_independently(self) -> None:
+        """The same property over the socket, because that is where it must hold."""
+        self.a_live_rail()
+        phase = self.Phase()
+        controller = self.controller()
+        run = self.a_run()
+        server = controller.serve_observed(run, controller.queue_scope(run), alive=phase)
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+        port = server.server_address[1]
+
+        live = payload_in(fetched(port))
+        phase.live = False
+        gone = payload_in(fetched(port))
+
+        self.assertEqual(live["rows"][0]["state"], STATE_RUNNING)
+        self.assertEqual(live["agents"]["current"], 1)
+        self.assertEqual(gone["rows"][0]["state"], STATE_DISCONNECTED)
+        self.assertIsNone(gone["agents"]["current"])
+
+    def test_nothing_about_the_observation_is_retained_on_the_controller(self) -> None:
+        """Structural: a response's observation may not outlive the response."""
+        self.a_live_rail()
+        controller = self.controller()
+        before = set(vars(controller))
+
+        self.observed(controller)
+
+        self.assertEqual(set(vars(controller)), before)
+        self.assertEqual(sorted(before), ["ceiling", "registry", "source", "store"])
+
+    # -- the same store and the same registry, not merely equal ones -------
+
+    def test_both_halves_read_the_controllers_own_store_object(self) -> None:
+        """Not a second store over the same root: the same object, provably.
+
+        A controller that reserves against one store and draws its rows from
+        another agrees only by reading the same files, which is agreement by
+        accident. `FlippingStore` counts reads, so this fails outright if either
+        half constructs its own.
+        """
+        self.a_live_rail()
+        controller = self.controller()
+        controller.store = self.FlippingStore(self.binding_root, self.Phase(), at=0)
+
+        self.observed(controller)
+
+        self.assertEqual(controller.store.reads, 2)
+
+    # -- the durable half is resolved once, and no response refetches ------
+
+    def test_a_response_never_reaches_the_coordination_remote(self) -> None:
+        """Re-observing is not polling, stated as a count of resolutions.
+
+        The scope is what costs a fetch, and it is resolved once per run. A
+        response re-reads a local store and re-probes liveness; if it resolved the
+        scope again, this surface would have become the per-request fetch loop the
+        accepted composition forbids.
+        """
+        self.a_live_rail()
+        controller = self.controller()
+        run = self.a_run()
+        resolutions = []
+        real = queue_source_module.resolve_read_source
+
+        with unittest.mock.patch.object(
+            queue_source_module, "resolve_read_source",
+            lambda root: (resolutions.append(root), real(root))[1],
+        ):
+            scope = controller.queue_scope(run)
+            controller.observe(scope, run, alive=ALWAYS_ALIVE)
+            controller.observe(scope, run, alive=ALWAYS_ALIVE)
+
+        self.assertEqual(len(resolutions), 1)

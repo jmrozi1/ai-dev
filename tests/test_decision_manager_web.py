@@ -29,6 +29,7 @@ from ai_dev_flow.decision_manager_web import (
     build_allowance,
     build_payload,
     make_live_server,
+    make_observed_server,
     make_server,
     render_page,
     serialize_payload,
@@ -1535,3 +1536,125 @@ class AgentCountDisplayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ObservedServerSurfaceTests(unittest.TestCase):
+    """One source, called once per request, and the whole page drawn from it.
+
+    `make_live_server` keeps the rows and re-reads the figure. That is right while
+    the rows carry nothing that can change under the page, and wrong the moment
+    they do: a row saying a session is working beside a figure saying nothing
+    provable is running is one screen describing two moments. This server takes the
+    whole answer from one call so there is no second call for it to interleave
+    anything between.
+    """
+
+    def setUp(self) -> None:
+        self.observations = [
+            ([an_agent(state=STATE_RUNNING)], {"permitted": 6, "current": 1, "reason": None}),
+            ([an_agent(state=STATE_RUNNING)], {"permitted": 6, "current": 1, "reason": None}),
+            ([], {"permitted": 6, "current": 0, "reason": None}),
+        ]
+        self.taken = []
+
+        def observe():
+            agents, reading = self.observations[
+                min(len(self.taken), len(self.observations) - 1)
+            ]
+            self.taken.append(reading)
+            _page, view, details = rendered([], agents)
+            return view, details, reading
+
+        self.observe = observe
+        self.server = make_observed_server(observe, allowance=an_allowance(), port=0)
+        self.addCleanup(self.server.server_close)
+        self.serving = start_serving(self.server)
+        self.addCleanup(self.serving.stop)
+        self.port = self.server.server_address[1]
+
+    def fetch(self) -> dict:
+        connection = http.client.HTTPConnection(LOOPBACK_HOST, self.port, timeout=5)
+        try:
+            connection.request("GET", PAGE_PATH)
+            body = connection.getresponse().read().decode("utf-8")
+        finally:
+            connection.close()
+        return payload_of(body)
+
+    def test_the_observation_source_is_consulted_exactly_once_per_request(self) -> None:
+        """One call is the whole guarantee: two would be two instants."""
+        self.assertEqual(len(self.taken), 1)
+        self.fetch()
+        self.assertEqual(len(self.taken), 2)
+        self.fetch()
+        self.assertEqual(len(self.taken), 3)
+
+    def test_the_rows_and_the_figure_move_together(self) -> None:
+        first, second = self.fetch(), self.fetch()
+
+        self.assertEqual(len(first["rows"]), 1)
+        self.assertEqual(first["agents"]["current"], 1)
+        self.assertEqual(second["rows"], [])
+        self.assertEqual(second["agents"]["current"], 0)
+
+    def test_this_runs_projection_is_still_taken_once(self) -> None:
+        """The allowance is the caller's, projected once, and never re-taken."""
+        first, second = self.fetch(), self.fetch()
+
+        for key in ("allowance", "states", "defaultFilters"):
+            with self.subTest(key=key):
+                self.assertEqual(first[key], second[key])
+
+    def test_it_retains_no_document_between_requests(self) -> None:
+        """Nothing may be re-served: a page true a moment ago is not true now."""
+        for attribute in ("page", "queue", "view", "details", "store"):
+            self.assertFalse(
+                getattr(self.server.RequestHandlerClass, attribute, None), attribute
+            )
+        self.assertTrue(callable(self.server.RequestHandlerClass.document))
+
+    def test_a_non_loopback_bind_is_refused_here_too(self) -> None:
+        for host in ("0.0.0.0", "::", "10.0.0.5"):
+            with self.subTest(host=host):
+                with self.assertRaises(RenderError) as caught:
+                    make_observed_server(
+                        self.observe, allowance=an_allowance(), host=host, port=0
+                    )
+                self.assertEqual(caught.exception.reason, web.REASON_NOT_LOOPBACK)
+
+    def test_an_unusable_observation_is_refused_at_construction(self) -> None:
+        """The same construction contract the other two servers already have."""
+        _page, view, details = rendered([], [an_agent()])
+
+        with self.assertRaises(RenderError) as caught:
+            make_observed_server(
+                lambda: (view, details, {"permitted": 6, "current": None, "reason": None}),
+                allowance=an_allowance(), port=0,
+            )
+
+        self.assertEqual(caught.exception.reason, web.REASON_INVALID_AGENTS)
+
+    def test_a_failing_observation_is_never_answered_with_a_stale_page(self) -> None:
+        """A source that breaks must not be papered over with the last good page."""
+        broken = []
+        _page, view, details = rendered([], [an_agent()])
+
+        def observe():
+            if broken:
+                raise RuntimeError("the store could not be read")
+            broken.append(True)
+            return view, details, {"permitted": 6, "current": 1, "reason": None}
+
+        server = make_observed_server(observe, allowance=an_allowance(), port=0)
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+
+        connection = http.client.HTTPConnection(
+            LOOPBACK_HOST, server.server_address[1], timeout=5
+        )
+        self.addCleanup(connection.close)
+        with contextlib.redirect_stderr(io.StringIO()):
+            connection.request("GET", PAGE_PATH)
+            with self.assertRaises(Exception):
+                connection.getresponse().read()

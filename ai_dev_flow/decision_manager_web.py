@@ -88,6 +88,7 @@ __all__ = [
     "build_allowance",
     "build_payload",
     "make_live_server",
+    "make_observed_server",
     "make_server",
     "render_page",
     "serialize_payload",
@@ -625,6 +626,68 @@ def make_live_server(
     document()
     handler = type(
         "_LivePageHandler", (_PageHandler,), {"document": staticmethod(document)}
+    )
+    return http.server.HTTPServer((host, port), handler)
+
+
+def make_observed_server(
+    observe: Any,
+    *,
+    allowance: Sequence[AllowanceWindowView],
+    host: str = LOOPBACK_HOST,
+    port: int = 0,
+    template_path: Optional[Path] = None,
+) -> http.server.HTTPServer:
+    """A loopback server whose whole answer comes from one observation per request.
+
+    `make_live_server` split one page across two instants and was right to, given
+    what it was handed: rows describing durable state that outlives a render, and a
+    count true only of the instant it was taken. That split stops being right the
+    moment the rows themselves carry a liveness reading, because then the page can
+    say a session is working in one row and that nothing provably is in the figure
+    beside it -- two answers to one question, drawn from two instants, on one
+    screen a person is reading to decide what to do.
+
+    So this server takes exactly one source and calls it exactly once per request.
+    Whatever internal consistency that call establishes is the page's, entire:
+    there is no second call for this module to interleave anything between, which
+    is the only guarantee it is in a position to make. It cannot inspect liveness,
+    ownership, or occupancy -- it holds no store, no registry and no evidence, and
+    that stays deliberately true -- so it does not verify coherence. It makes the
+    incoherence unreachable by construction, and leaves the observation's own
+    boundedness to the caller that owns the evidence.
+
+    Nothing is retained between requests. The next client's answer comes from a
+    fresh call, so a page that was true a moment ago is never re-served as though
+    it were still true. That is the same rule `make_live_server` states for its
+    reading, applied to the whole document rather than to one figure on it.
+
+    Failures stay the source's, exactly as they do for `make_live_server`: if the
+    observation raises, the request is not answered. Inventing a refusal vocabulary
+    here would be a second rule about evidence this module cannot see, and
+    answering with the last good document would re-serve a moment nobody
+    re-observed.
+
+    One observation happens at construction and is discarded, keeping the same
+    construction contract `make_server` and `make_live_server` already have: a
+    malformed template, an unknown detail, or an unusable observation is refused
+    when the server is built rather than at the first request.
+    """
+    _require_loopback(host)
+
+    def document() -> str:
+        view, details, agents = observe()
+        return render_page(
+            view,
+            details,
+            allowance=allowance,
+            agents=agents,
+            template_path=template_path,
+        )
+
+    document()
+    handler = type(
+        "_ObservedPageHandler", (_PageHandler,), {"document": staticmethod(document)}
     )
     return http.server.HTTPServer((host, port), handler)
 

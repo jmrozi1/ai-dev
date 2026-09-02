@@ -95,7 +95,13 @@ from .decision_manager import (
 )
 from .decision_manager_web import serve_forever
 from .decision_queue import QUEUE_STATES, DecisionQueue, QueueView, SelectedDetail
-from .queue_source import QueueSourceError, load_queue
+from .queue_source import (
+    QueueScope,
+    QueueSourceError,
+    load_queue,
+    project_queue,
+    resolve_queue_scope,
+)
 from .repository import resolve_repo_root
 from .session_binding import BindingStore
 from .session_lifecycle import SessionRegistry
@@ -116,6 +122,8 @@ __all__ = [
     "launch_manager_server",
     "load_run_queue",
     "main",
+    "project_run_queue",
+    "resolve_run_scope",
     "render_launch_page",
     "resolve_run",
     "stated_run_inputs",
@@ -266,6 +274,7 @@ def load_run_queue(
     source: QueueSourceContext,
     *,
     registry: SessionRegistry,
+    store: Optional[BindingStore] = None,
     expected_head: Optional[str] = None,
     alive: Optional[Callable] = None,
 ) -> Tuple[QueueView, Dict[str, SelectedDetail]]:
@@ -282,7 +291,10 @@ def load_run_queue(
     started, so a caller that owns none passes an empty one and the accepted
     lifecycle reports the durable bindings it did not start as disconnected.
     `alive` is passed straight through for the same reason and defaults to the
-    accepted prober; neither is a liveness rule of this module's own.
+    accepted prober; neither is a liveness rule of this module's own. `store` is the
+    caller's for the third time over: a controller that admits against its own store
+    must draw its rows from that same object rather than from a second one built
+    here that merely happens to read the same files.
 
     An empty return is a fact rather than a silence: `load_queue` returned, so the
     scope was read and had nothing in it.
@@ -293,8 +305,74 @@ def load_run_queue(
         ticket=source.ticket,
         registry=registry,
         now=_queue_instant(run.now),
-        store=BindingStore(source.binding_root),
+        store=_run_store(source, store),
         expected_head=expected_head,
+        alive=alive,
+    )
+    return _projected(queue)
+
+
+def _run_store(source: QueueSourceContext, store: Optional[BindingStore]) -> BindingStore:
+    """The caller's store when it has one, and otherwise this run's own.
+
+    A caller that already owns a store must be able to hand it in. Constructing a
+    second one over the same root reads the same durable files today, so the two
+    agree by accident rather than by construction -- and "by accident" is exactly
+    what the controller-owned composition exists to remove. A controller that
+    reserves against one store object and draws its rows from another is one edit
+    away from the split-evidence defect checkpoint 45 closed one layer down.
+
+    Constructing one when none is given keeps every existing caller unchanged.
+    """
+    return store if store is not None else BindingStore(source.binding_root)
+
+
+def resolve_run_scope(
+    source: QueueSourceContext,
+    *,
+    expected_head: Optional[str] = None,
+) -> QueueScope:
+    """This run's durable control-plane authority, proven once against the remote.
+
+    The half of `load_run_queue` that reaches the coordination remote, so a caller
+    that renders more than once from one run does this exactly once. The stated
+    scope is the caller's, exactly as it is for `load_run_queue`; nothing about
+    freshness, rail authorization, or decision validity is decided here.
+    """
+    return resolve_queue_scope(
+        Path(source.control_plane),
+        project=source.project,
+        ticket=source.ticket,
+        expected_head=expected_head,
+    )
+
+
+def project_run_queue(
+    scope: QueueScope,
+    run: ManagerRun,
+    source: QueueSourceContext,
+    *,
+    registry: SessionRegistry,
+    store: Optional[BindingStore] = None,
+    alive: Optional[Callable] = None,
+) -> Tuple[QueueView, Dict[str, SelectedDetail]]:
+    """One projection of an already-proven scope, at this run's instant.
+
+    The half of `load_run_queue` that may honestly be repeated: it re-reads the
+    caller's durable store and re-observes the caller's liveness, and it fetches
+    nothing. The refusal reasons are `queue_source`'s and are neither repeated nor
+    softened here.
+
+    `run.now` is still the instant, so a row's age and the allowance beside it keep
+    describing one moment. Age is display, not a liveness reading -- what moves
+    between two projections of one run is which sessions this controller can prove,
+    which is the only thing that can have moved.
+    """
+    queue = project_queue(
+        scope,
+        registry=registry,
+        now=_queue_instant(run.now),
+        store=_run_store(source, store),
         alive=alive,
     )
     return _projected(queue)

@@ -32,7 +32,14 @@ from ai_dev_flow.decision_queue import (
     OperationalAgent,
     QueueError,
 )
-from ai_dev_flow.queue_source import QueueSourceError, load_queue
+from ai_dev_flow import queue_source as queue_source_module
+from ai_dev_flow.queue_source import (
+    QueueScope,
+    QueueSourceError,
+    load_queue,
+    project_queue,
+    resolve_queue_scope,
+)
 from ai_dev_flow.session_binding import (
     BINDING_STATE_BOUND,
     BINDING_STATE_RESERVED,
@@ -1252,3 +1259,128 @@ def _every_string(value, seen=None):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# The two halves of a read, and which of them may honestly be repeated
+# ---------------------------------------------------------------------------
+
+
+class QueueScopeTests(QueueSourceTestBase):
+    """`load_queue` split where its two halves expire, and nowhere else.
+
+    Half of a queue read is durable control-plane authority: the revision being
+    served, the rails it authorizes, the decisions it publishes. Establishing it
+    reaches the coordination remote and it describes state that outlives any one
+    render. The other half is what a controller can prove about its own sessions,
+    and that is only ever true of the instant it was taken.
+
+    A reader that renders once is unaffected and still calls `load_queue`. A reader
+    that renders repeatedly from one run must be able to re-observe the second half
+    without re-fetching the first, or re-observing becomes polling. These prove the
+    split is exactly that and changes nothing else.
+    """
+
+    def a_live_rail_with_a_handle(self):
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+    def resolved_scope(self, **overrides) -> QueueScope:
+        arguments = {"project": PROJECT, "ticket": TICKET}
+        arguments.update(overrides)
+        return resolve_queue_scope(self.coordination, **arguments)
+
+    def projected(self, scope, **overrides):
+        arguments = {
+            "registry": self.registry, "now": NOW,
+            "store": self.store, "alive": lambda pgid: True,
+        }
+        arguments.update(overrides)
+        return project_queue(scope, **arguments)
+
+    def test_the_composed_halves_produce_the_queue_load_queue_produces(self) -> None:
+        """The split is a decomposition, not a second reader."""
+        self.a_live_rail_with_a_handle()
+
+        whole = self.load()
+        halves = self.projected(self.resolved_scope())
+
+        self.assertEqual(whole.view(filters=QUEUE_STATES), halves.view(filters=QUEUE_STATES))
+
+    def test_the_scope_pins_the_revision_every_projection_is_served_from(self) -> None:
+        self.a_live_rail_with_a_handle()
+        scope = self.resolved_scope()
+
+        self.assertEqual(scope.head, self._git(self.coordination, "rev-parse", "HEAD"))
+        self.assertEqual(scope.project, PROJECT)
+        self.assertEqual(scope.ticket, TICKET)
+        self.assertIn(LIVE_RAIL, scope.rails)
+
+    def test_projecting_again_re_observes_and_does_not_re_resolve(self) -> None:
+        """The whole reason for the split, stated as two counts at once.
+
+        Liveness is asked again -- the second projection is allowed to disagree
+        with the first, and does. The coordination remote is not consulted again,
+        which is what keeps re-observing from being a poll.
+        """
+        self.a_live_rail_with_a_handle()
+        answers = [True, False]
+        probes = []
+
+        def alive(pgid):
+            probes.append(pgid)
+            return answers[min(len(probes) - 1, len(answers) - 1)]
+
+        resolutions = []
+        real = queue_source_module.resolve_read_source
+        with patch.object(
+            queue_source_module, "resolve_read_source",
+            lambda root: (resolutions.append(root), real(root))[1],
+        ):
+            scope = self.resolved_scope()
+            first = self.projected(scope, alive=alive)
+            second = self.projected(scope, alive=alive)
+
+        self.assertEqual(len(resolutions), 1)
+        self.assertEqual(len(probes), 2)
+        self.assertEqual(
+            [row.state for row in first.view(filters=QUEUE_STATES).rows], [STATE_RUNNING]
+        )
+        self.assertEqual(
+            [row.state for row in second.view(filters=QUEUE_STATES).rows],
+            [STATE_DISCONNECTED],
+        )
+
+    def test_a_scope_holds_no_liveness_and_no_binding_of_its_own(self) -> None:
+        """Structural: nothing observed may be frozen into the durable half.
+
+        A scope outlives a response by design. A liveness reading or a binding
+        record captured in one would therefore be exactly the durable cache the
+        lifecycle refuses, re-served to every later response.
+        """
+        self.a_live_rail_with_a_handle()
+
+        scope = self.resolved_scope()
+
+        self.assertEqual(
+            sorted(field.name for field in dataclass_fields(QueueScope)),
+            ["decisions", "project", "rails", "source", "ticket"],
+        )
+        self.assertNotIn(SESSION, repr(scope.rails))
+        with self.assertRaises(Exception):
+            scope.project = "other"
+
+    def test_the_refusals_belong_to_the_half_that_owns_them(self) -> None:
+        """Source refusals resolve; projection refusals project. Neither moved."""
+        with self.assertRaises(QueueSourceError) as stale:
+            self.resolved_scope(expected_head="f" * 40)
+        self.assertEqual(stale.exception.reason, queue_source.REASON_SOURCE_STALE)
+
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL, blob="f" * 40)
+        scope = self.resolved_scope()
+        with self.assertRaises(QueueSourceError) as drifted:
+            self.projected(scope)
+        self.assertEqual(
+            drifted.exception.reason, queue_source.REASON_LIFECYCLE_REFUSED
+        )

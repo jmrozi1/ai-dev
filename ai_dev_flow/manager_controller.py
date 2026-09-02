@@ -71,7 +71,7 @@ from __future__ import annotations
 import http.server
 from pathlib import Path
 import sys
-from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tuple
 
 from .authorization import AgentSlots, CONCURRENCY_CEILING_DEFAULT, reconcile_agent_slots
 from .claude_allowance_view import AllowanceViewError
@@ -79,19 +79,22 @@ from .decision_manager import (
     ManagerRun,
     ManagerRunError,
     make_live_manager_server,
+    make_observed_manager_server,
     render_manager_page,
 )
 from .decision_manager_launch import (
     LaunchError,
     QueueSourceContext,
     load_run_queue,
+    project_run_queue,
     resolve_run,
+    resolve_run_scope,
     stated_run_inputs,
 )
 from .decision_manager_web import serve_forever
 from .decision_queue import QueueView, SelectedDetail
 from .orchestrator_invocation import InvocationOutcome, invoke_orchestrator
-from .queue_source import QueueSourceError
+from .queue_source import QueueScope, QueueSourceError
 from .session_binding import BindingRecord, BindingStore
 from .session_lifecycle import (
     LaunchOutcome,
@@ -99,14 +102,37 @@ from .session_lifecycle import (
     StopOutcome,
     launch_session,
     ownership_evidence,
+    single_liveness_snapshot,
     stop_session,
 )
 
 __all__ = [
     "ManagerController",
+    "PageObservation",
     "REASON_OWNERSHIP_UNPROVABLE",
     "main",
 ]
+
+
+class PageObservation(NamedTuple):
+    """Everything one rendered response says about running sessions, from one instant.
+
+    The rows and the aggregate are the two halves of a single question -- what is
+    this controller running -- and a response that draws them from two observations
+    can state a session is working in a row and that nothing provable is running in
+    the figure beside it. Both would be honestly derived and the page would still be
+    describing a moment that never existed.
+
+    So they are produced together or not at all. This type exists to make that
+    structural: there is no way to obtain one half of it without the other, and no
+    way for a renderer to ask for a fresher aggregate than the rows it already has.
+    It carries no liveness reading of its own and holds nothing open -- it is the
+    finished output of one observation, not a handle onto one.
+    """
+
+    view: QueueView
+    details: Mapping[str, SelectedDetail]
+    agents: Dict[str, Any]
 
 # The one reason this surface reports for a count it could not establish. It is the
 # reconciler's answer restated for display, not a second rule: `reconcile_agent_slots`
@@ -273,8 +299,126 @@ class ManagerController:
             run,
             self.source,
             registry=self.registry,
+            store=self.store,
             expected_head=expected_head,
             alive=alive,
+        )
+
+    # ----------------------------------------------------------------------
+    # One response, one instant
+    # ----------------------------------------------------------------------
+
+    def queue_scope(self, run: ManagerRun, *, expected_head: Optional[str] = None) -> QueueScope:
+        """This run's durable control-plane authority, proven once.
+
+        `queue` above is one acquisition for a caller that renders once. A caller
+        that renders repeatedly from one run splits it here instead: this half
+        reaches the coordination remote and is taken exactly once, and `observe`
+        below repeats only the half that can have changed.
+
+        `run` is taken so that a scope is asked for in the context of the run it
+        will be projected at, rather than resolved loose and paired up later. The
+        stated scope itself is this controller's, exactly as it is for `queue`.
+        """
+        return resolve_run_scope(self.source, expected_head=expected_head)
+
+    def observe(
+        self, scope: QueueScope, run: ManagerRun, *, alive: Optional[Callable] = None
+    ) -> PageObservation:
+        """One bounded observation: this controller's rows and its aggregate, together.
+
+        This is the whole seam. `page` and `serve` below ask two questions --
+        `queue(alive=...)` and `agent_count(alive=...)` -- and each takes its own
+        liveness reading. Between them a worker can exit, and one response then
+        draws a row from before that exit and a count from after it. Neither half
+        is wrong; the response is, because the two describe different moments and
+        the page presents them as one.
+
+        So the observation is taken here, once, and both halves are derived from
+        it. `single_liveness_snapshot` is the accepted checkpoint-49 primitive and
+        this is deliberately the same one the read below already uses: handing it
+        the outer snapshot means `_work_items` takes its snapshot over an
+        observation that is already fixed, so the inner guarantee is unchanged and
+        the outer one extends it from one read to one response. A snapshot of a
+        snapshot answers each process group exactly once, from the outer reading.
+
+        It is a snapshot and not a cache, for exactly the reason the primitive is.
+        Nothing here is stored on this object, shared between responses, refreshed
+        or invalidated. It is created by one response and dies with it, and the
+        next response asks again from scratch and gets that instant's truth. A
+        controller that held one of these open would be serving a claim about
+        processes nobody re-observed, which is the durable liveness cache the
+        lifecycle refuses.
+
+        `alive` is still the caller's, and is snapshotted rather than used directly
+        for the same reason: a caller may state which prober answers, and may not
+        decide how many instants one response spans.
+        """
+        observed = single_liveness_snapshot(alive)
+        view, details = project_run_queue(
+            scope,
+            run,
+            self.source,
+            registry=self.registry,
+            store=self.store,
+            alive=observed,
+        )
+        return PageObservation(view=view, details=details, agents=self.agent_count(alive=observed))
+
+    def observed_page(
+        self,
+        run: ManagerRun,
+        scope: QueueScope,
+        *,
+        alive: Optional[Callable] = None,
+        template_path: Optional[Path] = None,
+    ) -> str:
+        """One response's complete page, rows and aggregate from one observation."""
+        seen = self.observe(scope, run, alive=alive)
+        return render_manager_page(
+            run, seen.view, seen.details, agents=seen.agents, template_path=template_path
+        )
+
+    def serve_observed(
+        self,
+        run: ManagerRun,
+        scope: QueueScope,
+        *,
+        alive: Optional[Callable] = None,
+        port: int = 0,
+        template_path: Optional[Path] = None,
+    ) -> http.server.HTTPServer:
+        """A loopback server that observes once per request and renders that instant.
+
+        `serve` established that a live count must be reduced while a request is
+        being answered rather than frozen into the page, and that is kept exactly.
+        What it could not do is keep the rows honest at the same time: they were
+        acquired before the server existed, so a session this controller started
+        afterwards could never appear in one -- and once the aggregate did move,
+        the rows and the figure beside them were readings of two different moments.
+
+        This passes the accepted server one observation source instead of a frozen
+        queue plus a live reading. Each request takes exactly one observation from
+        this controller's own scope, store and registry, and the whole document is
+        rendered from it, so the rows and the aggregate on any single response are
+        the same instant by construction rather than by timing.
+
+        Everything whose subject cannot change under the page stays this run's and
+        is still projected once: the allowance windows are taken at construction,
+        and `scope` pins the revision, the rails and the decisions every response
+        is served from. So this re-observes without re-fetching -- there is no
+        timer, no watcher, no poller, and no request that reaches the coordination
+        remote.
+
+        No host is passed, for the reason `serve` passes none: the accepted server
+        owns the loopback rule and stays the only place that decides what this
+        surface binds.
+        """
+        return make_observed_manager_server(
+            run,
+            lambda: self.observe(scope, run, alive=alive),
+            port=port,
+            template_path=template_path,
         )
 
     def page(
@@ -353,6 +497,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     binding. Durable bindings this controller did not start make the total
     unprovable, and the page prints that reason instead of a number.
 
+    The rows and that aggregate come from one observation per response rather than
+    from two readings taken in sequence. This process launches nothing, so the
+    honest answer here rarely changes -- but "rarely changes" is not a property a
+    surface may rely on, and a page that could report a session working beside a
+    figure that proves nothing is running would be describing a moment that never
+    existed whether or not this particular process can reach it.
+
     The claim and the scope rules are the accepted launcher's and are called, not
     restated, so there is one place a run states what it is about.
     """
@@ -380,14 +531,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     print("owned session handles: {0}".format(len(controller.owned_session_ids())))
 
+    # The durable half once, against the remote; the half a session can change is
+    # observed below and again on every request, which is the only way either
+    # figure can still be true when someone reads it.
     try:
-        view, details = controller.queue(run)
+        scope = controller.queue_scope(run)
+        seen = controller.observe(scope, run)
     except QueueSourceError as exc:
         print("manager-controller: {0}".format(exc), file=sys.stderr)
         return 2
 
-    print("queue rows: {0}".format(len(view.rows)))
-    reading = controller.agent_count()
+    # Both lines come from `seen`, so this summary is one instant for the same
+    # reason a served response is: a row count and an occupancy taken from two
+    # readings could describe two different moments to the person reading them.
+    print("queue rows: {0}".format(len(seen.view.rows)))
+    reading = seen.agents
     print(
         "live occupancy: {0}".format(
             "{0} / {1}".format(reading["current"], reading["permitted"])
@@ -397,7 +555,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
 
     try:
-        server = controller.serve(run, view, details)
+        server = controller.serve_observed(run, scope)
+    except QueueSourceError as exc:
+        print("manager-controller: {0}".format(exc), file=sys.stderr)
+        return 2
     except (AllowanceViewError, ManagerRunError) as exc:
         print("manager-controller: {0}".format(exc), file=sys.stderr)
         return 3

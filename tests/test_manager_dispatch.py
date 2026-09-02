@@ -36,6 +36,12 @@ from pathlib import Path
 from ai_dev_flow import manager_controller as controller_module
 from ai_dev_flow import decision_manager_web as web_module
 from ai_dev_flow import manager_dispatch as dispatch_module
+from ai_dev_flow import queue_source as queue_source_module
+from ai_dev_flow.attention_projection import (
+    ACTIVITY_ORCHESTRATOR_RECONCILING,
+    OWNER_AGENT,
+)
+from ai_dev_flow.queue_source import REASON_BINDING_RAIL_UNKNOWN
 from ai_dev_flow import session_lifecycle, workspaces
 from ai_dev_flow.authorization import CONCURRENCY_CEILING_DEFAULT
 from ai_dev_flow.decision_manager_launch import QueueSourceContext
@@ -693,13 +699,21 @@ class LiveOccupancyTests(DispatchTestBase):
 
 
 class QueuePreservationTests(DispatchTestBase):
-    """The queue is still the page, and it is still this one run's snapshot of it.
+    """The queue is still the page, and this run still reads its authority once.
 
-    Only the agent count follows the clock, and it has to: it is the one figure
-    whose subject changes underneath the page. Everything else here describes
-    durable state read from the coordination repository, which this run reads once
-    -- reading it again per request would be a fetch per request, which is the
-    polling loop this surface is not allowed to become.
+    What a run reads once is the durable control-plane scope: the revision being
+    served, the rails it authorizes and the decisions it publishes. Reading that
+    again per request would be a fetch per request, which is the polling loop this
+    surface is not allowed to become, and it is asserted below that no request
+    does.
+
+    What follows the clock is everything whose subject is a running session -- the
+    rows and the occupancy alike. That used to be the occupancy alone, and the
+    consequence was that this entry point could never show the sessions it itself
+    started: it dispatches behind its own page, so rows acquired before the
+    dispatch describe a controller that owns nothing and go on describing it for
+    the life of the surface. They are observed per request now, together with the
+    figure beside them and from the same observation.
     """
 
     def test_the_decision_queue_is_still_drawn_beside_the_count(self) -> None:
@@ -741,12 +755,13 @@ class QueuePreservationTests(DispatchTestBase):
             self.last_seen["agents"]["reason"], REASON_OWNERSHIP_UNPROVABLE
         )
 
-    def test_only_the_count_moves_between_two_requests(self) -> None:
-        """The exact scope of what became live, stated as two real fetches.
+    def test_this_runs_projection_is_identical_in_both_answers(self) -> None:
+        """The exact scope of what this run reads once, stated as two real fetches.
 
-        The rows, their details, the filters and the allowance windows are this
-        run's projection and are identical in both answers. The agent count is not
-        a projection of this run at all, and it is the only thing that differs.
+        The filters and the allowance windows are this run's projection and are
+        byte-identical in both answers, taken minutes apart in principle and either
+        side of a whole dispatch in fact. Nothing here re-projects them, and the
+        test below proves nothing re-fetches the authority underneath them.
         """
         self.wake()
         during = {}
@@ -757,11 +772,191 @@ class QueuePreservationTests(DispatchTestBase):
 
         _code, _out, _err, _served = self.serve()
 
-        for key in ("rows", "details", "allowance", "states", "defaultFilters"):
+        for key in ("allowance", "states", "defaultFilters"):
             with self.subTest(key=key):
                 self.assertEqual(during["payload"][key], self.last_seen[key])
-        self.assertEqual(during["payload"]["agents"]["current"], 1)
+
+    def test_the_rows_and_the_count_move_together_between_two_requests(self) -> None:
+        """The exact scope of what became live, stated as two real fetches.
+
+        One real client asks while the dispatched session is genuinely running and
+        is told a running row and `1 / 6`. The very same server tells the next
+        client the row is gone and the slot is free, because the accepted lifecycle
+        stopped the session and terminalized its binding. Both answers are
+        internally consistent, and the disagreement between them is the truth
+        changing rather than a stale half being re-served.
+        """
+        self.wake()
+        during = {}
+
+        self.while_the_agent_works.append(
+            lambda: during.setdefault("payload", fetched(self.served_server()))
+        )
+
+        _code, _out, _err, _served = self.serve()
+
+        live = during["payload"]
+        self.assertEqual([row["title"] for row in live["rows"]], [ORCH_RAIL])
+        self.assertEqual(live["rows"][0]["state"], STATE_RUNNING)
+        self.assertEqual(live["agents"]["current"], 1)
+
+        self.assertEqual(self.last_seen["rows"], [])
+        self.assertEqual(self.last_seen["details"], {})
         self.assertEqual(self.last_seen["agents"]["current"], 0)
+
+
+class ProductionReachabilityTests(DispatchTestBase):
+    """The live-session activity branch, reached through the real entry point.
+
+    Everything below runs `manager_dispatch.main` itself. The coordination
+    repository is real and published, the binding store is real and on disk, the
+    server is the accepted one bound to a real loopback socket by the entry point,
+    and every observation is a real HTTP request made from inside the window in
+    which the dispatched session is genuinely running. The only stand-in anywhere
+    is the worker process boundary, which is what makes the live window a window
+    rather than a hope.
+
+    Before this rail none of it was reachable: the entry point dispatches behind
+    its own page, so the rows were acquired against a registry that was empty by
+    construction and stayed that way for the life of the surface.
+    """
+
+    def observing(self, look):
+        self.while_the_agent_works.append(look)
+
+    def test_the_entry_point_renders_the_session_it_itself_started(self) -> None:
+        """A genuinely live owned session, on a real screen, for the first time.
+
+        The row is the durable rail, the state is Running, the activity is the one
+        the accepted projection assigns this session's durable role, and the
+        aggregate beside it counts the same session. Every one of those is a fact
+        about a process this very entry point started moments earlier.
+        """
+        self.wake()
+        during = {}
+        self.observing(lambda: during.setdefault("payload", fetched(self.served_server())))
+
+        code, _out, _err, _served = self.serve()
+
+        self.assertEqual(code, 0)
+        payload = during["payload"]
+        self.assertEqual([row["title"] for row in payload["rows"]], [ORCH_RAIL])
+        self.assertEqual(payload["rows"][0]["state"], STATE_RUNNING)
+        item_id = payload["rows"][0]["itemId"]
+        self.assertEqual(
+            payload["details"][item_id]["activity"], ACTIVITY_ORCHESTRATOR_RECONCILING
+        )
+        self.assertEqual(payload["details"][item_id]["attentionOwner"], OWNER_AGENT)
+        self.assertEqual(
+            payload["agents"],
+            {"permitted": CONCURRENCY_CEILING_DEFAULT, "current": 1, "reason": None},
+        )
+
+    def test_the_row_and_the_figure_beside_it_are_one_observation(self) -> None:
+        """Both halves of one response agree because they are one reading.
+
+        Asserted on the live window rather than on a quiet page, because that is
+        the only instant at which the two halves have anything to disagree about.
+        """
+        self.wake()
+        during = {}
+        self.observing(lambda: during.setdefault("payload", fetched(self.served_server())))
+
+        self.serve()
+
+        payload = during["payload"]
+        running = [row for row in payload["rows"] if row["state"] == STATE_RUNNING]
+        self.assertEqual(len(running), 1)
+        self.assertEqual(payload["agents"]["current"], len(running))
+
+    def test_the_surface_answers_before_the_dispatch_and_owns_nothing_yet(self) -> None:
+        """Checkpoint 47's ordering is unchanged, and still asserted here.
+
+        The page must be reachable before a session exists, and what it says then
+        must be the truth: this controller has started nothing. A row invented at
+        that instant would be the frozen-rows defect in the other direction.
+        """
+        self.wake()
+        before = {}
+        started = web_module.start_serving
+
+        def answering(server):
+            # The accepted socket loop, and then a real fetch on it -- taken here
+            # because this is the last instant before `dispatch_behind` runs.
+            serving = started(server)
+            before["payload"] = fetched(server)
+            return serving
+
+        with unittest.mock.patch.object(web_module, "start_serving", answering):
+            code, _out, _err, _served = self.serve()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(before["payload"]["rows"], [])
+        self.assertEqual(before["payload"]["details"], {})
+        self.assertEqual(before["payload"]["agents"]["current"], 0)
+
+    def test_no_request_refetches_the_coordination_remote(self) -> None:
+        """Re-observing per request is not polling, counted rather than asserted.
+
+        The scope is what costs a fetch. It is resolved once for the run, and the
+        two real requests below -- one from inside the live window, one after it --
+        add none. If a response resolved the scope again this surface would have
+        become the per-request fetch loop the accepted composition forbids.
+        """
+        self.wake()
+        resolutions = []
+        real = queue_source_module.resolve_read_source
+        self.observing(lambda: fetched(self.served_server()))
+
+        with unittest.mock.patch.object(
+            queue_source_module, "resolve_read_source",
+            lambda root: (resolutions.append(root), real(root))[1],
+        ):
+            code, _out, _err, _served = self.serve()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(len(resolutions), 1)
+
+    def test_a_durable_binding_this_process_did_not_start_stays_unprovable(self) -> None:
+        """Fail closed at the row and the aggregate, through the real entry point."""
+        self.foreign_binding()
+
+        code, _out, _err, _served = self.serve()
+
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [row["state"] for row in self.last_seen["rows"]], [STATE_DISCONNECTED]
+        )
+        self.assertEqual(
+            self.last_seen["agents"],
+            {
+                "permitted": CONCURRENCY_CEILING_DEFAULT,
+                "current": None,
+                "reason": REASON_OWNERSHIP_UNPROVABLE,
+            },
+        )
+
+    def test_a_source_refusal_still_reaches_no_server(self) -> None:
+        """The construction contract is unchanged: a refusal never draws a page.
+
+        The projection now happens per response, so this proves the first one still
+        happens while the server is being built. A refusal that first appeared at a
+        client's request would be an empty or unanswered page, which is the outcome
+        this entry point exists to never produce.
+        """
+        unauthorized = "issue-55-rail-nobody-authorized"
+        self.rail(unauthorized, role="executor", status="running")
+        self.foreign_binding(rail=unauthorized)
+        # Withdrawn before publication, so the durable binding names a rail the
+        # published scope does not authorize -- a real refusal, not a fabricated one.
+        (self.scope / "rails" / unauthorized / "rail.md").unlink()
+
+        code, _out, err, served = self.serve()
+
+        self.assertEqual(code, 2)
+        self.assertEqual(served, [])
+        self.assertIn(REASON_BINDING_RAIL_UNKNOWN, err)
+        self.assertNotIn("Traceback", err)
 
 
 class AdmissionPreservationTests(DispatchTestBase):
