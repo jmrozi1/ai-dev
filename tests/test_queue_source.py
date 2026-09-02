@@ -1579,24 +1579,51 @@ class ActionableBlockerSourceTests(QueueSourceTestBase):
 
     # -- proof 9: fail closed, never fabricate ---------------------------
 
-    def test_a_rail_with_no_role_assignment_withholds_the_whole_blocker(self) -> None:
-        """The one field with no durable home, absent, and said so by name."""
+    def test_a_rail_with_no_role_states_the_absence_and_keeps_every_other_fact(self) -> None:
+        """The one field with no durable home, absent, said so by name -- and only it.
+
+        This is the invariant the whole seam exists for: one genuinely unsourceable
+        field must not destroy five complete, publisher-validated ones. The record
+        here is exactly what the supported publisher accepts -- a `blocked` rail
+        with no `Role:` header carrying a valid six-field blocker -- so nothing
+        about it is malformed, and there is nothing to fail closed *about* except
+        the agent itself.
+        """
         self.authorize(BLOCKED_RAIL, "blocked", role=None)
         published = decision_payload(blocker=dict(BLOCKERS["credential"]))
         self.decide(payload=published)
 
         item = self.waiting_item()
 
-        self.assertIsNone(item.blocker)
-        self.assertEqual(item.blocker_unavailable, queue_source.BLOCKER_AGENT_UNSOURCED)
+        # The item carries a blocker, and no item-level withholding notice: the
+        # absence is stated in the field it belongs to, not in place of the whole.
+        self.assertIsNotNone(item.blocker)
+        self.assertIsNone(item.blocker_unavailable)
+
+        # Every published fact, carried verbatim.
+        self.assertEqual(item.blocker.kind, published["blocker"]["kind"])
+        self.assertEqual(item.blocker.what_failed, published["blocker"]["whatFailed"])
+        self.assertEqual(
+            item.blocker.missing_capability, published["blocker"]["missingCapability"]
+        )
+        self.assertEqual(item.blocker.human_change, published["blocker"]["humanChange"])
+        self.assertIs(item.blocker.state_changed, published["blocker"]["stateChanged"])
+        self.assertEqual(item.blocker.next_action, published["blocker"]["nextAction"])
+
+        # And the one fact that had no source is stated, never invented.
+        self.assertIsNone(item.blocker.agent)
+        self.assertEqual(item.blocker.agent_unavailable, queue_source.BLOCKER_AGENT_UNSOURCED)
+        for invented in ("executor", "reviewer", "orchestrator"):
+            with self.subTest(invented=invented):
+                self.assertNotIn(invented, item.blocker.agent_unavailable)
         # And not one word of the published blocker leaked into the notice, in
         # either direction: nothing was paraphrased and nothing was quoted.
         for value in published["blocker"].values():
             if isinstance(value, str):
-                self.assertNotIn(value, item.blocker_unavailable)
+                self.assertNotIn(value, item.blocker.agent_unavailable)
 
-    def test_the_human_owned_item_survives_an_unsourceable_blocker(self) -> None:
-        """Failing closed must not fail silent: the person is still asked."""
+    def test_the_human_owned_item_survives_an_unsourceable_agent(self) -> None:
+        """Not failing silent, and now not failing blank either: the person can act."""
         self.authorize(BLOCKED_RAIL, "blocked", role=None)
         self.decide(payload=decision_payload(blocker=dict(BLOCKERS["credential"])))
 
@@ -1607,8 +1634,9 @@ class ActionableBlockerSourceTests(QueueSourceTestBase):
         self.assertEqual(view.rows[0].state, STATE_WAITING)
         self.assertEqual(view.detail.attention_owner, OWNER_HUMAN)
         self.assertEqual(view.detail.rail, BLOCKED_RAIL)
+        self.assertIsNone(view.detail.blocker_unavailable)
         self.assertEqual(
-            view.detail.blocker_unavailable, queue_source.BLOCKER_AGENT_UNSOURCED
+            view.detail.blocker.agent_unavailable, queue_source.BLOCKER_AGENT_UNSOURCED
         )
 
     def test_a_blocker_missing_a_field_is_withheld_whole_rather_than_part_shown(self) -> None:

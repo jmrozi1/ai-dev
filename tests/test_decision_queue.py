@@ -954,25 +954,78 @@ def a_blocker(**overrides) -> queue_module.ActionableBlocker:
 class ActionableBlockerShapeTests(unittest.TestCase):
     """The six failure facts arrive complete or not at all."""
 
-    def test_every_field_is_required_with_no_default(self) -> None:
+    def test_every_published_fact_is_required_with_no_default(self) -> None:
         """A blocker cannot be constructed half-described, so none can exist.
 
         Asserted over the dataclass rather than by omitting one field in a call,
         because a default added later would make the omission test pass while the
         property it stands for was gone.
+
+        `agent_unavailable` is the one field with a default, and it is the reason
+        the agent is absent rather than a published fact. Defaulting it to `None`
+        is what makes "no reason was given" the state that cannot be constructed
+        alongside an absent agent -- the exactly-one-of rule below is what enforces
+        that, and it is checked separately rather than by this field's presence.
         """
         for entry in fields(queue_module.ActionableBlocker):
             with self.subTest(field=entry.name):
+                if entry.name == "agent_unavailable":
+                    self.assertIsNone(entry.default)
+                    continue
                 self.assertIs(entry.default, MISSING)
                 self.assertIs(entry.default_factory, MISSING)
 
-    def test_the_field_set_is_exactly_d8_s_six(self) -> None:
-        """Project, ticket and rail are not here: the item states them once."""
+    def test_the_field_set_is_d8_s_six_plus_the_agent_s_stated_absence(self) -> None:
+        """Project, ticket and rail are not here: the item states them once.
+
+        The seventh name is not a seventh D8 fact. The affected agent is the one
+        D8 field sourced from the rail rather than from the record, so it is the
+        one that can be genuinely absent from a complete, publisher-validated
+        blocker; `agent_unavailable` is where that absence is stated instead of
+        guessed. Nothing else gained a companion field, because nothing else has
+        a source that can go missing.
+        """
         self.assertEqual(
             {f.name for f in fields(queue_module.ActionableBlocker)},
-            {"kind", "what_failed", "agent", "missing_capability", "human_change",
-             "state_changed", "next_action"},
+            {"kind", "what_failed", "agent", "agent_unavailable", "missing_capability",
+             "human_change", "state_changed", "next_action"},
         )
+
+    def test_exactly_one_answer_about_the_affected_agent_and_never_neither(self) -> None:
+        """The pair is one rule. Both is incoherent; neither is a confident blank."""
+        with self.assertRaises(QueueError) as neither:
+            a_blocker(agent=None)
+        self.assertEqual(
+            neither.exception.reason, queue_module.REASON_BLOCKER_AGENT_DOUBLE_ANSWER
+        )
+
+        with self.assertRaises(QueueError) as both:
+            a_blocker(agent="executor", agent_unavailable="the rail publishes no role")
+        self.assertEqual(
+            both.exception.reason, queue_module.REASON_BLOCKER_AGENT_DOUBLE_ANSWER
+        )
+
+        stated = a_blocker(agent=None, agent_unavailable="the rail publishes no role")
+        self.assertIsNone(stated.agent)
+        self.assertEqual(stated.agent_unavailable, "the rail publishes no role")
+
+        named = a_blocker(agent="executor")
+        self.assertEqual(named.agent, "executor")
+        self.assertIsNone(named.agent_unavailable)
+
+    def test_the_stated_absence_is_bounded_exact_text_like_every_other_notice(self) -> None:
+        """A reason is not a place to paste something unbounded either."""
+        for value in ("", "   ", 7, []):
+            with self.subTest(value=value):
+                with self.assertRaises(QueueError) as caught:
+                    a_blocker(agent=None, agent_unavailable=value)
+                self.assertEqual(caught.exception.reason, queue_module.REASON_INVALID_TEXT)
+        with self.assertRaises(QueueError) as caught:
+            a_blocker(
+                agent=None,
+                agent_unavailable="x" * (queue_module.MAX_BLOCKER_NOTICE + 1),
+            )
+        self.assertEqual(caught.exception.reason, queue_module.REASON_TEXT_TOO_LONG)
 
     def test_each_of_the_five_kinds_is_accepted_and_a_sixth_is_not(self) -> None:
         for kind in queue_module.BLOCKER_KINDS:
@@ -1000,11 +1053,20 @@ class ActionableBlockerShapeTests(unittest.TestCase):
         self.assertIs(a_blocker(state_changed=False).state_changed, False)
 
     def test_every_text_field_must_be_present_bounded_and_exact(self) -> None:
+        """`agent` is swept here too, because a *supplied* agent is still exact.
+
+        Its `None` case is the one that moved: an absent agent is now answered by
+        the exactly-one-of rule above rather than by this bound, so it is asserted
+        there. Every other way of being not-text -- empty, blank, a number, too
+        long -- is refused for the agent exactly as it always was, which is what
+        keeps "the rail published no role" from becoming a place to put anything.
+        """
         text_fields = (
             "what_failed", "agent", "missing_capability", "human_change", "next_action",
         )
         for name in text_fields:
-            for value in (None, "", "   ", 7):
+            values = ("", "   ", 7) if name == "agent" else (None, "", "   ", 7)
+            for value in values:
                 with self.subTest(field=name, value=value):
                     with self.assertRaises(QueueError) as caught:
                         a_blocker(**{name: value})

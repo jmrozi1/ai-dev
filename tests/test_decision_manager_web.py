@@ -1712,7 +1712,7 @@ class ActionablePayloadTests(unittest.TestCase):
             item_id = payload["rows"][0]["itemId"]
         return payload["details"][item_id]
 
-    def test_the_blocker_crosses_as_seven_named_fields_and_verbatim_text(self) -> None:
+    def test_the_blocker_crosses_as_eight_named_fields_and_verbatim_text(self) -> None:
         blocker = a_blocker()
         page, _, _ = rendered([a_decision(blocker=blocker)])
 
@@ -1720,15 +1720,38 @@ class ActionablePayloadTests(unittest.TestCase):
 
         self.assertEqual(
             set(drawn),
-            {"kind", "whatFailed", "agent", "missingCapability", "humanChange",
-             "stateChanged", "nextAction"},
+            {"kind", "whatFailed", "agent", "agentUnavailable", "missingCapability",
+             "humanChange", "stateChanged", "nextAction"},
         )
         self.assertEqual(drawn["kind"], blocker.kind)
         self.assertEqual(drawn["whatFailed"], blocker.what_failed)
         self.assertEqual(drawn["agent"], blocker.agent)
+        self.assertIsNone(drawn["agentUnavailable"])
         self.assertEqual(drawn["missingCapability"], blocker.missing_capability)
         self.assertEqual(drawn["humanChange"], blocker.human_change)
         self.assertEqual(drawn["nextAction"], blocker.next_action)
+
+    def test_the_agent_pair_crosses_uncollapsed_so_a_name_is_not_a_sentence(self) -> None:
+        """Both halves cross as themselves. Neither is folded into the other.
+
+        A payload that collapsed them into one `agent` string would leave the page
+        unable to tell a rail whose published assignment is `executor` from a rail
+        that published no assignment at all -- and a page that cannot tell those
+        apart is one keystroke from printing a reason where a name belongs.
+        """
+        stated = a_blocker(agent=None, agent_unavailable="the rail publishes no role")
+        page, _, _ = rendered([a_decision(blocker=stated)])
+
+        drawn = self.detail_of(page)["blocker"]
+
+        self.assertIsNone(drawn["agent"])
+        self.assertEqual(drawn["agentUnavailable"], "the rail publishes no role")
+        # And the five published facts crossed beside it, not instead of it.
+        self.assertEqual(drawn["whatFailed"], stated.what_failed)
+        self.assertEqual(drawn["missingCapability"], stated.missing_capability)
+        self.assertEqual(drawn["humanChange"], stated.human_change)
+        self.assertEqual(drawn["nextAction"], stated.next_action)
+        self.assertIs(drawn["stateChanged"], stated.state_changed)
 
     def test_state_changed_crosses_as_a_boolean_in_both_directions(self) -> None:
         """A phrase in the payload would let two callers ship two phrasings."""
@@ -1844,14 +1867,48 @@ class ActionablePageTests(unittest.TestCase):
 
     def test_all_six_blocker_facts_are_drawn_and_none_is_composed(self) -> None:
         for expression in (
-            "blocker.whatFailed", "blocker.agent", "blocker.missingCapability",
-            "blocker.humanChange", "blocker.stateChanged", "blocker.nextAction",
+            "blocker.whatFailed", "blocker.agent", "blocker.agentUnavailable",
+            "blocker.missingCapability", "blocker.humanChange", "blocker.stateChanged",
+            "blocker.nextAction",
         ):
             with self.subTest(expression=expression):
                 self.assertIn(expression, self.detail_block)
         # Nothing is concatenated onto published text, and nothing is truncated.
         self.assertNotIn("substring", self.script)
         self.assertNotIn("slice(0", self.script)
+
+    def test_the_agent_row_prints_a_published_name_or_the_stated_absence(self) -> None:
+        """The row is always drawn, and the page never authors what goes in it.
+
+        Both halves of the pair are read, and the choice between them is a null
+        test on the value the projection set -- not a test for a blank followed by
+        wording invented here. The row itself is unconditional: "who is affected"
+        is a question a person asks whether or not it has an answer, and a row that
+        disappeared would read as an oversight rather than as the fact it is.
+        """
+        self.assertIn("blocker.agentUnavailable", self.detail_block)
+        self.assertIn("blocker.agent === null", self.detail_block)
+        self.assertIn('["Agent", affected]', self.detail_block)
+        # The page composes no sentence of its own for the absent case: the only
+        # string it can put in that row came from the projection.
+        chooser = self.detail_block.split("var affected", 1)[1].split(";", 1)[0]
+        self.assertNotIn('"', chooser)
+
+    def test_the_absent_agent_reaches_the_page_beside_the_published_facts(self) -> None:
+        """Proof 8 on the rendered page: stated, not invented, and not alone."""
+        stated = a_blocker(
+            agent=None,
+            agent_unavailable="the rail publishes no role assignment",
+        )
+        page, _, _ = rendered([a_decision(blocker=stated)])
+
+        drawn = payload_of(page)["details"]
+        blocker = [d["blocker"] for d in drawn.values() if d["blocker"]][0]
+
+        self.assertIsNone(blocker["agent"])
+        self.assertEqual(blocker["agentUnavailable"], stated.agent_unavailable)
+        self.assertEqual(blocker["whatFailed"], stated.what_failed)
+        self.assertEqual(blocker["nextAction"], stated.next_action)
 
     def test_the_three_routing_facts_are_drawn_for_every_item(self) -> None:
         for expression in ("detail.project", "detail.ticket", "detail.rail"):

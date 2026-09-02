@@ -143,6 +143,7 @@ REASON_INVALID_BLOCKER = "invalid-blocker"
 REASON_UNSUPPORTED_BLOCKER_KIND = "unsupported-blocker-kind"
 REASON_BLOCKER_STATE_NOT_EXPLICIT = "blocker-state-changed-not-explicit"
 REASON_BLOCKER_DOUBLE_ANSWER = "blocker-both-carried-and-unsourced"
+REASON_BLOCKER_AGENT_DOUBLE_ANSWER = "blocker-agent-both-named-and-unsourced"
 
 # The five failure kinds D8 names, and no sixth. Restated from
 # `control_plane.DECISION_BLOCKER_KINDS` for the reason the bound above is, and
@@ -328,6 +329,16 @@ class ActionableBlocker:
     models no session role for, and refusing it here would be this module deciding
     what a durable record is allowed to say.
 
+    Because that home is the rail rather than the record, it is also the one field
+    a complete, publisher-validated blocker can genuinely fail to supply -- the
+    `Role:` header is optional by design, so a `blocked` rail carrying a valid
+    six-field blocker and publishing no role is a state the supported publisher
+    accepts. `agent_unavailable` is the honest answer for exactly that case, and
+    `agent` is `Optional` only in its company: one of the two is always present and
+    never both. Everything else in the blocker is still all-or-nothing, so this
+    stays "complete or absent" for the five facts that have a durable home, and
+    replaces a fabricated agent with a stated absence rather than with silence.
+
     `state_changed` is an exact `bool`. "The worktree may have changed" is the one
     answer a person cannot act on, so there is no third value and no string that
     could carry one.
@@ -335,11 +346,12 @@ class ActionableBlocker:
 
     kind: str
     what_failed: str
-    agent: str
+    agent: Optional[str]
     missing_capability: str
     human_change: str
     state_changed: bool
     next_action: str
+    agent_unavailable: Optional[str] = None
 
     def __post_init__(self) -> None:
         if self.kind not in BLOCKER_KINDS:
@@ -350,7 +362,39 @@ class ActionableBlocker:
                 ),
             )
         _text(self.what_failed, label="blocker what_failed", limit=MAX_BLOCKER_TEXT)
-        _text(self.agent, label="blocker agent", limit=MAX_BLOCKER_TEXT)
+        # Exactly one answer about the affected agent, the same shape the item
+        # level already uses for the blocker as a whole. The agent is the one D8
+        # field with no dedicated durable home, so it is the one field a complete,
+        # publisher-validated record can genuinely fail to supply. That is a fact
+        # about the record, not a reason to destroy the five facts beside it: the
+        # five were published, validated and are actionable, and a person who is
+        # told "the affected agent has no durable source" plus what failed, what is
+        # missing, what to change and what to retry can act, while a person told
+        # nothing cannot. Nothing is inferred to fill the gap -- there is no
+        # default, no session role, and no process identity here -- so the pair is
+        # either a published assignment or an explicit statement that there is
+        # none, and never both and never neither.
+        if self.agent is None:
+            if self.agent_unavailable is None:
+                raise QueueError(
+                    REASON_BLOCKER_AGENT_DOUBLE_ANSWER,
+                    "blocker agent is absent and no reason was given for its absence; "
+                    "a blank where the affected agent belongs is the confident blank "
+                    "this projection refuses everywhere else",
+                )
+            _text(
+                self.agent_unavailable,
+                label="blocker agent_unavailable",
+                limit=MAX_BLOCKER_NOTICE,
+            )
+        else:
+            _text(self.agent, label="blocker agent", limit=MAX_BLOCKER_TEXT)
+            if self.agent_unavailable is not None:
+                raise QueueError(
+                    REASON_BLOCKER_AGENT_DOUBLE_ANSWER,
+                    "blocker carries an affected agent and also reports that one could "
+                    "not be sourced; a person reading both learns neither",
+                )
         _text(
             self.missing_capability, label="blocker missing_capability", limit=MAX_BLOCKER_TEXT
         )

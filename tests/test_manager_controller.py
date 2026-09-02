@@ -1261,24 +1261,120 @@ class ActionableAttentionOverHttpTests(SourcedLaunchTestCase):
 
     # -- proof 9, over the production surface ----------------------------
 
-    def test_an_unsourceable_agent_fails_closed_on_the_served_page(self) -> None:
-        """The item still arrives; the blocker does not; nothing is invented."""
+    def test_the_rail_role_missing_case_arrives_actionable_on_its_own(self) -> None:
+        """The concrete reachable record, over a real socket. Proofs 2 to 8.
+
+        This is the case that made the behaviour a defect rather than a caution.
+        `authorize()` refuses `rail-role-missing` for a rail with no `Role:`, so an
+        orchestrator publishing *about* that refusal produces a valid record whose
+        own `humanChange` says to add the missing `Role:`. When the projection
+        discarded the blocker for want of an agent, the one published sentence
+        telling a person how to make the item actionable was the sentence it threw
+        away -- self-perpetuating by construction. Every field below is asserted
+        verbatim against what was published, because a paraphrase here is exactly
+        the failure D8 names.
+        """
+        rail = "issue-55-launch-refused-no-role"
+        published = {
+            "schemaVersion": 1,
+            "decisionId": "d-rail-role-missing",
+            "project": "ai-dev",
+            "ticket": "issue-55",
+            "rail": rail,
+            "raisedAt": "2026-08-31T11:00:00Z",
+            "title": "Launch refused: this rail publishes no Role:",
+            "explanation": "This rail cannot start until a person changes something.",
+            "evidence": [{"label": "rail", "locator": "rails/{0}/rail.md".format(rail)}],
+            "blocker": {
+                "kind": "configuration",
+                "whatFailed": (
+                    "authorize() refused with rail-role-missing: this rail's authorization "
+                    "publishes no Role: header, so no managed session can start on it."
+                ),
+                "missingCapability": "a durable Role: assignment on this rail",
+                "humanChange": "add 'Role: executor' to this rail's rail.md and republish it",
+                "stateChanged": False,
+                "nextAction": "re-run the launch once the rail republishes with a Role: header",
+            },
+        }
+        self.write(
+            self.scope / "rails" / rail / "rail.md",
+            "# Rail: {0}\n\nStatus: blocked\nDepends on: none\n"
+            "Shared resource: none\n\n## Goal\n\nbounded work\n".format(rail),
+        )
+        self.decide(rail_id=rail, payload=published)
+
+        served = self.waiting_details(self.payload_over_http())[rail]
+        blocker = served["blocker"]
+
+        # Proof 2: it reached the served surface at all.
+        self.assertIsNotNone(blocker)
+        # Proofs 3 to 7, verbatim.
+        self.assertEqual(blocker["kind"], "configuration")
+        self.assertEqual(blocker["whatFailed"], published["blocker"]["whatFailed"])
+        self.assertEqual(
+            blocker["missingCapability"], published["blocker"]["missingCapability"]
+        )
+        self.assertEqual(blocker["humanChange"], published["blocker"]["humanChange"])
+        self.assertIs(blocker["stateChanged"], False)
+        self.assertEqual(blocker["nextAction"], published["blocker"]["nextAction"])
+        # Proof 8: the agent is stated absent, not guessed.
+        self.assertIsNone(blocker["agent"])
+        self.assertEqual(
+            blocker["agentUnavailable"], queue_source_module.BLOCKER_AGENT_UNSOURCED
+        )
+        # Routing still arrives, and the item is still the person's.
+        self.assertEqual(served["project"], "ai-dev")
+        self.assertEqual(served["ticket"], "issue-55")
+        self.assertEqual(served["rail"], rail)
+        self.assertEqual(served["attentionOwner"], OWNER_HUMAN)
+        # The self-perpetuating half, closed: the instruction that clears this
+        # item is now on the page a person is looking at.
+        self.assertIn("Role: executor", blocker["humanChange"])
+
+    def test_an_unsourceable_agent_is_stated_and_the_rest_is_served(self) -> None:
+        """The item arrives, the published blocker arrives, and nothing is invented.
+
+        Over the production surface, on a rail the supported publisher genuinely
+        accepts: `blocked`, no `Role:` header, one complete six-field record. The
+        agent has no durable source and says so; the five facts that do have one
+        are on the page, verbatim, where a person can act on them.
+        """
         rail, published = self.publish_blocker("credential", role=None)
 
         payload = self.payload_over_http()
 
         served = self.waiting_details(payload)
         detail = served[rail]
-        self.assertIsNone(detail["blocker"])
-        self.assertEqual(
-            detail["blockerUnavailable"], queue_source_module.BLOCKER_AGENT_UNSOURCED
-        )
         self.assertEqual(detail["attentionOwner"], OWNER_HUMAN)
         self.assertEqual(detail["rail"], rail)
-        # Not one word of the withheld blocker was paraphrased into the notice.
+
+        # No item-level withholding: the absence is stated in its own field.
+        self.assertIsNone(detail["blockerUnavailable"])
+        blocker = detail["blocker"]
+        self.assertIsNotNone(blocker)
+
+        self.assertEqual(blocker["kind"], published["blocker"]["kind"])
+        self.assertEqual(blocker["whatFailed"], published["blocker"]["whatFailed"])
+        self.assertEqual(
+            blocker["missingCapability"], published["blocker"]["missingCapability"]
+        )
+        self.assertEqual(blocker["humanChange"], published["blocker"]["humanChange"])
+        self.assertIs(blocker["stateChanged"], published["blocker"]["stateChanged"])
+        self.assertEqual(blocker["nextAction"], published["blocker"]["nextAction"])
+
+        self.assertIsNone(blocker["agent"])
+        self.assertEqual(
+            blocker["agentUnavailable"], queue_source_module.BLOCKER_AGENT_UNSOURCED
+        )
+        # No managed role was guessed into the gap, and no word of the published
+        # blocker was paraphrased into the statement of the gap.
+        for invented in ("executor", "reviewer", "orchestrator"):
+            with self.subTest(invented=invented):
+                self.assertNotIn(invented, blocker["agentUnavailable"])
         for value in published["blocker"].values():
             if isinstance(value, str):
-                self.assertNotIn(value, detail["blockerUnavailable"])
+                self.assertNotIn(value, blocker["agentUnavailable"])
 
     # -- proofs 6 and 10 to 12, beside a genuinely live session ----------
 

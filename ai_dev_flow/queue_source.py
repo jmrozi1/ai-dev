@@ -171,15 +171,24 @@ REASON_LIFECYCLE_REFUSED = "lifecycle-refused"
 REASON_CONFLICTING_ITEMS = "conflicting-items"
 REASON_OWNERSHIP_CONTRADICTORY = "ownership-contradictory"
 
-# Why an item that published a blocker is showing none. Neither of these refuses
-# the queue: a human-owned item is never hidden because part of it was unreadable,
-# because hiding it is how a person stops being asked at all. They are carried on
-# the item, in place of the blocker, and say which half was missing.
+# What a person is told when part of a published blocker had no durable source.
+# Neither refuses the queue: a human-owned item is never hidden because part of it
+# was unreadable, because hiding it is how a person stops being asked at all.
+#
+# They are not the same kind of statement, and they no longer sit in the same
+# place. `BLOCKER_UNUSABLE` is still carried on the item in place of a blocker
+# this module could not complete at all. `BLOCKER_AGENT_UNSOURCED` is carried
+# inside the blocker, in place of the one field with no durable home, precisely so
+# the rest of the blocker can still be served: the affected agent is sourced from
+# the rail's optional `Role:` header, so a complete, publisher-validated six-field
+# blocker on a role-less rail is a state the supported publisher accepts, and
+# discarding five published facts over the sixth leaves a person holding an item
+# they cannot act on -- including, in the reachable case, the published sentence
+# that tells them to add the missing `Role:`.
 BLOCKER_AGENT_UNSOURCED = (
-    "blocker-agent-unsourced: this item's durable rail publishes no role "
-    "assignment, so the affected agent has no durable source. The rest of the "
-    "published blocker is withheld with it, because a blocker missing one of the "
-    "things a person needs is not one they can finish acting on."
+    "Not established: this item's durable rail publishes no role assignment, so "
+    "the affected agent has no durable source and none is guessed here. Every "
+    "other fact in this blocker was published and is shown."
 )
 BLOCKER_UNUSABLE = (
     "blocker-unusable: the published blocker block did not survive projection "
@@ -429,6 +438,16 @@ def _actionable_blocker(
     blocker and a reason naming what was missing. Refusing the whole queue would
     remove every other person's work from the screen over one rail's bad record;
     dropping the item would remove the one person who is owed an answer.
+
+    Failing closed is about not fabricating, and it is not the same as withholding.
+    The affected agent is the one D8 field sourced from the rail rather than from
+    the record, and the `Role:` header it comes from is optional by design, so a
+    complete six-field blocker with no sourceable agent is a state the supported
+    publisher accepts rather than a malformed record. That absence is stated, by
+    name, in the field it belongs to, and the five facts that were published are
+    served. Withholding them would fabricate nothing and would also help nobody:
+    the person would be left with an item naming no failure, no missing capability
+    and no next action, which is the unactionable item D8 exists to prevent.
     """
     raw = decision.blocker
     if raw is None:
@@ -440,9 +459,13 @@ def _actionable_blocker(
     if not isinstance(raw, dict):
         return None, BLOCKER_UNUSABLE.format("not-an-object")
 
+    # The affected agent, or an explicit statement that the rail publishes none.
+    # Exactly one of the two is passed, and neither is derived from anything but
+    # the rail's own durable assignment: no session, binding, process or role
+    # default reaches this decision, so an item can say "there is no source for
+    # this" but can never say a name nobody published.
     agent = decision.agent
-    if agent is None:
-        return None, BLOCKER_AGENT_UNSOURCED
+    unsourced = BLOCKER_AGENT_UNSOURCED if agent is None else None
 
     try:
         return (
@@ -454,6 +477,7 @@ def _actionable_blocker(
                 human_change=raw.get("humanChange"),
                 state_changed=raw.get("stateChanged"),
                 next_action=raw.get("nextAction"),
+                agent_unavailable=unsourced,
             ),
             None,
         )

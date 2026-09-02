@@ -433,17 +433,28 @@ details summary { cursor: pointer; font-weight: 600; }
     explanationEl.hidden = !waiting;
 
     // D8's actionable half. Present exactly when the accepted projection supplied
-    // a complete blocker, and never assembled here from parts: this branch either
-    // prints six published facts or prints none of them. Nothing on this page
-    // fills a missing one in, and nothing shortens one -- the bound that keeps a
-    // blocker readable was applied where it was published.
+    // a blocker, and never assembled here from parts: this branch prints the
+    // published facts or prints none of them. Nothing on this page fills a missing
+    // one in, and nothing shortens one -- the bound that keeps a blocker readable
+    // was applied where it was published.
+    //
+    // The Agent row is the one place a published name and a stated absence share a
+    // row, and the choice between them is the projection's, not this page's. The
+    // projection sets exactly one of `agent` and `agentUnavailable`, so this reads
+    // whichever it set rather than testing for a blank and inventing wording for
+    // it. The row is never dropped: "who is affected" is a question a person asks
+    // whether or not it has an answer, and a missing row reads as an oversight
+    // while a row saying the rail publishes no assignment reads as the fact it is.
     var blocker = detail.blocker;
     actionableEl.hidden = blocker === null || blocker === undefined;
     if (!actionableEl.hidden) {
       actionableKindEl.textContent = blocker.kind + " blocker";
+      var affected = blocker.agent === null || blocker.agent === undefined
+        ? blocker.agentUnavailable
+        : blocker.agent;
       fillFacts(actionableFactsEl, [
         ["What failed", blocker.whatFailed],
-        ["Agent", blocker.agent],
+        ["Agent", affected],
         ["Missing", blocker.missingCapability],
         ["You must change", blocker.humanChange],
         ["State", stateChangedLabel(blocker.stateChanged)],

@@ -334,6 +334,13 @@ def _blocker(blocker) -> Optional[dict]:
     it belongs to the page beside every other one -- but the *fact* must arrive as
     a fact, because a payload that shipped the phrase would let two callers ship
     two different phrases for one durable answer.
+
+    `agent` and `agentUnavailable` both cross, as the accepted pair they already
+    are: exactly one is set, the projection decided which, and this module does not
+    collapse them into one field. Collapsing them would put a sentence in the place
+    a published name goes, and a page reading that field could no longer tell a
+    rail whose assignment is `executor` from a rail that published no assignment at
+    all -- which is the whole distinction the pair exists to keep.
     """
     if blocker is None:
         return None
@@ -341,6 +348,7 @@ def _blocker(blocker) -> Optional[dict]:
         "kind": blocker.kind,
         "whatFailed": blocker.what_failed,
         "agent": blocker.agent,
+        "agentUnavailable": blocker.agent_unavailable,
         "missingCapability": blocker.missing_capability,
         "humanChange": blocker.human_change,
         "stateChanged": blocker.state_changed,
