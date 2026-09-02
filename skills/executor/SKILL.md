@@ -107,6 +107,12 @@ return a resumable handoff.
 
 ## Evidence and Handoff
 
+For non-trivial development changes, use `change-validation` to select the
+smallest sufficient test tier from the changed boundary. Do not inherit full
+discovery, historical comparisons, or mutation campaigns merely because an
+earlier checkpoint used them. Record the selected tier and justification, and
+capture validation and total runtime when observable.
+
 Verify work with appropriate commands, tests, or diagnostics. Return a concise
 handoff for the orchestrator to rewrite the same tasking file. Include only
 useful current state:

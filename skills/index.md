@@ -37,6 +37,7 @@ remain in the applicable canonical `SKILL.md` files.
 
 | Skill | Use when | Canonical path |
 | --- | --- | --- |
+| `change-validation` | Selecting proportionate test/review evidence for development changes, including expensive validation, pre-release compatibility, adjacent simplification, and proof-obligation retirement. | `skills/change-validation/SKILL.md` |
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
 | `feedback-loop-design` | Designing discovery, prototyping, implementation, or validation loops when builds, live environments, screenshots, human relay, or other feedback are materially slow or costly. | `skills/feedback-loop-design/SKILL.md` |
 | `investigation-synthesis` | Preserving the durable results of substantial research, debugging, reverse engineering, or source comparison without turning the investigation into transcript documentation; route accepted findings to the smallest correct durable home and discard the rest. | `skills/investigation-synthesis/SKILL.md` |

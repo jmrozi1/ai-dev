@@ -42,6 +42,10 @@ treat a cheap representation as final integrated proof, and do not use an
 integrated environment to answer questions that a focused lower-cost loop can
 answer objectively.
 
+For development validation, use `change-validation` to name the selected tier
+and its changed-boundary justification. A prior checkpoint's evidence ladder is
+not a reason to repeat an expensive loop.
+
 ## Increase Payload Before Paying The Outer-Loop Cost
 
 Before entering a materially expensive loop:

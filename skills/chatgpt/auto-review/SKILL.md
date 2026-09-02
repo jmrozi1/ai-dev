@@ -11,6 +11,11 @@ deterministic repository helpers and their execution.
 
 ## Contract
 
+- Apply `change-validation` when selecting or judging product evidence. A fresh
+  reviewer normally attacks the riskiest novel claim and consumes valid executor
+  evidence; freshness does not require repeating the executor's full suite,
+  old/new comparison, or mutation campaign.
+
 - Decide which configured candidate reviews apply from the evidence surface,
   issue scope, requirements, and current task state.
 - Load or invoke only applicable review skills. A skipped candidate is not a

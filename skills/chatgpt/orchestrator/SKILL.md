@@ -67,6 +67,13 @@ SHAs, status, validation results, and material warnings over unsupported
 summaries such as "tests passed." Do not dump large logs or unrelated repository
 state when a focused excerpt or deterministic helper output is sufficient.
 
+For non-trivial development rails, apply `change-validation`: name the changed
+boundary, the expected validation tier, and any reason a broader or live pass is
+uniquely required. Permit deletion of directly superseded machinery inside that
+boundary. Before publishing a rail, verify that named commands exist at its
+authorized base and that each required proof can be exhibited by the capability
+the rail authorizes.
+
 A tasking file is current state, not history. Keep it as simple Markdown and
 include only what a fresh executor needs:
 
