@@ -40,6 +40,15 @@ from __future__ import annotations
 # zero, because a confident zero would be read as "none used" when the truth is
 # "not known".
 #
+# Progress is shown on exactly those terms, and on one more. A finished
+# `ProgressView` arrives from the caller; this module opens no progress store,
+# runs no git, counts no checkpoint, and rounds the percentage only at the moment
+# of drawing, so a view that could not establish the measure prints its reason
+# rather than a confident figure. The one extra term is that nothing it draws may
+# become an input to anything: accepted decision D11 makes this observability for
+# the human, and this module is a page with no endpoint that accepts a response,
+# so a progress figure reaching it has nowhere further to go.
+#
 # Sixth, a fixture submission is presentation, not success. It removes the
 # selected item from the page's own memory and moves on. Nothing is stored,
 # nothing is transmitted, no endpoint exists to receive it, and the page never
@@ -89,6 +98,7 @@ from .decision_queue import (
     QueueView,
     SelectedDetail,
 )
+from .progress_view import ProgressView
 
 __all__ = [
     "LOOPBACK_HOST",
@@ -97,6 +107,7 @@ __all__ = [
     "Serving",
     "build_allowance",
     "build_payload",
+    "build_progress",
     "make_live_server",
     "make_observed_server",
     "make_server",
@@ -130,6 +141,7 @@ _JSON_HTML_ESCAPES = (
 )
 
 REASON_INVALID_ALLOWANCE = "invalid-allowance"
+REASON_INVALID_PROGRESS = "invalid-progress"
 REASON_INVALID_VIEW = "invalid-view"
 REASON_INVALID_DETAIL = "invalid-detail"
 REASON_DETAIL_MISSING = "detail-missing"
@@ -326,6 +338,74 @@ def build_agents(reading) -> "dict":
     return {"permitted": permitted, "current": current, "reason": reason}
 
 
+def build_progress(progress) -> Optional[dict]:
+    """The D11 progress surface as the page's own data, shown only when supplied.
+
+    `None` means no caller supplied one and the page draws nothing at all, the
+    same absence the roster and an unsupplied allowance window already use.
+
+    Everything here was decided by the accepted projection. This module opens no
+    store, runs no git, reads no clock, counts no checkpoint, and has no branch
+    that turns an absent figure into a plausible one -- a view that could not
+    establish the measure arrives with its reason, and the reason is what gets
+    drawn. The one thing left to presentation is the rounding: the projection
+    keeps its exact `Decimal` because rounding is one-way, and the whole
+    percentage point is produced here, at the moment of drawing, and never
+    written back anywhere.
+
+    Nothing crosses that a control path could act on. The payload carries no
+    elapsed time, no handoff count, no session, no token figure and no velocity,
+    because accepted decision D11 makes those management signals for the human
+    alone -- and this dictionary is written out field by field rather than by
+    `asdict`, so a field added to the accepted view never reaches a page nobody
+    wrote a place for.
+    """
+    if progress is None:
+        return None
+    if type(progress) is not ProgressView:
+        raise RenderError(
+            REASON_INVALID_PROGRESS,
+            "progress consumes an accepted ProgressView, got {0!r}".format(
+                type(progress).__name__
+            ),
+        )
+    revision = None
+    if progress.revision_at is not None:
+        # Drawn as one object because the four facts are only meaningful
+        # together: an instant with no before-and-after would say a revision
+        # happened without saying the denominator moved, which is the reading
+        # D11 exists to prevent.
+        revision = {
+            "at": progress.revision_at,
+            "from": progress.revision_from,
+            "to": progress.revision_to,
+            "note": progress.revision_note,
+        }
+    return {
+        "available": progress.available,
+        "reason": progress.reason,
+        "sourceHealthy": progress.source_healthy,
+        "namedCheckpoint": progress.named_checkpoint,
+        "namedTotal": progress.named_total,
+        "namedCompletedAt": progress.named_completed_at,
+        "acceptedCheckpoint": progress.accepted_checkpoint,
+        "acceptedAt": progress.accepted_at,
+        "projectedRemaining": progress.projected_remaining,
+        "projectedFinal": progress.projected_final,
+        "percentage": (
+            None
+            if progress.percentage is None
+            else "{0}%".format(_whole_percent(progress.percentage, ROUND_HALF_UP))
+        ),
+        "confidence": progress.confidence,
+        "delta24h": progress.delta_24h,
+        "delta48h": progress.delta_48h,
+        "deltaReason": progress.delta_reason,
+        "revision": revision,
+        "preservedCount": progress.preserved_count,
+    }
+
+
 def _blocker(blocker) -> Optional[dict]:
     """One accepted `ActionableBlocker` as the page's own data, or `null`.
 
@@ -362,6 +442,7 @@ def build_payload(
     *,
     allowance: Sequence[AllowanceWindowView],
     agents=None,
+    progress=None,
 ) -> "dict":
     """Reduce accepted projection objects to the exact data the page draws.
 
@@ -412,6 +493,10 @@ def build_payload(
         "allowance": build_allowance(allowance),
         # Absent unless a caller supplied a reading, exactly like the roster.
         "agents": build_agents(agents),
+        # Absent on the same terms. A projection of this run, taken once by the
+        # caller: unlike the roster it describes durable recorded facts rather
+        # than a running session, so it does not expire between requests.
+        "progress": build_progress(progress),
         "rows": [
             {
                 "itemId": row.item_id,
@@ -539,6 +624,7 @@ def render_page(
     *,
     allowance: Sequence[AllowanceWindowView],
     agents=None,
+    progress=None,
     template_path: Optional[Path] = None,
 ) -> str:
     """The complete page: template, its policy, and this view's data."""
@@ -551,7 +637,9 @@ def render_page(
             )
 
     payload = serialize_payload(
-        build_payload(view, details, allowance=allowance, agents=agents)
+        build_payload(
+            view, details, allowance=allowance, agents=agents, progress=progress
+        )
     )
     # The policy is computed before the payload lands, so hostile fixture text can
     # never change which code the policy admits.
@@ -619,6 +707,7 @@ def make_server(
     *,
     allowance: Sequence[AllowanceWindowView],
     agents=None,
+    progress=None,
     host: str = LOOPBACK_HOST,
     port: int = 0,
     template_path: Optional[Path] = None,
@@ -631,7 +720,12 @@ def make_server(
     """
     _require_loopback(host)
     page = render_page(
-        view, details, allowance=allowance, agents=agents, template_path=template_path
+        view,
+        details,
+        allowance=allowance,
+        agents=agents,
+        progress=progress,
+        template_path=template_path,
     )
     handler = type("_BoundPageHandler", (_PageHandler,), {"page": page})
     return http.server.HTTPServer((host, port), handler)
@@ -643,6 +737,7 @@ def make_live_server(
     *,
     allowance: Sequence[AllowanceWindowView],
     agents: Any,
+    progress=None,
     host: str = LOOPBACK_HOST,
     port: int = 0,
     template_path: Optional[Path] = None,
@@ -677,6 +772,7 @@ def make_live_server(
             details,
             allowance=allowance,
             agents=agents(),
+            progress=progress,
             template_path=template_path,
         )
 
@@ -691,6 +787,7 @@ def make_observed_server(
     observe: Any,
     *,
     allowance: Sequence[AllowanceWindowView],
+    progress=None,
     host: str = LOOPBACK_HOST,
     port: int = 0,
     template_path: Optional[Path] = None,
@@ -739,6 +836,7 @@ def make_observed_server(
             details,
             allowance=allowance,
             agents=agents,
+            progress=progress,
             template_path=template_path,
         )
 

@@ -1027,6 +1027,19 @@ class AccessibilityTests(unittest.TestCase):
 # --------------------------------------------------------------------------
 
 
+# Every `new Date(...)` the production script is allowed to contain, by its exact
+# argument. Each one converts a fact the payload already carried -- an epoch the
+# allowance view supplied, or an instant the progress view took from the
+# control-plane mechanism -- and none of them reads a clock. Pinning the arguments
+# rather than banning the word says both things at once: no clock may be read, and
+# the supplied fact may not be swapped for something else.
+DATE_CONVERSIONS = [
+    "progress.revision.at",
+    "instant",
+    "entry.resetsAt * 1000",
+]
+
+
 class SurfacePurityTests(unittest.TestCase):
     def setUp(self) -> None:
         self.page, _, _ = rendered([a_decision()], [an_agent()])
@@ -1053,7 +1066,7 @@ class SurfacePurityTests(unittest.TestCase):
         """
         script = script_of(self.page)
         uses = [seg.split(")", 1)[0] for seg in script.split("new Date(")[1:]]
-        self.assertEqual(uses, ["entry.resetsAt * 1000"])
+        self.assertEqual(uses, DATE_CONVERSIONS)
         self.assertNotIn("new Date()", script)
 
     def test_every_date_token_is_that_one_conversion_and_nothing_else(self) -> None:
@@ -1066,14 +1079,14 @@ class SurfacePurityTests(unittest.TestCase):
         supplied-epoch conversion puts it at, and there must be exactly one.
         """
         script = script_of(self.page)
-        allowed = "new Date(entry.resetsAt * 1000)"
         found = [m.start() for m in re.finditer("Date", script)]
-        accounted = [
-            m.start() + allowed.index("Date")
-            for m in re.finditer(re.escape(allowed), script)
-        ]
+        accounted = sorted(
+            m.start() + len("new ")
+            for argument in DATE_CONVERSIONS
+            for m in re.finditer(re.escape("new Date({0})".format(argument)), script)
+        )
         self.assertEqual(found, accounted)
-        self.assertEqual(len(accounted), 1)
+        self.assertEqual(len(accounted), len(DATE_CONVERSIONS))
 
     def _imported_modules(self):
         """What the module imports, read from the AST rather than from its prose."""
@@ -1102,7 +1115,7 @@ class SurfacePurityTests(unittest.TestCase):
             self._imported_modules(),
             {"__future__", "base64", "hashlib", "http.server", "json", "re", "decimal",
              "pathlib", "threading", "typing", ".decision_queue", ".claude_allowance",
-             ".claude_allowance_view"},
+             ".claude_allowance_view", ".progress_view"},
         )
 
     def test_the_module_never_reaches_the_control_plane_a_session_or_a_provider(self) -> None:

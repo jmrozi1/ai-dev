@@ -1199,8 +1199,8 @@ class NoAddedAuthorityTests(LaunchTestCase):
                 "__future__", "dataclasses", "datetime", "pathlib", "typing",
                 ".claude_allowance_store", ".claude_allowance_view",
                 ".decision_manager", ".decision_manager_web", ".decision_queue",
-                ".queue_source", ".repository", ".session_binding",
-                ".session_lifecycle",
+                ".progress_store", ".queue_source", ".repository",
+                ".session_binding", ".session_lifecycle",
             },
         )
 

@@ -78,6 +78,7 @@ body {
 .allowance-used { font-variant-numeric: tabular-nums; }
 .allowance-unavailable { font-style: italic; }
 .allowance-reset { font-size: 12px; opacity: 0.8; white-space: nowrap; }
+.allowance-note { font-size: 12px; opacity: 0.8; }
 .rows {
   list-style: none;
   margin: 0;
@@ -183,7 +184,7 @@ details summary { cursor: pointer; font-weight: 600; }
       <label for="filter-running"><input type="checkbox" id="filter-running" data-state="running"> Running</label>
       <label for="filter-disconnected"><input type="checkbox" id="filter-disconnected" data-state="disconnected"> Disconnected</label>
     </fieldset>
-    <p class="allowance" id="allowance" aria-label="Claude usage"></p>
+    <p class="allowance" id="allowance" aria-label="Manager aggregate"></p>
     <ul class="rows" id="rows" role="listbox" aria-label="Decision queue" tabindex="0"></ul>
     <p class="quiet" id="queue-empty" hidden>Nothing is waiting.</p>
   </aside>
@@ -293,6 +294,131 @@ details summary { cursor: pointer; font-weight: 600; }
   function clearFailure() {
     failureEl.hidden = true;
     failureEl.textContent = "";
+  }
+
+  // One small secondary fact beside the progress figure. A span rather than a
+  // sentence, so each fact stays separately readable and an absent one simply
+  // does not appear instead of leaving a gap in prose.
+  function progressNote(text, className) {
+    var note = document.createElement("span");
+    note.className = className || "allowance-reset";
+    note.textContent = text;
+    return note;
+  }
+
+  // The D11 ticket figure, drawn once at the head of the same strip the usage
+  // figures use. It is deliberately one more name/value pair in the treatment
+  // this strip already repeats: the queue is the screen, and progress is a
+  // figure beside it.
+  //
+  // Nothing here computes anything. The percentage arrived already rounded, the
+  // counts already counted and the instants already derived from the
+  // control-plane mechanism; a surface that could not establish the measure
+  // arrives with its reason and the reason is what gets drawn, exactly as an
+  // unavailable usage window does. There is no control on it, nothing is
+  // clickable, and no value it shows is read back by anything on this page.
+  function renderProgress() {
+    if (payload.progress === null || payload.progress === undefined) { return; }
+    var progress = payload.progress;
+
+    var group = document.createElement("span");
+    group.className = "allowance-window";
+    group.setAttribute("data-window", "progress");
+    group.setAttribute("data-available", progress.available ? "true" : "false");
+    group.setAttribute("data-source-healthy", progress.sourceHealthy ? "true" : "false");
+
+    var name = document.createElement("span");
+    name.className = "allowance-label";
+    name.textContent = "Progress";
+    group.appendChild(name);
+
+    var value = document.createElement("span");
+    if (progress.available) {
+      value.className = "allowance-used";
+      // "of ~" and not "of": the denominator is an estimate, and a figure that
+      // reads as a commitment is the one thing D11 says it is not.
+      value.textContent = progress.percentage + " · checkpoint "
+        + progress.acceptedCheckpoint + " of ~" + progress.projectedFinal;
+    } else {
+      value.className = "allowance-unavailable";
+      value.textContent = progress.reason;
+      // An unavailable measure still shows the last accepted checkpoint when one
+      // is recorded: the estimate is what went missing, not the progress.
+      if (progress.acceptedCheckpoint !== null
+        && progress.acceptedCheckpoint !== undefined) {
+        value.textContent = progress.reason + " (last accepted checkpoint "
+          + progress.acceptedCheckpoint + ")";
+      }
+    }
+    group.appendChild(value);
+
+    if (progress.namedCheckpoint !== null && progress.namedCheckpoint !== undefined
+      && progress.namedTotal !== null && progress.namedTotal !== undefined) {
+      group.appendChild(progressNote(
+        "named " + progress.namedCheckpoint + " of " + progress.namedTotal));
+    }
+
+    if (progress.confidence !== null && progress.confidence !== undefined) {
+      group.appendChild(progressNote(progress.confidence + " confidence"));
+    }
+
+    // The exact instant, machine-readable, derived only from what the
+    // control-plane mechanism recorded. No countdown and no relative phrase:
+    // this page is static, so "2 hours ago" would silently rot on screen.
+    if (progress.acceptedAt !== null && progress.acceptedAt !== undefined) {
+      group.appendChild(instantNote("accepted ", progress.acceptedAt));
+    }
+    if (progress.namedCompletedAt !== null && progress.namedCompletedAt !== undefined) {
+      group.appendChild(instantNote("last named checkpoint ", progress.namedCompletedAt));
+    }
+
+    // Absent rather than zero when the recorded history does not reach back far
+    // enough: "none accepted in 48 hours" and "this history is four hours old"
+    // are different facts and must not print the same.
+    var deltas = [];
+    if (progress.delta24h !== null && progress.delta24h !== undefined) {
+      deltas.push("+" + progress.delta24h + " / 24h");
+    }
+    if (progress.delta48h !== null && progress.delta48h !== undefined) {
+      deltas.push("+" + progress.delta48h + " / 48h");
+    }
+    if (progress.deltaReason !== null && progress.deltaReason !== undefined) {
+      deltas.push("delta " + progress.deltaReason);
+    }
+    if (deltas.length) { group.appendChild(progressNote(deltas.join(" · "))); }
+
+    // Why the denominator moved. Drawn whenever there has been a revision, so a
+    // percentage that dropped because the estimate grew can never be read as
+    // work that was lost.
+    if (progress.revision !== null && progress.revision !== undefined) {
+      var revision = document.createElement("span");
+      revision.className = "allowance-note";
+      var when = new Date(progress.revision.at);
+      var text = "estimate revised " + when.toLocaleString(undefined, {
+        month: "short", day: "numeric", hour: "numeric", minute: "2-digit"
+      }) + ": " + progress.revision.from + " → " + progress.revision.to;
+      if (progress.revision.note) { text = text + " — " + progress.revision.note; }
+      if (progress.preservedCount) {
+        text = text + " (preserved unchanged " + progress.preservedCount
+          + (progress.preservedCount === 1 ? " time" : " times") + " since)";
+      }
+      revision.textContent = text;
+      group.appendChild(revision);
+    }
+
+    allowanceEl.appendChild(group);
+  }
+
+  // One recorded instant, drawn as the calendar time it is.
+  function instantNote(prefix, instant) {
+    var at = new Date(instant);
+    var element = document.createElement("time");
+    element.className = "allowance-reset";
+    element.setAttribute("datetime", at.toISOString());
+    element.textContent = prefix + at.toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "numeric", minute: "2-digit"
+    });
+    return element;
   }
 
   // Static context, drawn once. Every field was decided by the accepted
@@ -570,6 +696,7 @@ details summary { cursor: pointer; font-weight: 600; }
     submit();
   });
 
+  renderProgress();
   renderAllowance();
   render();
 })();

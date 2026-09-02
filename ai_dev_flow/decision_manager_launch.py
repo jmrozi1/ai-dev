@@ -102,6 +102,7 @@ from .queue_source import (
     project_queue,
     resolve_queue_scope,
 )
+from .progress_store import ProgressStore, progress_store_path
 from .repository import resolve_repo_root
 from .session_binding import BindingStore
 from .session_lifecycle import SessionRegistry
@@ -204,13 +205,16 @@ def resolve_run(
     human_exclusive_since: Optional[int],
     cwd: Optional[Path] = None,
 ) -> ManagerRun:
-    """One run's four inputs, each resolved exactly once, as one frozen value.
+    """One run's five inputs, each resolved exactly once, as one frozen value.
 
     The repository root comes from the accepted repository helper rather than a
-    path walk of this module's own, and the store path from the accepted store-path
-    helper against that root, so this module invents no second convention for
+    path walk of this module's own, and both store paths from their own accepted
+    path helpers against that root, so this module invents no second convention for
     either. The instant is read here, once, because `decision_manager` deliberately
     reads no clock and something has to.
+
+    The progress store is resolved from the same root as the allowance store, so
+    one run reports the recorded progress of the worktree it is actually serving.
 
     `human_exclusive_since` is keyword-only and has no default, exactly as
     `ManagerRun` and `project_window` give theirs none. A caller that omits it gets
@@ -218,17 +222,19 @@ def resolve_run(
     silence unrepresentable rather than merely discouraged. `None` means the human
     affirmed nothing for this run and is carried through untouched.
 
-    Read-only and durable-free: resolving a root, naming a store path, and
-    constructing an `AllowanceStore` open no file, create no directory, take no
-    lock, and write nothing.
+    Read-only and durable-free: resolving a root, naming the store paths, and
+    constructing an `AllowanceStore` and a `ProgressStore` open no file, create no
+    directory, take no lock, and write nothing.
     """
     repo_root = resolve_repo_root(cwd)
     store = AllowanceStore(allowance_store_path(repo_root))
+    progress = ProgressStore(progress_store_path(repo_root))
     now = int(time.time())
     return ManagerRun(
         store=store,
         now=now,
         human_exclusive_since=human_exclusive_since,
+        progress=progress,
     )
 
 

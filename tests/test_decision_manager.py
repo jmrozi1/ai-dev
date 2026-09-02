@@ -30,6 +30,7 @@ from ai_dev_flow.claude_allowance import (
     WINDOW_SEVEN_DAY,
 )
 from ai_dev_flow.claude_allowance_store import AllowanceStore
+from ai_dev_flow.progress_store import ProgressStore
 from ai_dev_flow.claude_allowance_view import (
     REASON_NO_ANCHOR,
     AllowanceViewError,
@@ -147,6 +148,8 @@ class ManagerTestCase(unittest.TestCase):
         self.addCleanup(self._remove_root)
         self.path = self.root / "workload.json"
         self.store = AllowanceStore(self.path)
+        self.progress_path = self.root / "progress.json"
+        self.progress = ProgressStore(self.progress_path)
 
     def _remove_root(self) -> None:
         for item in sorted(self.root.rglob("*"), reverse=True):
@@ -187,11 +190,12 @@ class ManagerTestCase(unittest.TestCase):
         self.spend(2.0, "k2")
         self.read(60, five="30")
 
-    def a_run(self, *, now=NOW, since=SINCE, store=None) -> ManagerRun:
+    def a_run(self, *, now=NOW, since=SINCE, store=None, progress=None) -> ManagerRun:
         return ManagerRun(
             store=self.store if store is None else store,
             now=now,
             human_exclusive_since=since,
+            progress=self.progress if progress is None else progress,
         )
 
     def a_queue(self, decisions=None):
@@ -294,7 +298,7 @@ class HumanExclusivityTests(ManagerTestCase):
     def test_the_claim_has_no_default_and_must_be_stated(self) -> None:
         """Absence is something a caller says, never something it falls into."""
         fields = {field.name: field for field in dataclasses.fields(ManagerRun)}
-        for name in ("store", "now", "human_exclusive_since"):
+        for name in ("store", "now", "human_exclusive_since", "progress"):
             self.assertIs(fields[name].default, dataclasses.MISSING)
             self.assertIs(fields[name].default_factory, dataclasses.MISSING)
         with self.assertRaises(TypeError):

@@ -9,14 +9,15 @@ from __future__ import annotations
 # percentage, a bound, a health, a reset, a label, a row, or an order, and nothing
 # here re-derives one that was already computed.
 #
-# Five boundaries hold it honest.
+# Six boundaries hold it honest.
 #
 # First, one run has one set of inputs. `ManagerRun` is frozen and holds exactly
-# one `AllowanceStore` and one epoch, resolved once by the caller before the run
-# and reused for both windows. There is no per-window store argument and no clock
-# of this module's own, so there is no code path on which the seven-day window is
-# projected against a different store object or a later instant than the five-hour
-# window.
+# one `AllowanceStore`, one `ProgressStore` and one epoch, resolved once by the
+# caller before the run and reused for every projection. There is no per-window
+# store argument and no clock of this module's own, so there is no code path on
+# which the seven-day window is projected against a different store object or a
+# later instant than the five-hour window, or on which the progress figure and the
+# allowance beside it describe two different moments.
 #
 # Second, the human exclusivity claim lives in memory for the length of one run
 # and nowhere else. It is a required field with no default, exactly as
@@ -47,6 +48,16 @@ from __future__ import annotations
 # new store method is introduced to manufacture a coherence the contract does not
 # ask for.
 #
+# Sixth, progress is observability and this module is where that stays true.
+# `project_progress` reads the accepted view and hands it to the accepted render
+# path, and that is the only thing it does with it. Nothing here compares a
+# percentage, thresholds a confidence, or passes a progress value to anything but
+# a page: there is no branch on it, no caller of this module that receives one
+# except a renderer, and no function in this module that takes one as an argument.
+# Accepted decision D11 makes progress telemetry observability for the human and
+# never authorization, acceptance, review, remediation, scheduling, prioritization
+# or admission -- and none of those live here or are reachable from here.
+#
 # Fifth, the queue stays dominant and arrives already accepted. The `QueueView`
 # and its `SelectedDetail` values come from the caller; this module builds no
 # queue from durable state, opens no repository, reads no control-plane prose, and
@@ -69,6 +80,8 @@ from .decision_manager_web import (
     render_page,
 )
 from .decision_queue import QueueView, SelectedDetail
+from .progress_store import ProgressStore
+from .progress_view import ProgressView, project_progress as project_recorded_progress
 
 __all__ = [
     "MANAGER_WINDOWS",
@@ -79,6 +92,7 @@ __all__ = [
     "make_manager_server",
     "make_observed_manager_server",
     "project_allowance",
+    "project_progress",
     "render_manager_page",
 ]
 
@@ -135,6 +149,13 @@ class ManagerRun:
     is held in memory for this run only: nothing here writes it, and there is no
     restart across which it could survive.
 
+    `progress` is the durable progress store this run reports from, and it has no
+    default either -- for the reason the allowance store has none. Which
+    worktree's recorded acceptance and projection facts a run is about is not this
+    module's decision, and a store that could be defaulted is a store a run could
+    silently report the wrong ticket's progress from. It is named, never opened
+    here: this module reads nothing durable and writes nothing durable at all.
+
     Not validated here. `project_window` already checks the instant and the
     assertion, with reasons this module would otherwise have to spell a second
     time, and a second spelling of one refusal is a second thing to keep in step.
@@ -143,6 +164,7 @@ class ManagerRun:
     store: AllowanceStore
     now: int
     human_exclusive_since: Optional[int]
+    progress: ProgressStore
 
 
 def _checked_run(run: object) -> ManagerRun:
@@ -189,6 +211,28 @@ def project_allowance(run: ManagerRun) -> Tuple[AllowanceWindowView, ...]:
     )
 
 
+def project_progress(run: ManagerRun) -> ProgressView:
+    """This run's D11 progress surface: one projection, at this run's instant.
+
+    Exactly one `project_progress` call against this run's own store and this
+    run's own instant, and the view comes back untouched. This module counts no
+    checkpoint, reads no git, opens no repository and derives no percentage --
+    the accepted projection decided all of it, including what it could not
+    establish and why.
+
+    Projected once per run rather than per request, deliberately, and unlike the
+    live agent count. Recorded acceptance and projection facts describe state that
+    outlives a render: they change only when the orchestrator records a new one,
+    and re-reading the store while answering every request would be the polling
+    loop this surface is not permitted to become. A later instant is a later run.
+
+    A store that refuses arrives as the unavailable view it decided, carrying its
+    reason, so a run that asked properly can always draw something truthful.
+    """
+    checked = _checked_run(run)
+    return project_recorded_progress(checked.progress, now=checked.now)
+
+
 # --------------------------------------------------------------------------
 # Composition
 # --------------------------------------------------------------------------
@@ -213,6 +257,7 @@ def render_manager_page(
         details,
         allowance=project_allowance(run),
         agents=agents,
+        progress=project_progress(run),
         template_path=template_path,
     )
 
@@ -247,6 +292,7 @@ def make_manager_server(
         details,
         allowance=project_allowance(run),
         agents=agents,
+        progress=project_progress(run),
         host=host,
         port=port,
         template_path=template_path,
@@ -284,6 +330,7 @@ def make_live_manager_server(
         details,
         allowance=project_allowance(run),
         agents=agents,
+        progress=project_progress(run),
         host=host,
         port=port,
         template_path=template_path,
@@ -317,6 +364,7 @@ def make_observed_manager_server(
     return make_observed_server(
         observe,
         allowance=project_allowance(run),
+        progress=project_progress(run),
         host=host,
         port=port,
         template_path=template_path,

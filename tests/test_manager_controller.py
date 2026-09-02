@@ -29,6 +29,7 @@ from ai_dev_flow.attention_projection import (
 )
 from ai_dev_flow.authorization import CONCURRENCY_CEILING_DEFAULT
 from ai_dev_flow.claude_allowance_store import AllowanceStore
+from ai_dev_flow.progress_store import ProgressStore
 from ai_dev_flow.decision_manager import ManagerRun
 from ai_dev_flow.decision_manager_launch import QueueSourceContext
 from ai_dev_flow.decision_manager_web import LOOPBACK_HOST, PAGE_PATH, start_serving
@@ -133,6 +134,7 @@ class ControllerLaunchOwnershipTests(LifecycleTestBase):
             store=AllowanceStore(self.tmp_path / "allowance.json"),
             now=1_800_000_000,
             human_exclusive_since=None,
+            progress=ProgressStore(self.tmp_path / "progress.json"),
         )
 
     def test_a_session_launched_through_the_controller_is_counted_by_it(self) -> None:
