@@ -202,6 +202,38 @@ class SessionRegistry:
         self._in_flight.discard(session_id)
 
 
+def single_liveness_snapshot(alive=None):
+    """One prober whose answer per process group is fixed for the caller's read.
+
+    Liveness is a fact about an instant, and a caller that needs it more than once
+    within a single read needs it *from one instant* -- otherwise it can combine a
+    session that was live when ownership was proved with the same session already
+    gone when its state was projected, and describe a moment that never existed.
+    That is not a hypothetical: proving ownership and projecting a state are two
+    separate consumers of this question, and an ordinary worker exit lands between
+    them often enough to matter.
+
+    So this resolves the accepted default prober once and answers each process
+    group once, reusing that exact observation for the rest of the read.
+
+    It is deliberately **not** a cache. Nothing here is durable, nothing is shared
+    between reads, and nothing is invalidated or refreshed, because there is
+    nothing to invalidate: the snapshot is created by one read and dies with it.
+    The next read asks again, from scratch, and gets that instant's truth. Holding
+    one of these open across reads would be the durable liveness cache the
+    lifecycle refuses, and it would be a claim about a process nobody re-observed.
+    """
+    prober = alive if alive is not None else process_group_alive
+    observed = {}
+
+    def observe(pgid) -> bool:
+        if pgid not in observed:
+            observed[pgid] = bool(prober(pgid))
+        return observed[pgid]
+
+    return observe
+
+
 def require_owned(
     registry: SessionRegistry, record: BindingRecord, *, alive=None
 ) -> OwnedSession:

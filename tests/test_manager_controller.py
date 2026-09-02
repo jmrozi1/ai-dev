@@ -423,6 +423,112 @@ class ControllerEntryPointTests(SourcedLaunchTestCase):
 
 
 # --------------------------------------------------------------------------
+# One queue read is one liveness instant
+# --------------------------------------------------------------------------
+
+
+class ControllerQueueCoherenceTests(SourcedLaunchTestCase):
+    """The supported boundary, on the facts that used to refuse the whole queue.
+
+    Both halves of this controller consume the same liveness question. The
+    aggregate asks it once and has always degraded gracefully; the queue asked it
+    twice, with a control-plane subprocess between the two, and refused every row
+    when the two answers disagreed. An ordinary worker exit is exactly that
+    disagreement, so the failing case was the end of a normal run.
+
+    These drive `ManagerController.queue`, not the pure model, because that is
+    where the two observations lived.
+    """
+
+    class Flipping:
+        """Would answer differently on each successive observation, if asked twice."""
+
+        def __init__(self, answers):
+            self.answers = list(answers)
+            self.probes = []
+
+        def __call__(self, pgid):
+            self.probes.append(pgid)
+            return self.answers[min(len(self.probes) - 1, len(self.answers) - 1)]
+
+    def controller(self, registry=None) -> ManagerController:
+        return ManagerController(
+            self.context(), registry=self.registry if registry is None else registry
+        )
+
+    def a_live_rail(self):
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+    def test_a_stably_live_session_is_still_drawn_running(self) -> None:
+        self.a_live_rail()
+        prober = self.Flipping([True])
+
+        view, _details = self.controller().queue(self.a_run(), alive=prober)
+
+        self.assertEqual([row.state for row in view.rows], [STATE_RUNNING])
+
+    def test_a_stably_dead_session_is_still_drawn_disconnected(self) -> None:
+        self.a_live_rail()
+        prober = self.Flipping([False])
+
+        view, _details = self.controller().queue(self.a_run(), alive=prober)
+
+        self.assertEqual([row.state for row in view.rows], [STATE_DISCONNECTED])
+
+    def test_a_worker_exiting_mid_read_serves_a_row_instead_of_refusing(self) -> None:
+        """`True` then `False` used to raise `lifecycle-refused` for the whole queue."""
+        self.a_live_rail()
+        prober = self.Flipping([True, False])
+        controller = self.controller()
+
+        view, _details = controller.queue(self.a_run(), alive=prober)
+
+        self.assertEqual([row.state for row in view.rows], [STATE_RUNNING])
+        self.assertEqual(len(prober.probes), 1)
+
+    def test_a_worker_appearing_mid_read_serves_a_row_instead_of_refusing(self) -> None:
+        """`False` then `True`, the direction that refused just as completely."""
+        self.a_live_rail()
+        prober = self.Flipping([False, True])
+
+        view, _details = self.controller().queue(self.a_run(), alive=prober)
+
+        self.assertEqual([row.state for row in view.rows], [STATE_DISCONNECTED])
+        self.assertEqual(len(prober.probes), 1)
+
+    def _both_halves_survive(self, answers):
+        """`agent_count` never refused on these facts. Now neither does the queue."""
+        self.a_live_rail()
+        controller = self.controller()
+
+        view, _details = controller.queue(self.a_run(), alive=self.Flipping(answers))
+        reading = controller.agent_count(alive=self.Flipping(answers))
+
+        self.assertEqual(len(view.rows), 1)
+        self.assertEqual(reading["permitted"], 6)
+
+    def test_neither_half_collapses_when_a_worker_exits_mid_read(self) -> None:
+        self._both_halves_survive([True, False])
+
+    def test_neither_half_collapses_when_a_worker_appears_mid_read(self) -> None:
+        self._both_halves_survive([False, True])
+
+    def test_a_controller_that_started_nothing_still_reports_unprovable(self) -> None:
+        """Coherence did not turn a fail-closed aggregate into a confident count."""
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+        stranger = self.controller(registry=SessionRegistry())
+
+        view, _details = stranger.queue(self.a_run(), alive=self.Flipping([True, False]))
+        reading = stranger.agent_count(alive=ALWAYS_ALIVE)
+
+        self.assertEqual([row.state for row in view.rows], [STATE_DISCONNECTED])
+        self.assertIsNone(reading["current"])
+        self.assertEqual(reading["reason"], REASON_OWNERSHIP_UNPROVABLE)
+
+
+# --------------------------------------------------------------------------
 # The composition adds no authority
 # --------------------------------------------------------------------------
 

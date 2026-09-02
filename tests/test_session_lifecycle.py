@@ -40,6 +40,7 @@ from ai_dev_flow.session_lifecycle import (
     observe_session,
     recover_session,
     require_owned,
+    single_liveness_snapshot,
     stop_session,
 )
 from ai_dev_flow.tickets import TicketReference
@@ -617,6 +618,84 @@ class ObservationTests(LifecycleTestBase):
                 now=self.clock, alive=lambda pgid: True,
             )
         self.assertEqual(caught.exception.reason, session_lifecycle.REASON_SCOPE_MISMATCH)
+
+
+class SingleLivenessSnapshotTests(LifecycleTestBase):
+    """One observation per process group, for the life of one caller's read.
+
+    The primitive on its own. What consumes it, and why one read needs it, is
+    `queue_source`'s business; this only proves the snapshot is a snapshot.
+    """
+
+    class Counting:
+        def __init__(self, answers):
+            self.answers = list(answers)
+            self.calls = []
+
+        def __call__(self, pgid):
+            self.calls.append(pgid)
+            return self.answers[min(len(self.calls) - 1, len(self.answers) - 1)]
+
+    def test_one_process_group_is_observed_once_however_often_it_is_asked(self) -> None:
+        underlying = self.Counting([True, False, False])
+        observe = single_liveness_snapshot(underlying)
+
+        readings = [observe(4242) for _ in range(3)]
+
+        self.assertEqual(readings, [True, True, True])
+        self.assertEqual(underlying.calls, [4242])
+
+    def test_a_false_reading_is_held_just_as_firmly_as_a_true_one(self) -> None:
+        underlying = self.Counting([False, True, True])
+        observe = single_liveness_snapshot(underlying)
+
+        readings = [observe(4242) for _ in range(3)]
+
+        self.assertEqual(readings, [False, False, False])
+        self.assertEqual(underlying.calls, [4242])
+
+    def test_distinct_process_groups_each_get_their_own_observation(self) -> None:
+        underlying = self.Counting([True, False])
+        observe = single_liveness_snapshot(underlying)
+
+        first, second = observe(4242), observe(4343)
+
+        self.assertEqual((first, second), (True, False))
+        self.assertEqual(underlying.calls, [4242, 4343])
+        # And each is then held.
+        self.assertEqual((observe(4242), observe(4343)), (True, False))
+        self.assertEqual(underlying.calls, [4242, 4343])
+
+    def test_a_fresh_snapshot_re_observes_rather_than_reusing_the_last_one(self) -> None:
+        """This is what keeps it a snapshot rather than a durable cache."""
+        underlying = self.Counting([True, False])
+
+        first = single_liveness_snapshot(underlying)(4242)
+        second = single_liveness_snapshot(underlying)(4242)
+
+        self.assertEqual((first, second), (True, False))
+        self.assertEqual(underlying.calls, [4242, 4242])
+
+    def test_it_defaults_to_the_accepted_prober_rather_than_a_rule_of_its_own(self) -> None:
+        with patch.object(session_lifecycle, "process_group_alive") as probe:
+            probe.return_value = True
+            observe = single_liveness_snapshot()
+
+            self.assertTrue(observe(4242))
+            self.assertTrue(observe(4242))
+
+        probe.assert_called_once_with(4242)
+
+    def test_require_owned_reads_the_snapshot_and_probes_nothing_further(self) -> None:
+        """The consumer seam: proving ownership twice observes liveness once."""
+        outcome, _worker, _sent = self._launch()
+        underlying = self.Counting([True, False])
+        observe = single_liveness_snapshot(underlying)
+
+        require_owned(self.registry, outcome.binding, alive=observe)
+        require_owned(self.registry, outcome.binding, alive=observe)
+
+        self.assertEqual(len(underlying.calls), 1)
 
 
 class ElapsedTimeTests(LifecycleTestBase):

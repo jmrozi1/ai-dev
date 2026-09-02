@@ -51,6 +51,17 @@ from __future__ import annotations
 # reconciler consumes for the ceiling, so a row drawn Running and a count that
 # includes it rest on one piece of evidence rather than two that could disagree.
 # There is no second registry, no second store, no pid lookup, and no cache.
+#
+# Seventh, and this is what makes the sixth rule true rather than merely intended:
+# liveness is *observed* once per read, not merely proved by one function. Asking
+# the same question twice inside one read is asking it at two instants, and the
+# ordinary end of a run lands between them -- so the read would combine a session
+# that was live when ownership was proved with the same session already gone when
+# its state was projected, and refuse the entire queue for describing a moment
+# that never existed. One snapshot is taken here and reused by every projection
+# and ownership decision below. It is scoped to this read and dies with it; a
+# snapshot that survived the read would be the durable liveness cache the
+# lifecycle refuses.
 
 from dataclasses import dataclass
 import json
@@ -93,6 +104,7 @@ from .session_lifecycle import (
     elapsed_seconds,
     observe_session,
     ownership_evidence,
+    single_liveness_snapshot,
 )
 
 __all__ = [
@@ -488,10 +500,18 @@ def _work_items(
     for record in sorted(records, key=lambda entry: entry.session_id):
         grouped.setdefault(record.rail, []).append(record)
 
+    # One liveness snapshot for the whole read, taken before anything reads it.
+    # `ownership_evidence` below and `observe_session` further down are two
+    # consumers of one question, and they used to ask it separately -- with a
+    # `rail_blob_sha` subprocess running in between, so the gap was real wall time
+    # rather than a theoretical interleaving. Handing both the same observation is
+    # what makes this read one coherent instant.
+    observed = single_liveness_snapshot(alive)
+
     # One ownership proof for the whole read, from the accepted primitive that the
     # concurrency reconciler uses. Not a second opinion about liveness: the same
     # question, asked once, so the rows and the ceiling cannot disagree.
-    ownership = ownership_evidence(registry, list(records), alive=alive)
+    ownership = ownership_evidence(registry, list(records), alive=observed)
 
     agents = []
     attention_by_rail: Dict[str, Tuple[str, str]] = {}
@@ -520,7 +540,7 @@ def _work_items(
                     )
                 try:
                     projections.append(
-                        observe_session(facts, record, registry, now=now, alive=alive)
+                        observe_session(facts, record, registry, now=now, alive=observed)
                     )
                 except LifecycleError as exc:
                     raise _wrap(exc, REASON_LIFECYCLE_REFUSED) from exc

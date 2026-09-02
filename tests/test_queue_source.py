@@ -1021,6 +1021,173 @@ class CheckpointSixPreservationTests(QueueSourceTestBase):
             self.assertNotIn(forbidden, source, forbidden)
 
 
+class SingleLivenessSnapshotTests(QueueSourceTestBase):
+    """One queue read is one liveness instant, for every session it touches.
+
+    Ownership evidence and the lifecycle projection both need to know whether a
+    process group is still there. They used to ask separately, with a
+    `rail_blob_sha` subprocess between them, so the gap was real wall time and an
+    ordinary worker exit landed in it. The read then combined a session that was
+    live when ownership was proved with the same session already gone when its
+    state was projected, and refused the whole queue for describing a moment that
+    never existed -- while the same controller's `agent_count`, which asks once,
+    degraded gracefully on identical facts.
+
+    These are the coherence assertions. A read may report live or report
+    disconnected; what it may not do is report both about one session.
+    """
+
+    class Flipping:
+        """A prober that would answer differently on each successive observation.
+
+        It is not a simulation of a race: it *is* the observable difference
+        between asking once and asking twice. Under one observation per read the
+        later answers are never reached, which is the property under test.
+        """
+
+        def __init__(self, answers):
+            self.answers = list(answers)
+            self.probes = []
+
+        def __call__(self, pgid):
+            self.probes.append(pgid)
+            return self.answers[min(len(self.probes) - 1, len(self.answers) - 1)]
+
+    def a_live_rail(self):
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+    # Proofs 1 and 2: the stable readings are exactly what they were.
+
+    def test_a_stably_live_session_still_projects_running_and_executor_working(self) -> None:
+        self.a_live_rail()
+        prober = self.Flipping([True])
+
+        item = self.load(alive=prober).items[0]
+
+        self.assertEqual(item.state, STATE_RUNNING)
+        self.assertEqual(item.activity, ACTIVITY_EXECUTOR_WORKING)
+        self.assertEqual(item.attention_owner, OWNER_AGENT)
+
+    def test_a_stably_dead_session_still_projects_disconnected_recovery(self) -> None:
+        self.a_live_rail()
+        prober = self.Flipping([False])
+
+        item = self.load(alive=prober).items[0]
+
+        self.assertEqual(item.state, STATE_DISCONNECTED)
+        self.assertEqual(item.activity, ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertEqual(item.attention_owner, OWNER_AGENT)
+
+    # The mechanism itself, stated rather than inferred from the outcomes.
+
+    def test_one_read_observes_each_process_group_exactly_once(self) -> None:
+        self.a_live_rail()
+        prober = self.Flipping([True])
+
+        self.load(alive=prober)
+
+        self.assertEqual(prober.probes, [4242])
+
+    def test_two_sessions_on_two_rails_are_each_observed_once(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL, session_id=SESSION), pgid=4242)
+        other_rail = "issue-55-agent-sdk-isolation-contract"
+        self.authorize(other_rail, "running")
+        self.own(
+            self.bind(other_rail, session_id=OTHER_SESSION, pid=4343), pgid=4343
+        )
+        prober = self.Flipping([True])
+
+        self.load(alive=prober)
+
+        self.assertEqual(sorted(prober.probes), [4242, 4343])
+
+    # Proofs 3 and 4: the two directions that refused the whole queue.
+
+    def test_a_worker_that_exits_mid_read_no_longer_refuses_the_queue(self) -> None:
+        """`True` then `False`: the ordinary end of a run, which used to refuse."""
+        self.a_live_rail()
+        prober = self.Flipping([True, False])
+
+        item = self.load(alive=prober).items[0]
+
+        self.assertEqual(item.state, STATE_RUNNING)
+        self.assertEqual(item.activity, ACTIVITY_EXECUTOR_WORKING)
+        self.assertEqual(len(prober.probes), 1)
+
+    def test_a_worker_that_appears_mid_read_no_longer_refuses_the_queue(self) -> None:
+        """`False` then `True`, the other direction, refused just as completely."""
+        self.a_live_rail()
+        prober = self.Flipping([False, True])
+
+        item = self.load(alive=prober).items[0]
+
+        self.assertEqual(item.state, STATE_DISCONNECTED)
+        self.assertEqual(item.activity, ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertEqual(len(prober.probes), 1)
+
+    def test_a_rotation_survives_a_mid_read_exit_as_one_item(self) -> None:
+        """The same coherence, on the rail shape that carries two sessions."""
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL, session_id=SESSION))
+        self.bind(LIVE_RAIL, session_id=OTHER_SESSION, state=BINDING_STATE_RESERVED)
+        prober = self.Flipping([True, False])
+
+        items = self.load(alive=prober).items
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0].state, STATE_RUNNING)
+        self.assertEqual(items[0].activity, ACTIVITY_CONTEXT_ROTATION)
+
+    # Proofs 5 and 6: coherence did not soften either fail-closed path.
+
+    def test_ownership_that_cannot_be_proved_remains_fail_closed(self) -> None:
+        """Unprovable is still Disconnected and still an unprovable ceiling."""
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)
+        prober = self.Flipping([True, True])
+
+        item = self.load(alive=prober).items[0]
+        slots = reconcile_agent_slots(
+            self.store.records(),
+            ownership=ownership_evidence(
+                self.registry, self.store.records(), alive=prober
+            ),
+        )
+
+        self.assertEqual(item.state, STATE_DISCONNECTED)
+        self.assertEqual(item.activity, ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertFalse(slots.provable)
+
+    def test_contradictory_ownership_still_refuses_and_still_names_both_sessions(self) -> None:
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL, session_id=SESSION), pgid=4242)
+        self.own(
+            self.bind(LIVE_RAIL, session_id=OTHER_SESSION, pid=4343), pgid=4343
+        )
+
+        refusal = self.refusal(alive=self.Flipping([True]))
+
+        self.assertEqual(refusal.reason, queue_source.REASON_OWNERSHIP_CONTRADICTORY)
+        self.assertIn(SESSION, str(refusal))
+        self.assertIn(OTHER_SESSION, str(refusal))
+
+    # The boundary of the fix: within a read, never across reads.
+
+    def test_the_snapshot_does_not_survive_the_read_that_took_it(self) -> None:
+        """A cache would answer the second read from the first read's instant."""
+        self.a_live_rail()
+        prober = self.Flipping([True, False])
+
+        first = self.load(alive=prober).items[0]
+        second = self.load(alive=prober).items[0]
+
+        self.assertEqual(first.state, STATE_RUNNING)
+        self.assertEqual(second.state, STATE_DISCONNECTED)
+        self.assertEqual(len(prober.probes), 2)
+
+
 class DenseRowContractTests(QueueSourceTestBase):
     def test_the_row_contract_is_unchanged_by_the_new_facts(self) -> None:
         self.authorize(BLOCKED_RAIL, "blocked")
