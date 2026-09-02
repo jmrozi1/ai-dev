@@ -1080,3 +1080,294 @@ class ProductionCompositionTests(SourcedLaunchTestCase):
             controller.observe(scope, run, alive=ALWAYS_ALIVE)
 
         self.assertEqual(len(resolutions), 1)
+
+
+# --------------------------------------------------------------------------
+# D8 through the supported production surface, read by a real HTTP client
+# --------------------------------------------------------------------------
+
+
+D8_BLOCKERS = {
+    "permission": {
+        "kind": "permission",
+        "whatFailed": "publishing the executor handoff to the coordination remote",
+        "missingCapability": "write access to jmrozi1/ai-dev-control-plane for this host key",
+        "humanChange": "add this host's public key as a deploy key with write access",
+        "stateChanged": True,
+        "nextAction": "re-run the publish step; the checkpoint is already committed",
+    },
+    "configuration": {
+        "kind": "configuration",
+        "whatFailed": "resolving the ticket provider for this workspace",
+        "missingCapability": "a ticketProvider entry in .ai-dev/config.json",
+        "humanChange": "add the github provider block naming jmrozi1/ai-dev",
+        "stateChanged": False,
+        "nextAction": "re-dispatch this rail; nothing was written and nothing needs undoing",
+    },
+    "capability": {
+        "kind": "capability",
+        "whatFailed": "starting a reviewer session through the supported headless path",
+        "missingCapability": "the Claude Agent SDK headless entry point on this host",
+        "humanChange": "install the supported CLI and confirm it answers --version",
+        "stateChanged": False,
+        "nextAction": "re-dispatch this rail to a fresh reviewer session",
+    },
+    "credential": {
+        "kind": "credential",
+        "whatFailed": "authenticating the coordination remote fetch",
+        "missingCapability": "a valid GitHub token for jmrozi1 on this host",
+        "humanChange": "run gh auth login and grant repo scope",
+        "stateChanged": False,
+        "nextAction": "re-run the rail read; the queue projects once the fetch succeeds",
+    },
+    "environment": {
+        "kind": "environment",
+        "whatFailed": "starting-identity verification of the canonical worktree",
+        "missingCapability": "an exclusively held product worktree",
+        "humanChange": "decide the disposition of the two untracked launcher paths",
+        "stateChanged": True,
+        "nextAction": "re-dispatch the rail to a fresh executor session",
+    },
+}
+
+
+class ActionableAttentionOverHttpTests(SourcedLaunchTestCase):
+    """The rail's central proof: all nine D8 facts, served to a real client.
+
+    Nothing here stands in for the composition. The scope is resolved from a real
+    coordination repository through `ManagerController.queue_scope`, the rows come
+    from the accepted queue source, the page is rendered by the accepted renderer
+    and served by `serve_observed`, and the bytes are read back over a real
+    loopback socket by a real `http.client`. What is asserted is what a person
+    fetching that page is actually told.
+    """
+
+    def controller(self, registry=None) -> ManagerController:
+        return ManagerController(
+            self.context(), registry=self.registry if registry is None else registry
+        )
+
+    def publish_blocker(self, kind, *, rail=None, role="executor"):
+        """One blocked rail carrying one published D8 record."""
+        rail = rail or "issue-55-{0}-blocker".format(kind)
+        assignment = "" if role is None else "Role: {0}\n".format(role)
+        self.write(
+            self.scope / "rails" / rail / "rail.md",
+            "# Rail: {0}\n\nStatus: blocked\n{1}Depends on: none\n"
+            "Shared resource: none\n\n## Goal\n\nbounded work\n".format(rail, assignment),
+        )
+        published = {
+            "schemaVersion": 1,
+            "decisionId": "d-{0}".format(kind),
+            "project": "ai-dev",
+            "ticket": "issue-55",
+            "rail": rail,
+            "raisedAt": "2026-08-31T11:00:00Z",
+            "title": "Clear the {0} blocker on {1}".format(kind, rail),
+            "explanation": "This rail cannot continue until a person changes something.",
+            "evidence": [{"label": "rail", "locator": "rails/{0}/rail.md".format(rail)}],
+            "blocker": dict(D8_BLOCKERS[kind]),
+        }
+        self.decide(rail_id=rail, payload=published)
+        return rail, published
+
+    def payload_over_http(self, controller=None, *, alive=ALWAYS_ALIVE) -> dict:
+        owner = self.controller() if controller is None else controller
+        run = self.a_run()
+        server = owner.serve_observed(run, owner.queue_scope(run), alive=alive)
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+        return payload_in(fetched(server.server_address[1]))
+
+    def waiting_details(self, payload):
+        return {
+            payload["details"][row["itemId"]]["rail"]: payload["details"][row["itemId"]]
+            for row in payload["rows"]
+            if row["state"] == STATE_WAITING
+        }
+
+    # -- proofs 1 to 5, 7 and 8, over a socket ---------------------------
+
+    def test_all_five_blocker_kinds_reach_a_real_client_self_contained(self) -> None:
+        published_by_rail = {}
+        for kind in D8_BLOCKERS:
+            rail, published = self.publish_blocker(kind)
+            published_by_rail[rail] = published
+
+        payload = self.payload_over_http()
+
+        served = self.waiting_details(payload)
+        self.assertEqual(sorted(served), sorted(published_by_rail))
+        for rail, published in sorted(published_by_rail.items()):
+            block = published["blocker"]
+            with self.subTest(kind=block["kind"]):
+                detail = served[rail]
+                self.assertEqual(detail["attentionOwner"], OWNER_HUMAN)
+                # 3, 4, 5 -- project, ticket and the durable rail.
+                self.assertEqual(detail["project"], "ai-dev")
+                self.assertEqual(detail["ticket"], "issue-55")
+                self.assertEqual(detail["rail"], rail)
+                blocker = detail["blocker"]
+                self.assertIsNone(detail["blockerUnavailable"])
+                # 1 -- what failed. 2 -- the affected agent.
+                self.assertEqual(blocker["whatFailed"], block["whatFailed"])
+                self.assertEqual(blocker["agent"], "executor")
+                # 6 -- the missing capability, permission, configuration or credential.
+                self.assertEqual(blocker["missingCapability"], block["missingCapability"])
+                # 7 -- exactly what the human must change.
+                self.assertEqual(blocker["humanChange"], block["humanChange"])
+                # 8 -- whether state changed, as a boolean and not a hedge.
+                self.assertIs(blocker["stateChanged"], block["stateChanged"])
+                # 9 -- the exact next action once it is resolved.
+                self.assertEqual(blocker["nextAction"], block["nextAction"])
+                self.assertEqual(blocker["kind"], block["kind"])
+
+    def test_the_served_html_carries_the_published_text_and_no_transcript(self) -> None:
+        """Proofs 13 and 14 over the bytes rather than over the payload object."""
+        rail, published = self.publish_blocker("permission")
+        run = self.a_run()
+        controller = self.controller()
+        server = controller.serve_observed(
+            run, controller.queue_scope(run), alive=ALWAYS_ALIVE
+        )
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+
+        body = fetched(server.server_address[1])
+
+        self.assertIn("<!doctype html>", body.lower())
+        for value in published["blocker"].values():
+            if isinstance(value, str):
+                self.assertIn(value, body)
+        lowered = body.lower()
+        for forbidden in ("transcript", "raw log", "session inspector", "console.",
+                          "setinterval", "eventsource", "websocket", "<iframe"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lowered, forbidden)
+
+    def test_state_changed_is_served_explicitly_in_both_directions(self) -> None:
+        """Proof 8. The one answer a person cannot act on is unreachable."""
+        changed, _ = self.publish_blocker("permission")
+        unchanged, _ = self.publish_blocker("configuration")
+
+        served = self.waiting_details(self.payload_over_http())
+
+        self.assertIs(served[changed]["blocker"]["stateChanged"], True)
+        self.assertIs(served[unchanged]["blocker"]["stateChanged"], False)
+        for rail in (changed, unchanged):
+            self.assertIn(served[rail]["blocker"]["stateChanged"], (True, False))
+
+    # -- proof 9, over the production surface ----------------------------
+
+    def test_an_unsourceable_agent_fails_closed_on_the_served_page(self) -> None:
+        """The item still arrives; the blocker does not; nothing is invented."""
+        rail, published = self.publish_blocker("credential", role=None)
+
+        payload = self.payload_over_http()
+
+        served = self.waiting_details(payload)
+        detail = served[rail]
+        self.assertIsNone(detail["blocker"])
+        self.assertEqual(
+            detail["blockerUnavailable"], queue_source_module.BLOCKER_AGENT_UNSOURCED
+        )
+        self.assertEqual(detail["attentionOwner"], OWNER_HUMAN)
+        self.assertEqual(detail["rail"], rail)
+        # Not one word of the withheld blocker was paraphrased into the notice.
+        for value in published["blocker"].values():
+            if isinstance(value, str):
+                self.assertNotIn(value, detail["blockerUnavailable"])
+
+    # -- proofs 6 and 10 to 12, beside a genuinely live session ----------
+
+    def test_a_live_agent_row_gains_nothing_and_waiting_stays_human_owned(self) -> None:
+        """Proofs 10, 11 and 12 in one response, non-vacuously."""
+        rail, _ = self.publish_blocker("environment")
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        payload = self.payload_over_http()
+
+        states = {row["itemId"]: row["state"] for row in payload["rows"]}
+        self.assertEqual(sorted(states.values()), [STATE_RUNNING, STATE_WAITING])
+        owners = {
+            payload["details"][item]["attentionOwner"]: item for item in states
+        }
+        self.assertEqual(len(owners), 2)
+        waiting = [item for item, state in states.items() if state == STATE_WAITING]
+        self.assertEqual([owners[OWNER_HUMAN]], waiting)
+
+        running_detail = payload["details"][owners[OWNER_AGENT]]
+        self.assertEqual(running_detail["activity"], ACTIVITY_EXECUTOR_WORKING)
+        self.assertIsNone(running_detail["blocker"])
+        self.assertIsNone(running_detail["blockerUnavailable"])
+        self.assertEqual(running_detail["rail"], LIVE_RAIL)
+
+        # Rows stayed dense: the row contract is unchanged and carries none of it.
+        for row in payload["rows"]:
+            with self.subTest(item=row["itemId"]):
+                self.assertEqual(
+                    set(row),
+                    {"itemId", "state", "title", "project", "ticket", "elapsedSeconds"},
+                )
+
+        # And the aggregate the checkpoint-6 model owns is untouched by any of it.
+        self.assertEqual(
+            payload["agents"],
+            {"permitted": CONCURRENCY_CEILING_DEFAULT, "current": 1, "reason": None},
+        )
+
+    def test_transport_identity_stayed_evidence_on_the_served_page(self) -> None:
+        """Proof 6. Session ids and pids are locators, never a work item's name."""
+        rail, _ = self.publish_blocker("permission")
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        payload = self.payload_over_http()
+
+        for row in payload["rows"]:
+            with self.subTest(item=row["itemId"]):
+                self.assertNotIn(SESSION, json.dumps(row))
+        for item_id, detail in payload["details"].items():
+            with self.subTest(item=item_id):
+                self.assertNotIn(SESSION, detail["rail"])
+                self.assertNotIn(SESSION, json.dumps(detail["blocker"]))
+        evidence = json.dumps(
+            [d["evidence"] for d in payload["details"].values()]
+        )
+        self.assertIn(SESSION, evidence)
+
+    # -- the requirement's own exclusion ---------------------------------
+
+    def test_ordinary_rails_create_no_human_attention_item_at_all(self) -> None:
+        """Acceptance, reconciliation and review commissioning are not human work.
+
+        Four rails in four ordinary states and a live executor, and the default
+        Waiting view is empty. D8 says this as plainly as it says the nine fields.
+        """
+        for index, status in enumerate(("ready", "running", "completed", "ready")):
+            self.write(
+                self.scope / "rails" / "issue-55-ordinary-{0}".format(index) / "rail.md",
+                "# Rail: issue-55-ordinary-{0}\n\nStatus: {1}\nRole: executor\n"
+                "Depends on: none\nShared resource: none\n\n## Goal\n\nwork\n".format(
+                    index, status
+                ),
+            )
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        payload = self.payload_over_http()
+
+        self.assertEqual(payload["defaultFilters"], [STATE_WAITING])
+        self.assertEqual(
+            [row for row in payload["rows"] if row["state"] == STATE_WAITING], []
+        )
+        self.assertEqual(
+            [
+                item for item, detail in payload["details"].items()
+                if detail["attentionOwner"] == OWNER_HUMAN
+            ],
+            [],
+        )

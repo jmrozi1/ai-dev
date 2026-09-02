@@ -62,6 +62,19 @@ from __future__ import annotations
 # and ownership decision below. It is scoped to this read and dies with it; a
 # snapshot that survived the read would be the durable liveness cache the
 # lifecycle refuses.
+#
+# Eighth, D8's actionable half makes its last hop here, and it fails closed. The
+# publisher validates a blocker block all-or-nothing and `DurableDecision` has
+# always carried it whole; what was missing was anything that handed it to a
+# person. It is handed over verbatim -- never summarised, never paraphrased,
+# never completed from context -- and the one field the durable record has no
+# dedicated home for, the affected agent, is sourced from the rail's own
+# published assignment rather than invented. When any required field cannot be
+# sourced, this module says so by name and hands over nothing. That is a
+# deliberate choice between two failures: an item that admits it is not fully
+# actionable can still be acted on by a person who goes and looks, while an item
+# carrying a plausible sentence nobody published cannot be distinguished from a
+# true one at all.
 
 from dataclasses import dataclass
 import json
@@ -86,6 +99,7 @@ from .control_plane import (
     validate_identifier,
 )
 from .decision_queue import (
+    ActionableBlocker,
     DecisionQueue,
     EvidenceReference,
     OperationalAgent,
@@ -108,6 +122,8 @@ from .session_lifecycle import (
 )
 
 __all__ = [
+    "BLOCKER_AGENT_UNSOURCED",
+    "BLOCKER_UNUSABLE",
     "DurableDecision",
     "QueueSourceError",
     "REASON_BINDING_RAIL_UNKNOWN",
@@ -155,15 +171,42 @@ REASON_LIFECYCLE_REFUSED = "lifecycle-refused"
 REASON_CONFLICTING_ITEMS = "conflicting-items"
 REASON_OWNERSHIP_CONTRADICTORY = "ownership-contradictory"
 
+# Why an item that published a blocker is showing none. Neither of these refuses
+# the queue: a human-owned item is never hidden because part of it was unreadable,
+# because hiding it is how a person stops being asked at all. They are carried on
+# the item, in place of the blocker, and say which half was missing.
+BLOCKER_AGENT_UNSOURCED = (
+    "blocker-agent-unsourced: this item's durable rail publishes no role "
+    "assignment, so the affected agent has no durable source. The rest of the "
+    "published blocker is withheld with it, because a blocker missing one of the "
+    "things a person needs is not one they can finish acting on."
+)
+BLOCKER_UNUSABLE = (
+    "blocker-unusable: the published blocker block did not survive projection "
+    "({0}). None of it is shown, because a partly shown blocker cannot be told "
+    "apart from a complete one."
+)
+
 
 @dataclass(frozen=True)
 class DurableDecision:
     """One validated human-attention record, plus the rail it was cross-checked against.
 
-    The D8 blocker block rides along whole. `PendingDecision` has no field for it
-    and `decision_queue` is not this rail's to change, so it is carried here rather
-    than folded into the explanation -- summarising it into prose would be this
-    module inventing the very text a person is supposed to be reading verbatim.
+    The D8 blocker block rides along whole, and it now reaches a person.
+    `PendingDecision` had no field for it and `decision_queue` was not the
+    previous rail's to change, so it stopped here; both of those are now closed,
+    and it is still carried whole rather than folded into the explanation --
+    summarising it into prose would be this module inventing the very text a
+    person is supposed to be reading verbatim.
+
+    `agent` is the one D8 field with no dedicated place in the record. It is the
+    rail's own published assignment, which is the only durable statement of who
+    works a rail that survives the session, the process and the host underneath it
+    being replaced. It is deliberately not the role of whichever binding happens
+    to be nonterminal right now: a blocker is usually published *after* its agent
+    stopped, so a live-session reading would answer "nobody" exactly when a person
+    most needs an answer. It can be absent, and absent is reported rather than
+    filled in.
     """
 
     payload: Dict[str, Any]
@@ -176,6 +219,21 @@ class DurableDecision:
     @property
     def blocker(self) -> Optional[Dict[str, Any]]:
         return self.payload.get("blocker")
+
+    @property
+    def agent(self) -> Optional[str]:
+        """The affected agent, from the rail's durable assignment, or nothing.
+
+        Carried exactly as published. A rail may name an assignment this product
+        models no session role for -- `evidence-worker` is a real one -- and
+        mapping those onto the three modeled roles, or refusing them, would be
+        this module deciding what a durable record is allowed to say about who
+        does the work.
+        """
+        role = self.rail.role
+        if type(role) is not str or not role.strip():
+            return None
+        return role.strip()
 
 
 def _wrap(exc: Exception, reason: str) -> QueueSourceError:
@@ -343,6 +401,70 @@ def read_decisions(
     return found
 
 
+def _actionable_blocker(
+    decision: DurableDecision,
+) -> Tuple[Optional[ActionableBlocker], Optional[str]]:
+    """D8's actionable half, complete, or a named reason there is none.
+
+    Three properties, and each is deliberate.
+
+    It never fabricates. Every string handed to `ActionableBlocker` is subscripted
+    straight out of the published payload or is the rail's own assignment. There
+    is no default, no fallback wording, no "unknown", and no sentence composed
+    here out of what the record implies -- because a person cannot tell a composed
+    sentence from a published one, and the whole point of the item is that they
+    should not have to.
+
+    It does not trust the publisher's validation to have run. `_decision_blocker`
+    already enforces exactly this shape, and `read_decisions` calls it on the way
+    in, so in a well-formed system this function's own refusal is unreachable.
+    That is precisely why it is here: the guarantee a person gets should not
+    depend on which of two modules happened to look. `.get` rather than `[...]`,
+    so a missing key arrives at `ActionableBlocker` as `None` and is refused by
+    the same bound that refuses every other malformed field, instead of raising a
+    `KeyError` that no caller is shaped to catch.
+
+    It fails closed toward the visible item rather than toward silence. A record
+    that carries a blocker this module cannot complete produces an item with no
+    blocker and a reason naming what was missing. Refusing the whole queue would
+    remove every other person's work from the screen over one rail's bad record;
+    dropping the item would remove the one person who is owed an answer.
+    """
+    raw = decision.blocker
+    if raw is None:
+        # The ordinary case for a decision that is not a failure. "Which of these
+        # two approaches" has no thing that failed and no capability to grant, and
+        # manufacturing an empty blocker for it would put six blank rows in front
+        # of a person who was asked a straight question.
+        return None, None
+    if not isinstance(raw, dict):
+        return None, BLOCKER_UNUSABLE.format("not-an-object")
+
+    agent = decision.agent
+    if agent is None:
+        return None, BLOCKER_AGENT_UNSOURCED
+
+    try:
+        return (
+            ActionableBlocker(
+                kind=raw.get("kind"),
+                what_failed=raw.get("whatFailed"),
+                agent=agent,
+                missing_capability=raw.get("missingCapability"),
+                human_change=raw.get("humanChange"),
+                state_changed=raw.get("stateChanged"),
+                next_action=raw.get("nextAction"),
+            ),
+            None,
+        )
+    except QueueError as exc:
+        # The reason only, never the detail. A detail quotes the offending value,
+        # and a notice about a blocker is not a place to print fragments of the
+        # blocker -- that is the paraphrase this function exists to refuse,
+        # arriving through the error path instead of the success one.
+        return None, BLOCKER_UNUSABLE.format(exc.reason)
+
+
 def _pending_decision(
     decision: DurableDecision, *, now: str, activity: str, attention_owner: str
 ) -> PendingDecision:
@@ -358,8 +480,14 @@ def _pending_decision(
     durable record would refuse here rather than quietly agreeing with itself. A
     literal `human` written at this call site would make that check compare the
     module to itself and prove nothing.
+
+    D8's actionable half is resolved before the age is, and it cannot refuse this
+    call: `_actionable_blocker` returns either a complete blocker or the reason
+    there is none, and both are legal on the item. An unreadable blocker therefore
+    costs a person the blocker, not the item.
     """
     payload = decision.payload
+    blocker, unavailable = _actionable_blocker(decision)
     try:
         age = elapsed_seconds(payload["raisedAt"], now)
     except LifecycleError as exc:
@@ -381,6 +509,8 @@ def _pending_decision(
             activity=activity,
             attention_owner=attention_owner,
             evidence=evidence,
+            blocker=blocker,
+            blocker_unavailable=unavailable,
         )
     except QueueError as exc:
         raise _wrap(exc, REASON_DECISION_INVALID) from exc

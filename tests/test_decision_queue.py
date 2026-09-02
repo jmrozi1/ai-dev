@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import fields, replace
+from dataclasses import MISSING, fields, replace
 from itertools import combinations
 from pathlib import Path
 from typing import List, Optional
@@ -313,7 +313,10 @@ class InputValidationTests(unittest.TestCase):
         self.assertEqual(
             {f.name for f in fields(PendingDecision)},
             {"decision_id", "project", "ticket", "rail", "raised_at", "title", "explanation",
-             "elapsed_seconds", "activity", "attention_owner", "evidence"},
+             "elapsed_seconds", "activity", "attention_owner", "evidence",
+             # D8's actionable half, and the reason there is none. Exactly two
+             # fields, and both only on the human-owned kind.
+             "blocker", "blocker_unavailable"},
         )
         self.assertEqual(
             {f.name for f in fields(OperationalAgent)},
@@ -788,7 +791,10 @@ class SelectionAndDetailTests(unittest.TestCase):
     def test_the_detail_field_set_is_exactly_the_right_pane_data(self) -> None:
         self.assertEqual(
             {f.name for f in fields(SelectedDetail)},
-            {"item_id", "state", "activity", "attention_owner", "explanation", "evidence"},
+            {"item_id", "state", "activity", "attention_owner", "explanation", "evidence",
+             # Three routing facts D8 requires an item to state, on both kinds,
+             # plus the actionable half, which only a decision ever carries.
+             "project", "ticket", "rail", "blocker", "blocker_unavailable"},
         )
 
 
@@ -878,7 +884,8 @@ class PurityTests(unittest.TestCase):
             {
                 # its own constructors and helpers
                 "DecisionQueue", "QueueError", "QueueRow", "QueueView", "SelectedDetail",
-                "_activity", "_detail", "_elapsed", "_identity", "_normalize_filters",
+                "_activity", "_blocker", "_detail", "_elapsed", "_identity",
+                "_normalize_filters",
                 "_owner", "_references", "_require_waiting_is_the_human_owned_set",
                 "_text", "_visible",
                 "__init__", "super", "dataclass",
@@ -923,3 +930,269 @@ class PurityTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# --------------------------------------------------------------------------
+# D8: a human-owned item is actionable on its own, or says which part is missing
+# --------------------------------------------------------------------------
+
+
+def a_blocker(**overrides) -> queue_module.ActionableBlocker:
+    base = dict(
+        kind="permission",
+        what_failed="publishing the executor handoff to the coordination remote",
+        agent="executor",
+        missing_capability="push access to jmrozi1/ai-dev-control-plane for this host key",
+        human_change="add this host's key as a deploy key with write access",
+        state_changed=True,
+        next_action="re-run the publish step; the checkpoint is already committed",
+    )
+    base.update(overrides)
+    return queue_module.ActionableBlocker(**base)
+
+
+class ActionableBlockerShapeTests(unittest.TestCase):
+    """The six failure facts arrive complete or not at all."""
+
+    def test_every_field_is_required_with_no_default(self) -> None:
+        """A blocker cannot be constructed half-described, so none can exist.
+
+        Asserted over the dataclass rather than by omitting one field in a call,
+        because a default added later would make the omission test pass while the
+        property it stands for was gone.
+        """
+        for entry in fields(queue_module.ActionableBlocker):
+            with self.subTest(field=entry.name):
+                self.assertIs(entry.default, MISSING)
+                self.assertIs(entry.default_factory, MISSING)
+
+    def test_the_field_set_is_exactly_d8_s_six(self) -> None:
+        """Project, ticket and rail are not here: the item states them once."""
+        self.assertEqual(
+            {f.name for f in fields(queue_module.ActionableBlocker)},
+            {"kind", "what_failed", "agent", "missing_capability", "human_change",
+             "state_changed", "next_action"},
+        )
+
+    def test_each_of_the_five_kinds_is_accepted_and_a_sixth_is_not(self) -> None:
+        for kind in queue_module.BLOCKER_KINDS:
+            with self.subTest(kind=kind):
+                self.assertEqual(a_blocker(kind=kind).kind, kind)
+        self.assertEqual(len(queue_module.BLOCKER_KINDS), 5)
+        for invalid in ("network", "", None, "Permission", 1):
+            with self.subTest(kind=invalid):
+                with self.assertRaises(QueueError) as caught:
+                    a_blocker(kind=invalid)
+                self.assertEqual(
+                    caught.exception.reason, queue_module.REASON_UNSUPPORTED_BLOCKER_KIND
+                )
+
+    def test_state_changed_is_an_exact_boolean_and_nothing_that_reads_like_one(self) -> None:
+        """"It may have changed" is the one answer a person cannot act on."""
+        for value in (1, 0, "true", "false", "unknown", None, "", []):
+            with self.subTest(value=value):
+                with self.assertRaises(QueueError) as caught:
+                    a_blocker(state_changed=value)
+                self.assertEqual(
+                    caught.exception.reason, queue_module.REASON_BLOCKER_STATE_NOT_EXPLICIT
+                )
+        self.assertIs(a_blocker(state_changed=True).state_changed, True)
+        self.assertIs(a_blocker(state_changed=False).state_changed, False)
+
+    def test_every_text_field_must_be_present_bounded_and_exact(self) -> None:
+        text_fields = (
+            "what_failed", "agent", "missing_capability", "human_change", "next_action",
+        )
+        for name in text_fields:
+            for value in (None, "", "   ", 7):
+                with self.subTest(field=name, value=value):
+                    with self.assertRaises(QueueError) as caught:
+                        a_blocker(**{name: value})
+                    self.assertEqual(
+                        caught.exception.reason, queue_module.REASON_INVALID_TEXT
+                    )
+            with self.subTest(field=name, value="too long"):
+                with self.assertRaises(QueueError) as caught:
+                    a_blocker(**{name: "x" * (queue_module.MAX_BLOCKER_TEXT + 1)})
+                self.assertEqual(
+                    caught.exception.reason, queue_module.REASON_TEXT_TOO_LONG
+                )
+
+    def test_the_bound_and_the_kinds_match_the_publisher_s_own(self) -> None:
+        """Restated constants drift. This is the thing that notices.
+
+        `decision_queue` is pure and will not import the control plane to borrow
+        an integer, so the two definitions are checked against each other here
+        instead of one being derived from the other.
+        """
+        from ai_dev_flow import control_plane
+
+        self.assertEqual(
+            queue_module.MAX_BLOCKER_TEXT, control_plane.MAX_DECISION_BLOCKER_STRING
+        )
+        self.assertEqual(
+            set(queue_module.BLOCKER_KINDS), set(control_plane.DECISION_BLOCKER_KINDS)
+        )
+        # And the key names the two sides use for one field, which is the other
+        # way this pair could silently stop describing the same thing.
+        self.assertEqual(
+            {"kind", "whatFailed", "missingCapability", "humanChange", "stateChanged",
+             "nextAction"},
+            set(control_plane.DECISION_BLOCKER_ALLOWED_KEYS),
+        )
+
+
+class ActionableItemTests(unittest.TestCase):
+    """Where D8's nine live on an item, and where they refuse to live."""
+
+    def test_a_decision_carries_the_blocker_through_to_its_detail(self) -> None:
+        blocker = a_blocker()
+        item = decision(blocker=blocker)
+        view = build_queue(decisions=[item]).view(selected_id=item.item_id)
+
+        detail = view.detail
+        self.assertIs(detail.blocker, blocker)
+        self.assertIsNone(detail.blocker_unavailable)
+        # All nine, read off one selected item and nothing else.
+        self.assertEqual(detail.project, PROJECT)
+        self.assertEqual(detail.ticket, TICKET)
+        self.assertEqual(detail.rail, "issue-55-some-rail")
+        self.assertEqual(detail.blocker.what_failed, blocker.what_failed)
+        self.assertEqual(detail.blocker.agent, "executor")
+        self.assertEqual(detail.blocker.missing_capability, blocker.missing_capability)
+        self.assertEqual(detail.blocker.human_change, blocker.human_change)
+        self.assertIs(detail.blocker.state_changed, True)
+        self.assertEqual(detail.blocker.next_action, blocker.next_action)
+
+    def test_a_decision_without_a_blocker_carries_neither_half(self) -> None:
+        """Not every question put to a person is a failure report."""
+        item = decision()
+        detail = build_queue(decisions=[item]).view(selected_id=item.item_id).detail
+        self.assertIsNone(detail.blocker)
+        self.assertIsNone(detail.blocker_unavailable)
+        # It is still actionable: the routing facts and the published prose are
+        # all there, which is what a straight question needs.
+        self.assertEqual((detail.project, detail.ticket, detail.rail),
+                         (PROJECT, TICKET, "issue-55-some-rail"))
+        self.assertEqual(detail.explanation, EXPLANATION_SECRET)
+
+    def test_an_unsourced_blocker_is_named_rather_than_invented(self) -> None:
+        notice = "blocker-agent-unsourced: the rail publishes no role assignment."
+        item = decision(blocker_unavailable=notice)
+        detail = build_queue(decisions=[item]).view(selected_id=item.item_id).detail
+        self.assertIsNone(detail.blocker)
+        self.assertEqual(detail.blocker_unavailable, notice)
+
+    def test_an_item_may_not_both_carry_a_blocker_and_report_none(self) -> None:
+        with self.assertRaises(QueueError) as caught:
+            decision(blocker=a_blocker(), blocker_unavailable="something was missing")
+        self.assertEqual(
+            caught.exception.reason, queue_module.REASON_BLOCKER_DOUBLE_ANSWER
+        )
+
+    def test_the_unavailability_notice_is_bounded_exact_text(self) -> None:
+        for value in ("", "  ", 7, b"bytes"):
+            with self.subTest(value=value):
+                with self.assertRaises(QueueError):
+                    decision(blocker_unavailable=value)
+        with self.assertRaises(QueueError) as caught:
+            decision(blocker_unavailable="x" * (queue_module.MAX_BLOCKER_NOTICE + 1))
+        self.assertEqual(caught.exception.reason, queue_module.REASON_TEXT_TOO_LONG)
+
+    def test_a_blocker_must_be_the_accepted_type_and_not_a_lookalike(self) -> None:
+        """A dict of the right shape is not a validated blocker."""
+        with self.assertRaises(QueueError) as caught:
+            decision(blocker={
+                "kind": "permission", "what_failed": "x", "agent": "executor",
+                "missing_capability": "x", "human_change": "x",
+                "state_changed": True, "next_action": "x",
+            })
+        self.assertEqual(caught.exception.reason, queue_module.REASON_INVALID_BLOCKER)
+
+    def test_an_operational_item_has_nowhere_to_put_a_human_attention_field(self) -> None:
+        """Proof 10, by construction rather than by omission.
+
+        An agent-owned item does not merely happen to carry no blocker: there is
+        no field on `OperationalAgent` to carry one, so no future caller can put
+        human-attention content on a row whose next action belongs to an agent.
+        """
+        names = {f.name for f in fields(OperationalAgent)}
+        self.assertNotIn("blocker", names)
+        self.assertNotIn("blocker_unavailable", names)
+        with self.assertRaises(TypeError):
+            agent(blocker=a_blocker())
+
+        item = agent()
+        detail = build_queue(agents=[item]).view(
+            filters=QUEUE_STATES, selected_id=item.item_id
+        ).detail
+        self.assertIsNone(detail.blocker)
+        self.assertIsNone(detail.blocker_unavailable)
+        self.assertEqual(detail.attention_owner, OWNER_AGENT)
+
+    def test_a_blocked_or_disconnected_agent_item_stays_agent_owned(self) -> None:
+        """Being stuck is not the same as being human work."""
+        stuck = agent(
+            rail="issue-55-stuck-rail",
+            projection=projection(rail="issue-55-stuck-rail", state=STATE_DISCONNECTED),
+            activity=ACTIVITY_DISCONNECTED_RECOVERY,
+        )
+        queue = build_queue(agents=[stuck])
+        detail = queue.view(filters=QUEUE_STATES, selected_id=stuck.item_id).detail
+        self.assertEqual(detail.attention_owner, OWNER_AGENT)
+        self.assertIsNone(detail.blocker)
+        self.assertIsNone(detail.blocker_unavailable)
+        # And it is still absent from the default Waiting view.
+        self.assertEqual(queue.view().rows, ())
+
+    def test_the_row_gained_nothing_at_all(self) -> None:
+        """Proof 12. D8 is detail-pane content, and rows stay dense."""
+        before = {f.name for f in fields(QueueRow)}
+        item = decision(blocker=a_blocker())
+        view = build_queue(decisions=[item]).view()
+        self.assertEqual(before, {"item_id", "state", "title", "project", "ticket",
+                                  "elapsed_seconds"})
+        row = view.rows[0]
+        self.assertFalse(hasattr(row, "blocker"))
+        self.assertFalse(hasattr(row, "rail"))
+        # None of the blocker's own text is reachable from a row, including
+        # through the fields a row does have.
+        printed = "|".join(str(getattr(row, name)) for name in before)
+        for secret in (a_blocker().what_failed, a_blocker().human_change,
+                       a_blocker().next_action, a_blocker().missing_capability):
+            self.assertNotIn(secret, printed)
+
+    def test_waiting_is_still_exactly_the_human_owned_set_with_blockers_present(self) -> None:
+        """Proof 11, non-vacuously: one of each kind in one queue."""
+        blocked = decision(blocker=a_blocker())
+        working = agent()
+        queue = build_queue(decisions=[blocked], agents=[working])
+
+        waiting = {row.item_id for row in queue.view().rows}
+        human = {
+            entry.item_id for entry in queue.items
+            if entry.attention_owner == OWNER_HUMAN
+        }
+        self.assertEqual(waiting, human)
+        self.assertEqual(waiting, {blocked.item_id})
+        self.assertEqual(
+            {row.item_id for row in queue.view(filters=QUEUE_STATES).rows},
+            {blocked.item_id, working.item_id},
+        )
+
+    def test_a_detail_must_state_its_routing_and_cannot_be_built_without_it(self) -> None:
+        with self.assertRaises(TypeError):
+            SelectedDetail(
+                item_id="x", state=STATE_WAITING,
+                activity=ACTIVITY_BLOCKED, attention_owner=OWNER_HUMAN,
+            )
+        for missing in ("project", "ticket", "rail"):
+            base = dict(
+                item_id="x", state=STATE_WAITING, project=PROJECT, ticket=TICKET,
+                rail="issue-55-some-rail", activity=ACTIVITY_BLOCKED,
+                attention_owner=OWNER_HUMAN,
+            )
+            base[missing] = ""
+            with self.subTest(field=missing):
+                with self.assertRaises(QueueError):
+                    SelectedDetail(**base)

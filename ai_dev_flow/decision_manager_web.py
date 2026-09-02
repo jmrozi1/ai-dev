@@ -5,7 +5,7 @@ from __future__ import annotations
 # This is presentation. Every fact it shows was decided by `decision_queue`, and
 # nothing here re-derives one.
 #
-# Seven boundaries hold it honest.
+# Eight boundaries hold it honest.
 #
 # First, it consumes accepted types only. A `QueueView` supplies the rows, their
 # order, and the filter set; `SelectedDetail` supplies the right pane. This module
@@ -44,6 +44,16 @@ from __future__ import annotations
 # selected item from the page's own memory and moves on. Nothing is stored,
 # nothing is transmitted, no endpoint exists to receive it, and the page never
 # claims otherwise. Real response routing is a later seam.
+#
+# Eighth, an item a person owns must be actionable without leaving the page. The
+# accepted projection decides all of it -- the three routing facts every item now
+# states, and the six-field blocker a decision item may carry -- and this module
+# reduces them field by field into the payload. It composes no sentence, fills no
+# gap, shortens nothing, and has no branch that turns a missing field into a
+# plausible one: a blocker arrives complete or arrives as `null` beside the
+# projection's own reason for there being none. The one thing left to presentation
+# is which words a JSON boolean is drawn as, and the page owns that decision in
+# one place so two callers cannot ship two phrasings of one durable answer.
 #
 # Seventh, a figure whose truth expires is drawn when it is asked for, not when the
 # server was built. Everything a run projects once -- the queue, the details, the
@@ -316,6 +326,28 @@ def build_agents(reading) -> "dict":
     return {"permitted": permitted, "current": current, "reason": reason}
 
 
+def _blocker(blocker) -> Optional[dict]:
+    """One accepted `ActionableBlocker` as the page's own data, or `null`.
+
+    `state_changed` crosses as a JSON boolean and not as a rendered phrase. Which
+    words a person reads for "the worktree changed" is a presentation decision, and
+    it belongs to the page beside every other one -- but the *fact* must arrive as
+    a fact, because a payload that shipped the phrase would let two callers ship
+    two different phrases for one durable answer.
+    """
+    if blocker is None:
+        return None
+    return {
+        "kind": blocker.kind,
+        "whatFailed": blocker.what_failed,
+        "agent": blocker.agent,
+        "missingCapability": blocker.missing_capability,
+        "humanChange": blocker.human_change,
+        "stateChanged": blocker.state_changed,
+        "nextAction": blocker.next_action,
+    }
+
+
 def build_payload(
     view: QueueView,
     details: Mapping[str, SelectedDetail],
@@ -392,7 +424,24 @@ def build_payload(
                 # to a badge on a dense row.
                 "activity": details[row_id].activity,
                 "attentionOwner": details[row_id].attention_owner,
+                # Three of D8's nine. The row already prints project and ticket,
+                # and repeating them here is not redundancy in the payload sense:
+                # the detail pane is where a person reads what to do, and an
+                # instruction that needs the reader to glance back at a list to
+                # learn which rail it is about is not actionable on its own.
+                "project": details[row_id].project,
+                "ticket": details[row_id].ticket,
+                "rail": details[row_id].rail,
                 "explanation": details[row_id].explanation,
+                # The other six, or `null`. Reduced field by field rather than by
+                # `asdict`, so a field added to the accepted type never reaches a
+                # page nobody wrote a place for -- and so this dictionary is a
+                # readable statement of exactly what a person is shown.
+                "blocker": _blocker(details[row_id].blocker),
+                # Why there is none, when a blocker was published and could not be
+                # completed. Carried because the alternative is a page that looks
+                # exactly like an item that never had a blocker at all.
+                "blockerUnavailable": details[row_id].blocker_unavailable,
                 "evidence": [
                     {"label": reference.label, "locator": reference.locator}
                     for reference in details[row_id].evidence

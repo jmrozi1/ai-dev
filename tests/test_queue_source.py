@@ -147,11 +147,27 @@ class QueueSourceTestBase(unittest.TestCase):
     def accept_state(self, text: str = "# Control Plane State\n\nProject: ai-dev\n") -> Path:
         return self._write(self.scope / "state.md", text)
 
-    def authorize(self, rail_id: str, status: str = "ready", *, handoff: str | None = None) -> Path:
+    def authorize(
+        self,
+        rail_id: str,
+        status: str = "ready",
+        *,
+        handoff: str | None = None,
+        role: str | None = "executor",
+    ) -> Path:
+        """`role=None` publishes a rail with no `Role:` header, which is legal.
+
+        The header is optional in the accepted parser, so a scope can genuinely
+        contain one. It is the only durable statement of who works a rail, so a
+        rail without it is the case where D8's affected agent has no source.
+        """
+        assignment = "" if role is None else "Role: {0}\n".format(role)
         path = self._write(
             self.scope / "rails" / rail_id / "rail.md",
-            "# Rail: {0}\n\nStatus: {1}\nRole: executor\nDepends on: none\n"
-            "Shared resource: none\n\n## Goal\n\nbounded work\n".format(rail_id, status),
+            "# Rail: {0}\n\nStatus: {1}\n{2}Depends on: none\n"
+            "Shared resource: none\n\n## Goal\n\nbounded work\n".format(
+                rail_id, status, assignment
+            ),
         )
         if handoff is not None:
             self._write(self.scope / "rails" / rail_id / "handoff.md", handoff)
@@ -1384,3 +1400,387 @@ class QueueScopeTests(QueueSourceTestBase):
         self.assertEqual(
             drifted.exception.reason, queue_source.REASON_LIFECYCLE_REFUSED
         )
+
+
+# --------------------------------------------------------------------------
+# D8's last hop: the validated durable blocker reaches the person, or says why not
+# --------------------------------------------------------------------------
+
+
+BLOCKERS = {
+    "permission": {
+        "kind": "permission",
+        "whatFailed": "publishing the executor handoff to the coordination remote",
+        "missingCapability": "write access to jmrozi1/ai-dev-control-plane for this host key",
+        "humanChange": "add this host's public key as a deploy key with write access",
+        "stateChanged": True,
+        "nextAction": "re-run the publish step; the checkpoint is already committed",
+    },
+    "configuration": {
+        "kind": "configuration",
+        "whatFailed": "resolving the ticket provider for this workspace",
+        "missingCapability": "a ticketProvider entry in .ai-dev/config.json",
+        "humanChange": "add the github provider block naming jmrozi1/ai-dev",
+        "stateChanged": False,
+        "nextAction": "re-dispatch this rail; nothing was written and nothing needs undoing",
+    },
+    "capability": {
+        "kind": "capability",
+        "whatFailed": "starting a reviewer session through the supported headless path",
+        "missingCapability": "the Claude Agent SDK headless entry point on this host",
+        "humanChange": "install the supported CLI and confirm it answers --version",
+        "stateChanged": False,
+        "nextAction": "re-dispatch this rail to a fresh reviewer session",
+    },
+    "credential": {
+        "kind": "credential",
+        "whatFailed": "authenticating the coordination remote fetch",
+        "missingCapability": "a valid GitHub token for jmrozi1 on this host",
+        "humanChange": "run gh auth login and grant repo scope",
+        "stateChanged": False,
+        "nextAction": "re-run the rail read; the queue will project once the fetch succeeds",
+    },
+    "environment": {
+        "kind": "environment",
+        "whatFailed": "starting-identity verification of the canonical worktree",
+        "missingCapability": "an exclusively held product worktree at /home/jtmrozi/src/ai-dev",
+        "humanChange": "decide the disposition of the two untracked launcher paths",
+        "stateChanged": True,
+        "nextAction": "re-dispatch the rail to a fresh executor session",
+    },
+}
+
+
+class ActionableBlockerSourceTests(QueueSourceTestBase):
+    """Every D8 field a person reads, traced to the durable record it came from."""
+
+    def waiting_item(self, **load_overrides):
+        queue = self.load(**load_overrides)
+        items = [entry for entry in queue.items if entry.state == STATE_WAITING]
+        self.assertEqual(len(items), 1)
+        return items[0]
+
+    def detail_for(self, item, **load_overrides):
+        queue = self.load(**load_overrides)
+        return queue.view(filters=QUEUE_STATES_ALL, selected_id=item.item_id).detail
+
+    # -- proofs 2 to 5: each kind is self-contained ------------------------
+
+    def test_each_of_the_five_blocker_kinds_arrives_complete_and_verbatim(self) -> None:
+        """One rail, one published record, one item a person can act on alone.
+
+        Every string is compared against the published payload rather than against
+        a literal retyped here, so a projection that reworded anything on the way
+        fails even when the rewording reads better than the original.
+        """
+        published_by_rail = {}
+        for kind, block in BLOCKERS.items():
+            rail = "issue-55-{0}-blocker".format(kind)
+            self.authorize(rail, "blocked")
+            published = decision_payload(
+                decisionId="d-{0}".format(kind), rail=rail, blocker=dict(block)
+            )
+            self.decide(rail_id=rail, payload=published)
+            published_by_rail[rail] = published
+
+        queue = self.load()
+        items = {entry.rail: entry for entry in queue.items}
+        self.assertEqual(sorted(items), sorted(published_by_rail))
+
+        for rail, published in sorted(published_by_rail.items()):
+            kind = published["blocker"]["kind"]
+            with self.subTest(kind=kind):
+                item = items[rail]
+                blocker = item.blocker
+
+                self.assertIsNone(item.blocker_unavailable)
+                self.assertIsNotNone(blocker)
+                # 1. what failed
+                self.assertEqual(blocker.what_failed, published["blocker"]["whatFailed"])
+                # 2. the affected agent
+                self.assertEqual(blocker.agent, "executor")
+                # 3, 4, 5. project, ticket and the durable rail
+                self.assertEqual(item.project, PROJECT)
+                self.assertEqual(item.ticket, TICKET)
+                self.assertEqual(item.rail, rail)
+                # 6. the missing capability / permission / configuration / credential
+                self.assertEqual(
+                    blocker.missing_capability, published["blocker"]["missingCapability"]
+                )
+                # 7. exactly what the human must change
+                self.assertEqual(blocker.human_change, published["blocker"]["humanChange"])
+                # 8. whether state changed, explicitly
+                self.assertIs(blocker.state_changed, published["blocker"]["stateChanged"])
+                self.assertIn(blocker.state_changed, (True, False))
+                # 9. the exact next action after resolution
+                self.assertEqual(blocker.next_action, published["blocker"]["nextAction"])
+                self.assertEqual(blocker.kind, kind)
+
+    def test_a_person_reaches_all_nine_from_the_selected_detail_alone(self) -> None:
+        """Proof 1 and proof 7, over the pane a person actually reads."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        published = decision_payload(blocker=dict(BLOCKERS["permission"]))
+        self.decide(payload=published)
+
+        item = self.waiting_item()
+        detail = self.detail_for(item)
+
+        block = published["blocker"]
+        # All nine, asserted here rather than named in the method name. An earlier
+        # version of this test checked six and claimed nine; a paraphrase control
+        # on `whatFailed` walked straight past it, which is how the gap was found.
+        self.assertEqual(detail.blocker.what_failed, block["whatFailed"])
+        self.assertEqual(detail.blocker.agent, "executor")
+        self.assertEqual(detail.project, PROJECT)
+        self.assertEqual(detail.ticket, TICKET)
+        self.assertEqual(detail.rail, BLOCKED_RAIL)
+        self.assertEqual(detail.blocker.missing_capability, block["missingCapability"])
+        self.assertEqual(detail.blocker.human_change, block["humanChange"])
+        self.assertIs(detail.blocker.state_changed, block["stateChanged"])
+        self.assertEqual(detail.blocker.next_action, block["nextAction"])
+        self.assertEqual(detail.explanation, published["explanation"])
+        self.assertIsNone(detail.blocker_unavailable)
+
+    # -- the affected agent, and where it comes from ----------------------
+
+    def test_the_affected_agent_is_the_rail_s_durable_assignment(self) -> None:
+        """Not the role of whichever session happens to be nonterminal right now.
+
+        The rail is authorized to a reviewer here while a live *executor* binding
+        sits on it. If the projection read the session, it would answer
+        `executor`; it answers `reviewer`, because that is what the durable record
+        says about who works this rail.
+        """
+        self.authorize(BLOCKED_RAIL, "blocked", role="reviewer")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["permission"])))
+        record = self.bind(BLOCKED_RAIL, role="executor")
+        self.own(record)
+
+        item = self.waiting_item()
+
+        self.assertEqual(item.blocker.agent, "reviewer")
+
+    def test_an_assignment_this_product_models_no_session_role_for_is_carried(self) -> None:
+        """`evidence-worker` is a real published assignment. It is not corrected."""
+        self.authorize(BLOCKED_RAIL, "blocked", role="evidence-worker")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["capability"])))
+
+        self.assertEqual(self.waiting_item().blocker.agent, "evidence-worker")
+
+    def test_the_agent_survives_the_session_that_hit_the_blocker_being_gone(self) -> None:
+        """The ordinary case: a blocker is published after its agent stopped."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["environment"])))
+
+        item = self.waiting_item()
+
+        self.assertEqual(self.store.records(), [])
+        self.assertEqual(item.blocker.agent, "executor")
+
+    # -- proof 9: fail closed, never fabricate ---------------------------
+
+    def test_a_rail_with_no_role_assignment_withholds_the_whole_blocker(self) -> None:
+        """The one field with no durable home, absent, and said so by name."""
+        self.authorize(BLOCKED_RAIL, "blocked", role=None)
+        published = decision_payload(blocker=dict(BLOCKERS["credential"]))
+        self.decide(payload=published)
+
+        item = self.waiting_item()
+
+        self.assertIsNone(item.blocker)
+        self.assertEqual(item.blocker_unavailable, queue_source.BLOCKER_AGENT_UNSOURCED)
+        # And not one word of the published blocker leaked into the notice, in
+        # either direction: nothing was paraphrased and nothing was quoted.
+        for value in published["blocker"].values():
+            if isinstance(value, str):
+                self.assertNotIn(value, item.blocker_unavailable)
+
+    def test_the_human_owned_item_survives_an_unsourceable_blocker(self) -> None:
+        """Failing closed must not fail silent: the person is still asked."""
+        self.authorize(BLOCKED_RAIL, "blocked", role=None)
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["credential"])))
+
+        queue = self.load()
+        view = queue.view()
+
+        self.assertEqual(len(view.rows), 1)
+        self.assertEqual(view.rows[0].state, STATE_WAITING)
+        self.assertEqual(view.detail.attention_owner, OWNER_HUMAN)
+        self.assertEqual(view.detail.rail, BLOCKED_RAIL)
+        self.assertEqual(
+            view.detail.blocker_unavailable, queue_source.BLOCKER_AGENT_UNSOURCED
+        )
+
+    def test_a_blocker_missing_a_field_is_withheld_whole_rather_than_part_shown(self) -> None:
+        """The publisher's all-or-nothing rule, enforced again at this boundary.
+
+        `_actionable_blocker` is driven directly, because `read_decisions` refuses
+        this record before it ever reaches the projection -- which is the point.
+        The guarantee a person gets must not depend on which of the two modules
+        happened to look.
+        """
+        state = queue_source.RailState(
+            identifier=BLOCKED_RAIL, status="blocked", artifacts=[], depends_on=[],
+            shared_resource=None, role="executor",
+        )
+        for field in ("whatFailed", "missingCapability", "humanChange", "nextAction",
+                      "stateChanged", "kind"):
+            with self.subTest(missing=field):
+                partial = dict(BLOCKERS["permission"])
+                removed = partial.pop(field)
+                durable = queue_source.DurableDecision(
+                    payload=decision_payload(blocker=partial), rail=state
+                )
+
+                blocker, notice = queue_source._actionable_blocker(durable)
+
+                self.assertIsNone(blocker)
+                self.assertIsNotNone(notice)
+                self.assertTrue(notice.startswith("blocker-unusable:"), notice)
+                # The surviving fields are not shown either, and the removed value
+                # is certainly not reconstructed.
+                if isinstance(removed, str):
+                    self.assertNotIn(removed, notice)
+                for value in partial.values():
+                    if isinstance(value, str):
+                        self.assertNotIn(value, notice)
+
+    def test_the_publisher_still_refuses_a_partial_blocker_at_read_time(self) -> None:
+        """The first of the two enforcements, still doing its job."""
+        partial = dict(BLOCKERS["permission"])
+        del partial["nextAction"]
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(payload=decision_payload(blocker=partial))
+
+        self.assertEqual(self.refusal().reason, queue_source.REASON_DECISION_INVALID)
+
+    def test_a_blocker_that_is_not_an_object_is_withheld_rather_than_coerced(self) -> None:
+        state = queue_source.RailState(
+            identifier=BLOCKED_RAIL, status="blocked", artifacts=[], depends_on=[],
+            shared_resource=None, role="executor",
+        )
+        for value in ("permission denied", ["permission"], 7, True):
+            with self.subTest(value=value):
+                durable = queue_source.DurableDecision(
+                    payload=decision_payload(blocker=value), rail=state
+                )
+                blocker, notice = queue_source._actionable_blocker(durable)
+                self.assertIsNone(blocker)
+                self.assertEqual(notice, queue_source.BLOCKER_UNUSABLE.format("not-an-object"))
+
+    def test_a_record_with_no_blocker_produces_no_blocker_and_no_notice(self) -> None:
+        """"There is no blocker" and "the blocker was unreadable" stay different."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        payload = decision_payload()
+        del payload["blocker"]
+        self.decide(payload=payload)
+
+        item = self.waiting_item()
+
+        self.assertIsNone(item.blocker)
+        self.assertIsNone(item.blocker_unavailable)
+
+    # -- proofs 6, 10, 11, 12 over the durable read -----------------------
+
+    def test_no_transport_identity_became_visible_identity(self) -> None:
+        """Proof 6. Session ids and pids stay evidence on the item that has them."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["permission"])))
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        queue = self.load()
+        waiting = [e for e in queue.items if e.state == STATE_WAITING][0]
+        running = [e for e in queue.items if e.state == STATE_RUNNING][0]
+
+        for entry in (waiting, running):
+            with self.subTest(item=entry.item_id):
+                self.assertNotIn(SESSION, entry.item_id)
+                self.assertNotIn(SESSION, entry.rail)
+                self.assertNotIn("4242", entry.item_id)
+        self.assertEqual(waiting.rail, BLOCKED_RAIL)
+        self.assertEqual(running.rail, LIVE_RAIL)
+        # The live rail's session identity survives exactly where it belongs.
+        self.assertIn(
+            SESSION, " ".join(entry.locator for entry in running.evidence)
+        )
+        # And the blocker names an agent by role, never by session.
+        self.assertEqual(waiting.blocker.agent, "executor")
+
+    def test_a_disconnected_agent_item_acquires_no_human_attention_field(self) -> None:
+        """Proof 10 over the durable read, beside a genuine human item."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["permission"])))
+        self.authorize(LIVE_RAIL, "running")
+        self.bind(LIVE_RAIL)  # durable, but this controller owns no handle
+
+        queue = self.load()
+        view = queue.view(filters=QUEUE_STATES_ALL)
+        details = {
+            row.item_id: queue.view(
+                filters=QUEUE_STATES_ALL, selected_id=row.item_id
+            ).detail
+            for row in view.rows
+        }
+
+        agent_items = [d for d in details.values() if d.attention_owner == OWNER_AGENT]
+        human_items = [d for d in details.values() if d.attention_owner == OWNER_HUMAN]
+        self.assertEqual(len(agent_items), 1)
+        self.assertEqual(len(human_items), 1)
+        self.assertEqual(agent_items[0].state, STATE_DISCONNECTED)
+        self.assertEqual(agent_items[0].activity, ACTIVITY_DISCONNECTED_RECOVERY)
+        self.assertIsNone(agent_items[0].blocker)
+        self.assertIsNone(agent_items[0].blocker_unavailable)
+        self.assertIsNotNone(human_items[0].blocker)
+
+    def test_waiting_remains_exactly_the_human_owned_set(self) -> None:
+        """Proof 11, non-vacuous: both kinds present in one real read."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["environment"])))
+        self.authorize(LIVE_RAIL, "running")
+        self.own(self.bind(LIVE_RAIL))
+
+        queue = self.load()
+
+        waiting = {row.item_id for row in queue.view().rows}
+        human = {e.item_id for e in queue.items if e.attention_owner == OWNER_HUMAN}
+        self.assertEqual(waiting, human)
+        self.assertEqual(len(waiting), 1)
+        self.assertEqual(len(queue.view(filters=QUEUE_STATES_ALL).rows), 2)
+
+    def test_the_rows_stayed_dense_through_the_real_read(self) -> None:
+        """Proof 12. Nothing D8 added is reachable from a row."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        published = decision_payload(blocker=dict(BLOCKERS["permission"]))
+        self.decide(payload=published)
+
+        row = self.load().view().rows[0]
+
+        self.assertEqual(
+            {f.name for f in dataclass_fields(type(row))},
+            {"item_id", "state", "title", "project", "ticket", "elapsed_seconds"},
+        )
+        printed = "|".join(str(getattr(row, f.name)) for f in dataclass_fields(type(row)))
+        for value in published["blocker"].values():
+            if isinstance(value, str):
+                self.assertNotIn(value, printed)
+
+    def test_reading_twice_produces_the_same_blocker(self) -> None:
+        """The blocker is a durable fact, not something this read composes."""
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["configuration"])))
+
+        first = self.waiting_item().blocker
+        second = self.waiting_item().blocker
+
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+
+    def test_nothing_durable_was_written_by_projecting_a_blocker(self) -> None:
+        self.authorize(BLOCKED_RAIL, "blocked")
+        self.decide(payload=decision_payload(blocker=dict(BLOCKERS["permission"])))
+        before = self.snapshot()
+
+        self.waiting_item()
+
+        self.assertEqual(self.snapshot(), before)

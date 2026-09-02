@@ -148,6 +148,29 @@ details summary { cursor: pointer; font-weight: 600; }
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 10px 0 0; }
 .facts dt { color: var(--muted); }
 .facts dd { margin: 0; }
+.routing { margin: 0; }
+.routing dd { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+/* The actionable block is bordered rather than tinted, and carries no colour of
+   its own beyond the rule and the heading. A blocker is not an alarm: colouring
+   it would make five kinds of ordinary obstacle read as five severities nobody
+   published, and severity is not one of the nine things D8 asks for. */
+.actionable {
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 14px 16px;
+  max-width: 68ch;
+}
+.actionable h2 { margin: 0; font-size: 14px; letter-spacing: 0.02em; text-transform: uppercase; color: var(--muted); }
+.actionable .facts { margin-top: 12px; }
+.actionable dd { overflow-wrap: anywhere; }
+.withheld {
+  margin: 0;
+  padding: 12px 14px;
+  max-width: 68ch;
+  border: 1px dashed var(--rule);
+  border-radius: 8px;
+  color: var(--muted);
+}
 [hidden] { display: none !important; }
 </style>
 </head>
@@ -166,7 +189,16 @@ details summary { cursor: pointer; font-weight: 600; }
   </aside>
 
   <section class="detail" id="detail" aria-label="Selected decision">
+    <dl class="facts routing" id="routing" aria-label="Affected work"></dl>
+
     <p class="explanation" id="explanation"></p>
+
+    <section class="actionable" id="actionable" hidden aria-labelledby="actionable-kind">
+      <h2 id="actionable-kind"></h2>
+      <dl class="facts" id="actionable-facts"></dl>
+    </section>
+
+    <p class="withheld" id="blocker-withheld" hidden></p>
 
     <form class="response" id="response">
       <label for="response-input">Response</label>
@@ -214,10 +246,41 @@ details summary { cursor: pointer; font-weight: 600; }
   var detailsEl = document.getElementById("details");
   var factsEl = document.getElementById("facts");
   var evidenceEl = document.getElementById("evidence");
+  var routingEl = document.getElementById("routing");
+  var actionableEl = document.getElementById("actionable");
+  var actionableKindEl = document.getElementById("actionable-kind");
+  var actionableFactsEl = document.getElementById("actionable-facts");
+  var withheldEl = document.getElementById("blocker-withheld");
   var allowanceEl = document.getElementById("allowance");
 
   function visible() {
     return items.filter(function (item) { return filters[item.state]; });
+  }
+
+  // One way to draw a labelled list of facts, used by all three of them. Every
+  // value arrives as a text node: published prose is written by people and is
+  // never markup here, whatever it contains.
+  function fillFacts(target, pairs) {
+    while (target.firstChild) { target.removeChild(target.firstChild); }
+    pairs.forEach(function (pair) {
+      var name = document.createElement("dt");
+      name.textContent = pair[0];
+      var value = document.createElement("dd");
+      value.textContent = pair[1];
+      target.appendChild(name);
+      target.appendChild(value);
+    });
+  }
+
+  // The one place the durable boolean becomes words. "May have changed" is the
+  // single answer a person cannot act on, so there is no third branch and no
+  // path that reaches this function without a boolean: the payload carries
+  // `stateChanged` as a JSON boolean, and an item with no blocker never gets
+  // here at all.
+  function stateChangedLabel(changed) {
+    return changed
+      ? "Yes - product or worktree state changed."
+      : "No - no product or worktree state changed.";
   }
 
   function elapsedLabel(seconds) {
@@ -355,8 +418,48 @@ details summary { cursor: pointer; font-weight: 600; }
     var detail = payload.details[item.itemId];
     var waiting = detail.explanation !== null && detail.explanation !== undefined;
 
+    // Which work this is, on every item and above everything else. It used to be
+    // reachable only by decoding the item identity, which is a routing key rather
+    // than something a person reads -- so an item genuinely did not say which
+    // durable rail it was about. The rail is shown as the rail, never as a
+    // session, a worker name or a process: those stay inside Details, as evidence.
+    fillFacts(routingEl, [
+      ["Project", detail.project],
+      ["Ticket", detail.ticket],
+      ["Rail", detail.rail]
+    ]);
+
     explanationEl.textContent = waiting ? detail.explanation : "";
     explanationEl.hidden = !waiting;
+
+    // D8's actionable half. Present exactly when the accepted projection supplied
+    // a complete blocker, and never assembled here from parts: this branch either
+    // prints six published facts or prints none of them. Nothing on this page
+    // fills a missing one in, and nothing shortens one -- the bound that keeps a
+    // blocker readable was applied where it was published.
+    var blocker = detail.blocker;
+    actionableEl.hidden = blocker === null || blocker === undefined;
+    if (!actionableEl.hidden) {
+      actionableKindEl.textContent = blocker.kind + " blocker";
+      fillFacts(actionableFactsEl, [
+        ["What failed", blocker.whatFailed],
+        ["Agent", blocker.agent],
+        ["Missing", blocker.missingCapability],
+        ["You must change", blocker.humanChange],
+        ["State", stateChangedLabel(blocker.stateChanged)],
+        ["Next action", blocker.nextAction]
+      ]);
+    } else {
+      fillFacts(actionableFactsEl, []);
+    }
+
+    // A published blocker that could not be completed says so, in this module's
+    // own words, where the blocker would have been. An item that simply never had
+    // one shows nothing here -- "no blocker" and "the blocker was unreadable" are
+    // different facts and a person acts differently on each.
+    var withheld = detail.blockerUnavailable;
+    withheldEl.hidden = withheld === null || withheld === undefined;
+    withheldEl.textContent = withheldEl.hidden ? "" : withheld;
 
     // Responding belongs to a decision a person was asked to make. An operational
     // row is inspectable, and that is all it is -- so the whole composer goes
@@ -380,18 +483,10 @@ details summary { cursor: pointer; font-weight: 600; }
     // combines them, colours one by the other, or hides one when the other has a
     // particular value -- they are two independent facts and they are printed as
     // two independent facts.
-    while (factsEl.firstChild) { factsEl.removeChild(factsEl.firstChild); }
-    [
+    fillFacts(factsEl, [
       ["Activity", detail.activity],
       ["Attention", detail.attentionOwner]
-    ].forEach(function (pair) {
-      var name = document.createElement("dt");
-      name.textContent = pair[0];
-      var value = document.createElement("dd");
-      value.textContent = pair[1];
-      factsEl.appendChild(name);
-      factsEl.appendChild(value);
-    });
+    ]);
 
     while (evidenceEl.firstChild) { evidenceEl.removeChild(evidenceEl.firstChild); }
     detail.evidence.forEach(function (reference) {

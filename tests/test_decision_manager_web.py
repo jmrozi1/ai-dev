@@ -53,6 +53,7 @@ from ai_dev_flow.claude_allowance import (
 from ai_dev_flow.claude_allowance_view import AllowanceWindowView
 from ai_dev_flow.decision_queue import (
     QUEUE_STATES,
+    ActionableBlocker,
     STATE_DISCONNECTED,
     STATE_RUNNING,
     STATE_WAITING,
@@ -274,8 +275,16 @@ class SerializationTests(unittest.TestCase):
         )
         self.assertEqual(
             set(payload["details"][payload["rows"][0]["itemId"]]),
-            {"state", "activity", "attentionOwner", "explanation", "evidence"},
+            {"state", "activity", "attentionOwner", "explanation", "evidence",
+             # D8's nine reach a person through the detail pane and nowhere else.
+             # Three routing facts on every item, and the actionable half plus its
+             # unavailability reason, which only a decision ever carries.
+             "project", "ticket", "rail", "blocker", "blockerUnavailable"},
         )
+        # And none of the new detail fields reached a row. The dense contract is
+        # the row field set above, and D8 spent nothing out of it.
+        for absent in ("rail", "blocker", "blockerUnavailable"):
+            self.assertNotIn(absent, set(payload["rows"][0]), absent)
         # The row field set above is the dense contract, and neither of the two
         # new facts appears in it: activity and attention owner reach a person
         # through the filters and the detail pane, never as a row field.
@@ -335,6 +344,7 @@ class SerializationTests(unittest.TestCase):
         stray = dict(details)
         stray["not-a-row"] = SelectedDetail(
             item_id="not-a-row", state=STATE_WAITING,
+            project="ai-dev", ticket="issue-55", rail="rail-stray",
             activity=ACTIVITY_BLOCKED, attention_owner=OWNER_HUMAN,
         )
         with self.assertRaises(RenderError) as caught:
@@ -349,6 +359,7 @@ class SerializationTests(unittest.TestCase):
                 view,
                 {only: SelectedDetail(
                     item_id="other", state=STATE_WAITING,
+                    project="ai-dev", ticket="issue-55", rail="rail-other",
                     activity=ACTIVITY_BLOCKED, attention_owner=OWNER_HUMAN,
                 )},
                 allowance=an_allowance(),
@@ -887,10 +898,20 @@ class OperationalComposerTests(unittest.TestCase):
         # `allowance` is the top aggregate band in the queue column, not a
         # substitute for the composer: it is outside the detail pane entirely and
         # says nothing about the selected row.
+        # `blocker-withheld` is in the detail pane and it is not a substitute for
+        # anything: it is written only from `detail.blockerUnavailable`, which only
+        # a decision item can carry, and it is hidden whenever that field is absent.
+        # The guard this test exists to be -- no prose explaining an operational
+        # row's state -- is kept by the two assertions below it rather than by the
+        # element simply not existing.
         self.assertEqual(
             sorted(paragraphs),
-            ["allowance", "explanation", "queue-empty", "response-failure", "response-hint"],
+            ["allowance", "blocker-withheld", "explanation", "queue-empty",
+             "response-failure", "response-hint"],
         )
+        withheld = self.script.split("var withheld =", 1)[1].split("fillFacts(factsEl", 1)[0]
+        self.assertIn("detail.blockerUnavailable", withheld)
+        self.assertIn("withheldEl.hidden = withheld === null", withheld)
         self.assertNotIn("detail", self.ancestry.ancestors["allowance"])
         self.assertEqual(self.page.count("<button"), 1)
         self.assertEqual(self.page.count("<textarea"), 1)
@@ -1658,3 +1679,280 @@ class ObservedServerSurfaceTests(unittest.TestCase):
             connection.request("GET", PAGE_PATH)
             with self.assertRaises(Exception):
                 connection.getresponse().read()
+
+
+# --------------------------------------------------------------------------
+# D8: the actionable half reaches the page, and only where it belongs
+# --------------------------------------------------------------------------
+
+
+BLOCKER_TEXT = {
+    "kind": "permission",
+    "what_failed": "publishing the executor handoff to the coordination remote",
+    "agent": "executor",
+    "missing_capability": "write access to jmrozi1/ai-dev-control-plane for this host key",
+    "human_change": "add this host's public key as a deploy key with write access",
+    "next_action": "re-run the publish step; the checkpoint is already committed",
+}
+
+
+def a_blocker(**overrides):
+    base = dict(BLOCKER_TEXT)
+    base["state_changed"] = True
+    base.update(overrides)
+    return ActionableBlocker(**base)
+
+
+class ActionablePayloadTests(unittest.TestCase):
+    """What a person is handed, field by field, without a second request."""
+
+    def detail_of(self, page, item_id=None):
+        payload = payload_of(page)
+        if item_id is None:
+            item_id = payload["rows"][0]["itemId"]
+        return payload["details"][item_id]
+
+    def test_the_blocker_crosses_as_seven_named_fields_and_verbatim_text(self) -> None:
+        blocker = a_blocker()
+        page, _, _ = rendered([a_decision(blocker=blocker)])
+
+        drawn = self.detail_of(page)["blocker"]
+
+        self.assertEqual(
+            set(drawn),
+            {"kind", "whatFailed", "agent", "missingCapability", "humanChange",
+             "stateChanged", "nextAction"},
+        )
+        self.assertEqual(drawn["kind"], blocker.kind)
+        self.assertEqual(drawn["whatFailed"], blocker.what_failed)
+        self.assertEqual(drawn["agent"], blocker.agent)
+        self.assertEqual(drawn["missingCapability"], blocker.missing_capability)
+        self.assertEqual(drawn["humanChange"], blocker.human_change)
+        self.assertEqual(drawn["nextAction"], blocker.next_action)
+
+    def test_state_changed_crosses_as_a_boolean_in_both_directions(self) -> None:
+        """A phrase in the payload would let two callers ship two phrasings."""
+        for changed in (True, False):
+            with self.subTest(changed=changed):
+                page, _, _ = rendered(
+                    [a_decision(blocker=a_blocker(state_changed=changed))]
+                )
+                drawn = self.detail_of(page)["blocker"]
+                self.assertIs(drawn["stateChanged"], changed)
+                # And the serialized block carries a JSON literal, not a word.
+                block = page.split('id="queue-payload">', 1)[1].split("</script>", 1)[0]
+                self.assertIn('"stateChanged":{0}'.format(str(changed).lower()), block)
+
+    def test_the_three_routing_facts_reach_every_item_s_detail(self) -> None:
+        page, _, _ = rendered([a_decision()], [an_agent()])
+        payload = payload_of(page)
+
+        for row in payload["rows"]:
+            with self.subTest(item=row["itemId"]):
+                detail = payload["details"][row["itemId"]]
+                self.assertEqual(detail["project"], PROJECT)
+                self.assertEqual(detail["ticket"], TICKET)
+                self.assertTrue(detail["rail"].startswith("issue-55-rail-"))
+
+    def test_an_operational_detail_carries_neither_half(self) -> None:
+        """Proof 10 at the payload boundary."""
+        page, _, _ = rendered([a_decision(blocker=a_blocker())], [an_agent()])
+        payload = payload_of(page)
+
+        by_owner = {
+            payload["details"][row["itemId"]]["attentionOwner"]: payload["details"][row["itemId"]]
+            for row in payload["rows"]
+        }
+        self.assertIsNone(by_owner[OWNER_AGENT]["blocker"])
+        self.assertIsNone(by_owner[OWNER_AGENT]["blockerUnavailable"])
+        self.assertIsNotNone(by_owner[OWNER_HUMAN]["blocker"])
+
+    def test_a_decision_with_no_blocker_reports_null_for_both(self) -> None:
+        page, _, _ = rendered([a_decision()])
+        detail = self.detail_of(page)
+        self.assertIsNone(detail["blocker"])
+        self.assertIsNone(detail["blockerUnavailable"])
+
+    def test_an_unsourced_blocker_crosses_as_its_reason_and_no_blocker(self) -> None:
+        notice = "blocker-agent-unsourced: the rail publishes no role assignment."
+        page, _, _ = rendered([a_decision(blocker_unavailable=notice)])
+        detail = self.detail_of(page)
+        self.assertIsNone(detail["blocker"])
+        self.assertEqual(detail["blockerUnavailable"], notice)
+
+    def test_hostile_blocker_text_cannot_become_markup(self) -> None:
+        """Published prose is written by people. It is data here, in every field."""
+        blocker = a_blocker(
+            what_failed=HOSTILE_TITLE,
+            human_change=HOSTILE_EXPLANATION,
+            next_action=HOSTILE_LOCATOR,
+        )
+        page, _, _ = rendered([a_decision(blocker=blocker)])
+
+        drawn = self.detail_of(page)["blocker"]
+        self.assertEqual(drawn["whatFailed"], HOSTILE_TITLE)
+        self.assertEqual(drawn["humanChange"], HOSTILE_EXPLANATION)
+        self.assertEqual(drawn["nextAction"], HOSTILE_LOCATOR)
+        # It survived exactly, and it did not survive as markup.
+        block = page.split('id="queue-payload">', 1)[1].split("</script>", 1)[0]
+        self.assertNotIn("<script>", block)
+        self.assertNotIn("</script>", block)
+        self.assertNotIn("<img", block)
+
+    def test_the_reducer_names_every_field_rather_than_dumping_the_dataclass(self) -> None:
+        """A field added later must not reach a page nobody wrote a place for."""
+        source = Path(web.__file__).read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        # Nothing in this module reflects over a dataclass. Checked on the parsed
+        # names rather than on the text, so the comment beside `_blocker` saying
+        # it deliberately does not use `asdict` does not fail its own claim.
+        names = {
+            node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+        } | {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        for reflective in ("asdict", "astuple", "fields", "__dict__", "vars"):
+            self.assertNotIn(reflective, names, reflective)
+        reducer = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "_blocker"
+        ]
+        self.assertEqual(len(reducer), 1)
+        emitted = {
+            node.value for node in ast.walk(reducer[0])
+            if isinstance(node, ast.Constant) and isinstance(node.value, str)
+        }
+        self.assertTrue(
+            {"kind", "whatFailed", "agent", "missingCapability", "humanChange",
+             "stateChanged", "nextAction"}.issubset(emitted)
+        )
+
+
+class ActionablePageTests(unittest.TestCase):
+    """The page's own declarations about how it draws the actionable half."""
+
+    def setUp(self) -> None:
+        self.page, _, _ = rendered(
+            [a_decision(blocker=a_blocker())], [an_agent()]
+        )
+        self.script = script_of(self.page)
+        self.detail_block = code_only(
+            self.script.split("function renderDetail", 1)[1].split("function render(", 1)[0]
+        )
+
+    def test_the_block_is_hidden_unless_a_complete_blocker_arrived(self) -> None:
+        self.assertIn("actionableEl.hidden = blocker === null", self.detail_block)
+        self.assertIn("var blocker = detail.blocker;", self.detail_block)
+
+    def test_all_six_blocker_facts_are_drawn_and_none_is_composed(self) -> None:
+        for expression in (
+            "blocker.whatFailed", "blocker.agent", "blocker.missingCapability",
+            "blocker.humanChange", "blocker.stateChanged", "blocker.nextAction",
+        ):
+            with self.subTest(expression=expression):
+                self.assertIn(expression, self.detail_block)
+        # Nothing is concatenated onto published text, and nothing is truncated.
+        self.assertNotIn("substring", self.script)
+        self.assertNotIn("slice(0", self.script)
+
+    def test_the_three_routing_facts_are_drawn_for_every_item(self) -> None:
+        for expression in ("detail.project", "detail.ticket", "detail.rail"):
+            with self.subTest(expression=expression):
+                self.assertIn(expression, self.detail_block)
+        # Above the fold rather than inside the collapsed Details block: an
+        # instruction a person must expand something to finish reading is not
+        # actionable on its own.
+        ancestry = ancestry_of(self.page)
+        self.assertNotIn("details", ancestry.ancestors.get("routing", []))
+        self.assertNotIn("details", ancestry.ancestors.get("actionable", []))
+        self.assertIn("detail", ancestry.ancestors.get("actionable", []))
+
+    def test_state_changed_has_exactly_two_answers_and_no_third(self) -> None:
+        """"May have changed" must be unreachable, not merely unwritten."""
+        label = self.script.split("function stateChangedLabel", 1)[1]
+        label = label.split("function ", 1)[0]
+        self.assertIn("Yes - product or worktree state changed.", label)
+        self.assertIn("No - no product or worktree state changed.", label)
+        self.assertEqual(label.count("?"), 1)
+        # No hedge is reachable as displayed text. Checked over the code with its
+        # prose removed and over the markup, because a comment explaining why
+        # "may have changed" is refused must not be what fails this test -- nor
+        # what passes it.
+        readable = code_only(script_of(self.page)).lower()
+        readable += self.page.split("<body>", 1)[1].split("<script", 1)[0].lower()
+        for hedge in ("may have", "unknown", "possibly", "might"):
+            self.assertNotIn(hedge, readable, hedge)
+
+    def test_every_drawn_value_is_a_text_node(self) -> None:
+        """Data cannot become code, in the new block as in the old ones."""
+        self.assertNotIn("innerHTML", self.script)
+        self.assertNotIn("insertAdjacentHTML", self.script)
+        self.assertNotIn("document.write", self.script)
+        fill = self.script.split("function fillFacts", 1)[1]
+        fill = fill.split("function stateChangedLabel", 1)[0]
+        self.assertIn("name.textContent = pair[0];", fill)
+        self.assertIn("value.textContent = pair[1];", fill)
+        self.assertNotIn("innerHTML", fill)
+
+    def test_no_transcript_log_console_or_session_inspector_was_added(self) -> None:
+        """Proof 13, over the served page itself."""
+        lowered = self.page.lower()
+        for forbidden in ("transcript", "raw log", "session inspector", "console.",
+                          "stdout", "stderr", "<iframe", "eventsource", "websocket",
+                          "setinterval", "settimeout", "fetch(", "xmlhttprequest"):
+            with self.subTest(forbidden=forbidden):
+                self.assertNotIn(forbidden, lowered, forbidden)
+
+    def test_no_session_identity_reached_the_page_as_identity(self) -> None:
+        """Proof 6 over the rendered bytes: transport stays inside evidence."""
+        payload = payload_of(self.page)
+        for row in payload["rows"]:
+            with self.subTest(item=row["itemId"]):
+                self.assertNotIn(SESSION_SECRET, json.dumps(row))
+        for item_id, detail in payload["details"].items():
+            with self.subTest(item=item_id):
+                self.assertNotIn(SESSION_SECRET, json.dumps(detail["rail"]))
+                self.assertNotIn(SESSION_SECRET, json.dumps(detail["blocker"]))
+        self.assertNotIn(LIFECYCLE_DETAIL, self.page)
+        self.assertNotIn(LIFECYCLE_REASON, self.page)
+
+
+class ActionableOverHttpTests(unittest.TestCase):
+    """A real client, a real loopback socket, and the accepted server."""
+
+    def test_a_real_client_is_told_all_nine_in_one_response(self) -> None:
+        blocker = a_blocker()
+        _, view, details = rendered([a_decision(blocker=blocker)], [an_agent()])
+        server = make_server(view, details, allowance=an_allowance())
+        self.addCleanup(server.server_close)
+        serving = start_serving(server)
+        self.addCleanup(serving.stop)
+
+        connection = http.client.HTTPConnection(
+            LOOPBACK_HOST, server.server_address[1], timeout=5
+        )
+        try:
+            connection.request("GET", PAGE_PATH)
+            response = connection.getresponse()
+            status = response.status
+            body = response.read().decode("utf-8")
+        finally:
+            connection.close()
+
+        self.assertEqual(status, 200)
+        payload = json.loads(body.split('id="queue-payload">', 1)[1].split("</script>", 1)[0])
+        waiting = [
+            payload["details"][row["itemId"]]
+            for row in payload["rows"] if row["state"] == STATE_WAITING
+        ]
+        self.assertEqual(len(waiting), 1)
+        detail = waiting[0]
+        self.assertEqual(detail["project"], PROJECT)
+        self.assertEqual(detail["ticket"], TICKET)
+        self.assertEqual(detail["rail"], "issue-55-rail-one")
+        self.assertEqual(detail["blocker"]["whatFailed"], blocker.what_failed)
+        self.assertEqual(detail["blocker"]["agent"], blocker.agent)
+        self.assertEqual(
+            detail["blocker"]["missingCapability"], blocker.missing_capability
+        )
+        self.assertEqual(detail["blocker"]["humanChange"], blocker.human_change)
+        self.assertIs(detail["blocker"]["stateChanged"], True)
+        self.assertEqual(detail["blocker"]["nextAction"], blocker.next_action)

@@ -44,6 +44,19 @@ from __future__ import annotations
 # manufactures either of them. A row shows neither: activity reaches a person
 # through the operational filters and the detail pane, because a dense row that can
 # carry one more badge is no longer a dense row.
+#
+# Sixth, a human-owned item must be actionable without leaving it. Decision D8
+# names nine things a person needs before they can clear a permission,
+# configuration, capability, credential or environment obstacle. Three of them are
+# durable routing facts this module already held and simply never showed --
+# project, ticket and the durable rail -- and six more arrive as one validated
+# block, `ActionableBlocker`, or do not arrive at all. There is no partial
+# version and no synthesised one: a field this module cannot source from the
+# durable record is reported as unsourced, by name, rather than paraphrased into
+# something that reads like an instruction. All of it lives in the selected
+# detail. `QueueRow` gained no field, because a dense row that can carry one more
+# useful thing is no longer a dense row, and `OperationalAgent` gained none
+# either, because an agent-owned item does not become human work by being stuck.
 
 from dataclasses import dataclass
 from typing import Iterable, Optional, Sequence, Tuple
@@ -64,6 +77,8 @@ from .session_lifecycle import (
 )
 
 __all__ = [
+    "ActionableBlocker",
+    "BLOCKER_KINDS",
     "DEFAULT_FILTERS",
     "DecisionQueue",
     "EvidenceReference",
@@ -97,6 +112,18 @@ MAX_LABEL = 80
 MAX_LOCATOR = 200
 MAX_TITLE = 120
 MAX_EXPLANATION = 2000
+# The D8 blocker strings. 240 is `control_plane.MAX_DECISION_BLOCKER_STRING`, the
+# bound the publisher already enforces, restated rather than imported: this module
+# is pure, and importing the control plane to borrow an integer would give a
+# clock-free, file-free projection a dependency on Git and the filesystem. Restated
+# constants drift, so a test asserts the two are equal rather than trusting this
+# comment to be read.
+MAX_BLOCKER_TEXT = 240
+# This module's own sentence about why an actionable field could not be sourced.
+# Deliberately larger than one blocker string and far smaller than an explanation:
+# it names fields and says where they were looked for, and it is never a place to
+# put what the blocker would have said.
+MAX_BLOCKER_NOTICE = 400
 
 # Stable refusal reasons.
 REASON_INVALID_TEXT = "invalid-text"
@@ -112,6 +139,15 @@ REASON_DUPLICATE_ITEM = "duplicate-item-identity"
 REASON_INVALID_FILTER = "invalid-filter"
 REASON_ACTIVITY_CONTRADICTS_STATE = "activity-contradicts-state"
 REASON_WAITING_NOT_HUMAN_OWNED = "waiting-is-not-the-human-owned-set"
+REASON_INVALID_BLOCKER = "invalid-blocker"
+REASON_UNSUPPORTED_BLOCKER_KIND = "unsupported-blocker-kind"
+REASON_BLOCKER_STATE_NOT_EXPLICIT = "blocker-state-changed-not-explicit"
+REASON_BLOCKER_DOUBLE_ANSWER = "blocker-both-carried-and-unsourced"
+
+# The five failure kinds D8 names, and no sixth. Restated from
+# `control_plane.DECISION_BLOCKER_KINDS` for the reason the bound above is, and
+# checked against it by a test rather than by this comment.
+BLOCKER_KINDS = ("permission", "configuration", "capability", "credential", "environment")
 
 
 class QueueError(Exception):
@@ -213,6 +249,29 @@ def _references(value: object, *, label: str) -> Tuple["EvidenceReference", ...]
     return value
 
 
+def _blocker(blocker: object, unavailable: object) -> None:
+    """At most one answer about D8's actionable half, and each one well formed.
+
+    Split out rather than inlined because the pair is one rule, not two fields.
+    `ActionableBlocker` already refuses an incomplete blocker when it is
+    constructed; what is left to check here is that a caller did not hand this
+    item both a blocker and a statement that no blocker could be sourced.
+    """
+    if blocker is not None and type(blocker) is not ActionableBlocker:
+        raise QueueError(
+            REASON_INVALID_BLOCKER,
+            "blocker must be an ActionableBlocker, got {0!r}".format(type(blocker).__name__),
+        )
+    if unavailable is not None:
+        _text(unavailable, label="blocker_unavailable", limit=MAX_BLOCKER_NOTICE)
+        if blocker is not None:
+            raise QueueError(
+                REASON_BLOCKER_DOUBLE_ANSWER,
+                "an item carries an actionable blocker and also reports that one could "
+                "not be sourced; a person reading both learns neither",
+            )
+
+
 # The two item kinds. They are the first encoded component, so a decision and an
 # operational agent can never produce the same identity even when every other
 # durable fact matches.
@@ -244,6 +303,73 @@ def _identity(kind: str, *parts: str) -> str:
 
 
 @dataclass(frozen=True)
+class ActionableBlocker:
+    """The six failure facts D8 requires, complete or absent. There is no partial one.
+
+    D8 names nine things a human-attention item must state. Three of them --
+    project, ticket and the durable rail -- are routing facts the item already
+    carries, and they are not restated here: one fact stored twice is two facts
+    that can disagree, and this projection has spent five other rules on making
+    disagreement impossible rather than plausible. The remaining six live here.
+
+    Every field is required, with no default, so an incomplete blocker cannot be
+    constructed at all. That is the whole design: a half-described obstacle is the
+    kind of item a person re-reads, fails to act on, and leaves in the queue. The
+    publisher already enforces the same all-or-nothing rule
+    (`control_plane._decision_blocker`); this is the second, independent
+    enforcement at the projection boundary, so a record that reached this module
+    without passing that one still cannot produce a plausible-looking half answer.
+
+    `agent` is the affected agent, and it is the one field with no dedicated
+    durable home. It is sourced from the durable rail's own published assignment
+    by `queue_source`, which is the only statement of who works a rail that
+    survives the transport being replaced. It is carried verbatim and validated
+    only as bounded text: a rail may legitimately name an assignment this product
+    models no session role for, and refusing it here would be this module deciding
+    what a durable record is allowed to say.
+
+    `state_changed` is an exact `bool`. "The worktree may have changed" is the one
+    answer a person cannot act on, so there is no third value and no string that
+    could carry one.
+    """
+
+    kind: str
+    what_failed: str
+    agent: str
+    missing_capability: str
+    human_change: str
+    state_changed: bool
+    next_action: str
+
+    def __post_init__(self) -> None:
+        if self.kind not in BLOCKER_KINDS:
+            raise QueueError(
+                REASON_UNSUPPORTED_BLOCKER_KIND,
+                "blocker kind must be one of {0}; got {1!r}".format(
+                    ", ".join(BLOCKER_KINDS), self.kind
+                ),
+            )
+        _text(self.what_failed, label="blocker what_failed", limit=MAX_BLOCKER_TEXT)
+        _text(self.agent, label="blocker agent", limit=MAX_BLOCKER_TEXT)
+        _text(
+            self.missing_capability, label="blocker missing_capability", limit=MAX_BLOCKER_TEXT
+        )
+        _text(self.human_change, label="blocker human_change", limit=MAX_BLOCKER_TEXT)
+        _text(self.next_action, label="blocker next_action", limit=MAX_BLOCKER_TEXT)
+        # `type(...) is bool` rather than `isinstance`: `1` and `0` are `int`
+        # values that would pass an `isinstance(..., int)` check and print as
+        # something other than a decision, and a truthy string would pass any
+        # check that only asked whether it was set.
+        if type(self.state_changed) is not bool:
+            raise QueueError(
+                REASON_BLOCKER_STATE_NOT_EXPLICIT,
+                "blocker state_changed must be exactly True or False, got {0!r}; "
+                "'it may have changed' is the one answer a person cannot act "
+                "on".format(self.state_changed),
+            )
+
+
+@dataclass(frozen=True)
 class EvidenceReference:
     """A pointer to evidence, never the evidence itself."""
 
@@ -272,6 +398,15 @@ class PendingDecision:
     session is live, or while its execution ownership can no longer be proved at
     all. Pinning one to the other here would be the derivation this checkpoint
     exists to remove.
+
+    `blocker` and `blocker_unavailable` are D8's actionable half, and exactly one
+    of them may be set. A published record that carries no blocker block sets
+    neither: not every decision a person is asked to make is a failure, and an
+    item asking which of two approaches to take has no "what failed" to state.
+    A record that does carry one either produces a complete `ActionableBlocker`
+    or sets `blocker_unavailable` to the reason it could not, naming the field
+    that had no durable source. Both at once is refused, because "here is the
+    blocker, and also it could not be sourced" is not something a person can read.
     """
 
     decision_id: str
@@ -285,6 +420,8 @@ class PendingDecision:
     activity: str
     attention_owner: str
     evidence: Tuple[EvidenceReference, ...] = ()
+    blocker: Optional["ActionableBlocker"] = None
+    blocker_unavailable: Optional[str] = None
 
     def __post_init__(self) -> None:
         _text(self.decision_id, label="decision_id", limit=MAX_LABEL)
@@ -308,6 +445,7 @@ class PendingDecision:
                 "Waiting row outside the human-owned set".format(self.attention_owner),
             )
         _references(self.evidence, label="evidence")
+        _blocker(self.blocker, self.blocker_unavailable)
 
     @property
     def item_id(self) -> str:
@@ -445,14 +583,38 @@ class SelectedDetail:
     purpose. The accepted contract is that richer activity states reach a person
     through the operational filters and this pane, never as a per-row badge, so
     there is deliberately nowhere on a row to put either of them.
+
+    `project`, `ticket` and `rail` are three of D8's nine, and they are required
+    on both kinds of item rather than optional on one. They were always known --
+    `item_id` encodes all three -- but that encoding is a routing key, not
+    something a person reads, so a human-owned item genuinely did not state which
+    durable rail it was about. They are stated for operational items too, because
+    an item that names its rail only in its title is naming it by coincidence.
+
+    `blocker` and `blocker_unavailable` are the other half, and only a decision
+    item ever carries either. An operational item is refused them at the one place
+    details are built: being blocked or disconnected is agent-owned work, and
+    giving it human-attention fields would put it in front of a person who has
+    nothing to do about it.
     """
 
     item_id: str
     state: str
+    project: str
+    ticket: str
+    rail: str
     activity: str
     attention_owner: str
     explanation: Optional[str] = None
     evidence: Tuple[EvidenceReference, ...] = ()
+    blocker: Optional[ActionableBlocker] = None
+    blocker_unavailable: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        _text(self.project, label="detail project", limit=MAX_LABEL)
+        _text(self.ticket, label="detail ticket", limit=MAX_LABEL)
+        _text(self.rail, label="detail rail", limit=MAX_LOCATOR)
+        _blocker(self.blocker, self.blocker_unavailable)
 
 
 @dataclass(frozen=True)
@@ -499,19 +661,35 @@ class DecisionQueue:
             return SelectedDetail(
                 item_id=entry.item_id,
                 state=entry.state,
+                project=entry.project,
+                ticket=entry.ticket,
+                rail=entry.rail,
                 activity=entry.activity,
                 attention_owner=entry.attention_owner,
                 explanation=entry.explanation,
                 evidence=entry.evidence,
+                # D8's actionable half reaches a person here and nowhere else.
+                # Carried across exactly as it arrived: this pane is where the
+                # published text is read, so summarising it on the way would be
+                # the screen writing the sentence a person is meant to act on.
+                blocker=entry.blocker,
+                blocker_unavailable=entry.blocker_unavailable,
             )
         # An operational item has no human-decision explanation, and inventing a
         # plausible one is how a screen starts asking for decisions nobody raised.
         # Its evidence is a different kind entirely: the transport sessions behind
         # this rail, bounded, carried here because Details is the one place session
         # identity is allowed to be seen at all.
+        # No blocker and no unavailability notice, and not because an operational
+        # item happens to have neither to give: `OperationalAgent` has no field
+        # for either, so there is nothing here to pass even by accident. An item
+        # whose agent is stuck is still the agent's to unstick.
         return SelectedDetail(
             item_id=entry.item_id,
             state=entry.state,
+            project=entry.project,
+            ticket=entry.ticket,
+            rail=entry.rail,
             activity=entry.activity,
             attention_owner=entry.attention_owner,
             evidence=entry.evidence,
