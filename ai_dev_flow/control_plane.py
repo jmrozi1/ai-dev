@@ -882,6 +882,94 @@ def _checkpoint_subject(product_repo: Path, commit: str) -> str:
     return completed.stdout.strip()
 
 
+_FLOW_SUBJECT = re.compile(r"\A(?:0|[1-9][0-9]*)\Z")
+
+
+def _lineage_checkpoints(product_repo: Path, *, since: str, until: str) -> list[int]:
+    """The numeric Flow subjects on the product lineage `since..until`, oldest first.
+
+    Read from product history and nothing else. Commits that are not Flow
+    checkpoints -- a merge, a note, anything whose subject is not a bare decimal
+    number -- are not checkpoints and are skipped rather than refused; only what
+    the product actually numbered counts. `--topo-order --reverse` puts a parent
+    before its child, so the list is the order the checkpoints were reached
+    rather than the order their commit dates happen to sort in.
+    """
+    completed = _git_capture(
+        product_repo,
+        ["log", "--topo-order", "--reverse", "--format=%s", f"{since}..{until}", "--"],
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+        raise ControlPlaneError(
+            f"Cannot accept: the product lineage {since}..{until} could not be read from "
+            f"{product_repo}. {detail}"
+        )
+    return [
+        int(subject)
+        for subject in (line.strip() for line in completed.stdout.splitlines())
+        if _FLOW_SUBJECT.match(subject)
+    ]
+
+
+def _require_contiguous_lineage(
+    product_repo: Path,
+    *,
+    standing: int,
+    standing_commit: str | None,
+    checkpoint: int,
+    commit: str,
+) -> None:
+    """Refuse unless the range this acceptance makes accepted is real product lineage.
+
+    One acceptance may advance the accepted checkpoint by more than one, and when
+    it does, every checkpoint it steps over becomes accepted by that same act.
+    The record therefore has to be able to stand for the whole range `standing+1
+    .. checkpoint` -- so this proves the range from product history before the
+    record is allowed to imply it, rather than letting the reader manufacture the
+    integers in between.
+
+    Three things are established, all from the product repository:
+
+    - the previously accepted product commit **is an ancestor of** the one being
+      accepted, so the two are one lineage and not two branches;
+    - the numeric Flow subjects reachable from the new commit but not from the
+      previously accepted one are **exactly** `standing+1, standing+2, ... checkpoint`,
+      in that order, so every newly accepted checkpoint exists on that lineage and
+      its number is read from product history rather than stated;
+    - nothing else numbered is in there, so a checkpoint cannot be hidden by the
+      jump, and a checkpoint that does not exist cannot be invented by it.
+
+    The first acceptance into an empty record has no previously accepted commit
+    to measure against. It stands for itself alone, and no earlier checkpoint is
+    implied by it -- which is why adopting this record mid-ticket does not
+    retroactively claim checkpoints nobody published a record for.
+    """
+    if standing_commit is None:
+        return
+    if not branch_contains(product_repo, ancestor=standing_commit, descendant=commit):
+        raise ControlPlaneError(
+            f"Cannot accept: the accepted checkpoint {standing} at {standing_commit} is not an "
+            f"ancestor of {commit} in {product_repo}. Acceptance advances one product lineage, "
+            "so the checkpoints between them can be read from history rather than assumed."
+        )
+    reached = _lineage_checkpoints(product_repo, since=standing_commit, until=commit)
+    expected = list(range(standing + 1, checkpoint + 1))
+    if reached != expected:
+        raise ControlPlaneError(
+            f"Cannot accept: accepting checkpoint {checkpoint} over the accepted checkpoint "
+            f"{standing} makes {_range_phrase(expected)} accepted, but the product lineage "
+            f"{standing_commit}..{commit} carries {_range_phrase(reached)}. The accepted range "
+            "is read from product history; it is never manufactured."
+        )
+
+
+def _range_phrase(checkpoints: list[int]) -> str:
+    if not checkpoints:
+        return "no numbered checkpoint"
+    return "checkpoint " + ", ".join(str(number) for number in checkpoints)
+
+
 def _publish_acceptance(
     repo_root: Path,
     *,
@@ -973,6 +1061,13 @@ def accept_progress(
     checked against durable product history rather than taken on the caller's
     word.
 
+    One acceptance may advance the accepted checkpoint by more than one, and when
+    it does, every checkpoint it steps over becomes accepted by this same act and
+    is derived back out of the record as such. So the whole range it makes
+    accepted is proved against the product lineage first: see
+    `_require_contiguous_lineage`. A jump the product history does not actually
+    carry is refused, never filled in.
+
     Publication is fail-closed against a lost record. The currently published
     state is read first and its head is carried into `publish`, so a record that
     landed in between refuses this one rather than overwriting it. That, and not
@@ -1009,6 +1104,13 @@ def accept_progress(
                 f"{str(checkpoint)!r}. The accepted checkpoint number is read from product "
                 "history, not stated."
             )
+        _require_contiguous_lineage(
+            root,
+            standing=standing,
+            standing_commit=None if accepted is None else accepted["commit"],
+            checkpoint=checkpoint,
+            commit=commit,
+        )
         accepted = {"checkpoint": checkpoint, "commit": commit}
 
     completion = current["named"]
@@ -1025,10 +1127,20 @@ def accept_progress(
                 "grow and a completion means nothing without the size it was reached on."
             )
         standing = _completed_named(current)
-        if named <= standing:
+        # Named completion is the contiguous prefix of the roadmap, so a
+        # completion follows the standing one by exactly one. Strictly
+        # increasing is not enough: 1 -> 3 would leave the served page
+        # asserting that named checkpoint 2 was completed with nothing
+        # recording it. The first completion into an empty record has no
+        # standing one to follow and stands alone -- the record may be adopted
+        # part-way through a roadmap, and doing so claims no earlier checkpoint.
+        # This action deliberately has no grouped named completion; one act
+        # completes one named checkpoint.
+        if named <= standing or (standing and named != standing + 1):
             raise ControlPlaneError(
                 f"Cannot accept: named checkpoint {named} does not follow the completed named "
-                f"checkpoint {standing}."
+                f"checkpoint {standing}. Completed named checkpoints are the contiguous prefix "
+                "of the roadmap; completion advances one checkpoint at a time."
             )
         completion = {"checkpoint": named, "total": named_total}
 

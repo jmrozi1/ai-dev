@@ -35,7 +35,11 @@ from __future__ import annotations
 # happens only when the orchestrator publishes that record; the act of pushing a
 # checkpoint to the product remote touches nothing here. Accepted checkpoints
 # must arrive strictly increasing, and there is no published shape a not-yet-
-# accepted checkpoint could occupy.
+# accepted checkpoint could occupy. One published version may advance the
+# accepted checkpoint by more than one, and every checkpoint that advance makes
+# accepted is derived out of it -- see `_newly_accepted` -- so a checkpoint the
+# product accepted cannot go missing from these facts just because one event
+# accepted several.
 #
 # Third, a projection is measured against evidence rather than against a claim.
 # The basis of a projection is the accepted checkpoint standing in the very
@@ -256,6 +260,40 @@ def _exact_object_name(value: object) -> str:
 # --------------------------------------------------------------------------
 
 
+def _newly_accepted(checkpoint: int, acceptances: List["Acceptance"]) -> range:
+    """Which numeric checkpoints one published record newly makes accepted.
+
+    The record is a compact current-state artifact: it names the checkpoint that
+    stands accepted, not the list of every checkpoint that ever did. The list is
+    the difference between consecutive published versions, which is why there is
+    no event log here to keep in step with anything.
+
+    A version that advances the accepted checkpoint from N to M makes every
+    checkpoint in N+1 .. M accepted, because one acceptance event is what made
+    each of them accepted; they therefore share that event's commit and its
+    instant, which is the honest source for all of them. Deriving only M would
+    lose the ones stepped over -- they would be accepted in the product and
+    absent from every figure computed here.
+
+    Nothing is invented by that. The supported action proves the whole range
+    against the product lineage before publishing a record that implies it, and
+    refuses a jump product history does not carry. The very first acceptance has
+    no predecessor to measure from, so it stands for itself alone and claims no
+    earlier checkpoint. A republished record that restates the standing
+    checkpoint accepts nothing new; one that goes backwards is a refusal.
+    """
+    if not acceptances:
+        return range(checkpoint, checkpoint + 1)
+    standing = acceptances[-1].checkpoint
+    if checkpoint < standing:
+        raise ProgressStoreError(
+            REASON_CHECKPOINT_REGRESSED,
+            "accepted checkpoints are published strictly increasing; {0} "
+            "follows {1}".format(checkpoint, standing),
+        )
+    return range(standing + 1, checkpoint + 1)
+
+
 class ProgressStore:
     """One ticket's published progress record, and every version of it.
 
@@ -301,20 +339,12 @@ class ProgressStore:
         accepted_checkpoints = set()
         for commit, instant, document in versions:
             accepted = document["accepted"]
-            if accepted is not None and (
-                not acceptances or accepted["checkpoint"] != acceptances[-1].checkpoint
-            ):
-                entry = Acceptance(
-                    checkpoint=accepted["checkpoint"], commit=commit, accepted_at=instant
-                )
-                if acceptances and entry.checkpoint <= acceptances[-1].checkpoint:
-                    raise ProgressStoreError(
-                        REASON_CHECKPOINT_REGRESSED,
-                        "accepted checkpoints are published strictly increasing; {0} "
-                        "follows {1}".format(entry.checkpoint, acceptances[-1].checkpoint),
+            if accepted is not None:
+                for number in _newly_accepted(accepted["checkpoint"], acceptances):
+                    acceptances.append(
+                        Acceptance(checkpoint=number, commit=commit, accepted_at=instant)
                     )
-                acceptances.append(entry)
-                accepted_checkpoints.add(entry.checkpoint)
+                    accepted_checkpoints.add(number)
 
             completion = document["named"]
             if completion is not None and (
@@ -326,11 +356,11 @@ class ProgressStore:
                     commit=commit,
                     completed_at=instant,
                 )
-                if named and entry.checkpoint <= named[-1].checkpoint:
+                if named and entry.checkpoint != named[-1].checkpoint + 1:
                     raise ProgressStoreError(
                         REASON_NAMED_OUT_OF_ORDER,
-                        "completed named checkpoints are published strictly "
-                        "increasing; {0} follows {1}".format(
+                        "completed named checkpoints are the contiguous prefix of the "
+                        "roadmap; {0} follows {1}".format(
                             entry.checkpoint, named[-1].checkpoint
                         ),
                     )

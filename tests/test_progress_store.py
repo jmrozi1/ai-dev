@@ -354,6 +354,96 @@ class AcceptanceTests(ProgressStoreTestCase):
         self.assertEqual(raised.exception.reason, REASON_MALFORMED_STORE)
 
 
+class GroupedAcceptanceTests(ProgressStoreTestCase):
+    """One acceptance event may accept several checkpoints, and keeps them all.
+
+    The record is a compact current-state artifact, so what these prove is that
+    the *derivation* from consecutive published versions loses nothing: every
+    checkpoint an event made accepted comes back out of the history it left
+    behind, and no checkpoint the product never carried is invented by it.
+
+    Nothing here is written by hand. Every acceptance below goes through the
+    supported production action against a real product repository, and the
+    numbers are generic -- a baseline and a run above it -- rather than this
+    ticket's own.
+    """
+
+    BASE = 30
+
+    def a_run_above_the_baseline(self, length: int) -> str:
+        """Real contiguous product checkpoints BASE+1 .. BASE+length, published.
+
+        Publishing them is all this does. None of them is accepted by existing;
+        the acceptance is a separate act, which is the whole point of the
+        distinction being tested.
+        """
+        commit = ""
+        for number in range(self.BASE + 1, self.BASE + length + 1):
+            commit = self.checkpoint_commit(number)
+        return commit
+
+    def test_one_acceptance_of_a_run_keeps_every_checkpoint_it_accepts(self) -> None:
+        """A single event advancing N to N+3 leaves all three in retained history."""
+        self.accept(self.BASE, "2026-08-30T09:00:00+00:00")
+        top = self.a_run_above_the_baseline(3)
+        self.publish("2026-09-02T09:00:00+00:00", checkpoint=self.BASE + 3, commit=top)
+        self.assertEqual(
+            [entry.checkpoint for entry in self.store.facts().acceptances],
+            [self.BASE, self.BASE + 1, self.BASE + 2, self.BASE + 3],
+        )
+
+    def test_every_checkpoint_one_event_accepted_is_sourced_to_that_event(self) -> None:
+        """They share the acceptance commit and its instant, because one act made them accepted."""
+        self.accept(self.BASE, "2026-08-30T09:00:00+00:00")
+        top = self.a_run_above_the_baseline(3)
+        self.publish("2026-09-02T09:00:00+00:00", checkpoint=self.BASE + 3, commit=top)
+        grouped = self.store.facts().acceptances[1:]
+        acceptance_commit = self._git("rev-parse", "HEAD")
+        self.assertEqual(
+            self._git("log", "-1", "--format=%s", acceptance_commit),
+            "orchestrator: accept ({0}/{1})".format(PROJECT, TICKET),
+        )
+        for entry in grouped:
+            self.assertEqual(entry.commit, acceptance_commit)
+            self.assertEqual(
+                entry.accepted_at, self._git("log", "-1", "--format=%cI", acceptance_commit)
+            )
+        self.assertNotEqual(grouped[0].accepted_at, self.store.facts().acceptances[0].accepted_at)
+
+    def test_a_run_the_product_never_carried_is_refused_rather_than_filled_in(self) -> None:
+        """The missing checkpoint is not manufactured; the acceptance is refused."""
+        self.accept(self.BASE, "2026-08-30T09:00:00+00:00")
+        self.checkpoint_commit(self.BASE + 1)
+        top = self.checkpoint_commit(self.BASE + 3)  # BASE+2 was never published
+        before = self.published()
+        with self.assertRaises(ControlPlaneError) as raised:
+            self.publish("2026-09-02T09:00:00+00:00", checkpoint=self.BASE + 3, commit=top)
+        self.assertIn("read from product history", str(raised.exception))
+        self.assertEqual(self.published(), before)
+        self.assertEqual(
+            [entry.checkpoint for entry in self.store.facts().acceptances], [self.BASE]
+        )
+
+    def test_a_checkpoint_off_the_accepted_lineage_is_refused(self) -> None:
+        """A run must descend from what is already accepted, not merely be numbered above it."""
+        self.accept(self.BASE, "2026-08-30T09:00:00+00:00")
+        self._run(self.product, "checkout", "-q", "--orphan", "elsewhere")
+        divergent = self.checkpoint_commit(self.BASE + 1)
+        with self.assertRaises(ControlPlaneError) as raised:
+            self.publish("2026-09-02T09:00:00+00:00", checkpoint=self.BASE + 1, commit=divergent)
+        self.assertIn("is not an ancestor of", str(raised.exception))
+        self.assertEqual(
+            [entry.checkpoint for entry in self.store.facts().acceptances], [self.BASE]
+        )
+
+    def test_the_first_acceptance_claims_no_checkpoint_before_itself(self) -> None:
+        """Adopting the record part-way through a ticket does not backfill 1 .. N."""
+        self.accept(self.BASE, "2026-08-30T09:00:00+00:00")
+        self.assertEqual(
+            [entry.checkpoint for entry in self.store.facts().acceptances], [self.BASE]
+        )
+
+
 # --------------------------------------------------------------------------
 # Projection: measured against evidence, never against a claim
 # --------------------------------------------------------------------------
@@ -371,6 +461,8 @@ class ProjectionTests(ProgressStoreTestCase):
 
         self.assertNotIn("basis", inspect.signature(accept_progress).parameters)
         self.accept(48, remaining=12)
+        for number in (49, 50, 51):
+            self.checkpoint_commit(number)
         self.accept(52, remaining=10)
         projections = self.store.facts().projections
         self.assertEqual([entry.basis for entry in projections], [48, 52])
@@ -445,7 +537,7 @@ class ProjectionNoteTests(ProgressStoreTestCase):
 
 
 class NamedCompletionTests(ProgressStoreTestCase):
-    def test_completions_are_derived_strictly_increasing(self) -> None:
+    def test_completions_are_the_contiguous_prefix_of_the_roadmap(self) -> None:
         for number in (1, 2, 3):
             self.publish(named=number, named_total=9)
         self.assertEqual(
@@ -459,6 +551,34 @@ class NamedCompletionTests(ProgressStoreTestCase):
                 with self.assertRaises(ControlPlaneError) as raised:
                     self.publish(named=number, named_total=9)
                 self.assertIn("does not follow", str(raised.exception))
+
+    def test_a_gap_in_the_prefix_is_refused(self) -> None:
+        """1 -> 3 would assert that named checkpoint 2 completed with nothing recording it.
+
+        Completing 1 and then 3 is the exact shape that stopped being refused, so
+        this asks the supported action for it directly and then reads the history
+        back: the refusal must leave the recorded completions untouched, and the
+        contiguous step that follows must still be ordinary.
+        """
+        self.publish(named=1, named_total=9)
+        before = self.published()
+        with self.assertRaises(ControlPlaneError) as raised:
+            self.publish(named=3, named_total=9)
+        self.assertIn("does not follow", str(raised.exception))
+        self.assertEqual(self.published(), before)
+        self.assertEqual([entry.checkpoint for entry in self.store.facts().named], [1])
+        self.publish(named=2, named_total=9)
+        self.assertEqual([entry.checkpoint for entry in self.store.facts().named], [1, 2])
+
+    def test_a_gap_in_the_prefix_in_the_history_is_refused_on_read(self) -> None:
+        """A record no supported action could have written is a refusal, not a repair."""
+        self.publish(named=1, named_total=9)
+        document = self.published()
+        document["named"] = {"checkpoint": 3, "total": 9}
+        self.commit_record(document)
+        with self.assertRaises(ProgressStoreError) as raised:
+            self.store.facts()
+        self.assertEqual(raised.exception.reason, REASON_NAMED_OUT_OF_ORDER)
 
     def test_a_regressed_completion_in_the_history_is_refused_on_read(self) -> None:
         self.publish(named=6, named_total=9)

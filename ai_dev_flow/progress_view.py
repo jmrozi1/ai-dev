@@ -252,6 +252,13 @@ def _deltas(facts: ProgressFacts, now: int):
     percentage-point delta would need the denominator that stood at each past
     instant, and would move when the estimate was revised -- which is precisely
     the confusion D11 asks this surface to prevent.
+
+    Checkpoints, not publications. The store yields one acceptance fact per
+    accepted numeric checkpoint even when one acceptance event accepted several,
+    so an event that took the accepted checkpoint from 52 to 54 contributes the
+    two it made accepted rather than the one record it wrote. Counting records
+    would report a smaller figure than the truth in exactly the case this
+    surface exists to describe.
     """
     if not facts.acceptances:
         return (None, None, REASON_INSUFFICIENT_HISTORY)

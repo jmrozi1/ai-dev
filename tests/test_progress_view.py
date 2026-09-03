@@ -580,6 +580,32 @@ class DeltaTests(ProgressViewTestCase):
         self.assertIsNone(view.delta_48h)
         self.assertEqual(view.delta_reason, REASON_HISTORY_AFTER_NOW)
 
+    def test_the_delta_counts_checkpoints_and_not_the_records_that_accepted_them(
+        self,
+    ) -> None:
+        """One event accepting three checkpoints is +3, because three became accepted.
+
+        This is the difference between counting accepted numeric checkpoints --
+        what this surface says it reports -- and counting the records that
+        published them. They coincide only while every acceptance advances by
+        exactly one, so the fixture deliberately advances by three in a single
+        act and would read 1 under the record-counting reading.
+        """
+        self.accept(30, "2026-08-30T09:00:00+00:00", remaining=12)
+        for number in (31, 32):
+            self.checkpoint_commit(number)
+        top = self.checkpoint_commit(33)
+        self.publish("2026-09-02T09:00:00+00:00", checkpoint=33, commit=top, remaining=9)
+        facts = self.store.facts()
+        self.assertEqual(
+            [entry.checkpoint for entry in facts.acceptances], [30, 31, 32, 33]
+        )
+        view = self.view("2026-09-02T12:00:00+00:00")
+        self.assertEqual(view.delta_24h, 3)
+        self.assertEqual(view.delta_48h, 3)
+        self.assertIsNone(view.delta_reason)
+        self.assertEqual(view.accepted_checkpoint, 33)
+
     def test_the_delta_counts_accepted_checkpoints_and_not_percentage_points(self) -> None:
         """A percentage-point delta would move when the estimate was revised."""
         self.the_issue_55_baseline()
