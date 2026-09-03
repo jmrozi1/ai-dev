@@ -58,6 +58,14 @@ STATE_RUNNING = "running"
 STATE_DISCONNECTED = "disconnected"
 PROJECTED_STATES = (STATE_WAITING, STATE_RUNNING, STATE_DISCONNECTED)
 
+# D9's safe boundary, projected the same way every other lifecycle state is: from
+# exact current facts, never stored. These are not scheduler states -- nothing
+# queues, schedules, or waits on them, and reaching `rotation-ready` performs no
+# action at all.
+ROTATION_READY = "rotation-ready"
+ROTATION_NOT_READY = "not-rotation-ready"
+ROTATION_STATES = (ROTATION_READY, ROTATION_NOT_READY)
+
 RAIL_STATUS_RUNNING = "running"
 RAIL_STATUS_BLOCKED = "blocked"
 
@@ -89,6 +97,11 @@ REASON_BLOCKED_WITHOUT_DECISION = "blocked-without-decision"
 REASON_RAIL_NOT_RUNNING = "rail-not-running"
 REASON_LAUNCH_FAILED = "launch-failed"
 REASON_INVALID_TIMESTAMP = "invalid-timestamp"
+
+REASON_NOT_MARKED_FOR_ROTATION = "not-marked-for-rotation"
+REASON_HANDOFF_NOT_PUBLISHED = "durable-handoff-not-published"
+REASON_WORKTREE_INCOHERENT = "worktree-incoherent"
+REASON_ROTATION_HANDOFF_ESTABLISHED = "durable-handoff-established"
 
 REASON_DISCONNECTED_NO_HANDLE = "disconnected-no-owned-handle"
 REASON_DISCONNECTED_NOT_LIVE = "disconnected-process-group-gone"
@@ -886,4 +899,306 @@ def recover_session(
     raise LifecycleError(
         REASON_HANDLE_MISMATCH,
         "session {0} has a live owned handle; it is not disconnected.".format(record.session_id),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Rotation readiness -- D9's safe boundary, and deliberately nothing past it
+# ---------------------------------------------------------------------------
+#
+# D9 says a marked session must, "at the next safe boundary", leave durable
+# resumable state, and that "only after that safe handoff" may the manager
+# terminate the old context. This section answers exactly the first half: has that
+# boundary been reached, and is that durable state established? It terminates
+# nothing, stops nothing, launches nothing, and writes nothing.
+#
+# Two choices are worth stating because both were the smaller option.
+#
+# First, rotation readiness is *projected*, not stored. There is no new scheduler
+# state, no new flag on a session, and nothing to invalidate -- for the same
+# reason `observe_session` projects rather than caches. A stored `rotation-ready`
+# bit would be a claim about a boundary nobody re-observed, and it would be false
+# the instant the next invocation starts or the worktree is touched. Projecting it
+# means the answer is always about the moment it was asked.
+#
+# Second, the boundary is composed from facts that already exist: the invocation
+# the registry already tracks, the threshold mark checkpoint 57 already computes,
+# the binding the store already holds, the rail authorization the control plane
+# already publishes, and the executor handoff already required on that rail. This
+# invents no artifact and no second collaboration model. It is the design test for
+# this slice, applied to itself: a replacement agent becomes ready by relying on
+# exactly the durable facts a fresh agent on this rail would already resolve.
+
+
+@dataclass(frozen=True)
+class WorktreeFacts:
+    """What a fresh read of one workspace said. Facts, not a judgement.
+
+    Supplied by the caller for the same reason `RailFacts` is: this module reads no
+    repository and shells out to nothing, so a projection can never be contaminated
+    by a read taken at some other instant than the caller's.
+    """
+
+    worktree_id: str
+    path: str
+    clean: bool
+    # A rebase, merge, cherry-pick or bisect in progress. Present means the
+    # repository is mid-operation, which is exactly the ambiguous state a rotation
+    # must not hand to a replacement.
+    active_operation: Optional[str] = None
+
+    @property
+    def coherent(self) -> bool:
+        return self.clean and not self.active_operation
+
+
+@dataclass(frozen=True)
+class RotationHandoffFacts:
+    """What a fresh control-plane read said about one rail's published handoff.
+
+    Presence and location only. The handoff's *content* contract -- outcome and
+    evidence, unresolved work, the exact next action -- is the existing executor
+    handoff convention, enforced where it already is: by the reviewer and
+    orchestrator loop that reads it. Re-parsing that prose here would invent a
+    schema the published handoffs in this ticket do not carry, and would make the
+    lifecycle a second judge of work it does not own.
+    """
+
+    rail: str
+    published: bool
+    location: str
+
+
+@dataclass(frozen=True)
+class RotationHandoff:
+    """Exactly the durable facts a fresh agent on this rail would already resolve.
+
+    Every field is copied from durable state that existed before this slice: the
+    binding record carries project, ticket, workspace, rail, iteration, role and
+    the head the session was launched at; the control plane carries the rail
+    authorization and the published handoff. Nothing here is derived from a
+    transcript, and nothing here is readable only by a rotating agent -- this is
+    the `rail` invocation and the workspace a fresh executor starts from.
+    """
+
+    project: str
+    ticket: str
+    rail: str
+    iteration_blob: str
+    role: str
+    workspace_key: str
+    worktree_id: str
+    workspace_path: str
+    launched_at_head: str
+    handoff_location: str
+    session_id: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "project": self.project,
+            "ticket": self.ticket,
+            "rail": self.rail,
+            "iteration": self.iteration_blob,
+            "role": self.role,
+            "workspaceKey": self.workspace_key,
+            "worktreeId": self.worktree_id,
+            "workspacePath": self.workspace_path,
+            "launchedAtHead": self.launched_at_head,
+            "handoff": self.handoff_location,
+            "sessionId": self.session_id,
+        }
+
+
+@dataclass(frozen=True)
+class RotationReadiness:
+    """One session's rotation boundary, projected from exact current facts.
+
+    `handoff` is present only when the state is `rotation-ready`, because a handoff
+    locator on a session that is not ready would be an invitation to act on it.
+    """
+
+    session_id: str
+    rail: str
+    state: str
+    reason: str
+    detail: str
+    observed: int
+    threshold: int
+    handoff: Optional[RotationHandoff] = None
+
+    @property
+    def ready(self) -> bool:
+        return self.state == ROTATION_READY
+
+
+def evaluate_rotation_readiness(
+    rail: Optional[RailFacts],
+    record: Optional[BindingRecord],
+    registry: SessionRegistry,
+    *,
+    handoff: Optional[RotationHandoffFacts],
+    worktree: Optional[WorktreeFacts],
+) -> RotationReadiness:
+    """Project whether one marked session has reached D9's safe rotation boundary.
+
+    Refuses rather than answers when the durable identity is missing or
+    contradictory, and answers `not-rotation-ready` when the boundary simply has
+    not been reached. The difference is deliberate: an absent condition is a fact
+    about now, while a contradiction between the binding, the rail and the
+    workspace means this controller cannot say which session it is describing --
+    and guessing which durable record is right is exactly what D9 forbids before a
+    context could be replaced.
+
+    Nothing here mutates anything, on any path.
+    """
+    if rail is None or record is None or handoff is None or worktree is None:
+        raise LifecycleError(
+            REASON_OBSERVATION_INCOMPLETE,
+            "a rotation boundary needs a rail observation, a binding, a handoff "
+            "observation and a worktree observation; got rail={0!r} binding={1!r} "
+            "handoff={2!r} worktree={3!r}.".format(
+                rail, record, handoff, worktree
+            ),
+        )
+    if record.is_terminal:
+        raise LifecycleError(
+            REASON_BINDING_TERMINAL,
+            "session {0} is {1}; a terminal binding has no context to rotate.".format(
+                record.session_id, record.state
+            ),
+        )
+    if record.state != BINDING_STATE_BOUND:
+        raise LifecycleError(
+            REASON_BINDING_NOT_BOUND,
+            "session {0} is {1}; only a bound session has a context that could be "
+            "rotated.".format(record.session_id, record.state),
+        )
+    # The same three identity refusals `observe_session` already makes, for the same
+    # reason: a binding and a rail that disagree describe no single piece of work.
+    if record.rail != rail.identifier:
+        raise LifecycleError(
+            REASON_SCOPE_MISMATCH,
+            "binding names rail {0}, the observation names {1}.".format(
+                record.rail, rail.identifier
+            ),
+        )
+    if record.iteration.blob != rail.rail_blob:
+        raise LifecycleError(
+            REASON_ITERATION_DRIFT,
+            "session {0} is bound at iteration {1} but rail {2} is now {3}; the "
+            "durable next action a replacement would resume is not the one this "
+            "session was launched for.".format(
+                record.session_id, record.iteration.blob, rail.identifier, rail.rail_blob
+            ),
+        )
+    if handoff.rail != record.rail:
+        raise LifecycleError(
+            REASON_SCOPE_MISMATCH,
+            "the handoff observation is for rail {0}, the binding for {1}.".format(
+                handoff.rail, record.rail
+            ),
+        )
+    if (worktree.worktree_id, worktree.path) != (record.worktree_id, record.workspace_path):
+        raise LifecycleError(
+            REASON_SCOPE_MISMATCH,
+            "the worktree observation is of {0} at {1}, the binding names {2} at "
+            "{3}.".format(
+                worktree.worktree_id, worktree.path,
+                record.worktree_id, record.workspace_path,
+            ),
+        )
+
+    context = registry.context(record.session_id)
+    reading = context.reading() if context is not None else None
+
+    def projected(state: str, reason: str, detail: str, carried=None) -> RotationReadiness:
+        return RotationReadiness(
+            session_id=record.session_id,
+            rail=record.rail,
+            state=state,
+            reason=reason,
+            detail=detail,
+            observed=reading.observed if reading is not None else 0,
+            threshold=(
+                reading.threshold if reading is not None else registry.rotation_threshold
+            ),
+            handoff=carried,
+        )
+
+    # 1. Marked, and only marked. Rotation is D9's threshold consequence, not
+    #    something a boundary alone earns. `is not True` is the point: an
+    #    undetermined mark on a partial history has not proven the threshold, and
+    #    undetermined is not permission.
+    if reading is None or reading.rotation_marked is not True:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_NOT_MARKED_FOR_ROTATION,
+            "session {0} is not marked for rotation, so there is no boundary to "
+            "reach.".format(record.session_id),
+        )
+
+    # 2. The whole of the safe boundary: no invocation of this session is in
+    #    flight. The registry already knows this exactly -- `begin_invocation`
+    #    records it and `end_invocation` clears it on every path including failure
+    #    -- so the boundary is *between* two bounded commands, which is the
+    #    smallest deterministic instant at which nothing is interrupted. It needs
+    #    no timer, no quiescence heuristic, and no cooperation from the agent.
+    if record.session_id in registry.in_flight():
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_INVOCATION_IN_FLIGHT,
+            "session {0} has an invocation in flight; a rotation boundary never "
+            "interrupts one.".format(record.session_id),
+        )
+
+    # 3. No ambiguous product state. A replacement resumes from the repository, so
+    #    a dirty tree or a half-finished git operation is work only the predecessor
+    #    could explain -- which is the one thing a rotation must never require.
+    if not worktree.coherent:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_WORKTREE_INCOHERENT,
+            "workspace {0} is {1}; a replacement cannot be handed a repository "
+            "state only the predecessor could explain.".format(
+                record.workspace_path,
+                "mid-{0}".format(worktree.active_operation)
+                if worktree.active_operation
+                else "not clean",
+            ),
+        )
+
+    # 4. The durable handoff this rail already requires is published. This is where
+    #    outcome and evidence, unresolved work and the exact next action live, and
+    #    where a fresh agent already reads them.
+    if not handoff.published:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_PUBLISHED,
+            "rail {0} has no published handoff at {1}, so the outcome, unresolved "
+            "work and next action a replacement would resume are not durable.".format(
+                record.rail, handoff.location
+            ),
+        )
+
+    return projected(
+        ROTATION_READY,
+        REASON_ROTATION_HANDOFF_ESTABLISHED,
+        "session {0} is marked at {1} of {2} observed compactions, is between "
+        "invocations, has a coherent workspace, and its rail carries a published "
+        "handoff. Nothing is terminated or replaced by this.".format(
+            record.session_id, reading.observed, reading.threshold
+        ),
+        carried=RotationHandoff(
+            project=record.project,
+            ticket=record.ticket,
+            rail=record.rail,
+            iteration_blob=record.iteration.blob,
+            role=record.role,
+            workspace_key=record.workspace_key,
+            worktree_id=record.worktree_id,
+            workspace_path=record.workspace_path,
+            launched_at_head=record.launched_at_head,
+            handoff_location=handoff.location,
+            session_id=record.session_id,
+        ),
     )

@@ -1243,6 +1243,20 @@ def rail_blob_sha(source: ReadSource, *, project: str, ticket: str, rail: str) -
     )
 
 
+def rail_handoff_publication(
+    source: ReadSource, *, project: str, ticket: str, rail: str
+) -> tuple[str, bool]:
+    """Where one rail's executor handoff lives, and whether it is published.
+
+    Presence and location, deliberately nothing about the content. A handoff is
+    executor-authored evidence whose contract is read by the reviewer and
+    orchestrator loop; a second reader that judged its prose would be a second
+    opinion about work this module does not own.
+    """
+    relative = artifact_relative(project=project, ticket=ticket, artifact="handoff", rail=rail)
+    return relative, source.exists(relative)
+
+
 def resolve_read_source(repo_root: Path) -> ReadSource:
     """Resolve tracked remote state freshly, or fail closed on ambiguity."""
     local_head = resolve_current_head(repo_root)

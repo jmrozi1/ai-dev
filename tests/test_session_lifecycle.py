@@ -31,9 +31,12 @@ from ai_dev_flow.session_binding import (
     RailIteration,
     SessionBindingError,
     attach_process,
+    reserve_binding,
     unbind_session,
 )
 from ai_dev_flow.session_lifecycle import (
+    ROTATION_NOT_READY,
+    ROTATION_READY,
     STATE_DISCONNECTED,
     STATE_RUNNING,
     STATE_WAITING,
@@ -41,9 +44,12 @@ from ai_dev_flow.session_lifecycle import (
     LifecycleError,
     OwnedSession,
     RailFacts,
+    RotationHandoffFacts,
     SessionRegistry,
+    WorktreeFacts,
     continue_session,
     elapsed_seconds,
+    evaluate_rotation_readiness,
     launch_session,
     observe_session,
     recover_session,
@@ -1341,6 +1347,344 @@ class FailedInvocationObservationTests(LifecycleTestBase):
         self.assertIsNone(self.registry.get(SESSION))
         self.assertIsNone(self.registry.context(SESSION))
         self.assertEqual(self.registry.context_readings(), {})
+
+
+class RotationBoundaryTests(LifecycleTestBase):
+    """marked -> safe boundary -> durable handoff -> rotation-ready, and nothing past it.
+
+    Every case here projects. Nothing in this class terminates a context, stops a
+    worker, launches or binds a replacement, or writes a durable record, and the
+    last two cases prove that rather than assert it.
+    """
+
+    HANDOFF = "ai-dev/issue-55/rails/{0}/handoff.md".format(RAIL)
+
+    def _mark(self, count=6, session_id=SESSION):
+        """Drive the accepted counter to a real threshold mark. No shortcut flag."""
+        events = [
+            {"event": EVENT_COMPACTION_OBSERVED, "session_id": session_id,
+             "uuid": "{0:08d}-0000-4000-8000-000000000000".format(index)}
+            for index in range(count)
+        ]
+        self.registry.observe_context_events(session_id, events)
+
+    def _rail(self, **overrides):
+        arguments = {"identifier": RAIL, "status": "running", "rail_blob": BLOB}
+        arguments.update(overrides)
+        return RailFacts(**arguments)
+
+    def _handoff(self, **overrides):
+        arguments = {"rail": RAIL, "published": True, "location": self.HANDOFF}
+        arguments.update(overrides)
+        return RotationHandoffFacts(**arguments)
+
+    def _worktree(self, **overrides):
+        arguments = {
+            "worktree_id": self.worktree_id, "path": str(self.workspace),
+            "clean": True, "active_operation": None,
+        }
+        arguments.update(overrides)
+        return WorktreeFacts(**arguments)
+
+    def _evaluate(self, **overrides):
+        arguments = {
+            "rail": self._rail(), "record": self.store.read(SESSION),
+            "registry": self.registry, "handoff": self._handoff(),
+            "worktree": self._worktree(),
+        }
+        arguments.update(overrides)
+        rail = arguments.pop("rail")
+        record = arguments.pop("record")
+        registry = arguments.pop("registry")
+        return evaluate_rotation_readiness(rail, record, registry, **arguments)
+
+    # -- the transition itself --------------------------------------------------
+
+    def test_marked_at_a_safe_boundary_with_a_durable_handoff_is_rotation_ready(self) -> None:
+        self._launch()
+        self._mark()
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_ROTATION_HANDOFF_ESTABLISHED)
+        self.assertTrue(readiness.ready)
+        self.assertEqual((readiness.observed, readiness.threshold), (6, 6))
+
+    def test_the_handoff_carries_the_exact_durable_identity_and_nothing_else(self) -> None:
+        self._launch()
+        self._mark()
+        handoff = self._evaluate().handoff
+        record = self.store.read(SESSION)
+        self.assertEqual(handoff.to_dict(), {
+            "project": "ai-dev", "ticket": "issue-55", "rail": RAIL, "iteration": BLOB,
+            "role": "executor", "workspaceKey": record.workspace_key,
+            "worktreeId": self.worktree_id, "workspacePath": str(self.workspace),
+            "launchedAtHead": HEAD, "handoff": self.HANDOFF, "sessionId": SESSION,
+        })
+        # Every value is the binding's own, so a replacement resolves the same rail
+        # and the same workspace a fresh agent would.
+        self.assertEqual(
+            (handoff.project, handoff.ticket, handoff.rail, handoff.iteration_blob),
+            (record.project, record.ticket, record.rail, record.iteration.blob),
+        )
+
+    def test_no_field_of_the_handoff_comes_from_a_transcript_or_the_provider(self) -> None:
+        # The whole payload is reproducible from durable state alone: this rebuilds
+        # it from the store and the control-plane locator, with no session held.
+        self._launch()
+        self._mark()
+        expected = self._evaluate().handoff.to_dict()
+        record = self.store.read(SESSION)
+        self.assertEqual(expected, {
+            "project": record.project, "ticket": record.ticket, "rail": record.rail,
+            "iteration": record.iteration.blob, "role": record.role,
+            "workspaceKey": record.workspace_key, "worktreeId": record.worktree_id,
+            "workspacePath": record.workspace_path,
+            "launchedAtHead": record.launched_at_head,
+            "handoff": self.HANDOFF, "sessionId": record.session_id,
+        })
+
+    # -- the safe boundary ------------------------------------------------------
+
+    def test_marked_but_in_flight_is_not_rotation_ready(self) -> None:
+        self._launch()
+        self._mark()
+        self.registry.begin_invocation(SESSION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_INVOCATION_IN_FLIGHT)
+        self.assertIsNone(readiness.handoff)
+        # And the boundary opens again the moment that invocation ends, with no
+        # timer and nothing else to wait for.
+        self.registry.end_invocation(SESSION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    def test_a_failed_invocation_still_closes_the_boundary_it_opened(self) -> None:
+        # The failure path clears in-flight in its `finally`, so a marked session
+        # that suffered a failed turn is still reachable as a boundary.
+        self._launch()
+        self._mark()
+        failure = claude_worker.ClaudeWorkerError(claude_worker.REASON_WORKER_FATAL, "boom")
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            continue_session(
+                self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
+                registry=self.registry, session_id=SESSION,
+                request_kwargs=self._request_kwargs(), prompt="carry on",
+                send=self._sender(fail=failure)[0], alive=lambda pgid: True,
+            )
+        self.assertEqual(self.registry.in_flight(), ())
+        readiness = self._evaluate()
+        # Still marked -- the floor proved the threshold -- and still ready, even
+        # though the history is now partial.
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(
+            self.registry.context(SESSION).reading().health, OBSERVATION_UNHEALTHY
+        )
+
+    # -- not marked -------------------------------------------------------------
+
+    def test_an_unmarked_session_never_transitions(self) -> None:
+        self._launch()
+        self._mark(count=5)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_NOT_MARKED_FOR_ROTATION)
+        self.assertEqual(readiness.observed, 5)
+
+    def test_an_undetermined_mark_on_a_partial_history_is_not_permission(self) -> None:
+        self._launch()
+        self._mark(count=5)
+        self.registry.observe_failed_invocation(SESSION, "a turn failed", ())
+        reading = self.registry.context(SESSION).reading()
+        self.assertIsNone(reading.rotation_marked)
+        self.assertEqual(self._evaluate().reason, session_lifecycle.REASON_NOT_MARKED_FOR_ROTATION)
+
+    def test_a_session_this_controller_does_not_observe_is_not_ready(self) -> None:
+        self._launch()
+        self.registry.remove(SESSION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_NOT_MARKED_FOR_ROTATION)
+
+    # -- ambiguous product state ------------------------------------------------
+
+    def test_a_dirty_worktree_is_not_a_rotation_boundary(self) -> None:
+        self._launch()
+        self._mark()
+        readiness = self._evaluate(worktree=self._worktree(clean=False))
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_WORKTREE_INCOHERENT)
+        self.assertIsNone(readiness.handoff)
+
+    def test_a_repository_mid_operation_is_not_a_rotation_boundary(self) -> None:
+        self._launch()
+        self._mark()
+        readiness = self._evaluate(worktree=self._worktree(active_operation="rebase"))
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_WORKTREE_INCOHERENT)
+        self.assertIn("mid-rebase", readiness.detail)
+
+    # -- durable handoff evidence -----------------------------------------------
+
+    def test_an_unpublished_handoff_leaves_the_session_marked_and_not_ready(self) -> None:
+        self._launch()
+        self._mark()
+        readiness = self._evaluate(handoff=self._handoff(published=False))
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_PUBLISHED)
+        self.assertIsNone(readiness.handoff)
+        # Still marked. Not ready is not un-marked.
+        self.assertIs(self.registry.context(SESSION).reading().rotation_marked, True)
+
+    # -- fail closed on missing or contradictory durable identity ---------------
+
+    def test_a_missing_durable_observation_is_refused_rather_than_answered(self) -> None:
+        self._launch()
+        self._mark()
+        for missing in ("record", "handoff", "worktree", "rail"):
+            with self.subTest(missing=missing):
+                with self.assertRaises(LifecycleError) as caught:
+                    self._evaluate(**{missing: None})
+                self.assertEqual(
+                    caught.exception.reason, session_lifecycle.REASON_OBSERVATION_INCOMPLETE
+                )
+
+    def test_a_rail_that_disagrees_with_the_binding_fails_closed(self) -> None:
+        self._launch()
+        self._mark()
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate(rail=self._rail(identifier=OTHER_RAIL))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_SCOPE_MISMATCH)
+
+    def test_an_iteration_that_has_moved_on_fails_closed(self) -> None:
+        self._launch()
+        self._mark()
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate(rail=self._rail(rail_blob=OTHER_BLOB))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_ITERATION_DRIFT)
+
+    def test_a_handoff_observation_of_another_rail_fails_closed(self) -> None:
+        self._launch()
+        self._mark()
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate(handoff=self._handoff(rail=OTHER_RAIL))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_SCOPE_MISMATCH)
+
+    def test_a_worktree_observation_of_another_workspace_fails_closed(self) -> None:
+        self._launch()
+        self._mark()
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate(worktree=self._worktree(path="/somewhere/else"))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_SCOPE_MISMATCH)
+
+    def test_a_terminal_or_unbound_binding_has_no_context_to_rotate(self) -> None:
+        self._launch()
+        self._mark()
+        unbind_session(self.store, SESSION)
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate()
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_BINDING_TERMINAL)
+
+    def test_a_reservation_that_never_bound_a_process_has_no_context_to_rotate(self) -> None:
+        reserve_binding(
+            self.store, project="ai-dev", ticket="issue-55", reference=self.reference,
+            workspace_path=str(self.workspace), worktree_id=self.worktree_id, rail=RAIL,
+            role="executor", iteration=self.iteration, session_id=OTHER_SESSION,
+            launched_at_head=HEAD, reserved_at=self.clock, ceiling=6,
+        )
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate(record=self.store.read(OTHER_SESSION))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_BINDING_NOT_BOUND)
+
+    # -- no side effect, which is the whole stop boundary -----------------------
+
+    def test_reaching_rotation_ready_changes_nothing_at_all(self) -> None:
+        self._launch()
+        self._mark()
+        before = (
+            self.store.read(SESSION).to_dict(),
+            self.registry.context_readings(),
+            self.registry.in_flight(),
+            sorted(owned.session_id for owned in self.registry.sessions()),
+        )
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        after = (
+            self.store.read(SESSION).to_dict(),
+            self.registry.context_readings(),
+            self.registry.in_flight(),
+            sorted(owned.session_id for owned in self.registry.sessions()),
+        )
+        self.assertEqual(before, after)
+        # The worker was never asked to stop, and the session is still continuable.
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+
+    def test_rotation_readiness_creates_no_human_attention_and_no_second_session(self) -> None:
+        self._launch()
+        self._mark()
+        with patch.object(session_lifecycle, "start_worker") as starter, \
+                patch.object(session_lifecycle, "shutdown_worker") as stopper:
+            readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        starter.assert_not_called()
+        stopper.assert_not_called()
+        # Rotation readiness is system-owned: the projection carries a machine
+        # reason and a locator, and nothing shaped like a human decision.
+        self.assertFalse(hasattr(readiness, "human_decision"))
+
+
+class RealWorkerFailedContinueJoinTests(LifecycleTestBase):
+    """One pipe-backed case protecting the real join the rest of the suite stubs.
+
+    Everywhere else `send` is injected, so `run_request`'s failure-side event
+    accumulation and the lifecycle fold that consumes it are proven separately and
+    their join is asserted. This drives the real `run_request` over a real pipe so
+    a change to either side has to keep them agreeing. One case, deliberately: the
+    branch coverage lives in the two suites that already have it.
+    """
+
+    def test_a_real_worker_failure_carries_its_event_into_lifecycle_state(self) -> None:
+        import os
+
+        self._launch()
+        read_fd, write_fd = os.pipe()
+        writer = os.fdopen(write_fd, "w", encoding="utf-8")
+        writer.write(json.dumps({
+            "type": claude_worker.MESSAGE_EVENT, "protocol": 1,
+            "event": {"event": EVENT_COMPACTION_OBSERVED, "session_id": SESSION,
+                      "uuid": "9f1d0c3a-0000-4000-8000-00000000000f"},
+        }) + "\n")
+        writer.write(json.dumps({
+            "type": "error", "reason": "worker-fatal", "detail": "the provider failed",
+        }) + "\n")
+        writer.close()
+        stdout = os.fdopen(read_fd, "r", encoding="utf-8")
+        self.addCleanup(stdout.close)
+        piped = claude_worker.WorkerHandle(
+            process=types.SimpleNamespace(
+                stdin=types.SimpleNamespace(write=lambda text: None, flush=lambda: None),
+                stdout=stdout, poll=lambda: None, returncode=None,
+            ),
+            pid=1, pgid=1, started_at="2026-08-26T12:00:01Z",
+            sdk_version="0.2.152", sdk_detail=None,
+        )
+
+        def send(_handle, request, *, prompt, markers=(), **kwargs):
+            return claude_worker.run_request(
+                piped, request, prompt=prompt, markers=markers, **kwargs
+            )
+
+        with self.assertRaises(claude_worker.ClaudeWorkerError) as caught:
+            continue_session(
+                self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
+                registry=self.registry, session_id=SESSION,
+                request_kwargs=self._request_kwargs(), prompt="carry on",
+                send=send, alive=lambda pgid: True,
+            )
+        self.assertEqual(caught.exception.reason, claude_worker.REASON_WORKER_FATAL)
+        reading = self.registry.context(SESSION).reading()
+        self.assertEqual(reading.observed, 1)
+        self.assertIsNone(reading.count)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
 
 
 if __name__ == "__main__":

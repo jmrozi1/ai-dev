@@ -23,6 +23,7 @@ from ai_dev_flow.control_plane import (
     resolve_control_plane_config,
     resolve_read_source,
     rail_blob_sha,
+    rail_handoff_publication,
     render_rail,
     render_status,
     resolve_coordination_repo,
@@ -757,6 +758,29 @@ class ControlPlaneTests(unittest.TestCase):
             rail="rail-iterated",
         )
         self.assertNotEqual(changed, first)
+
+    def test_a_rails_handoff_publication_is_reported_by_location_and_presence(self) -> None:
+        # What a rotation boundary needs to know about durable handoff evidence:
+        # exactly where a fresh agent reads it, and whether it is there yet.
+        self._publish()
+        source = resolve_read_source(self.coordination)
+        location, published = rail_handoff_publication(
+            source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
+        )
+        self.assertEqual(
+            location, "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
+        )
+        self.assertFalse(published)
+
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nnext action\n")
+        location, published = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )
+        self.assertEqual(
+            location, "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
+        )
+        self.assertTrue(published)
 
     def test_rail_blob_sha_is_absent_for_an_unauthorized_rail(self) -> None:
         source = resolve_read_source(self.coordination)
