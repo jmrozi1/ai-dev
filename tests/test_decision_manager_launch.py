@@ -236,6 +236,15 @@ class LaunchTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="decision-manager-launch-"))
         self.addCleanup(self._remove_root)
+        # A run states its scope, and the progress record is read from it rather
+        # than from the product root. Naming it opens nothing, exactly as naming
+        # the allowance store's path does.
+        self.source = QueueSourceContext(
+            control_plane=self.root / "coordination",
+            project=PROJECT,
+            ticket=TICKET,
+            binding_root=self.root / "controller-state",
+        )
 
     def _remove_root(self) -> None:
         for item in sorted(self.root.rglob("*"), reverse=True):
@@ -316,12 +325,12 @@ class ClaimStatementTests(LaunchTestCase):
 
     def test_explicit_absence_is_carried_through_untouched(self) -> None:
         with self.rooted():
-            run = resolve_run(human_exclusive_since=None)
+            run = resolve_run(human_exclusive_since=None, source=self.source)
         self.assertIsNone(run.human_exclusive_since)
 
     def test_exact_claim_is_carried_through_untouched(self) -> None:
         with self.rooted():
-            run = resolve_run(human_exclusive_since=SINCE)
+            run = resolve_run(human_exclusive_since=SINCE, source=self.source)
         self.assertEqual(run.human_exclusive_since, SINCE)
         self.assertIs(type(run.human_exclusive_since), int)
 
@@ -330,7 +339,7 @@ class ClaimStatementTests(LaunchTestCase):
         view, details = a_queue()
         spy = _ProjectionSpy()
         with self.rooted(), self.spied_projection(spy):
-            render_launch_page(view, details, human_exclusive_since=None)
+            render_launch_page(view, details, human_exclusive_since=None, source=self.source)
         self.assertEqual(len(spy.calls), 2)
         for call in spy.calls:
             self.assertIsNone(call["human_exclusive_since"])
@@ -339,7 +348,7 @@ class ClaimStatementTests(LaunchTestCase):
         view, details = a_queue()
         spy = _ProjectionSpy()
         with self.rooted(), self.spied_projection(spy):
-            render_launch_page(view, details, human_exclusive_since=SINCE)
+            render_launch_page(view, details, human_exclusive_since=SINCE, source=self.source)
         self.assertEqual([call["human_exclusive_since"] for call in spy.calls], [SINCE, SINCE])
 
 
@@ -402,13 +411,13 @@ class SingleResolutionTests(LaunchTestCase):
     def test_the_clock_is_read_exactly_once_per_run(self) -> None:
         reads = []
         with self.rooted(), self.counted_clock(reads):
-            resolve_run(human_exclusive_since=None)
+            resolve_run(human_exclusive_since=None, source=self.source)
         self.assertEqual(len(reads), 1)
 
     def test_the_store_is_constructed_exactly_once_per_run(self) -> None:
         built = []
         with self.rooted(), self.counted_stores(built):
-            resolve_run(human_exclusive_since=None)
+            resolve_run(human_exclusive_since=None, source=self.source)
         self.assertEqual(len(built), 1)
 
     def test_the_repository_is_resolved_exactly_once_per_run(self) -> None:
@@ -419,21 +428,21 @@ class SingleResolutionTests(LaunchTestCase):
             return self.root
 
         with unittest.mock.patch.object(launch, "resolve_repo_root", spy):
-            resolve_run(human_exclusive_since=None)
+            resolve_run(human_exclusive_since=None, source=self.source)
         self.assertEqual(len(resolutions), 1)
 
     def test_a_whole_render_resolves_each_input_exactly_once(self) -> None:
         view, details = a_queue()
         reads, built = [], []
         with self.rooted(), self.counted_clock(reads), self.counted_stores(built):
-            render_launch_page(view, details, human_exclusive_since=None)
+            render_launch_page(view, details, human_exclusive_since=None, source=self.source)
         self.assertEqual((len(reads), len(built)), (1, 1))
 
     def test_a_whole_launch_resolves_each_input_exactly_once(self) -> None:
         view, details = a_queue()
         reads, built = [], []
         with self.rooted(), self.counted_clock(reads), self.counted_stores(built):
-            server = launch_manager_server(view, details, human_exclusive_since=None)
+            server = launch_manager_server(view, details, human_exclusive_since=None, source=self.source)
         self.addCleanup(server.server_close)
         self.assertEqual((len(reads), len(built)), (1, 1))
 
@@ -442,7 +451,7 @@ class SingleResolutionTests(LaunchTestCase):
         view, details = a_queue()
         spy = _ProjectionSpy()
         with self.rooted(), self.spied_projection(spy):
-            render_launch_page(view, details, human_exclusive_since=SINCE)
+            render_launch_page(view, details, human_exclusive_since=SINCE, source=self.source)
         self.assertEqual(len(spy.calls), 2)
         first, second = spy.calls
         self.assertIs(first["store"], second["store"])
@@ -454,15 +463,15 @@ class SingleResolutionTests(LaunchTestCase):
     def test_two_runs_are_two_independent_resolutions(self) -> None:
         """One run's inputs never leak into the next; there is no cache to leak through."""
         with self.rooted():
-            first = resolve_run(human_exclusive_since=SINCE)
-            second = resolve_run(human_exclusive_since=None)
+            first = resolve_run(human_exclusive_since=SINCE, source=self.source)
+            second = resolve_run(human_exclusive_since=None, source=self.source)
         self.assertEqual(first.human_exclusive_since, SINCE)
         self.assertIsNone(second.human_exclusive_since)
         self.assertIsNot(first.store, second.store)
 
     def test_the_run_is_the_accepted_frozen_value(self) -> None:
         with self.rooted():
-            run = resolve_run(human_exclusive_since=None)
+            run = resolve_run(human_exclusive_since=None, source=self.source)
         self.assertIs(type(run), ManagerRun)
 
     def test_the_module_reads_one_clock_and_builds_one_store_structurally(self) -> None:
@@ -499,7 +508,7 @@ class SingleResolutionTests(LaunchTestCase):
 class AcceptedHelperTests(LaunchTestCase):
     def test_the_store_path_is_the_accepted_convention(self) -> None:
         with self.rooted():
-            run = resolve_run(human_exclusive_since=None)
+            run = resolve_run(human_exclusive_since=None, source=self.source)
         self.assertEqual(run.store.path.parts[-len(STORE_PARTS):], STORE_PARTS)
         self.assertEqual(run.store.path.parents[len(STORE_PARTS) - 1], self.root)
 
@@ -531,7 +540,7 @@ class AcceptedHelperTests(LaunchTestCase):
         marker = self.root / "marker.txt"
         marker.write_text("root", encoding="utf-8")
 
-        run = resolve_run(human_exclusive_since=None, cwd=self.root)
+        run = resolve_run(human_exclusive_since=None, source=self.source, cwd=self.root)
 
         self.assertEqual(run.store.path.parts[-len(STORE_PARTS):], STORE_PARTS)
         self.assertTrue((run.store.path.parents[len(STORE_PARTS) - 1] / "marker.txt").is_file())
@@ -546,7 +555,7 @@ class LoopbackTests(LaunchTestCase):
     def test_the_launched_server_binds_loopback(self) -> None:
         view, details = a_queue()
         with self.rooted():
-            server = launch_manager_server(view, details, human_exclusive_since=None)
+            server = launch_manager_server(view, details, human_exclusive_since=None, source=self.source)
         self.addCleanup(server.server_close)
         self.assertEqual(server.server_address[0], LOOPBACK_HOST)
 
@@ -591,7 +600,7 @@ class NoDurableStateTests(LaunchTestCase):
     def test_resolving_a_run_writes_nothing(self) -> None:
         before = self.tree()
         with self.rooted():
-            resolve_run(human_exclusive_since=SINCE)
+            resolve_run(human_exclusive_since=SINCE, source=self.source)
         self.assertEqual(self.tree(), before)
         self.assertFalse((self.root / ALLOWANCE_DIRECTORY).exists())
 
@@ -599,7 +608,7 @@ class NoDurableStateTests(LaunchTestCase):
         view, details = a_queue()
         before = self.tree()
         with self.rooted():
-            render_launch_page(view, details, human_exclusive_since=SINCE)
+            render_launch_page(view, details, human_exclusive_since=SINCE, source=self.source)
         self.assertEqual(self.tree(), before)
 
     def test_the_command_line_writes_nothing(self) -> None:
@@ -629,7 +638,7 @@ class NoDurableStateTests(LaunchTestCase):
     def test_a_claim_cannot_survive_into_a_later_run(self) -> None:
         """Restart requires a new statement: there is no state to carry the old one."""
         with self.rooted():
-            resolve_run(human_exclusive_since=SINCE)
+            resolve_run(human_exclusive_since=SINCE, source=self.source)
             with self.assertRaises(TypeError):
                 resolve_run()
 
@@ -645,13 +654,13 @@ class CallerSuppliedQueueTests(LaunchTestCase):
     def test_the_rendered_page_carries_the_callers_queue(self) -> None:
         view, details = a_queue([a_decision(decision_id="d-9", title="Pick the seam")])
         with self.rooted():
-            page = render_launch_page(view, details, human_exclusive_since=None)
+            page = render_launch_page(view, details, human_exclusive_since=None, source=self.source)
         self.assertIn("Pick the seam", page)
 
     def test_the_launch_helper_still_takes_the_callers_queue(self) -> None:
         view, details = a_queue([a_decision(decision_id="d-8", title="Pick the port")])
         with self.rooted():
-            server = launch_manager_server(view, details, human_exclusive_since=None)
+            server = launch_manager_server(view, details, human_exclusive_since=None, source=self.source)
         self.addCleanup(server.server_close)
         self.assertIn("Pick the port", server.RequestHandlerClass.page)
 
@@ -804,7 +813,7 @@ class SourcedLaunchTestCase(LaunchTestCase):
 
     def a_run(self):
         with self.rooted():
-            return resolve_run(human_exclusive_since=None)
+            return resolve_run(human_exclusive_since=None, source=self.context())
 
     def launch(self, argv=None, *, claim=(CLAIM_NONE_FLAG,)):
         """Run the entry point to completion, capturing the server it would serve."""

@@ -21,8 +21,14 @@ PROGRESS_MODULES = ("progress_store", "progress_view")
 PROGRESS_TYPES = (
     "ProgressStore", "ProgressView", "ProgressFacts", "ProgressStoreError",
     "ProgressViewError", "Acceptance", "NamedCompletion", "Projection",
-    "project_progress", "commit_instant", "progress_store_path",
+    "project_progress", "commit_instant",
 )
+
+# The published record's schema, which the writing side must also know. It holds
+# validators and constants and no measure at all -- no store, no view, no
+# percentage, no facts -- so naming it grants a module nothing to decide with.
+# `test_the_schema_module_carries_no_measure` proves that rather than asserting it.
+SCHEMA_MODULE = "progress_record"
 
 # The modules a progress value is permitted to reach, and why each one is here.
 #
@@ -134,6 +140,36 @@ class ImportGraphTests(unittest.TestCase):
                 for symbol in PROGRESS_TYPES:
                     self.assertNotIn(symbol, named(tree), "{0}.{1}".format(name, symbol))
 
+    def test_the_schema_module_carries_no_measure(self) -> None:
+        """The one progress module a writer may import defines nothing to decide on.
+
+        `control_plane` must know what a published progress record may say, so it
+        imports the schema. That import would be a hole if the schema carried a
+        measure, so this enumerates what the module actually defines: validators,
+        constants and one refusal, and no store, view, percentage or fact type.
+        """
+        tree = self.modules[SCHEMA_MODULE]
+        defined = {
+            node.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef))
+        }
+        for symbol in PROGRESS_TYPES:
+            self.assertNotIn(symbol, defined, symbol)
+        self.assertEqual(
+            {name for name in defined if name[:1].isupper()}, {"ProgressRecordError"}
+        )
+        for forbidden in ("percentage", "percent", "project_progress", "facts", "view"):
+            self.assertNotIn(forbidden, {name.lower() for name in defined}, forbidden)
+        self.assertEqual(local_imports(tree), set())
+
+    def test_only_the_schema_reaches_the_writing_side(self) -> None:
+        """The control plane publishes progress, so it knows the shape and no more."""
+        control_plane = self.modules["control_plane"]
+        imported = local_imports(control_plane)
+        self.assertIn(SCHEMA_MODULE, imported)
+        self.assertEqual(imported & set(PROGRESS_MODULES), set())
+
     def test_the_progress_subsystem_cannot_reach_any_authority_at_all(self) -> None:
         """The transitive closure of what the progress modules import.
 
@@ -151,7 +187,7 @@ class ImportGraphTests(unittest.TestCase):
                 continue
             seen.add(current)
             frontier.extend(local_imports(self.modules[current]) - seen)
-        self.assertEqual(seen, set(PROGRESS_MODULES) | {"json_files"})
+        self.assertEqual(seen, set(PROGRESS_MODULES) | {SCHEMA_MODULE})
         for name in CONTROL_PATH:
             self.assertNotIn(name, seen, name)
 

@@ -13,6 +13,13 @@ import tempfile
 from typing import Any, Iterable
 
 from .json_files import JsonFileError, load_json_object, write_text_atomic
+from .progress_record import (
+    CONFIDENCES,
+    PROGRESS_FILENAME,
+    ProgressRecordError,
+    empty_document,
+    validate_document,
+)
 from .repository import (
     RepositoryError,
     config_file_for_repo_root,
@@ -35,6 +42,7 @@ ARTIFACT_OWNERS: dict[str, str] = {
     "handoff": "executor",
     "decision": "orchestrator",
     "evidence": "evidence",
+    "progress": "orchestrator",
 }
 
 ARTIFACT_FILENAMES: dict[str, str] = {
@@ -43,6 +51,7 @@ ARTIFACT_FILENAMES: dict[str, str] = {
     "handoff": "handoff.md",
     "decision": "decision.json",
     "evidence": "evidence.json",
+    "progress": PROGRESS_FILENAME,
 }
 
 RAIL_SCOPED_ARTIFACTS = frozenset({"rail", "handoff", "decision", "evidence"})
@@ -744,12 +753,26 @@ def publish(
     rail: str | None = None,
     expected_head: str | None = None,
 ) -> tuple[Path, str]:
-    """Replace one owned artifact with current state and commit only that path."""
+    """Replace one owned artifact with current state and commit only that path.
+
+    The progress record is deliberately not publishable here. It is one half of an
+    acceptance, and `accept` writes it together with the accepted state in a single
+    commit; letting it be published alone would restore exactly the drift that
+    pairing them removes.
+    """
+    if artifact == "progress":
+        raise ControlPlaneError(
+            "Cannot publish the progress record directly: it is written with the accepted "
+            "state by `accept`, in one commit, so the two cannot disagree."
+        )
     require_owner(artifact, role)
     target = artifact_path(repo_root, project=project, ticket=ticket, artifact=artifact, rail=rail)
 
     if artifact in ("evidence", "decision"):
-        subject = "Provider evidence" if artifact == "evidence" else "Human-decision record"
+        subject = {
+            "evidence": "Provider evidence",
+            "decision": "Human-decision record",
+        }[artifact]
         try:
             payload = json.loads(content)
         except json.JSONDecodeError as exc:
@@ -781,6 +804,254 @@ def publish(
     subject = f"{role}: {artifact}" + (f" {rail}" if rail else "") + f" ({scope})"
     _git(repo_root, ["commit", "--quiet", "-m", subject, "--", relative])
     return target, resolve_current_head(repo_root)
+
+
+# --------------------------------------------------------------------------
+# The supported progress action
+# --------------------------------------------------------------------------
+#
+# Accepting a numeric checkpoint is a durable orchestrator transition, and this
+# is that transition -- the whole of it, in one commit.
+#
+# The ticket's acceptance convention is unchanged: accepted state is published to
+# the control plane as `state.md`, exactly as every accepted checkpoint before
+# this one was. What is added is a structured record of the same act, written by
+# this one action into the same commit -- both paths or neither.
+#
+# There is exactly one acceptance *fact*, and it lives in the record. `accept` is
+# the only action that writes it, it advances only forwards, and it is checked
+# against product history before it lands. `state.md` carries the prose a person
+# reads, which is never parsed and never was authority -- so a later reconciliation
+# that republishes `state.md` alone, as reconciliations must be able to do, can
+# restate the story but cannot move the accepted checkpoint. That is the whole of
+# the guarantee: two descriptions, one fact, and no second thing to keep in step.
+#
+# The limit, stated rather than implied: nothing stops a person writing prose that
+# contradicts the record. Prose is commentary, and the measure never reads it.
+#
+# The record it publishes carries no instant, because the commit it creates is
+# the instant. `progress_store` reads those commits back through
+# `git log -1 --format=%cI`, which is why a stated time cannot enter the measure
+# even in principle: there is no field to state one in.
+#
+# Publishing a product checkpoint does not reach this action, which is what keeps
+# a published-but-unaccepted checkpoint incapable of advancing the numerator.
+
+
+def _accepted_checkpoint(record: dict[str, Any]) -> int:
+    accepted = record.get("accepted")
+    return 0 if accepted is None else int(accepted["checkpoint"])
+
+
+def _completed_named(record: dict[str, Any]) -> int:
+    named = record.get("named")
+    return 0 if named is None else int(named["checkpoint"])
+
+
+def read_progress_record(source: ReadSource, *, project: str, ticket: str) -> dict[str, Any]:
+    """The ticket's currently published progress record, or the empty one."""
+    relative = artifact_relative(
+        project=project, ticket=ticket, artifact="progress", rail=None
+    )
+    text = source.read(relative)
+    if text is None:
+        return empty_document()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise ControlPlaneError(
+            f"Published progress for {scope_relative(project, ticket)} is not valid JSON: {exc.msg}"
+        ) from exc
+    try:
+        return validate_document(payload)
+    except ProgressRecordError as exc:
+        raise ControlPlaneError(
+            f"Published progress for {scope_relative(project, ticket)} is refused: {exc}"
+        ) from exc
+
+
+def _checkpoint_subject(product_repo: Path, commit: str) -> str:
+    """The Flow subject of one product commit, read from the product repository."""
+    completed = _git_capture(product_repo, ["log", "-1", "--format=%s", commit, "--"])
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or f"exit code {completed.returncode}"
+        raise ControlPlaneError(
+            f"Cannot accept: commit {commit} is not present in the product repository "
+            f"{product_repo}. {detail}"
+        )
+    return completed.stdout.strip()
+
+
+def _publish_acceptance(
+    repo_root: Path,
+    *,
+    project: str,
+    ticket: str,
+    state: str,
+    document: dict[str, Any],
+    expected_head: str | None,
+) -> tuple[Path, str]:
+    """Write the accepted state and its derived record, and commit them together.
+
+    One commit, two paths. `publish` deliberately commits a single artifact, which
+    is right for every artifact whose truth stands alone; acceptance is the one
+    transition whose two representations must not be separable, so it gets this
+    instead of two calls. A caller cannot land one and lose the other: either the
+    commit exists with both paths in it, or nothing moved.
+    """
+    state_target = artifact_path(
+        repo_root, project=project, ticket=ticket, artifact="state", rail=None
+    )
+    record_target = artifact_path(
+        repo_root, project=project, ticket=ticket, artifact="progress", rail=None
+    )
+
+    current_head = ensure_publishable(repo_root)
+    if expected_head is not None and expected_head.strip() and expected_head.strip() != current_head:
+        raise ControlPlaneError(
+            f"Cannot accept: expected head {expected_head.strip()} but the coordination "
+            f"repository is at {current_head or 'an empty history'}. Re-read the current "
+            "state and accept against it."
+        )
+
+    body = state if state.endswith("\n") else state + "\n"
+    record = json.dumps(document, indent=2, sort_keys=True) + "\n"
+    try:
+        write_text_atomic(state_target, body)
+        write_text_atomic(record_target, record)
+    except JsonFileError as exc:
+        raise ControlPlaneError(str(exc)) from exc
+
+    relatives = [
+        state_target.relative_to(repo_root).as_posix(),
+        record_target.relative_to(repo_root).as_posix(),
+    ]
+    _git(repo_root, ["add", "--"] + relatives)
+    if not _git(repo_root, ["diff", "--cached", "--name-only", "--"] + relatives, check=False):
+        return record_target, current_head
+    scope = f"{project}/{ticket}"
+    subject = f"{ARTIFACT_OWNERS['progress']}: accept ({scope})"
+    _git(repo_root, ["commit", "--quiet", "-m", subject, "--"] + relatives)
+    return record_target, resolve_current_head(repo_root)
+
+
+def accept_progress(
+    repo_root: Path,
+    *,
+    project: str,
+    ticket: str,
+    state: str,
+    remaining: int,
+    confidence: str,
+    note: str = "",
+    checkpoint: int | None = None,
+    commit: str | None = None,
+    named: int | None = None,
+    named_total: int | None = None,
+    product_repo: Path | None = None,
+) -> tuple[Path, str, dict[str, Any]]:
+    """Publish the ticket's current progress as one durable orchestrator transition.
+
+    One act, three possible facts, and the estimate always restated. A checkpoint
+    acceptance moves the numerator, a named completion moves the roadmap position,
+    and the projection is reconsidered every time -- because D11 asks that it be
+    reconsidered at every acceptance, and a record that could omit it would let
+    "did not reconsider" and "reconsidered and preserved" look alike.
+
+    The accepted state and its derived record are published together, in one
+    commit, by this one action. Neither can move without the other, so the prose a
+    person reads and the record a machine reads cannot drift apart -- not because
+    a caller is trusted to run two commands, but because no supported action
+    writes either alone.
+
+    What is *not* stated is what makes the record derived rather than a second
+    truth. There is no instant parameter: the commit this creates carries the time. The
+    projection's basis is not a parameter either: it is the accepted checkpoint
+    standing in the very record being published. And an accepted checkpoint is
+    cross-checked against the product repository -- the commit must exist there
+    and its Flow subject must be that checkpoint number -- so the number is
+    checked against durable product history rather than taken on the caller's
+    word.
+
+    Publication is fail-closed against a lost record. The currently published
+    state is read first and its head is carried into `publish`, so a record that
+    landed in between refuses this one rather than overwriting it. That, and not
+    a lock, is what makes a concurrent acceptance impossible to lose: the two
+    writers are serialized by the coordination repository's own history.
+    """
+    source = resolve_read_source(repo_root)
+    current = read_progress_record(source, project=project, ticket=ticket)
+
+    accepted = current["accepted"]
+    if checkpoint is None:
+        if commit is not None:
+            raise ControlPlaneError(
+                "Cannot accept: --commit names the product checkpoint being accepted, so it "
+                "needs --checkpoint. Omit both to reconsider the estimate alone."
+            )
+    else:
+        if commit is None:
+            raise ControlPlaneError(
+                "Cannot accept: --checkpoint needs the --commit it accepts, so the recorded "
+                "acceptance can be checked against product history."
+            )
+        standing = _accepted_checkpoint(current)
+        if checkpoint <= standing:
+            raise ControlPlaneError(
+                f"Cannot accept: checkpoint {checkpoint} does not follow the accepted "
+                f"checkpoint {standing}. Acceptance advances; it never repeats or regresses."
+            )
+        root = Path(product_repo).expanduser() if product_repo is not None else resolve_repo_root()
+        subject = _checkpoint_subject(root, commit)
+        if subject != str(checkpoint):
+            raise ControlPlaneError(
+                f"Cannot accept: commit {commit} has Flow subject {subject!r}, not "
+                f"{str(checkpoint)!r}. The accepted checkpoint number is read from product "
+                "history, not stated."
+            )
+        accepted = {"checkpoint": checkpoint, "commit": commit}
+
+    completion = current["named"]
+    if named is None:
+        if named_total is not None:
+            raise ControlPlaneError(
+                "Cannot accept: --named-total states the roadmap size a named completion was "
+                "reached on, so it needs --named."
+            )
+    else:
+        if named_total is None:
+            raise ControlPlaneError(
+                "Cannot accept: --named needs --named-total, because a roadmap may honestly "
+                "grow and a completion means nothing without the size it was reached on."
+            )
+        standing = _completed_named(current)
+        if named <= standing:
+            raise ControlPlaneError(
+                f"Cannot accept: named checkpoint {named} does not follow the completed named "
+                f"checkpoint {standing}."
+            )
+        completion = {"checkpoint": named, "total": named_total}
+
+    proposed = {
+        "schemaVersion": current["schemaVersion"],
+        "accepted": accepted,
+        "named": completion,
+        "projection": {"confidence": confidence, "note": note, "remaining": remaining},
+    }
+    try:
+        document = validate_document(proposed)
+    except ProgressRecordError as exc:
+        raise ControlPlaneError(f"Cannot accept: {exc}") from exc
+
+    target, head = _publish_acceptance(
+        repo_root,
+        project=project,
+        ticket=ticket,
+        state=state,
+        document=document,
+        expected_head=source.head,
+    )
+    return target, head, document
 
 
 class ReadSource:
@@ -1200,6 +1471,27 @@ def _build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--rail", help="Stable semantic rail identifier for rail-scoped artifacts.")
     publish_parser.add_argument("--expected-head", help="Head the caller last read; publication fails closed if stale.")
 
+    accept_parser = subparsers.add_parser(
+        "accept",
+        help="Publish the ticket's current progress: the accepted checkpoint, the completed "
+             "named checkpoint, and the reconsidered estimate.",
+    )
+    add_scope(accept_parser)
+    accept_parser.add_argument(
+        "--state-file",
+        dest="state_file",
+        required=True,
+        help="File holding the accepted state to publish; it lands in the same commit as the record.",
+    )
+    accept_parser.add_argument("--checkpoint", type=int, help="Numeric Flow checkpoint being accepted.")
+    accept_parser.add_argument("--commit", help="Full object name of the product commit being accepted.")
+    accept_parser.add_argument("--named", type=int, help="Named ticket checkpoint being completed.")
+    accept_parser.add_argument("--named-total", type=int, dest="named_total", help="Named roadmap size at that completion.")
+    accept_parser.add_argument("--remaining", type=int, required=True, help="Numeric checkpoints the orchestrator now projects as remaining.")
+    accept_parser.add_argument("--confidence", required=True, choices=list(CONFIDENCES), help="Projection confidence.")
+    accept_parser.add_argument("--note", default="", help="One bounded line saying why the estimate stands where it does.")
+    accept_parser.add_argument("--product-repo", dest="product_repo", help="Product repository the accepted commit is read from; defaults to the current one.")
+
     proceed_parser = subparsers.add_parser(
         "proceed", help="Allocate the next handoff indicator after durable publication."
     )
@@ -1258,6 +1550,44 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if arguments.command == "rail":
         print(render_rail(repo_root, project=project, ticket=ticket, rail=arguments.rail))
+        return 0
+    if arguments.command == "accept":
+        state_source = Path(arguments.state_file).expanduser()
+        try:
+            state_content = state_source.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ControlPlaneError(f"Cannot read {state_source}: {exc}") from exc
+        target, head, document = accept_progress(
+            repo_root,
+            project=project,
+            ticket=ticket,
+            state=state_content,
+            remaining=arguments.remaining,
+            confidence=arguments.confidence,
+            note=arguments.note,
+            checkpoint=arguments.checkpoint,
+            commit=arguments.commit,
+            named=arguments.named,
+            named_total=arguments.named_total,
+            product_repo=Path(arguments.product_repo) if arguments.product_repo else None,
+        )
+        accepted = document["accepted"]
+        named = document["named"]
+        print(f"published: {target.relative_to(repo_root).as_posix()}")
+        print(
+            "accepted checkpoint: "
+            + ("none" if accepted is None else f"{accepted['checkpoint']} at {accepted['commit']}")
+        )
+        print(
+            "named checkpoint: "
+            + ("none" if named is None else f"{named['checkpoint']} of {named['total']}")
+        )
+        print(
+            "projected remaining: {0} ({1} confidence)".format(
+                document["projection"]["remaining"], document["projection"]["confidence"]
+            )
+        )
+        print(f"head: {head or 'empty history'}")
         return 0
     if arguments.command == "proceed":
         # Allocation must already have succeeded before anything is printed.

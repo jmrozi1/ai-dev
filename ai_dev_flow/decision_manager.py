@@ -149,10 +149,10 @@ class ManagerRun:
     is held in memory for this run only: nothing here writes it, and there is no
     restart across which it could survive.
 
-    `progress` is the durable progress store this run reports from, and it has no
-    default either -- for the reason the allowance store has none. Which
-    worktree's recorded acceptance and projection facts a run is about is not this
-    module's decision, and a store that could be defaulted is a store a run could
+    `progress` is the published progress record this run reports from, and it has
+    no default either -- for the reason the allowance store has none. Which
+    ticket's accepted and projected facts a run is about is not this module's
+    decision, and a source that could be defaulted is a source a run could
     silently report the wrong ticket's progress from. It is named, never opened
     here: this module reads nothing durable and writes nothing durable at all.
 

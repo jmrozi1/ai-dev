@@ -15,10 +15,17 @@ from ai_dev_flow import decision_manager_web as web
 from ai_dev_flow.decision_manager import ManagerRun, project_progress
 from ai_dev_flow.decision_manager_web import RenderError, build_progress
 from ai_dev_flow.manager_controller import ManagerController
-from ai_dev_flow.progress_store import ProgressStore, progress_store_path
+from ai_dev_flow import control_plane
+from ai_dev_flow.progress_store import ProgressStore
 from ai_dev_flow.progress_view import ProgressView, project_progress as project_view
 
-from tests.test_decision_manager_launch import LIVE_RAIL, SESSION, SourcedLaunchTestCase
+from tests.test_decision_manager_launch import (
+    LIVE_RAIL,
+    PROJECT,
+    SESSION,
+    SourcedLaunchTestCase,
+    TICKET,
+)
 from tests.test_manager_controller import ALWAYS_ALIVE, fetched, payload_in
 from ai_dev_flow.decision_manager_web import start_serving
 
@@ -157,6 +164,11 @@ class CompositionTests(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
+        # A real, empty coordination repository: nothing published, honestly so.
+        subprocess.run(
+            ["git", "-C", str(self.tmp), "init", "-q"],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
 
     def a_run(self, *, now=1_800_000_000) -> ManagerRun:
         from ai_dev_flow.claude_allowance_store import AllowanceStore
@@ -165,7 +177,7 @@ class CompositionTests(unittest.TestCase):
             store=AllowanceStore(self.tmp / "allowance.json"),
             now=now,
             human_exclusive_since=None,
-            progress=ProgressStore(self.tmp / "progress.json"),
+            progress=ProgressStore.for_scope(self.tmp, project="ai-dev", ticket="issue-55"),
         )
 
     def test_one_run_projects_progress_exactly_once_at_its_own_instant(self) -> None:
@@ -191,12 +203,15 @@ class CompositionTests(unittest.TestCase):
         run = self.a_run(now=1_700_000_000)
         self.assertIs(project_progress(run).source_healthy, True)
         source = Path(manager.__file__).read_text(encoding="utf-8")
-        for forbidden in ("time.time", "progress_store_path", "ProgressStore("):
+        for forbidden in ("time.time", "for_scope", "ProgressStore("):
             self.assertNotIn(forbidden, source, forbidden)
 
     def test_composition_refuses_a_run_it_did_not_receive(self) -> None:
         with self.assertRaises(manager.ManagerRunError):
-            project_progress({"progress": ProgressStore(self.tmp / "progress.json")})
+            project_progress(
+                {"progress": ProgressStore.for_scope(
+                    self.tmp, project="ai-dev", ticket="issue-55")}
+            )
 
     def test_the_projected_view_reaches_the_page_unmodified(self) -> None:
         from tests.test_manager_controller import payload_in
@@ -244,40 +259,84 @@ class ProgressOverHttpTests(SourcedLaunchTestCase):
         )
         return self._git("rev-parse", "HEAD")
 
+    def product_repository(self) -> Path:
+        """A real product repository whose commits are published Flow checkpoints."""
+        if getattr(self, "_product", None) is None:
+            self._product = self.sources / "product"
+            self._product.mkdir(parents=True)
+            for arguments in (
+                ("init", "-q"),
+                ("config", "user.name", "Progress Surface Tests"),
+                ("config", "user.email", "progress-surface-tests@example.com"),
+            ):
+                subprocess.run(
+                    ["git", "-C", str(self._product), *arguments],
+                    check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                )
+        return self._product
+
+    def checkpoint_commit(self, checkpoint: int) -> str:
+        """Publish one numeric Flow checkpoint. Publishing is all this does."""
+        product = self.product_repository()
+        subprocess.run(
+            ["git", "-C", str(product), "commit", "-q", "--allow-empty", "-m", str(checkpoint)],
+            check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        completed = subprocess.run(
+            ["git", "-C", str(product), "rev-parse", "HEAD"],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return completed.stdout.strip()
+
+    def accept(self, when: str, **stated) -> None:
+        """The supported production action, run against real repositories.
+
+        This is the whole point of the fixture: nothing below writes a progress
+        store, because production has no such seam. The orchestrator publishes a
+        progress record into the coordination repository, and the manager derives
+        the measure from the commits that publication left behind.
+        """
+        previous = {key: os.environ.get(key) for key in ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE")}
+        for key in previous:
+            os.environ[key] = when
+        try:
+            control_plane.accept_progress(
+                self.coordination, project=PROJECT, ticket=TICKET,
+                state="# Control Plane State\n\nProject: ai-dev\n",
+                product_repo=self.product_repository(), **stated
+            )
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
     def record_the_baseline(self) -> ProgressStore:
-        """The exact state this rail names, written through the production store."""
-        store = ProgressStore(progress_store_path(self.root))
-        for number, when in (
-            (48, "2026-08-25T10:00:00+00:00"),
-            (49, "2026-08-28T10:00:00+00:00"),
-            (50, "2026-08-30T10:00:00+00:00"),
-            (51, "2026-09-01T10:00:00+00:00"),
-            (52, "2026-09-02T09:00:00+00:00"),
-        ):
-            store.record_acceptance(
-                repo_root=self.coordination,
-                commit=self.coordination_commit(when),
-                checkpoint=number,
-            )
-        for number in range(1, 7):
-            store.record_named_completion(
-                repo_root=self.coordination,
-                commit=self.coordination_commit("2026-08-30T12:00:00+00:00"),
-                checkpoint=number, total=9,
-            )
-        for remaining, when, note in (
-            (10, "2026-08-26T10:00:00+00:00", "initial estimate"),
-            (12, "2026-08-31T10:00:00+00:00",
-             "scope grew: D8 needed its own remediation checkpoint"),
-            (12, "2026-09-01T12:00:00+00:00", "reconsidered, unchanged"),
-            (12, "2026-09-02T10:00:00+00:00", "reconsidered, unchanged"),
-        ):
-            store.record_projection(
-                repo_root=self.coordination,
-                commit=self.coordination_commit(when),
-                remaining=remaining, confidence="low", note=note,
-            )
-        return store
+        """The exact state this rail names, published through the production action."""
+        self.accept("2026-08-25T10:00:00+00:00", checkpoint=48,
+                    commit=self.checkpoint_commit(48), remaining=12,
+                    confidence="low", note="initial estimate")
+        self.accept("2026-08-28T10:00:00+00:00", checkpoint=49,
+                    commit=self.checkpoint_commit(49), remaining=13,
+                    confidence="low", note="one more than thought")
+        self.accept("2026-08-30T10:00:00+00:00", checkpoint=50,
+                    commit=self.checkpoint_commit(50), remaining=12,
+                    confidence="low", note="reconsidered, unchanged")
+        self.accept("2026-08-30T12:00:00+00:00", named=6, named_total=9,
+                    remaining=12, confidence="low", note="named checkpoint 6 complete")
+        self.accept("2026-08-31T10:00:00+00:00", remaining=14, confidence="low",
+                    note="scope grew: D8 needed its own remediation checkpoint")
+        self.accept("2026-09-01T10:00:00+00:00", checkpoint=51,
+                    commit=self.checkpoint_commit(51), remaining=13,
+                    confidence="low", note="reconsidered, unchanged")
+        self.accept("2026-09-02T09:00:00+00:00", checkpoint=52,
+                    commit=self.checkpoint_commit(52), remaining=12,
+                    confidence="low", note="reconsidered, unchanged")
+        return ProgressStore.for_scope(self.coordination, project=PROJECT, ticket=TICKET)
+
+    def progress_path(self) -> Path:
+        return self.coordination / PROJECT / TICKET / "progress.json"
 
     def served(self, *, alive=ALWAYS_ALIVE):
         controller = self.controller()
@@ -305,7 +364,7 @@ class ProgressOverHttpTests(SourcedLaunchTestCase):
         self.assertEqual(progress["namedTotal"], 9)
         self.assertEqual(progress["revision"]["from"], 62)
         self.assertEqual(progress["revision"]["to"], 64)
-        self.assertEqual(progress["preservedCount"], 2)
+        self.assertEqual(progress["preservedCount"], 4)
 
     def test_the_served_timestamps_are_the_ones_git_reports(self) -> None:
         store = self.record_the_baseline()
@@ -321,16 +380,39 @@ class ProgressOverHttpTests(SourcedLaunchTestCase):
         )
 
     def test_a_published_but_unaccepted_checkpoint_changes_nothing_served(self) -> None:
-        """The commit is real and reachable. It was never accepted."""
+        """A real checkpoint 53 exists on the product remote. Nobody accepted it.
+
+        This is the invariant the whole wiring rests on: publishing a checkpoint
+        reaches no progress action at all, so the numerator cannot move until the
+        orchestrator performs the acceptance.
+        """
         self.record_the_baseline()
         _page, before = self.served()
-        published = self.coordination_commit("2026-09-02T11:00:00+00:00")
-        self.assertEqual(self._git("cat-file", "-t", published), "commit")
+        published = self.checkpoint_commit(53)
+        completed = subprocess.run(
+            ["git", "-C", str(self.product_repository()), "cat-file", "-t", published],
+            check=True, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.stdout.strip(), "commit")
         _page, after = self.served()
         self.assertEqual(after["progress"], before["progress"])
+        self.assertEqual(after["progress"]["acceptedCheckpoint"], 52)
 
-    def test_a_worktree_with_no_recorded_progress_says_so_over_the_socket(self) -> None:
-        self.assertFalse(progress_store_path(self.root).exists())
+    def test_accepting_that_checkpoint_is_what_moves_the_numerator(self) -> None:
+        """And it moves only through the supported action, over the same socket."""
+        self.record_the_baseline()
+        _page, before = self.served()
+        self.assertEqual(before["progress"]["acceptedCheckpoint"], 52)
+        self.accept("2026-09-02T11:00:00+00:00", checkpoint=53,
+                    commit=self.checkpoint_commit(53), remaining=11,
+                    confidence="low", note="reconsidered, unchanged")
+        _page, after = self.served()
+        self.assertEqual(after["progress"]["acceptedCheckpoint"], 53)
+        self.assertEqual(after["progress"]["projectedFinal"], 64)
+        self.assertEqual(after["progress"]["percentage"], "83%")
+
+    def test_a_scope_with_no_published_progress_says_so_over_the_socket(self) -> None:
+        self.assertFalse(self.progress_path().exists())
         _page, payload = self.served()
         progress = payload["progress"]
         self.assertFalse(progress["available"])
@@ -338,9 +420,11 @@ class ProgressOverHttpTests(SourcedLaunchTestCase):
         self.assertIsNone(progress["percentage"])
         self.assertTrue(progress["sourceHealthy"])
 
-    def test_an_unreadable_store_is_stated_rather_than_crashing_the_page(self) -> None:
+    def test_an_unreadable_record_is_stated_rather_than_crashing_the_page(self) -> None:
         self.record_the_baseline()
-        progress_store_path(self.root).write_text("{not json", encoding="utf-8")
+        self.progress_path().write_text("{not json", encoding="utf-8")
+        self._git("add", "--", str(self.progress_path()))
+        self._git("commit", "-q", "-m", "crafted")
         _page, payload = self.served()
         progress = payload["progress"]
         self.assertFalse(progress["available"])

@@ -102,7 +102,7 @@ from .queue_source import (
     project_queue,
     resolve_queue_scope,
 )
-from .progress_store import ProgressStore, progress_store_path
+from .progress_store import ProgressStore
 from .repository import resolve_repo_root
 from .session_binding import BindingStore
 from .session_lifecycle import SessionRegistry
@@ -203,6 +203,7 @@ class QueueSourceContext:
 def resolve_run(
     *,
     human_exclusive_since: Optional[int],
+    source: QueueSourceContext,
     cwd: Optional[Path] = None,
 ) -> ManagerRun:
     """One run's five inputs, each resolved exactly once, as one frozen value.
@@ -213,8 +214,14 @@ def resolve_run(
     either. The instant is read here, once, because `decision_manager` deliberately
     reads no clock and something has to.
 
-    The progress store is resolved from the same root as the allowance store, so
-    one run reports the recorded progress of the worktree it is actually serving.
+    The progress record is resolved from the *stated coordination scope*, not from
+    the product root, because that is where it is published and where it belongs.
+    Acceptance is an orchestrator act in the coordination repository; the product
+    worktree is a per-host checkout of the thing being accepted, and writing a
+    derived record into it would both dirty a worktree whose cleanliness is
+    load-bearing and give one ticket as many progress records as it has checkouts.
+    So this reads the scope the queue is already read from, and one run reports the
+    progress of the ticket it is actually serving.
 
     `human_exclusive_since` is keyword-only and has no default, exactly as
     `ManagerRun` and `project_window` give theirs none. A caller that omits it gets
@@ -228,7 +235,9 @@ def resolve_run(
     """
     repo_root = resolve_repo_root(cwd)
     store = AllowanceStore(allowance_store_path(repo_root))
-    progress = ProgressStore(progress_store_path(repo_root))
+    progress = ProgressStore.for_scope(
+        Path(source.control_plane), project=source.project, ticket=source.ticket
+    )
     now = int(time.time())
     return ManagerRun(
         store=store,
@@ -394,6 +403,7 @@ def render_launch_page(
     details: Mapping[str, SelectedDetail],
     *,
     human_exclusive_since: Optional[int],
+    source: QueueSourceContext,
     cwd: Optional[Path] = None,
     template_path: Optional[Path] = None,
 ) -> str:
@@ -404,7 +414,9 @@ def render_launch_page(
     durable state, and manufacturing an empty one here would present an unwired
     source as an answered one.
     """
-    run = resolve_run(human_exclusive_since=human_exclusive_since, cwd=cwd)
+    run = resolve_run(
+        human_exclusive_since=human_exclusive_since, source=source, cwd=cwd
+    )
     return render_manager_page(run, view, details, template_path=template_path)
 
 
@@ -413,6 +425,7 @@ def launch_manager_server(
     details: Mapping[str, SelectedDetail],
     *,
     human_exclusive_since: Optional[int],
+    source: QueueSourceContext,
     cwd: Optional[Path] = None,
     port: int = 0,
     template_path: Optional[Path] = None,
@@ -427,7 +440,9 @@ def launch_manager_server(
     and there is no timer, poller, or watcher by which a later instant could appear
     on a page this run already rendered. A later instant is a later run.
     """
-    run = resolve_run(human_exclusive_since=human_exclusive_since, cwd=cwd)
+    run = resolve_run(
+        human_exclusive_since=human_exclusive_since, source=source, cwd=cwd
+    )
     return make_manager_server(
         run,
         view,
@@ -570,12 +585,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     """
     try:
         claim, source = stated_run_inputs(list(sys.argv[1:] if argv is None else argv))
-        run = resolve_run(human_exclusive_since=claim)
+        run = resolve_run(human_exclusive_since=claim, source=source)
     except LaunchError as exc:
         print("decision-manager-launch: {0}".format(exc), file=sys.stderr)
         return 1
 
     print("allowance store: {0}".format(run.store.path))
+    print("progress record: {0}".format(run.progress.relative))
     print("run instant: {0}".format(run.now))
     print(
         "human exclusivity: {0}".format(

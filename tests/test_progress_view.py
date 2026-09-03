@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import inspect
+import json
 import os
 import subprocess
 import tempfile
@@ -13,7 +15,7 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 
-from ai_dev_flow import progress_view as view_module
+from ai_dev_flow import control_plane, progress_view as view_module
 from ai_dev_flow.progress_store import ProgressStore, ProgressStoreError
 from ai_dev_flow.progress_view import (
     DELTA_WINDOWS,
@@ -29,81 +31,182 @@ from ai_dev_flow.progress_view import (
 )
 
 
+_GIT_DATES = ("GIT_AUTHOR_DATE", "GIT_COMMITTER_DATE")
+
+
 def epoch(text: str) -> int:
     return int(datetime.fromisoformat(text).timestamp())
 
 
 class ProgressViewTestCase(unittest.TestCase):
-    """One disposable coordination repository and one store per fixture."""
+    """One disposable coordination repository, one product repository, no stubs.
+
+    Every progress fact below is published through the supported production
+    action -- `control_plane accept` -- into a real coordination repository, and
+    then derived back out of that repository's own history by the production
+    reader. Nothing here writes a store directly, because a fixture that did
+    would be proving something about a seam production does not have.
+
+    `publish_record` is the one deliberate exception and is never used to make an
+    acceptance: it commits a crafted record to exercise how the *reader* degrades
+    on a history the supported action could not have produced.
+    """
+
+    project_name = "ai-dev"
+    ticket_name = "issue-55"
 
     def setUp(self) -> None:
         self._tmpdir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self._tmpdir.name)
         self.addCleanup(self._tmpdir.cleanup)
         self.repo = self.tmp_path / "coordination"
-        self.repo.mkdir(parents=True)
-        self._git("init", "-q")
-        self._git("config", "user.name", "Progress View Tests")
-        self._git("config", "user.email", "progress-view-tests@example.com")
-        self.store = ProgressStore(self.tmp_path / "progress.json")
+        self.product = self.tmp_path / "product"
+        for root in (self.repo, self.product):
+            root.mkdir(parents=True)
+            self._run(root, "init", "-q")
+            self._run(root, "config", "user.name", "Progress View Tests")
+            self._run(root, "config", "user.email", "progress-view-tests@example.com")
+        self._run(self.repo, "commit", "-q", "--allow-empty", "-m", "initial")
+        self.store = ProgressStore.for_scope(
+            self.repo, project=self.project_name, ticket=self.ticket_name
+        )
+        self.remaining = 0
+        self.confidence = "low"
+        self.basis = 0
 
-    def _git(self, *args: str, when: str = None) -> str:
+    # -- real repositories -------------------------------------------------
+
+    def _run(self, root: Path, *args: str, when: str = None) -> str:
         environment = dict(os.environ)
         if when is not None:
             environment["GIT_AUTHOR_DATE"] = when
             environment["GIT_COMMITTER_DATE"] = when
         completed = subprocess.run(
-            ["git", "-C", str(self.repo), *args],
+            ["git", "-C", str(root), *args],
             check=True, text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=environment,
         )
         return completed.stdout.strip()
+
+    def _git(self, *args: str, when: str = None) -> str:
+        return self._run(self.repo, *args, when=when)
 
     def at(self, when: str) -> str:
         """One real commit in the coordination repository, at a stated instant."""
         self._git("commit", "-q", "--allow-empty", "-m", "orchestrator: state", when=when)
         return self._git("rev-parse", "HEAD")
 
-    def accept(self, checkpoint: int, when: str) -> None:
-        self.store.record_acceptance(
-            repo_root=self.repo, commit=self.at(when), checkpoint=checkpoint
+    def checkpoint_commit(self, checkpoint: int) -> str:
+        """One real published Flow checkpoint in the product repository.
+
+        Publishing is all this does. Nothing about it reaches the measure, which
+        is the point: a checkpoint exists here whether or not it is ever accepted.
+        """
+        self._run(self.product, "commit", "-q", "--allow-empty", "-m", str(checkpoint))
+        return self._run(self.product, "rev-parse", "HEAD")
+
+    # -- the supported production action -----------------------------------
+
+    @contextlib.contextmanager
+    def _dated(self, when: str):
+        previous = {key: os.environ.get(key) for key in _GIT_DATES}
+        for key in _GIT_DATES:
+            os.environ[key] = when
+        try:
+            yield
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def publish(self, when: str, **stated) -> dict:
+        """Publish one progress record through the supported production action."""
+        stated.setdefault("remaining", self.remaining)
+        stated.setdefault("confidence", self.confidence)
+        with self._dated(when):
+            _target, _head, document = control_plane.accept_progress(
+                self.repo,
+                project=self.project_name,
+                ticket=self.ticket_name,
+                state="# Control Plane State\n\nProject: ai-dev\n",
+                product_repo=self.product,
+                **stated
+            )
+        self.remaining = document["projection"]["remaining"]
+        self.confidence = document["projection"]["confidence"]
+        if document["accepted"] is not None:
+            self.basis = document["accepted"]["checkpoint"]
+        return document
+
+    def accept(self, checkpoint: int, when: str, *, remaining: int = None, **stated) -> dict:
+        """Accept one numeric checkpoint, the estimate consumed by that progress.
+
+        Omitting `remaining` means the orchestrator reconsidered and preserved the
+        projected final: the work just accepted comes out of what remains, so the
+        total holds still while the percentage rises.
+        """
+        if remaining is None:
+            remaining = max(0, self.remaining - (checkpoint - self.basis))
+        return self.publish(
+            when,
+            checkpoint=checkpoint,
+            commit=self.checkpoint_commit(checkpoint),
+            remaining=remaining,
+            **stated
         )
 
-    def project(self, remaining: int, when: str, *, confidence="low", note="") -> None:
-        self.store.record_projection(
-            repo_root=self.repo, commit=self.at(when),
-            remaining=remaining, confidence=confidence, note=note,
-        )
+    def project(self, remaining: int, when: str, *, confidence="low", note="") -> dict:
+        return self.publish(when, remaining=remaining, confidence=confidence, note=note)
 
-    def complete_named(self, checkpoint: int, total: int, when: str) -> None:
-        self.store.record_named_completion(
-            repo_root=self.repo, commit=self.at(when), checkpoint=checkpoint, total=total
+    def complete_named(self, checkpoint: int, total: int, when: str) -> dict:
+        return self.publish(when, named=checkpoint, named_total=total)
+
+    def publish_to(self, ticket: str, when: str, **stated) -> ProgressStore:
+        """One independent published scope, for a case that needs its own history."""
+        with self._dated(when):
+            control_plane.accept_progress(
+                self.repo, project=self.project_name, ticket=ticket,
+                state="# Control Plane State\n\nProject: ai-dev\n",
+                product_repo=self.product, **stated
+            )
+        return ProgressStore.for_scope(self.repo, project=self.project_name, ticket=ticket)
+
+    def publish_record(self, when: str, document: dict) -> str:
+        """Commit one crafted record directly, to exercise the reader's refusals.
+
+        Never an acceptance. The supported action cannot produce these histories,
+        which is exactly why the reader must still say something honest about one.
+        """
+        target = self.repo / self.project_name / self.ticket_name / "progress.json"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(
+            document if isinstance(document, str) else json.dumps(document, indent=2) + "\n",
+            encoding="utf-8",
         )
+        self._git("add", "--", str(target))
+        self._git("commit", "-q", "-m", "crafted", when=when)
+        return self._git("rev-parse", "HEAD")
 
     # -- the fixture the rail describes -----------------------------------
 
     def the_issue_55_baseline(self) -> None:
-        """Exactly the state this rail was authorized against.
+        """Exactly the state this rail was authorized against, published for real.
 
         Last accepted numeric checkpoint 52, a projected denominator of about 64,
         confidence low, named checkpoint 7 of 9 active, and a denominator that was
-        revised once from 62 and preserved unchanged twice since.
+        revised once from 62 and preserved unchanged since.
         """
-        for number, when in (
-            (48, "2026-08-25T10:00:00+00:00"),
-            (49, "2026-08-28T10:00:00+00:00"),
-            (50, "2026-08-30T10:00:00+00:00"),
-            (51, "2026-09-01T10:00:00+00:00"),
-            (52, "2026-09-02T09:00:00+00:00"),
-        ):
-            self.accept(number, when)
-        for number in range(1, 7):
-            self.complete_named(number, 9, "2026-08-30T12:00:00+00:00")
-        self.project(10, "2026-08-26T10:00:00+00:00", note="initial estimate")
-        self.project(12, "2026-08-31T10:00:00+00:00",
+        self.accept(48, "2026-08-25T10:00:00+00:00", remaining=12, note="initial estimate")
+        self.accept(49, "2026-08-28T10:00:00+00:00", remaining=13,
+                    note="one more than thought")
+        self.accept(50, "2026-08-30T10:00:00+00:00")
+        self.complete_named(6, 9, "2026-08-30T12:00:00+00:00")
+        self.project(14, "2026-08-31T10:00:00+00:00",
                      note="scope grew: D8 needed its own remediation checkpoint")
-        self.project(12, "2026-09-01T12:00:00+00:00", note="reconsidered, unchanged")
-        self.project(12, "2026-09-02T10:00:00+00:00", note="reconsidered, unchanged")
+        self.accept(51, "2026-09-01T10:00:00+00:00")
+        self.accept(52, "2026-09-02T09:00:00+00:00")
 
     def view(self, when: str = "2026-09-02T12:00:00+00:00") -> ProgressView:
         return project_progress(self.store, now=epoch(when))
@@ -128,7 +231,10 @@ class CoreMeasureTests(ProgressViewTestCase):
         self.assertEqual(view.confidence, "low")
         self.assertEqual((view.named_checkpoint, view.named_total), (7, 9))
         self.assertEqual((view.revision_from, view.revision_to), (62, 64))
-        self.assertEqual(view.preserved_count, 2)
+        # Every published record restates the estimate, so "reconsidered and
+        # preserved" is counted once per publication that held the total: the
+        # three before the revision and the two acceptances after it.
+        self.assertEqual(view.preserved_count, 4)
 
     def test_the_numerator_is_the_last_accepted_numeric_checkpoint(self) -> None:
         self.accept(51, "2026-09-01T10:00:00+00:00")
@@ -164,14 +270,11 @@ class CoreMeasureTests(ProgressViewTestCase):
     def test_the_percentage_is_the_numerator_over_the_projected_final(self) -> None:
         for accepted, remaining in ((52, 12), (10, 10), (1, 0), (7, 3)):
             with self.subTest(accepted=accepted, remaining=remaining):
-                store = ProgressStore(self.tmp_path / "p{0}-{1}.json".format(accepted, remaining))
-                store.record_acceptance(
-                    repo_root=self.repo, commit=self.at("2026-09-01T10:00:00+00:00"),
-                    checkpoint=accepted,
-                )
-                store.record_projection(
-                    repo_root=self.repo, commit=self.at("2026-09-01T11:00:00+00:00"),
-                    remaining=remaining, confidence="low", note="",
+                ticket = "case-{0}-{1}".format(accepted, remaining)
+                store = self.publish_to(
+                    ticket, "2026-09-01T10:00:00+00:00",
+                    checkpoint=accepted, commit=self.checkpoint_commit(accepted),
+                    remaining=remaining, confidence="low",
                 )
                 view = project_progress(store, now=epoch("2026-09-02T12:00:00+00:00"))
                 self.assertEqual(view.projected_final, accepted + remaining)
@@ -183,14 +286,10 @@ class CoreMeasureTests(ProgressViewTestCase):
     def test_confidence_is_exactly_the_recorded_one_of_three(self) -> None:
         for confidence in ("low", "medium", "high"):
             with self.subTest(confidence=confidence):
-                store = ProgressStore(self.tmp_path / "c-{0}.json".format(confidence))
-                store.record_acceptance(
-                    repo_root=self.repo, commit=self.at("2026-09-01T10:00:00+00:00"),
-                    checkpoint=52,
-                )
-                store.record_projection(
-                    repo_root=self.repo, commit=self.at("2026-09-01T11:00:00+00:00"),
-                    remaining=12, confidence=confidence, note="",
+                store = self.publish_to(
+                    "case-{0}".format(confidence), "2026-09-01T10:00:00+00:00",
+                    checkpoint=52, commit=self.checkpoint_commit(52),
+                    remaining=12, confidence=confidence,
                 )
                 view = project_progress(store, now=epoch("2026-09-02T12:00:00+00:00"))
                 self.assertEqual(view.confidence, confidence)
@@ -255,11 +354,10 @@ class RevisionVersusProgressTests(ProgressViewTestCase):
         )
         # And the drop is attributable: no work was lost, the numerator is equal.
         self.assertEqual(after.accepted_checkpoint, 52)
-        self.assertEqual(after.preserved_count, 2)
+        self.assertEqual(after.preserved_count, 4)
 
     def test_a_preserved_estimate_is_counted_and_is_not_a_revision(self) -> None:
-        self.accept(52, "2026-09-01T10:00:00+00:00")
-        self.project(12, "2026-09-01T11:00:00+00:00", note="initial")
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=12, note="initial")
         first = self.view()
         self.assertIsNone(first.revision_at)
         self.assertEqual(first.preserved_count, 0)
@@ -270,8 +368,8 @@ class RevisionVersusProgressTests(ProgressViewTestCase):
         self.assertEqual(second.projected_final, first.projected_final)
 
     def test_the_first_projection_establishes_rather_than_revises(self) -> None:
-        self.accept(52, "2026-09-01T10:00:00+00:00")
-        self.project(12, "2026-09-01T11:00:00+00:00", note="first estimate of all")
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=12,
+                    note="first estimate of all")
         view = self.view()
         self.assertEqual(view.projected_final, 64)
         self.assertIsNone(view.revision_at)
@@ -285,10 +383,9 @@ class RevisionVersusProgressTests(ProgressViewTestCase):
         the *same* total. Comparing the remaining counts alone would call that a
         revision, which is exactly the false alarm this test pins shut.
         """
-        self.accept(51, "2026-09-01T10:00:00+00:00")
-        self.project(13, "2026-09-01T11:00:00+00:00", note="initial")
-        self.accept(52, "2026-09-02T09:00:00+00:00")
-        self.project(12, "2026-09-02T10:00:00+00:00", note="reconsidered, unchanged")
+        self.accept(51, "2026-09-01T10:00:00+00:00", remaining=13, note="initial")
+        self.accept(52, "2026-09-02T09:00:00+00:00", remaining=12,
+                    note="reconsidered, unchanged")
         view = self.view()
         self.assertEqual(view.projected_final, 64)
         self.assertIsNone(view.revision_at)
@@ -301,29 +398,49 @@ class RevisionVersusProgressTests(ProgressViewTestCase):
 
 
 class UnavailableEvidenceTests(ProgressViewTestCase):
+    def test_the_supported_action_cannot_leave_an_estimate_overtaken(self) -> None:
+        """An acceptance carries its own estimate, so the two cannot disagree.
+
+        Under the published record a projection's basis *is* the accepted
+        checkpoint standing in the same record, so accepting more than the
+        estimate left room for is not a state the supported action can reach: it
+        restates the remainder in the same act. This pins that, and the test
+        below keeps the honest answer for a history that reached it some other
+        way.
+        """
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=1, note="nearly done")
+        self.accept(53, "2026-09-02T08:00:00+00:00")
+        self.accept(54, "2026-09-02T09:00:00+00:00", remaining=4, note="more than hoped")
+        view = self.view()
+        self.assertTrue(view.available)
+        self.assertEqual(view.accepted_checkpoint, 54)
+        self.assertEqual(view.projected_final, 58)
+
     def test_an_estimate_reality_overtook_is_stated_and_not_clamped(self) -> None:
         """More accepted than the standing projection left room for.
 
         The honest answer is that the estimate no longer describes reality. A
         clamp to 100% would announce the ticket finished on the strength of an
-        estimate nobody reconsidered.
+        estimate nobody reconsidered. The supported action cannot produce this
+        history -- the record below is committed directly -- but the reader must
+        still say something true about one it finds.
         """
-        self.accept(52, "2026-09-01T10:00:00+00:00")
-        self.project(1, "2026-09-01T11:00:00+00:00", note="nearly done")
-        self.accept(53, "2026-09-02T08:00:00+00:00")
-        self.accept(54, "2026-09-02T09:00:00+00:00")
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=1, note="nearly done")
+        self.publish_record("2026-09-02T09:00:00+00:00", {
+            "schemaVersion": 1, "accepted": None, "named": None,
+            "projection": {"confidence": "low", "note": "estimate alone", "remaining": 1},
+        })
         view = self.view()
         self.assertFalse(view.available)
         self.assertEqual(view.reason, REASON_PROJECTION_OVERTAKEN)
         self.assertIsNone(view.percentage)
         self.assertIsNone(view.projected_final)
         # The accepted facts survive: the estimate went stale, not the progress.
-        self.assertEqual(view.accepted_checkpoint, 54)
+        self.assertEqual(view.accepted_checkpoint, 52)
         self.assertIsNotNone(view.accepted_at)
 
     def test_an_estimate_exactly_consumed_is_still_available_at_one_hundred(self) -> None:
-        self.accept(52, "2026-09-01T10:00:00+00:00")
-        self.project(1, "2026-09-01T11:00:00+00:00")
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=1)
         self.accept(53, "2026-09-02T08:00:00+00:00")
         view = self.view()
         self.assertTrue(view.available)
@@ -338,14 +455,25 @@ class UnavailableEvidenceTests(ProgressViewTestCase):
         self.assertIsNone(view.accepted_checkpoint)
         self.assertIsNone(view.percentage)
 
-    def test_a_store_with_no_projection_shows_the_acceptance_and_no_estimate(self) -> None:
-        self.accept(52, "2026-09-01T10:00:00+00:00")
+    def test_an_acceptance_can_never_arrive_without_an_estimate(self) -> None:
+        """D11 asks the estimate be reconsidered at every acceptance; it must be.
+
+        `REASON_NO_PROJECTION` is the answer the view still gives for facts that
+        carry an acceptance and no estimate. No published record can express
+        that: the projection is not optional, so the state is unreachable rather
+        than merely unlikely, and this proves the refusal instead of the render.
+        """
+        with self.assertRaises(control_plane.ControlPlaneError):
+            control_plane.accept_progress(
+                self.repo, project=self.project_name, ticket=self.ticket_name,
+                state="# Control Plane State\n\nProject: ai-dev\n",
+                remaining=None, confidence="low",
+            )
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=12)
         view = self.view()
-        self.assertFalse(view.available)
-        self.assertEqual(view.reason, REASON_NO_PROJECTION)
-        self.assertEqual(view.accepted_checkpoint, 52)
-        self.assertIsNone(view.projected_final)
-        self.assertIsNone(view.confidence)
+        self.assertTrue(view.available)
+        self.assertNotEqual(view.reason, REASON_NO_PROJECTION)
+        self.assertEqual(view.confidence, "low")
 
     def test_an_empty_store_is_unavailable_rather_than_zero_percent(self) -> None:
         view = self.view()
@@ -357,7 +485,7 @@ class UnavailableEvidenceTests(ProgressViewTestCase):
     def test_a_refusing_store_becomes_an_unavailable_view_and_never_raises(self) -> None:
         """A page that crashes and a page showing 0% are both worse than a reason."""
         self.accept(52, "2026-09-01T10:00:00+00:00")
-        self.store.path.write_text("{not json", encoding="utf-8")
+        self.publish_record("2026-09-01T12:00:00+00:00", "{not json")
         with self.assertRaises(ProgressStoreError):
             self.store.facts()
         view = self.view()
@@ -368,8 +496,7 @@ class UnavailableEvidenceTests(ProgressViewTestCase):
         self.assertIsNone(view.accepted_checkpoint)
 
     def test_the_named_checkpoint_is_absent_before_any_completion(self) -> None:
-        self.accept(52, "2026-09-01T10:00:00+00:00")
-        self.project(12, "2026-09-01T11:00:00+00:00")
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=12)
         view = self.view()
         self.assertIsNone(view.named_checkpoint)
         self.assertIsNone(view.named_total)
@@ -378,8 +505,7 @@ class UnavailableEvidenceTests(ProgressViewTestCase):
     def test_a_finished_roadmap_names_no_current_named_checkpoint(self) -> None:
         for number in range(1, 10):
             self.complete_named(number, 9, "2026-09-01T10:00:00+00:00")
-        self.accept(52, "2026-09-01T10:00:00+00:00")
-        self.project(0, "2026-09-01T11:00:00+00:00")
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=0)
         view = self.view()
         self.assertIsNone(view.named_checkpoint)
         self.assertEqual(view.named_total, 9)

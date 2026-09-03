@@ -148,8 +148,7 @@ class ManagerTestCase(unittest.TestCase):
         self.addCleanup(self._remove_root)
         self.path = self.root / "workload.json"
         self.store = AllowanceStore(self.path)
-        self.progress_path = self.root / "progress.json"
-        self.progress = ProgressStore(self.progress_path)
+        self.progress = ProgressStore(self.root, "ai-dev/issue-55/progress.json")
 
     def _remove_root(self) -> None:
         for item in sorted(self.root.rglob("*"), reverse=True):

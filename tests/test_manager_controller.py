@@ -134,7 +134,7 @@ class ControllerLaunchOwnershipTests(LifecycleTestBase):
             store=AllowanceStore(self.tmp_path / "allowance.json"),
             now=1_800_000_000,
             human_exclusive_since=None,
-            progress=ProgressStore(self.tmp_path / "progress.json"),
+            progress=ProgressStore(self.tmp_path, "ai-dev/issue-55/progress.json"),
         )
 
     def test_a_session_launched_through_the_controller_is_counted_by_it(self) -> None:

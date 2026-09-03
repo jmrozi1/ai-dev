@@ -11,8 +11,12 @@ from unittest.mock import patch
 
 from ai_dev_flow import control_plane
 from ai_dev_flow.control_plane import (
+    ARTIFACT_FILENAMES,
+    ARTIFACT_OWNERS,
     ControlPlaneError,
+    accept_progress,
     allocate_proceed_number,
+    artifact_relative,
     collect_rail_states,
     parse_proceed_sequence,
     publish,
@@ -27,6 +31,8 @@ from ai_dev_flow.control_plane import (
     validate_evidence_projection,
     validate_identifier,
 )
+from ai_dev_flow.progress_record import progress_relative
+from ai_dev_flow.progress_store import ProgressStore
 
 
 SAFE_EVIDENCE = {
@@ -1180,6 +1186,224 @@ class ControlPlaneTests(unittest.TestCase):
             resolve_coordination_repo(plain)
         with self.assertRaises(ControlPlaneError):
             resolve_coordination_repo(self.tmp_path / "missing")
+
+
+# --------------------------------------------------------------------------
+# The supported progress action
+# --------------------------------------------------------------------------
+
+
+class ProgressActionTests(unittest.TestCase):
+    """Accepting a checkpoint is a durable control-plane transition, so it is tested here.
+
+    These are the boundary properties, not the measure: who may publish a
+    progress record, where it lands, that the reader looks exactly there, that a
+    concurrent record cannot be lost, and that none of it touches the product
+    worktree. What the published history comes to is `progress_view`'s question.
+    """
+
+    PROJECT = "ai-dev"
+    TICKET = "issue-55"
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tmp_path = Path(self._tmpdir.name)
+        self.coordination = self._repo("coordination")
+        self.product = self._repo("product")
+        self.checkpoints = {}
+        for number in (52, 53, 54):
+            self._git(self.product, "commit", "-q", "--allow-empty", "-m", str(number))
+            self.checkpoints[number] = self._git(self.product, "rev-parse", "HEAD")
+
+    def _git(self, repo_root: Path, *args: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            check=True, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return completed.stdout.strip()
+
+    def _repo(self, name: str) -> Path:
+        repo_root = self.tmp_path / name
+        repo_root.mkdir(parents=True)
+        self._git(repo_root, "init", "-q")
+        self._git(repo_root, "config", "user.name", "Progress Action Tests")
+        self._git(repo_root, "config", "user.email", "progress-action@example.com")
+        (repo_root / "README.md").write_text("{0}\n".format(name), encoding="utf-8")
+        self._git(repo_root, "add", "README.md")
+        self._git(repo_root, "commit", "-q", "-m", "initial commit")
+        return repo_root
+
+    def accept(self, **overrides: object) -> tuple[Path, str, dict]:
+        arguments: dict = {
+            "project": self.PROJECT, "ticket": self.TICKET,
+            "remaining": 12, "confidence": "low", "note": "",
+            "state": "# Control Plane State\n\nProject: ai-dev\n",
+            "product_repo": self.product,
+        }
+        arguments.update(overrides)
+        return accept_progress(self.coordination, **arguments)  # type: ignore[arg-type]
+
+    # -- ownership and placement ------------------------------------------
+
+    def test_the_progress_record_is_an_orchestrator_owned_scope_artifact(self) -> None:
+        self.assertEqual(ARTIFACT_OWNERS["progress"], "orchestrator")
+        self.assertNotIn("progress", control_plane.RAIL_SCOPED_ARTIFACTS)
+        # Stronger than ownership: no role may publish it, because it is one half
+        # of an acceptance and `accept` writes both halves in a single commit.
+        for role in ("executor", "orchestrator"):
+            with self.assertRaises(ControlPlaneError) as caught:
+                publish(
+                    self.coordination, project=self.PROJECT, ticket=self.TICKET,
+                    artifact="progress", role=role, content="{}\n",
+                )
+            self.assertIn(
+                "written with the accepted state by `accept`", str(caught.exception)
+            )
+
+    def test_the_reader_looks_exactly_where_the_action_publishes(self) -> None:
+        """One path, composed twice, pinned together rather than kept in step by hand."""
+        target, _head, _document = self.accept(
+            checkpoint=52, commit=self.checkpoints[52], remaining=12
+        )
+        relative = target.relative_to(self.coordination).as_posix()
+        self.assertEqual(relative, progress_relative(self.PROJECT, self.TICKET))
+        self.assertEqual(
+            relative,
+            artifact_relative(
+                project=self.PROJECT, ticket=self.TICKET, artifact="progress", rail=None
+            ),
+        )
+        store = ProgressStore.for_scope(
+            self.coordination, project=self.PROJECT, ticket=self.TICKET
+        )
+        self.assertEqual(store.relative, relative)
+        self.assertEqual(store.facts().acceptances[-1].checkpoint, 52)
+
+    def test_the_action_commits_the_state_and_the_record_and_nothing_else(self) -> None:
+        """Both halves of the acceptance, in one commit, and no third path.
+
+        This asserted a single path while the record was separately publishable.
+        Pairing them is the fix, so the property is now "exactly these two".
+        """
+        _target, head, _document = self.accept(
+            checkpoint=52, commit=self.checkpoints[52], remaining=12
+        )
+        changed = sorted(self._git(
+            self.coordination, "show", "--name-only", "--format=", head
+        ).split())
+        self.assertEqual(changed, sorted([
+            progress_relative(self.PROJECT, self.TICKET),
+            artifact_relative(
+                project=self.PROJECT, ticket=self.TICKET, artifact="state", rail=None
+            ),
+        ]))
+        self.assertEqual(self._git(self.coordination, "status", "--porcelain"), "")
+
+    def test_a_record_this_action_would_refuse_cannot_be_published_by_hand(self) -> None:
+        """`publish` validates the record too, so the artifact has one gate, not two."""
+        for content in (
+            "{}\n",
+            json.dumps({"schemaVersion": 1, "accepted": None, "named": None, "projection": None}),
+            json.dumps({
+                "schemaVersion": 1, "accepted": None, "named": None,
+                "projection": {"confidence": "urgent", "note": "", "remaining": 1},
+            }),
+            json.dumps({
+                "schemaVersion": 1, "accepted": None, "named": None, "diary": "what happened",
+                "projection": {"confidence": "low", "note": "", "remaining": 1},
+            }),
+        ):
+            with self.subTest(content=content[:40]), self.assertRaises(ControlPlaneError):
+                publish(
+                    self.coordination, project=self.PROJECT, ticket=self.TICKET,
+                    artifact="progress", role="orchestrator", content=content,
+                )
+        self.assertFalse(
+            (self.coordination / progress_relative(self.PROJECT, self.TICKET)).exists()
+        )
+
+    # -- the writer model --------------------------------------------------
+
+    def test_a_record_that_landed_in_between_refuses_this_one_rather_than_losing_it(
+        self,
+    ) -> None:
+        """The writer model, proven rather than asserted.
+
+        Publication carries the head the action read its current state from, so
+        two writers cannot both compose from one state and have the second
+        silently overwrite the first. The racing record here is a projection
+        reconsideration, which passes every value check the losing writer makes --
+        so the only thing that can stop it is the head it read, and it is stopped.
+        Nothing is lost, the reconsideration survives, and no lock was involved:
+        the coordination repository's own history is what serializes the two.
+        """
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        real = control_plane.resolve_read_source
+        landed = []
+
+        def racing(repo_root):
+            source = real(repo_root)
+            if not landed:
+                # Marked before the nested call, so the other writer reads the
+                # unpatched source and this stays one race rather than a loop.
+                landed.append(True)
+                self.accept(remaining=9, note="reconsidered while the other composed")
+            return source
+
+        with patch.object(control_plane, "resolve_read_source", racing):
+            with self.assertRaises(ControlPlaneError) as caught:
+                self.accept(checkpoint=53, commit=self.checkpoints[53], remaining=11)
+        self.assertIn("expected head", str(caught.exception))
+
+        store = ProgressStore.for_scope(
+            self.coordination, project=self.PROJECT, ticket=self.TICKET
+        )
+        facts = store.facts()
+        self.assertEqual([entry.checkpoint for entry in facts.acceptances], [52])
+        self.assertEqual(facts.projections[-1].remaining, 9)
+        self.assertEqual(
+            facts.projections[-1].note, "reconsidered while the other composed"
+        )
+
+    def test_the_action_holds_no_lock_and_needs_none(self) -> None:
+        """No lock file, no lock directory, and nothing left behind to recover."""
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        source = Path(control_plane.__file__).read_text(encoding="utf-8")
+        for forbidden in ("lock", "flock", "O_EXCL"):
+            self.assertNotIn(forbidden, source.lower().split("accept_progress")[-1][:4000])
+
+    # -- the product worktree ----------------------------------------------
+
+    def test_accepting_a_checkpoint_writes_nothing_into_the_product_worktree(self) -> None:
+        """Cleanliness by construction: the action never opens the product for writing."""
+        before = self._tree(self.product)
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        self.accept(named=6, named_total=9, remaining=12)
+        self.accept(checkpoint=53, commit=self.checkpoints[53], remaining=11)
+        self.assertEqual(self._tree(self.product), before)
+        self.assertEqual(self._git(self.product, "status", "--porcelain"), "")
+        self.assertFalse((self.product / ".ai-dev").exists())
+
+    def test_reading_the_published_history_writes_nothing_anywhere(self) -> None:
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        store = ProgressStore.for_scope(
+            self.coordination, project=self.PROJECT, ticket=self.TICKET
+        )
+        before = (self._tree(self.product), self._tree(self.coordination))
+        head = resolve_current_head(self.coordination)
+        store.facts()
+        store.facts()
+        self.assertEqual((self._tree(self.product), self._tree(self.coordination)), before)
+        self.assertEqual(resolve_current_head(self.coordination), head)
+
+    def _tree(self, root: Path) -> dict:
+        return {
+            str(item.relative_to(root)): item.read_bytes()
+            for item in sorted(root.rglob("*"))
+            if item.is_file() and ".git" not in item.relative_to(root).parts
+        }
 
 
 if __name__ == "__main__":

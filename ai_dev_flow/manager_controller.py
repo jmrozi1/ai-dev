@@ -509,7 +509,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     """
     try:
         claim, source = stated_run_inputs(list(sys.argv[1:] if argv is None else argv))
-        run = resolve_run(human_exclusive_since=claim)
+        run = resolve_run(human_exclusive_since=claim, source=source)
     except LaunchError as exc:
         print("manager-controller: {0}".format(exc), file=sys.stderr)
         return 1
@@ -517,6 +517,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     controller = ManagerController(source)
 
     print("allowance store: {0}".format(run.store.path))
+    print("progress record: {0}".format(run.progress.relative))
     print("run instant: {0}".format(run.now))
     print(
         "human exclusivity: {0}".format(

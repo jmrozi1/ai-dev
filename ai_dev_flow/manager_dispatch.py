@@ -642,7 +642,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     try:
         inputs, remaining = stated_dispatch_inputs(stated)
         claim, source = stated_run_inputs(remaining)
-        run = resolve_run(human_exclusive_since=claim)
+        run = resolve_run(human_exclusive_since=claim, source=source)
     except (DispatchError, LaunchError) as exc:
         print("manager-dispatch: {0}".format(exc), file=sys.stderr)
         return 1
