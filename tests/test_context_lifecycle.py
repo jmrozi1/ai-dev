@@ -386,6 +386,29 @@ class LedgerTests(unittest.TestCase):
         self.assertIsNone(ledger.get(SESSION))
         self.assertEqual(ledger.readings(), {})
 
+    def test_a_failed_invocation_keeps_its_events_and_degrades_the_claim(self) -> None:
+        ledger = self.ledger()
+        context = ledger.observe_failure(SESSION, "the invocation failed", [observed()])
+        self.assertEqual(context.observed, 1)
+        reading = context.reading()
+        self.assertIsNone(reading.count)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+
+    def test_a_failed_invocation_refuses_the_same_events_a_good_one_would(self) -> None:
+        ledger = self.ledger()
+        context = ledger.observe_failure(
+            SESSION, "the invocation failed",
+            [observed(session_id=OTHER_SESSION), {"event": "nonsense"}, "junk"],
+        )
+        self.assertEqual(context.observed, 0)
+        self.assertEqual(context.reading().health, OBSERVATION_UNHEALTHY)
+
+    def test_a_failure_for_a_session_this_ledger_dropped_raises_nothing(self) -> None:
+        # It runs while an error is already on its way out; a session that is gone is
+        # nothing to misrepresent, and must not replace the failure the caller sees.
+        ledger = self.ledger()
+        self.assertIsNone(ledger.observe_failure(OTHER_SESSION, "the invocation failed"))
+
     def test_the_role_context_policy_is_recorded_for_every_session(self) -> None:
         ledger = ContextLifecycleLedger()
         ledger.begin(SESSION, role="executor", observed_from_start=True)

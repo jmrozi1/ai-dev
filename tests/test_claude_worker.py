@@ -825,6 +825,77 @@ class LifecycleEventTransportTests(WorkerTestBase):
         self.assertEqual(len(set(deadlines)), 1)
 
 
+class FailedCommandEventRetentionTests(LifecycleEventTransportTests):
+    """A command that fails still reports the compactions it already decoded.
+
+    All four doors out of the read region are covered here rather than one branch per
+    error code, because the events are attached where they are accumulated: a read
+    that times out or loses the process, a lifecycle message with no event object, an
+    explicit worker error, a message that is not a result, and a result answering for
+    another session.
+    """
+
+    def _failed(self, messages):
+        with self.assertRaises(ClaudeWorkerError) as caught:
+            self._run(messages)
+        return caught.exception
+
+    def _boundary(self):
+        return self._event(
+            event="compaction-observed", session_id=SESSION, uuid=BOUNDARY_UUID
+        )
+
+    def test_a_worker_error_after_an_event_carries_the_event_out_with_it(self) -> None:
+        exc = self._failed([
+            self._boundary(),
+            {"type": "error", "reason": "worker-fatal", "detail": "boom"},
+        ])
+        self.assertEqual(exc.reason, claude_worker.REASON_WORKER_FATAL)
+        self.assertEqual([event["uuid"] for event in exc.events], [BOUNDARY_UUID])
+
+    def test_a_read_failure_after_an_event_carries_the_event_out_with_it(self) -> None:
+        exc = self._failed([
+            self._boundary(),
+            ClaudeWorkerError(
+                claude_worker.REASON_COMMAND_TIMEOUT, "the worker did not answer within its bound."
+            ),
+        ])
+        self.assertEqual(exc.reason, claude_worker.REASON_COMMAND_TIMEOUT)
+        self.assertEqual([event["uuid"] for event in exc.events], [BOUNDARY_UUID])
+
+    def test_a_non_result_message_after_an_event_carries_the_event_out_with_it(self) -> None:
+        exc = self._failed([self._boundary(), {"type": "ready", "protocol": 1}])
+        self.assertEqual(exc.reason, claude_worker.REASON_PROTOCOL_VIOLATION)
+        self.assertEqual([event["uuid"] for event in exc.events], [BOUNDARY_UUID])
+
+    def test_a_result_for_another_session_after_an_event_carries_the_event_out(self) -> None:
+        exc = self._failed([self._boundary(), self._result(session_id=OTHER_SESSION)])
+        self.assertEqual(exc.reason, claude_worker.REASON_PROTOCOL_VIOLATION)
+        self.assertEqual([event["uuid"] for event in exc.events], [BOUNDARY_UUID])
+
+    def test_a_malformed_lifecycle_message_keeps_the_events_read_before_it(self) -> None:
+        exc = self._failed([
+            self._boundary(),
+            {"type": claude_worker.MESSAGE_EVENT, "protocol": 1, "event": "not an object"},
+            self._result(),
+        ])
+        self.assertEqual(exc.reason, claude_worker.REASON_PROTOCOL_VIOLATION)
+        self.assertEqual([event["uuid"] for event in exc.events], [BOUNDARY_UUID])
+
+    def test_a_refusal_that_observed_nothing_carries_an_empty_tuple(self) -> None:
+        exc = self._failed([{"type": "error", "reason": "worker-fatal", "detail": "boom"}])
+        self.assertEqual(exc.events, ())
+
+    def test_every_other_worker_refusal_still_carries_no_events(self) -> None:
+        # The field is additive: nothing else in the module had to learn about it.
+        self.assertEqual(ClaudeWorkerError("some-reason", "some detail").events, ())
+
+    def test_the_successful_command_is_unchanged(self) -> None:
+        message = self._run([self._boundary(), self._result()])
+        self.assertEqual([event["uuid"] for event in message["events"]], [BOUNDARY_UUID])
+        self.assertEqual(message["subtype"], "success")
+
+
 class WorkerEntryPointTests(WorkerTestBase):
     def test_the_worker_announces_its_own_identity_and_sdk_verdict(self) -> None:
         environment = build_worker_environment(self._clean_env(), package_root=REPO_ROOT)

@@ -35,6 +35,7 @@ import uuid
 from .authorization import ACTION_CONTINUE, ACTION_LAUNCH, AuthorizationDecision
 from .claude_runtime import RuntimeRequest, launch_request, resume_request
 from .claude_worker import (
+    ClaudeWorkerError,
     WorkerHandle,
     process_group_alive,
     run_request,
@@ -212,6 +213,12 @@ class SessionRegistry:
     def observe_context_events(self, session_id: str, events) -> SessionContextLifecycle:
         """Fold one invocation's decoded lifecycle events into that session's state."""
         return self._context.observe(session_id, events)
+
+    def observe_failed_invocation(
+        self, session_id: str, detail: str, events=()
+    ) -> Optional[SessionContextLifecycle]:
+        """Keep what a failed invocation observed, and stop calling this session complete."""
+        return self._context.observe_failure(session_id, detail, events)
 
     def context_readings(self) -> Dict[str, Any]:
         """What this controller may honestly say about each held session's compaction."""
@@ -400,6 +407,37 @@ def _observe_context(registry: SessionRegistry, session_id: str, result: Any) ->
     """
     events = result.get("events") if isinstance(result, Mapping) else None
     registry.observe_context_events(session_id, events or ())
+
+
+def _observe_failed_invocation(registry: SessionRegistry, session_id: str, exc: Exception) -> None:
+    """Fold a failed invocation into lifecycle state on a session that survives it.
+
+    The asymmetry this exists for: a failed *launch* stops the process it started and
+    drops the session, so nothing is left to misrepresent. A failed *continue*
+    deliberately leaves the session continuable -- and that is the only path on which a
+    session lives long enough to compact repeatedly. Left alone, such a session went on
+    reporting a complete history whose last window nobody finished watching, and threw
+    away any compaction that window had already reported.
+
+    Both halves are needed and neither substitutes for the other. The events are kept
+    because they were genuinely observed; the health is degraded because the invocation
+    that observed them did not finish, so a boundary it never got to report cannot be
+    ruled out. This says nothing about *which* failure happened: a timeout and a worker
+    fatal leave exactly the same claim, because the thing that changed is the same.
+
+    Only the worker channel's own refusal may carry lifecycle evidence. Any other
+    failure still degrades the claim, but an arbitrary exception cannot introduce
+    events -- and the events that are carried are folded through the same association,
+    shape and identity checks as a successful invocation's, never around them.
+    """
+    events = exc.events if isinstance(exc, ClaudeWorkerError) else ()
+    registry.observe_failed_invocation(
+        session_id,
+        "an invocation this session's observation depended on failed ({0}: {1})".format(
+            type(exc).__name__, exc
+        ),
+        events,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -594,6 +632,13 @@ def continue_session(
     registry.begin_invocation(session_id)
     try:
         result = sender(owned.handle, request, **send_arguments)
+    except Exception as exc:
+        # The session survives this failure by design, so its lifecycle state must
+        # survive it truthfully: whatever compactions the invocation already reported
+        # are kept, and the count stops being advertised as a complete history. The
+        # failure itself is untouched and still leaves here.
+        _observe_failed_invocation(registry, session_id, exc)
+        raise
     finally:
         # Cleared regardless of outcome, and without swallowing it: a failed
         # invocation must not leave the session permanently un-continuable.

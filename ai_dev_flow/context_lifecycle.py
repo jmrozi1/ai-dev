@@ -472,6 +472,40 @@ class ContextLifecycleLedger:
                 context.mark_partial(exc.detail)
         return context
 
+    def observe_failure(
+        self, session_id: str, detail: str, events: Optional[Iterable] = None
+    ) -> Optional[SessionContextLifecycle]:
+        """Fold what a *failed* invocation already observed, and stop calling it complete.
+
+        Two different truths, kept apart on purpose. The compactions this invocation
+        decoded really were observed, so they still count -- discarding them would
+        under-report a session's real history. But the invocation that carried them
+        did not finish, so the window it was watching is no longer proven whole, and
+        the number stops being presented as a total. Count what was observed; degrade
+        the completeness claim because the invocation failed.
+
+        This runs while an error is already on its way out, so it never raises one of
+        its own: a session this controller no longer holds is simply nothing to
+        misrepresent, and an event that fails the same association, shape and identity
+        checks as ever is left uncounted rather than allowed to replace the failure
+        the caller is about to see.
+        """
+        context = self._contexts.get(session_id)
+        if context is None:
+            return None
+        # First, because it is true regardless of what the events turn out to be.
+        context.mark_partial(detail)
+        for event in events or ():
+            try:
+                context.observe(event)
+            except ContextLifecycleError:
+                # Refused by exactly the checks that guard the healthy path -- an
+                # unsupported shape, a missing identity, or a compaction naming
+                # another session. Nothing is counted, and this session is already
+                # partial, which is the whole claim a refusal supports.
+                continue
+        return context
+
     def readings(self) -> Dict[str, Dict[str, Any]]:
         return {
             session_id: self._contexts[session_id].reading().to_dict()

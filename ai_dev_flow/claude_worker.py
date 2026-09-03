@@ -117,12 +117,23 @@ DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 10.0
 
 
 class ClaudeWorkerError(Exception):
-    """A fail-closed worker refusal carrying one stable machine-readable reason."""
+    """A fail-closed worker refusal carrying one stable machine-readable reason.
 
-    def __init__(self, reason: str, detail: str) -> None:
+    A refusal may also carry the lifecycle events this command had already decoded
+    before it failed. They ride *beside* the reason rather than softening it: this
+    is still an exception, the command still failed, and a caller that ignores
+    `events` behaves exactly as it did before. What the field prevents is the
+    opposite error -- throwing away a compaction the product genuinely observed
+    just because the turn that reported it did not finish.
+    """
+
+    def __init__(self, reason: str, detail: str, events: Sequence = ()) -> None:
         super().__init__(detail)
         self.reason = reason
         self.detail = detail
+        # Always a tuple, always present, empty for every refusal that observed
+        # nothing -- so no caller has to tell absence from "no events".
+        self.events = tuple(events)
 
 
 REASON_SELECTOR_PRESENT = "credential-selector-present"
@@ -497,36 +508,48 @@ def run_request(
     # command that reports a compaction is still one bounded command.
     deadline = time.monotonic() + timeout
     events = []
-    while True:
-        message = _read_message(
-            handle.process.stdout, deadline=deadline, process=handle.process
-        )
-        if message.get("type") != MESSAGE_EVENT:
-            break
-        event = message.get("event")
-        if not isinstance(event, dict):
+    # Every way this command can fail after the first event was decoded leaves by
+    # exactly one door, so the events travel with the failure from one place rather
+    # than from a branch per error code. The four that discarded them are all here:
+    # a read that times out or loses the process, a lifecycle message carrying no
+    # event object, an explicit worker error, a message that is not a result, and a
+    # result answering for another session.
+    try:
+        while True:
+            message = _read_message(
+                handle.process.stdout, deadline=deadline, process=handle.process
+            )
+            if message.get("type") != MESSAGE_EVENT:
+                break
+            event = message.get("event")
+            if not isinstance(event, dict):
+                raise ClaudeWorkerError(
+                    REASON_PROTOCOL_VIOLATION,
+                    "the worker emitted a lifecycle message carrying no event object.",
+                )
+            events.append(event)
+        if message.get("type") == MESSAGE_ERROR:
+            raise ClaudeWorkerError(
+                REASON_WORKER_FATAL,
+                "{0}: {1}".format(message.get("reason"), message.get("detail")),
+            )
+        if message.get("type") != MESSAGE_RESULT:
             raise ClaudeWorkerError(
                 REASON_PROTOCOL_VIOLATION,
-                "the worker emitted a lifecycle message carrying no event object.",
+                "expected a result, got {0!r}.".format(message.get("type")),
             )
-        events.append(event)
-    if message.get("type") == MESSAGE_ERROR:
-        raise ClaudeWorkerError(
-            REASON_WORKER_FATAL,
-            "{0}: {1}".format(message.get("reason"), message.get("detail")),
-        )
-    if message.get("type") != MESSAGE_RESULT:
-        raise ClaudeWorkerError(
-            REASON_PROTOCOL_VIOLATION,
-            "expected a result, got {0!r}.".format(message.get("type")),
-        )
-    if message.get("session_id") != request.session_id:
-        raise ClaudeWorkerError(
-            REASON_PROTOCOL_VIOLATION,
-            "the worker answered for session {0!r}, not {1}.".format(
-                message.get("session_id"), request.session_id
-            ),
-        )
+        if message.get("session_id") != request.session_id:
+            raise ClaudeWorkerError(
+                REASON_PROTOCOL_VIOLATION,
+                "the worker answered for session {0!r}, not {1}.".format(
+                    message.get("session_id"), request.session_id
+                ),
+            )
+    except ClaudeWorkerError as exc:
+        # The refusal is unchanged and still leaves here as a refusal. It simply
+        # stops erasing what this command already observed on the way out.
+        exc.events = tuple(events)
+        raise
     # Additive, and always present: an invocation that observed no compaction says
     # so with an empty list rather than by omitting the field, so a caller never has
     # to read absence as either zero or unknown.

@@ -1158,5 +1158,190 @@ class NoProviderContactTests(LifecycleTestBase):
             mock.assert_not_called()
 
 
+class FailedInvocationObservationTests(LifecycleTestBase):
+    """A failed continue keeps what it observed and stops claiming a complete history.
+
+    The reviewer's exact failure: a compaction the product had already decoded was
+    discarded because the invocation carrying it failed, while the surviving session
+    went on reporting `healthy-complete-from-session-start`, `count 0`,
+    `rotationMarked False`. Every case below is that shape.
+    """
+
+    BOUNDARY = "83e1ea6e-7979-4dca-9cd8-85d26656f905"
+
+    def _observed(self, uuid=None, session_id=SESSION):
+        return {
+            "event": EVENT_COMPACTION_OBSERVED,
+            "session_id": session_id,
+            "uuid": uuid or self.BOUNDARY,
+        }
+
+    def _failing_sender(self, events=(), error=None):
+        """A sender that reports events exactly as `run_request` does, then fails."""
+        failure = error if error is not None else claude_worker.ClaudeWorkerError(
+            claude_worker.REASON_WORKER_FATAL, "provider-error: the provider blew up",
+            events,
+        )
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            raise failure
+
+        return send
+
+    def _succeeding_sender(self, events=()):
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            return {
+                "type": "result", "session_id": request.session_id, "mode": request.mode,
+                "subtype": "success", "is_error": False, "events": list(events),
+            }
+
+        return send
+
+    def _continue(self, send):
+        return continue_session(
+            self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
+            registry=self.registry, session_id=SESSION,
+            request_kwargs=self._request_kwargs(), prompt="carry on", send=send,
+            alive=lambda pgid: True,
+        )
+
+    def _reading(self):
+        return self.registry.context(SESSION).reading()
+
+    # -- 1. the positive control: nothing about the healthy path changed ---------
+
+    def test_a_valid_event_on_a_successful_invocation_counts_and_stays_healthy(self) -> None:
+        self._launch()
+        self._continue(self._succeeding_sender([self._observed()]))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 1)
+        self.assertEqual(reading.count, 1)
+        self.assertEqual(reading.health, OBSERVATION_HEALTHY)
+        self.assertIs(reading.rotation_marked, False)
+
+    # -- 2/3. the two failures the reviewer reproduced, and they behave alike ----
+
+    def test_a_worker_fatal_after_an_event_keeps_the_event_and_degrades_the_claim(self) -> None:
+        self._launch()
+        with self.assertRaises(claude_worker.ClaudeWorkerError) as caught:
+            self._continue(self._failing_sender([self._observed()]))
+        # The failure is still a failure and still carries its own reason.
+        self.assertEqual(caught.exception.reason, claude_worker.REASON_WORKER_FATAL)
+        reading = self._reading()
+        self.assertEqual(reading.observed, 1)          # kept, not discarded
+        self.assertIsNone(reading.count)               # no longer a complete history
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+        self.assertIsNot(reading.rotation_marked, False)
+
+    def test_a_command_timeout_after_an_event_behaves_exactly_as_a_fatal_does(self) -> None:
+        self._launch()
+        timeout = claude_worker.ClaudeWorkerError(
+            claude_worker.REASON_COMMAND_TIMEOUT,
+            "the worker did not answer within its bound.",
+            [self._observed()],
+        )
+        with self.assertRaises(claude_worker.ClaudeWorkerError) as caught:
+            self._continue(self._failing_sender(error=timeout))
+        self.assertEqual(caught.exception.reason, claude_worker.REASON_COMMAND_TIMEOUT)
+        reading = self._reading()
+        self.assertEqual(reading.observed, 1)
+        self.assertIsNone(reading.count)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+
+    def test_the_session_survives_the_failed_invocation_and_stays_continuable(self) -> None:
+        # The reason this matters at all: the failure does not remove the session.
+        self._launch()
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._continue(self._failing_sender([self._observed()]))
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertEqual(self.registry.in_flight(), ())
+        self._continue(self._succeeding_sender())
+        # And a later good turn does not heal what could not be watched.
+        self.assertEqual(self._reading().health, OBSERVATION_UNHEALTHY)
+
+    # -- 4. a duplicate cannot count twice, on the failing path either -----------
+
+    def test_a_duplicate_event_on_a_failed_invocation_does_not_double_count(self) -> None:
+        self._launch()
+        self._continue(self._succeeding_sender([self._observed()]))
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._continue(self._failing_sender([self._observed(), self._observed()]))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 1)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+
+    # -- 5. association still guards the failing path ----------------------------
+
+    def test_a_mismatched_session_event_on_a_failed_invocation_counts_nothing(self) -> None:
+        self._launch()
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._continue(self._failing_sender([self._observed(session_id=OTHER_SESSION)]))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 0)
+        self.assertIsNone(reading.count)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+        self.assertIsNone(reading.rotation_marked)
+
+    def test_a_malformed_event_on_a_failed_invocation_counts_nothing(self) -> None:
+        self._launch()
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._continue(self._failing_sender([{"event": "not-a-lifecycle-event"}, "junk"]))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 0)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+
+    def test_only_the_worker_channels_own_refusal_may_carry_events(self) -> None:
+        # An arbitrary exception degrades the claim, but cannot introduce events.
+        self._launch()
+        rogue = RuntimeError("provider error")
+        rogue.events = (self._observed(),)
+        with self.assertRaises(RuntimeError):
+            self._continue(self._failing_sender(error=rogue))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 0)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+
+    # -- 6. a preserved floor may still prove the threshold was reached ----------
+
+    def test_a_preserved_floor_reaching_the_threshold_still_marks_while_partial(self) -> None:
+        self._launch()
+        boundaries = [
+            self._observed(uuid="{0:08d}-0000-4000-8000-000000000000".format(index))
+            for index in range(6)
+        ]
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._continue(self._failing_sender(boundaries))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 6)
+        self.assertIs(reading.rotation_marked, True)   # the floor proves it
+        self.assertIsNone(reading.count)               # the total is still unknown
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+        self.assertEqual(self.registry.rotation_marked_session_ids(), (SESSION,))
+
+    def test_five_preserved_boundaries_leave_the_threshold_undetermined(self) -> None:
+        self._launch()
+        boundaries = [
+            self._observed(uuid="{0:08d}-0000-4000-8000-000000000000".format(index))
+            for index in range(5)
+        ]
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._continue(self._failing_sender(boundaries))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 5)
+        self.assertIsNone(reading.rotation_marked)     # undetermined, never a false mark
+        self.assertEqual(self.registry.rotation_marked_session_ids(), ())
+
+    # -- 7. launch failure is still different, and deliberately so ---------------
+
+    def test_a_failed_launch_still_removes_the_session_and_leaves_no_claim(self) -> None:
+        send = self._failing_sender([self._observed()])
+        with self.assertRaises(LifecycleError) as caught:
+            self._launch(sender=(send, []))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_LAUNCH_FAILED)
+        self.assertIsNone(self.registry.get(SESSION))
+        self.assertIsNone(self.registry.context(SESSION))
+        self.assertEqual(self.registry.context_readings(), {})
+
+
 if __name__ == "__main__":
     unittest.main()
