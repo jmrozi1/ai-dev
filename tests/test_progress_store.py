@@ -33,6 +33,7 @@ from ai_dev_flow.progress_store import (
     REASON_MALFORMED_STORE,
     REASON_NAMED_OUT_OF_ORDER,
     REASON_TIMESTAMP_UNAVAILABLE,
+    REASON_UNANCHORED_NAMED,
     REASON_UNREADABLE_STORE,
     SCHEMA_VERSION,
     commit_instant,
@@ -537,11 +538,32 @@ class ProjectionNoteTests(ProgressStoreTestCase):
 
 
 class NamedCompletionTests(ProgressStoreTestCase):
-    def test_completions_are_the_contiguous_prefix_of_the_roadmap(self) -> None:
-        for number in (1, 2, 3):
+    """The named contract, on a record that already carries a numeric acceptance.
+
+    Every case here is about the *shape of named history*, and a named fact is
+    not expressible at all without an accepted numeric checkpoint standing in the
+    same record -- so the anchor is a precondition of these cases rather than one
+    of the things they are testing. `NamedAnchorTests` below tests the anchor.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.accept(52, "2026-08-29T09:00:00+00:00")
+
+    def test_completions_are_a_contiguous_run_from_wherever_the_record_opens(self) -> None:
+        """Contiguous, but not required to begin at named checkpoint 1.
+
+        This opens at 6 rather than 1 deliberately. A fixture that opens at 1
+        cannot tell "the contiguous prefix of the roadmap" apart from "a
+        contiguous run starting anywhere", and it is the second of those that
+        this store actually enforces: the record may be adopted part-way through
+        a roadmap, so the first completion it carries need not be the first the
+        roadmap had.
+        """
+        for number in (6, 7, 8):
             self.publish(named=number, named_total=9)
         self.assertEqual(
-            [entry.checkpoint for entry in self.store.facts().named], [1, 2, 3]
+            [entry.checkpoint for entry in self.store.facts().named], [6, 7, 8]
         )
 
     def test_a_repeated_or_regressed_completion_is_refused(self) -> None:
@@ -609,6 +631,83 @@ class NamedCompletionTests(ProgressStoreTestCase):
             self.publish(named=6)
         with self.assertRaises(ControlPlaneError):
             self.publish(named_total=9)
+
+
+class NamedAnchorTests(ProgressStoreTestCase):
+    """A named completion stands on an accepted numeric checkpoint, or on nothing.
+
+    A named checkpoint is completed *by* accepted numeric checkpoints, so a record
+    saying "named 7 of 9 is complete" while saying "nothing has been accepted at
+    all" is internally incoherent. It is also the one state in which a named claim
+    is anchored to nothing whatsoever: every other field in the record is either
+    proved against product history or derived from the coordination repository's
+    own commits.
+
+    The anchor asked for is emphatically *not* named checkpoint 1. This record may
+    be adopted part-way through a roadmap, and demanding the earlier completions
+    would mean publishing them with commits and instants that would have to be
+    invented -- manufacturing exactly the evidence the numeric half refuses.
+    """
+
+    def test_a_first_named_completion_with_nothing_accepted_is_refused(self) -> None:
+        """The writer refuses, and nothing durable moves.
+
+        Both numbers the reviewer reached through the documented CLI are asked
+        for here, because `--named` does not require `--checkpoint` and the
+        refusal must not depend on which named checkpoint is claimed.
+        """
+        head = self._git("rev-parse", "HEAD")
+        for number in (7, 9):
+            with self.subTest(named=number):
+                with self.assertRaises(ControlPlaneError) as raised:
+                    self.publish(named=number, named_total=9)
+                self.assertIn("no accepted numeric checkpoint", str(raised.exception))
+                self.assertFalse(self.path.exists())
+                self.assertEqual(self._git("rev-parse", "HEAD"), head)
+        self.assertEqual(self.store.facts().named, ())
+
+    def test_one_acceptance_may_carry_the_checkpoint_and_the_first_completion(self) -> None:
+        """The mid-life bootstrap: anchored, in a single supported acceptance.
+
+        This is the shape the anchor exists to permit rather than refuse, and it
+        is the one that would break if the gate read the *standing* acceptance
+        instead of the proposed one: at this instant the record carries no
+        acceptance at all, and the checkpoint being accepted is the anchor.
+        """
+        self.publish("2026-09-02T09:00:00+00:00", named=7, named_total=9,
+                     checkpoint=52, commit=self.checkpoint_commit(52))
+        document = self.published()
+        self.assertEqual(document["accepted"]["checkpoint"], 52)
+        self.assertEqual(document["named"], {"checkpoint": 7, "total": 9})
+        facts = self.store.facts()
+        self.assertEqual([entry.checkpoint for entry in facts.acceptances], [52])
+        self.assertEqual([entry.checkpoint for entry in facts.named], [7])
+
+    def test_the_two_call_form_anchors_on_the_acceptance_already_recorded(self) -> None:
+        """Accept the checkpoint, then complete the named checkpoint on its own."""
+        self.accept(52, "2026-09-02T09:00:00+00:00")
+        self.publish("2026-09-02T10:00:00+00:00", named=7, named_total=9)
+        self.assertEqual(
+            [entry.checkpoint for entry in self.store.facts().named], [7]
+        )
+
+    def test_a_named_completion_standing_on_nothing_is_refused_on_read(self) -> None:
+        """A hand-crafted record the action would not have written is a refusal.
+
+        The reader is the half a writer-only gate would leave open: this record
+        never went through `accept_progress`, and without the cross-check the
+        store would hand it back and let the surface derive named checkpoint 8
+        from a completion with no accepted checkpoint behind it.
+        """
+        store = self.crafted_scope("issue-unanchored", {
+            "schemaVersion": SCHEMA_VERSION,
+            "accepted": None,
+            "named": {"checkpoint": 7, "total": 9},
+            "projection": {"confidence": "low", "note": "", "remaining": 8},
+        })
+        with self.assertRaises(ProgressStoreError) as raised:
+            store.facts()
+        self.assertEqual(raised.exception.reason, REASON_UNANCHORED_NAMED)
 
 
 # --------------------------------------------------------------------------

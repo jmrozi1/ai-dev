@@ -12,7 +12,7 @@ It holds values and refusals only. There is no store, no view, no measure, no
 percentage and no clock here -- nothing a decision could be made from -- which is
 why the writing side may import it without importing telemetry.
 
-Three properties are structural rather than asked for.
+Four properties are structural rather than asked for.
 
 First, the record is *current state*, not a log. It says what the last accepted
 numeric checkpoint is, which named checkpoint is complete, and what the
@@ -31,6 +31,13 @@ reconsider" is not representable.
 Third, the key set is closed and a record carrying anything else is refused
 rather than trimmed. There is no field through which a transcript, a session, a
 token figure or a wall-clock duration could arrive.
+
+Fourth, the two facts are not independent. A named completion is carried by the
+numeric checkpoints that completed it, so a record may not claim one while
+claiming that nothing has been accepted at all. That is a cross-check between
+fields rather than a rule about either, which is why it lives here with them and
+not in the writer: a record with a named claim standing on nothing is one this
+package refuses to read for the same reason it refuses to publish it.
 """
 
 from __future__ import annotations
@@ -54,6 +61,7 @@ __all__ = [
     "REASON_INVALID_NOTE",
     "REASON_INVALID_REMAINING",
     "REASON_MALFORMED_RECORD",
+    "REASON_UNANCHORED_NAMED",
     "SCHEMA_VERSION",
     "empty_document",
     "exact_checkpoint",
@@ -95,6 +103,7 @@ REASON_INVALID_REMAINING = "invalid-projected-remaining"
 REASON_INVALID_NOTE = "invalid-projection-note"
 REASON_INVALID_COMMIT = "invalid-commit"
 REASON_INVALID_NAMED_TOTAL = "invalid-named-total"
+REASON_UNANCHORED_NAMED = "unanchored-named-completion"
 
 # A full object name and nothing else. An abbreviation, a branch, `HEAD`, or a
 # reflog expression would each resolve to a different commit on a different day,
@@ -246,6 +255,29 @@ def validate_document(payload: object) -> Dict[str, Any]:
                 ),
             )
         named = {"checkpoint": completed, "total": total}
+
+    if named is not None and accepted is None:
+        # A named checkpoint is completed *by* accepted numeric checkpoints, so a
+        # record asserting one while asserting that nothing has been accepted at
+        # all is internally incoherent -- and it is the one state in which a
+        # named claim rests on nothing durable. The reader derives the checkpoint
+        # now in progress from the completions it finds, so an unanchored first
+        # completion of 7 would make the served surface assert named checkpoint 8
+        # with no accepted checkpoint behind it.
+        #
+        # This is deliberately not an anchor at named checkpoint 1. The record may
+        # be adopted part-way through a roadmap, and requiring the first recorded
+        # completion to be 1 would mean publishing the earlier ones with commits
+        # and instants that would have to be invented. The anchor asked for here
+        # is the one thing this package already proves against product history.
+        raise ProgressRecordError(
+            REASON_UNANCHORED_NAMED,
+            "named checkpoint {0} of {1} is completed with no accepted numeric "
+            "checkpoint in the same record; a named completion is carried by the "
+            "checkpoints that completed it, never by the claim alone".format(
+                named["checkpoint"], named["total"]
+            ),
+        )
 
     if document["projection"] is None:
         raise ProgressRecordError(

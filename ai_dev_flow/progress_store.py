@@ -97,6 +97,7 @@ __all__ = [
     "REASON_MALFORMED_STORE",
     "REASON_NAMED_OUT_OF_ORDER",
     "REASON_TIMESTAMP_UNAVAILABLE",
+    "REASON_UNANCHORED_NAMED",
     "REASON_UNREADABLE_STORE",
     "SCHEMA_VERSION",
     "commit_instant",
@@ -114,6 +115,7 @@ REASON_INVALID_COMMIT = "invalid-commit"
 REASON_TIMESTAMP_UNAVAILABLE = "acceptance-timestamp-unavailable"
 REASON_NAMED_OUT_OF_ORDER = "named-checkpoint-out-of-order"
 REASON_INVALID_NAMED_TOTAL = "invalid-named-total"
+REASON_UNANCHORED_NAMED = "unanchored-named-completion"
 
 # Exactly what `git log -1 --format=%cI` emits, which is strict ISO 8601 in
 # either of the two forms git actually produces: an explicit numeric offset, and
@@ -572,6 +574,7 @@ _RECORD_REASONS = {
     "invalid-projection-note": REASON_INVALID_NOTE,
     "invalid-commit": REASON_INVALID_COMMIT,
     "invalid-named-total": REASON_INVALID_NAMED_TOTAL,
+    "unanchored-named-completion": REASON_UNANCHORED_NAMED,
 }
 
 

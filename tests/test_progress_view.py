@@ -16,7 +16,11 @@ from decimal import Decimal
 from pathlib import Path
 
 from ai_dev_flow import control_plane, progress_view as view_module
-from ai_dev_flow.progress_store import ProgressStore, ProgressStoreError
+from ai_dev_flow.progress_store import (
+    ProgressStore,
+    ProgressStoreError,
+    REASON_UNANCHORED_NAMED,
+)
 from ai_dev_flow.progress_view import (
     DELTA_WINDOWS,
     ProgressView,
@@ -439,6 +443,31 @@ class UnavailableEvidenceTests(ProgressViewTestCase):
         self.assertEqual(view.accepted_checkpoint, 52)
         self.assertIsNotNone(view.accepted_at)
 
+    def test_a_named_completion_standing_on_nothing_never_renders_a_named_checkpoint(self) -> None:
+        """The projection path refuses the record rather than deriving from it.
+
+        This is the shape the surface must never render: one completion of named
+        checkpoint 7, no accepted checkpoint anywhere behind it, and a derivation
+        that would otherwise report the ticket to be on its eighth named
+        checkpoint of nine. The supported action cannot write this record -- it is
+        committed directly here -- which is exactly why the reader has to be the
+        one that refuses it, and it comes back unavailable and unhealthy rather
+        than as a confident named 8.
+        """
+        self.publish_record("2026-09-02T09:00:00+00:00", {
+            "schemaVersion": 1, "accepted": None,
+            "named": {"checkpoint": 7, "total": 9},
+            "projection": {"confidence": "low", "note": "unanchored", "remaining": 8},
+        })
+        view = self.view()
+        self.assertFalse(view.available)
+        self.assertFalse(view.source_healthy)
+        self.assertEqual(view.reason, REASON_UNANCHORED_NAMED)
+        self.assertIsNone(view.named_checkpoint)
+        self.assertIsNone(view.named_total)
+        self.assertIsNone(view.accepted_checkpoint)
+        self.assertIsNone(view.percentage)
+
     def test_an_estimate_exactly_consumed_is_still_available_at_one_hundred(self) -> None:
         self.accept(52, "2026-09-01T10:00:00+00:00", remaining=1)
         self.accept(53, "2026-09-02T08:00:00+00:00")
@@ -503,9 +532,9 @@ class UnavailableEvidenceTests(ProgressViewTestCase):
         self.assertIsNone(view.named_completed_at)
 
     def test_a_finished_roadmap_names_no_current_named_checkpoint(self) -> None:
+        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=0)
         for number in range(1, 10):
             self.complete_named(number, 9, "2026-09-01T10:00:00+00:00")
-        self.accept(52, "2026-09-01T10:00:00+00:00", remaining=0)
         view = self.view()
         self.assertIsNone(view.named_checkpoint)
         self.assertEqual(view.named_total, 9)

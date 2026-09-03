@@ -253,6 +253,12 @@ class AcceptanceActionTests(ProgressActionTestCase):
         self.assertEqual(document["projection"]["note"], "scope grew")
 
     def test_a_named_completion_is_a_supported_act_of_its_own(self) -> None:
+        """Its own act, on a record that already carries the acceptance it stands on.
+
+        A named completion needs no checkpoint *in the same call*; it does need an
+        accepted numeric checkpoint in the same record, which this one already has.
+        """
+        self.accept(checkpoint=52, commit=self.checkpoint_commit(52))
         _target, head, document = self.accept("2026-08-30T12:00:00+00:00", named=6, named_total=9)
         self.assertEqual(document["named"], {"checkpoint": 6, "total": 9})
         store = ProgressStore.for_scope(self.repo, project=PROJECT, ticket=TICKET)
