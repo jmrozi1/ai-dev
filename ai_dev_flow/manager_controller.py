@@ -75,6 +75,7 @@ from typing import Any, Callable, Dict, List, Mapping, NamedTuple, Optional, Tup
 
 from .authorization import AgentSlots, CONCURRENCY_CEILING_DEFAULT, reconcile_agent_slots
 from .claude_allowance_view import AllowanceViewError
+from .context_lifecycle import ContextLifecycleError, REASON_INVALID_THRESHOLD
 from .decision_manager import (
     ManagerRun,
     ManagerRunError,
@@ -159,6 +160,7 @@ class ManagerController:
         source: QueueSourceContext,
         *,
         ceiling: int = CONCURRENCY_CEILING_DEFAULT,
+        rotation_threshold: Optional[int] = None,
         registry: Optional[SessionRegistry] = None,
     ) -> None:
         self.source = source
@@ -166,8 +168,24 @@ class ManagerController:
         # Injectable so a caller that already owns a registry composes this around
         # it rather than around a second one. Nothing is read from it at
         # construction, and nothing durable is created here.
-        self.registry = registry if registry is not None else SessionRegistry()
+        if registry is not None and rotation_threshold is not None:
+            if registry.rotation_threshold != rotation_threshold:
+                raise ContextLifecycleError(
+                    REASON_INVALID_THRESHOLD,
+                    "the injected registry rotates at {0} but this controller was told "
+                    "{1}; one manager states one rotation policy.".format(
+                        registry.rotation_threshold, rotation_threshold
+                    ),
+                )
+        self.registry = (
+            registry if registry is not None
+            else SessionRegistry(rotation_threshold=rotation_threshold)
+        )
         self.ceiling = ceiling
+        # Two human-owned numbers that happen to share a default. `ceiling` is D6's
+        # concurrency policy and this is D9's rotation policy; neither is derived
+        # from the other, and moving one leaves the other exactly where it was.
+        self.rotation_threshold = self.registry.rotation_threshold
 
     # ----------------------------------------------------------------------
     # Lifecycle: this controller's own handles
@@ -235,6 +253,33 @@ class ManagerController:
     def owned_session_ids(self) -> Tuple[str, ...]:
         """Exactly the sessions this controller holds a handle for. No inference."""
         return tuple(owned.session_id for owned in self.registry.sessions())
+
+    # ----------------------------------------------------------------------
+    # Context lifecycle: system-owned, not human attention
+    # ----------------------------------------------------------------------
+
+    def context_lifecycle(self) -> Dict[str, Dict[str, Any]]:
+        """What this controller may honestly say about each held session's compaction.
+
+        One entry per owned session: its observation health, its count when the
+        count is trustworthy, and whether it is marked for graceful rotation. It is
+        this controller's own registry answering about this controller's own
+        handles, exactly as the occupancy reading is.
+
+        Deliberately not a queue row and not an alert. A threshold mark is
+        system-owned lifecycle state that a later rotation slice consumes; nothing
+        about it needs a person to look at it, and putting it in front of one would
+        make a mechanical fact compete with the decisions that do.
+        """
+        return self.registry.context_readings()
+
+    def rotation_marked_session_ids(self) -> Tuple[str, ...]:
+        """The sessions whose observed compactions have reached the threshold.
+
+        A mark and nothing more. This checkpoint neither terminates, replaces, nor
+        interrupts a marked session, and there is no code path here that could.
+        """
+        return self.registry.rotation_marked_session_ids()
 
     # ----------------------------------------------------------------------
     # The reading the page draws

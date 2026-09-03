@@ -15,6 +15,14 @@ from ai_dev_flow.authorization import (
     AuthorizationDecision,
 )
 from ai_dev_flow.claude_runtime import ClaudeRuntimeError
+from ai_dev_flow.context_lifecycle import (
+    CONTEXT_POLICY_FRESH,
+    CONTEXT_POLICY_PERSISTENT,
+    EVENT_COMPACTION_OBSERVED,
+    OBSERVATION_HEALTHY,
+    OBSERVATION_UNAVAILABLE,
+    OBSERVATION_UNHEALTHY,
+)
 from ai_dev_flow.session_binding import (
     BINDING_STATE_BOUND,
     BINDING_STATE_RESERVED,
@@ -52,6 +60,7 @@ BLOB = "a" * 40
 OTHER_BLOB = "b" * 40
 HEAD = "c" * 40
 SESSION = "1a2b3c4d-0001-4000-8000-00000000000a"
+OTHER_SESSION = "1a2b3c4d-0002-4000-8000-00000000000b"
 SKILL = "executor"
 TOOLS = ("Read", "Glob")
 
@@ -897,6 +906,226 @@ class RecoveryTests(LifecycleTestBase):
         with self.assertRaises(LifecycleError) as caught:
             recover_session(self.store.read(SESSION), SessionRegistry(), now=self.clock)
         self.assertEqual(caught.exception.reason, session_lifecycle.REASON_BINDING_TERMINAL)
+
+
+class ContextLifecycleTests(LifecycleTestBase):
+    """Compaction observation through the real launch/continue composition."""
+
+    BOUNDARY = "83e1ea6e-7979-4dca-9cd8-85d26656f905"
+    OTHER_BOUNDARY = "0f0f0f0f-1111-4222-8333-444444444444"
+
+    def _observed(self, uuid=None, session_id=SESSION):
+        return {
+            "event": EVENT_COMPACTION_OBSERVED,
+            "session_id": session_id,
+            "uuid": uuid or self.BOUNDARY,
+        }
+
+    def _boundaries(self, count):
+        return [
+            self._observed(uuid="{0:08d}-0000-4000-8000-000000000000".format(index))
+            for index in range(count)
+        ]
+
+    def _event_sender(self, turns):
+        """A sender whose successive invocations report successive event lists."""
+        remaining = list(turns)
+        sent = []
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            sent.append(request.mode)
+            events = remaining.pop(0) if remaining else []
+            return {
+                "type": "result", "session_id": request.session_id, "mode": request.mode,
+                "subtype": "success", "is_error": False, "events": events,
+            }
+
+        return send, sent
+
+    def _continue(self, send):
+        return continue_session(
+            self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
+            registry=self.registry, session_id=SESSION,
+            request_kwargs=self._request_kwargs(), prompt="carry on", send=send,
+            alive=lambda pgid: True,
+        )
+
+    def _reading(self, session_id=SESSION):
+        return self.registry.context(session_id).reading()
+
+    # -- observation from the session's own start ------------------------------
+
+    def test_a_launched_session_is_observed_from_its_own_start(self) -> None:
+        self._launch()
+        reading = self._reading()
+        self.assertEqual(reading.health, OBSERVATION_HEALTHY)
+        self.assertEqual(reading.count, 0)
+        self.assertIs(reading.rotation_marked, False)
+
+    def test_a_session_this_controller_did_not_start_reports_history_unavailable(self) -> None:
+        # Taking ownership is not the same as having watched a session from its
+        # beginning, and exact resume never replays what was missed.
+        outcome, _worker, _sent = self._launch()
+        self.registry.remove(SESSION)
+        self.registry.add(outcome.owned)
+        reading = self._reading()
+        self.assertEqual(reading.health, OBSERVATION_UNAVAILABLE)
+        self.assertIsNone(reading.count)
+        self.assertNotEqual(reading.count, 0)
+
+    # -- counting --------------------------------------------------------------
+
+    def test_a_valid_boundary_increments_manager_state_exactly_once(self) -> None:
+        send, _sent = self._event_sender([[self._observed()]])
+        self._launch(sender=(send, []))
+        self.assertEqual(self._reading().count, 1)
+
+    def test_the_same_boundary_observed_twice_does_not_count_twice(self) -> None:
+        send, _sent = self._event_sender([[self._observed(), self._observed()]])
+        self._launch(sender=(send, []))
+        self.assertEqual(self._reading().count, 1)
+
+    def test_a_boundary_replayed_on_a_later_turn_does_not_count_twice(self) -> None:
+        launch_send, _ = self._event_sender([[self._observed()]])
+        self._launch(sender=(launch_send, []))
+        resume_send, _ = self._event_sender([[self._observed()]])
+        self._continue(resume_send)
+        self.assertEqual(self._reading().count, 1)
+
+    def test_exact_resume_of_a_monitored_session_preserves_a_truthful_count(self) -> None:
+        launch_send, _ = self._event_sender([[self._observed()]])
+        self._launch(sender=(launch_send, []))
+        resume_send, sent = self._event_sender([[self._observed(uuid=self.OTHER_BOUNDARY)]])
+        self._continue(resume_send)
+        self.assertEqual(sent, ["resume"])
+        reading = self._reading()
+        self.assertEqual(reading.count, 2)
+        self.assertEqual(reading.health, OBSERVATION_HEALTHY)
+
+    def test_an_event_naming_another_session_contaminates_nothing(self) -> None:
+        send, _ = self._event_sender([[self._observed(session_id=OTHER_SESSION)]])
+        self._launch(sender=(send, []))
+        reading = self._reading()
+        self.assertEqual(reading.observed, 0)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+        self.assertIsNone(reading.count)
+
+    def test_a_turn_reporting_no_events_is_not_a_session_with_no_history(self) -> None:
+        # The accepted senders report no `events` key at all; that is one quiet turn,
+        # not a claim about the session, and the health says what the count is worth.
+        self._launch()
+        self._continue(self._sender()[0])
+        self.assertEqual(self._reading().health, OBSERVATION_HEALTHY)
+
+    # -- threshold -------------------------------------------------------------
+
+    def test_five_observed_compactions_do_not_mark_and_six_do(self) -> None:
+        send, _ = self._event_sender([self._boundaries(5)])
+        self._launch(sender=(send, []))
+        self.assertIs(self._reading().rotation_marked, False)
+        self.assertEqual(self.registry.rotation_marked_session_ids(), ())
+
+        self._continue(self._event_sender([self._boundaries(6)])[0])
+        self.assertIs(self._reading().rotation_marked, True)
+        self.assertEqual(self.registry.rotation_marked_session_ids(), (SESSION,))
+
+    def test_the_threshold_is_configurable_on_the_registry(self) -> None:
+        self.registry = SessionRegistry(rotation_threshold=3)
+        send, _ = self._event_sender([self._boundaries(3)])
+        self._launch(sender=(send, []))
+        self.assertEqual(self._reading().threshold, 3)
+        self.assertIs(self._reading().rotation_marked, True)
+
+    def test_reaching_the_threshold_neither_stops_nor_replaces_the_worker(self) -> None:
+        stopped = []
+        send, _ = self._event_sender([self._boundaries(6)])
+        outcome, worker, _sent = self._launch(
+            sender=(send, []), stop=lambda handle, **kwargs: stopped.append(handle)
+        )
+        self.assertIs(self._reading().rotation_marked, True)
+        # The mark is the whole action. The process, the handle, the registry entry
+        # and the binding are all exactly what they were.
+        self.assertEqual(stopped, [])
+        self.assertIs(self.registry.get(SESSION).handle, worker)
+        self.assertEqual(self.registry.get(SESSION), outcome.owned)
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+
+    def test_a_marked_session_still_continues_normally(self) -> None:
+        send, _ = self._event_sender([self._boundaries(6)])
+        self._launch(sender=(send, []))
+        resume_send, sent = self._event_sender([[]])
+        self._continue(resume_send)
+        self.assertEqual(sent, ["resume"])
+        self.assertIs(self._reading().rotation_marked, True)
+
+    # -- role policy -----------------------------------------------------------
+
+    def _launch_as(self, role):
+        """One launch under a role other than executor. Nothing is made persistent."""
+        assignment = session_lifecycle.Assignment(
+            **dict(self.assignment.__dict__, role=role)
+        )
+        start, _worker = self._starter()
+        return launch_session(
+            self._decision(role=role), assignment, store=self.store,
+            registry=self.registry, reference=self.reference,
+            request_kwargs=self._request_kwargs(), prompt="x",
+            package_root=self.repo_root, now=lambda: self.clock,
+            new_session_id=lambda: SESSION, start=start, send=self._sender()[0],
+        )
+
+    def test_a_reviewer_keeps_the_fresh_session_policy(self) -> None:
+        self._launch_as("reviewer")
+        reading = self._reading()
+        self.assertEqual(reading.role, "reviewer")
+        self.assertEqual(reading.context_policy, CONTEXT_POLICY_FRESH)
+        self.assertEqual(reading.count, 0)
+
+    def test_an_orchestrator_keeps_the_fresh_session_policy(self) -> None:
+        # D10 makes an orchestrator a fresh event-driven invocation, so its policy
+        # is recorded as fresh. It is still observed rather than exempted, because
+        # D10 also says the rotation invariant applies if one ever does reach the
+        # threshold -- and a session that is not observed reports zero, which is the
+        # one thing this checkpoint must never do.
+        self._launch_as("orchestrator")
+        reading = self._reading()
+        self.assertEqual(reading.role, "orchestrator")
+        self.assertEqual(reading.context_policy, CONTEXT_POLICY_FRESH)
+        self.assertEqual(reading.count, 0)
+
+    def test_nothing_here_makes_a_fresh_role_session_persistent(self) -> None:
+        # The fresh policy is preserved by not resuming these sessions, which is
+        # accepted behaviour this checkpoint leaves exactly as it found it.
+        outcome = self._launch_as("reviewer")
+        self.assertEqual(outcome.request.mode, "launch")
+        self.assertEqual(self.registry.context(SESSION).context_policy, CONTEXT_POLICY_FRESH)
+
+    def test_an_executor_carries_the_persistent_context_policy(self) -> None:
+        self._launch()
+        self.assertEqual(self._reading().context_policy, CONTEXT_POLICY_PERSISTENT)
+
+    # -- bounded memory --------------------------------------------------------
+
+    def test_stopping_a_session_drops_its_whole_observation_memory(self) -> None:
+        send, _ = self._event_sender([[self._observed()]])
+        outcome, worker, _sent = self._launch(sender=(send, []))
+        self.assertEqual(self._reading().count, 1)
+        stop_session(
+            self.store, self.registry, outcome.binding,
+            stop=lambda handle: {"graceful": True, "exit_code": 0, "process_group_gone": True},
+            alive=self._dying(worker.pgid),
+        )
+        self.assertIsNone(self.registry.context(SESSION))
+        self.assertEqual(self.registry.context_readings(), {})
+
+    def _dying(self, pgid):
+        seen = {"count": 0}
+
+        def alive(observed_pgid):
+            seen["count"] += 1
+            return seen["count"] == 1
+
+        return alive
 
 
 class NoProviderContactTests(LifecycleTestBase):

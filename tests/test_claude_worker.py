@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,8 @@ OTHER_BLOB = "b" * 40
 HEAD = "c" * 40
 SESSION = "1a2b3c4d-0001-4000-8000-00000000000a"
 OTHER_SESSION = "1a2b3c4d-0002-4000-8000-00000000000b"
+BOUNDARY_UUID = "83e1ea6e-7979-4dca-9cd8-85d26656f905"
+OTHER_UUID = "0f0f0f0f-1111-4222-8333-444444444444"
 SKILL = "executor"
 TOOLS = ("Read", "Glob", "Grep")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -528,7 +531,7 @@ class ProtocolTests(WorkerTestBase):
 class ProviderReductionTests(WorkerTestBase):
     """Drive the worker's provider path against an injected fake SDK."""
 
-    def _install_fake_sdk(self, *, result, texts=()):
+    def _install_fake_sdk(self, *, result, texts=(), system=()):
         module = types.ModuleType("claude_agent_sdk")
 
         class FakeOptions(object):
@@ -549,9 +552,23 @@ class ProviderReductionTests(WorkerTestBase):
                     setattr(self, key, value)
                 self.content = []
 
+        class SystemMessage(object):
+            """Shaped like the SDK's: a typed subtype and a `data` dict.
+
+            No `session_id` and no `uuid` attribute, because the real one has
+            neither -- both read absent on a real `compact_boundary` while the dict
+            carried the identity.
+            """
+
+            def __init__(self, subtype, data):
+                self.subtype = subtype
+                self.data = data
+
         def query(prompt, options):
             async def generator():
                 yield Assistant(texts)
+                for subtype, data in system:
+                    yield SystemMessage(subtype, data)
                 yield ResultMessage(result)
 
             return generator()
@@ -653,6 +670,159 @@ class ProviderReductionTests(WorkerTestBase):
         self.assertEqual(
             caught.exception.reason, claude_worker.REASON_PROTOCOL_VIOLATION
         )
+
+
+class ProviderLifecycleEventTests(ProviderReductionTests):
+    """The worker decodes completed compactions; it never decides what they mean."""
+
+    def _drive(self, system):
+        self._install_fake_sdk(
+            result={"session_id": SESSION, "subtype": "success", "is_error": False},
+            system=system,
+        )
+        seen = []
+        claude_worker._run_provider(self._command(), emit=seen.append)
+        return seen
+
+    def test_a_compact_boundary_is_reported_with_the_identity_from_its_data(self) -> None:
+        seen = self._drive(
+            [("compact_boundary", {"session_id": SESSION, "uuid": BOUNDARY_UUID,
+                                   "trigger": "manual", "pre_tokens": 15254})]
+        )
+        self.assertEqual(
+            seen,
+            [{"event": "compaction-observed", "session_id": SESSION, "uuid": BOUNDARY_UUID}],
+        )
+
+    def test_a_compacting_status_and_compact_progress_are_never_reported(self) -> None:
+        self.assertEqual(
+            self._drive(
+                [
+                    ("status", {"status": "compacting", "session_id": SESSION}),
+                    ("compact_progress", {"session_id": SESSION, "uuid": BOUNDARY_UUID}),
+                    ("status", {"compact_result": "success", "session_id": SESSION}),
+                    ("init", {"session_id": SESSION}),
+                ]
+            ),
+            [],
+        )
+
+    def test_an_unidentifiable_boundary_is_reported_rather_than_dropped(self) -> None:
+        seen = self._drive([("compact_boundary", {"trigger": "manual"})])
+        self.assertEqual(len(seen), 1)
+        self.assertEqual(seen[0]["event"], "compaction-unidentifiable")
+
+    def test_the_worker_emits_one_lifecycle_message_per_decoded_event(self) -> None:
+        self._install_fake_sdk(
+            result={"session_id": SESSION, "subtype": "success", "is_error": False},
+            system=[("compact_boundary", {"session_id": SESSION, "uuid": BOUNDARY_UUID})],
+        )
+        sink = io.StringIO()
+        produced = claude_worker._run_provider(
+            self._command(), emit=claude_worker._event_emitter(sink)
+        )
+        lines = [json.loads(line) for line in sink.getvalue().splitlines()]
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0]["type"], claude_worker.MESSAGE_EVENT)
+        self.assertEqual(lines[0]["protocol"], claude_worker.PROTOCOL_VERSION)
+        self.assertEqual(lines[0]["event"]["session_id"], SESSION)
+        # The result is unchanged by observing: the reduction still carries facts.
+        self.assertEqual(produced["observed"]["session_id"], SESSION)
+
+    def test_no_provider_text_or_metadata_rides_the_lifecycle_channel(self) -> None:
+        secret = "assistant prose that must not travel"
+        self._install_fake_sdk(
+            result={"session_id": SESSION, "subtype": "success", "is_error": False,
+                    "result": secret},
+            texts=[secret],
+            system=[("compact_boundary", {
+                "session_id": SESSION, "uuid": BOUNDARY_UUID, "trigger": "manual",
+                "pre_tokens": 15254, "cumulative_dropped_tokens": 13001,
+            })],
+        )
+        sink = io.StringIO()
+        claude_worker._run_provider(self._command(), emit=claude_worker._event_emitter(sink))
+        rendered = sink.getvalue()
+        for leaked in (secret, "trigger", "pre_tokens", "cumulative_dropped_tokens"):
+            self.assertNotIn(leaked, rendered)
+
+
+class LifecycleEventTransportTests(WorkerTestBase):
+    """Events reach the controller ahead of the result, on the one bounded command."""
+
+    def _handle(self):
+        return WorkerHandle(
+            process=types.SimpleNamespace(
+                stdin=types.SimpleNamespace(write=lambda text: None, flush=lambda: None),
+                stdout=None, poll=lambda: None,
+            ),
+            pid=1, pgid=1, started_at="2026-08-26T12:00:01Z",
+            sdk_version="0.2.152", sdk_detail=None,
+        )
+
+    def _request(self):
+        self._reserve()
+        return claude_worker.build_launch_request(
+            self.store.read(SESSION), **self._request_kwargs()
+        )
+
+    def _run(self, messages):
+        with patch.object(claude_worker, "_read_message", side_effect=list(messages)):
+            return run_request(self._handle(), self._request(), prompt="x")
+
+    def _result(self, **overrides):
+        payload = {"type": "result", "session_id": SESSION, "mode": "launch",
+                   "subtype": "success", "is_error": False, "markers": {}}
+        payload.update(overrides)
+        return payload
+
+    def _event(self, **event):
+        return {"type": claude_worker.MESSAGE_EVENT, "protocol": 1, "event": event}
+
+    def test_an_invocation_that_observed_nothing_reports_an_empty_list(self) -> None:
+        self.assertEqual(self._run([self._result()])["events"], [])
+
+    def test_events_are_collected_in_order_ahead_of_the_result(self) -> None:
+        message = self._run([
+            self._event(event="compaction-observed", session_id=SESSION, uuid=BOUNDARY_UUID),
+            self._event(event="compaction-observed", session_id=SESSION, uuid=OTHER_UUID),
+            self._result(),
+        ])
+        self.assertEqual(
+            [event["uuid"] for event in message["events"]], [BOUNDARY_UUID, OTHER_UUID]
+        )
+        self.assertEqual(message["subtype"], "success")
+
+    def test_a_lifecycle_message_carrying_no_event_object_is_a_protocol_violation(self) -> None:
+        with self.assertRaises(ClaudeWorkerError) as caught:
+            self._run([
+                {"type": claude_worker.MESSAGE_EVENT, "protocol": 1, "event": "not an object"},
+                self._result(),
+            ])
+        self.assertEqual(caught.exception.reason, claude_worker.REASON_PROTOCOL_VIOLATION)
+
+    def test_an_error_after_an_event_is_still_the_error(self) -> None:
+        with self.assertRaises(ClaudeWorkerError) as caught:
+            self._run([
+                self._event(event="compaction-observed", session_id=SESSION, uuid=BOUNDARY_UUID),
+                {"type": "error", "reason": "worker-fatal", "detail": "boom"},
+            ])
+        self.assertEqual(caught.exception.reason, claude_worker.REASON_WORKER_FATAL)
+
+    def test_collecting_events_does_not_extend_the_command_bound(self) -> None:
+        deadlines = []
+
+        def read(stream, *, deadline, process):
+            deadlines.append(deadline)
+            if len(deadlines) == 1:
+                return self._event(
+                    event="compaction-observed", session_id=SESSION, uuid=BOUNDARY_UUID
+                )
+            return self._result()
+
+        with patch.object(claude_worker, "_read_message", side_effect=read):
+            run_request(self._handle(), self._request(), prompt="x", timeout=30.0)
+        self.assertEqual(len(set(deadlines)), 1)
 
 
 class WorkerEntryPointTests(WorkerTestBase):

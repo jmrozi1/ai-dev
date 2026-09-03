@@ -29,7 +29,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import uuid
 
 from .authorization import ACTION_CONTINUE, ACTION_LAUNCH, AuthorizationDecision
@@ -41,6 +41,7 @@ from .claude_worker import (
     shutdown_worker,
     start_worker,
 )
+from .context_lifecycle import ContextLifecycleLedger, SessionContextLifecycle
 from .session_binding import (
     BINDING_STATE_BOUND,
     BindingRecord,
@@ -169,12 +170,32 @@ class SessionRegistry:
     project Disconnected rather than pretend the controller still owns something.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, *, rotation_threshold: Any = None) -> None:
         self._owned = {}
         self._in_flight = set()
+        # Context lifecycle lives beside ownership because it is the same kind of
+        # claim: what this controller itself observed about a process it holds. It
+        # is created and dropped with the handle, which is also the only bound the
+        # deduplication memory needs.
+        self._context = ContextLifecycleLedger(threshold=rotation_threshold)
 
-    def add(self, owned: OwnedSession) -> OwnedSession:
+    @property
+    def rotation_threshold(self) -> int:
+        return self._context.rotation_threshold
+
+    def add(self, owned: OwnedSession, *, observed_from_start: bool = False) -> OwnedSession:
+        """Take ownership of one session, and start observing its context with it.
+
+        `observed_from_start` defaults to false because taking ownership is not the
+        same as having watched a session from its beginning. Only a caller that
+        minted the session id and started the process can say otherwise, and a
+        caller that adopts an already-running session must report its history as
+        unavailable rather than as zero.
+        """
         self._owned[owned.session_id] = owned
+        self._context.begin(
+            owned.session_id, role=owned.role, observed_from_start=observed_from_start
+        )
         return owned
 
     def get(self, session_id: str) -> Optional[OwnedSession]:
@@ -183,6 +204,21 @@ class SessionRegistry:
     def remove(self, session_id: str) -> None:
         self._owned.pop(session_id, None)
         self._in_flight.discard(session_id)
+        self._context.forget(session_id)
+
+    def context(self, session_id: str) -> Optional[SessionContextLifecycle]:
+        return self._context.get(session_id)
+
+    def observe_context_events(self, session_id: str, events) -> SessionContextLifecycle:
+        """Fold one invocation's decoded lifecycle events into that session's state."""
+        return self._context.observe(session_id, events)
+
+    def context_readings(self) -> Dict[str, Any]:
+        """What this controller may honestly say about each held session's compaction."""
+        return self._context.readings()
+
+    def rotation_marked_session_ids(self) -> Tuple[str, ...]:
+        return self._context.rotation_marked_session_ids()
 
     def sessions(self) -> List[OwnedSession]:
         return [self._owned[key] for key in sorted(self._owned)]
@@ -350,6 +386,22 @@ def _require_decision(decision: AuthorizationDecision, assignment: Assignment, *
         )
 
 
+def _observe_context(registry: SessionRegistry, session_id: str, result: Any) -> None:
+    """Fold one invocation's decoded lifecycle events into manager lifecycle state.
+
+    The events were decoded by the worker and carried on the invocation's own
+    channel, so they are folded into exactly the session that invocation was for --
+    never into whichever session an event happens to name, which is the one way a
+    compaction could be counted against work it did not happen to.
+
+    A result carrying no events is not a session with no history. It is one turn
+    that reported none, and what the session's history is worth saying is already
+    decided by its observation health.
+    """
+    events = result.get("events") if isinstance(result, Mapping) else None
+    registry.observe_context_events(session_id, events or ())
+
+
 # ---------------------------------------------------------------------------
 # Launch
 # ---------------------------------------------------------------------------
@@ -431,6 +483,10 @@ def launch_session(
         start_arguments["ready_timeout"] = ready_timeout
     handle, bound = starter(store, reserved, **start_arguments)
 
+    # Observed from the session's authoritative start: this call minted the session
+    # id, reserved it before any process existed, and started the process itself, so
+    # there is no earlier history for a boundary to have happened in. It is the only
+    # place in the product that may say so.
     owned = registry.add(
         OwnedSession(
             session_id=bound.session_id,
@@ -442,7 +498,8 @@ def launch_session(
             iteration=bound.iteration,
             workspace_path=bound.workspace_path,
             role=bound.role,
-        )
+        ),
+        observed_from_start=True,
     )
 
     send_arguments = {"prompt": prompt, "markers": list(markers)}
@@ -467,6 +524,7 @@ def launch_session(
             ),
         ) from exc
 
+    _observe_context(registry, owned.session_id, result)
     return LaunchOutcome(binding=bound, owned=owned, request=request, result=result)
 
 
@@ -535,11 +593,17 @@ def continue_session(
 
     registry.begin_invocation(session_id)
     try:
-        return sender(owned.handle, request, **send_arguments)
+        result = sender(owned.handle, request, **send_arguments)
     finally:
         # Cleared regardless of outcome, and without swallowing it: a failed
         # invocation must not leave the session permanently un-continuable.
         registry.end_invocation(session_id)
+
+    # Exact resume is the same session, so its observation is the same observation:
+    # the count carries across the resume rather than restarting, and the identity
+    # pairs already seen keep a replayed boundary from counting twice.
+    _observe_context(registry, session_id, result)
+    return result
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,7 @@ from ai_dev_flow.attention_projection import (
 )
 from ai_dev_flow.authorization import CONCURRENCY_CEILING_DEFAULT
 from ai_dev_flow.claude_allowance_store import AllowanceStore
+from ai_dev_flow.context_lifecycle import REASON_INVALID_THRESHOLD, ContextLifecycleError
 from ai_dev_flow.progress_store import ProgressStore
 from ai_dev_flow.decision_manager import ManagerRun
 from ai_dev_flow.decision_manager_launch import QueueSourceContext
@@ -283,6 +284,121 @@ class ControllerLaunchOwnershipTests(LifecycleTestBase):
 
         self.assertEqual(controller.store.root, self.store.root)
         self.assertIsNotNone(self.store.read(outcome.binding.session_id))
+
+
+class ControllerContextLifecycleTests(LifecycleTestBase):
+    """Compaction state is exposed as system lifecycle state, and only as that."""
+
+    def _source(self) -> QueueSourceContext:
+        return QueueSourceContext(
+            control_plane=self.tmp_path / "coordination", project="ai-dev",
+            ticket="issue-55", binding_root=self.store.root,
+        )
+
+    def _controller(self, **kwargs) -> ManagerController:
+        kwargs.setdefault("registry", self.registry)
+        return ManagerController(self._source(), **kwargs)
+
+    def _run(self) -> ManagerRun:
+        return ManagerRun(
+            store=AllowanceStore(self.tmp_path / "allowance.json"),
+            now=1_800_000_000,
+            human_exclusive_since=None,
+            progress=ProgressStore(self.tmp_path, "ai-dev/issue-55/progress.json"),
+        )
+
+    def _boundaries(self, count):
+        return [
+            {
+                "event": "compaction-observed",
+                "session_id": LIFECYCLE_SESSION,
+                "uuid": "{0:08d}-0000-4000-8000-000000000000".format(index),
+            }
+            for index in range(count)
+        ]
+
+    def _launch_with(self, controller, boundaries):
+        start, _worker = self._starter()
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            return {
+                "type": "result", "session_id": request.session_id, "mode": request.mode,
+                "subtype": "success", "is_error": False, "events": self._boundaries(boundaries),
+            }
+
+        return controller.launch(
+            self._decision(), self.assignment, reference=self.reference,
+            request_kwargs=self._request_kwargs(), prompt="do the work",
+            package_root=self.repo_root, now=lambda: self.clock,
+            new_session_id=lambda: LIFECYCLE_SESSION, start=start, send=send,
+        )
+
+    def test_the_controller_reports_health_count_and_whether_rotation_is_marked(self) -> None:
+        controller = self._controller()
+        self._launch_with(controller, 2)
+        reading = controller.context_lifecycle()[LIFECYCLE_SESSION]
+        self.assertEqual(reading["health"], "healthy-complete-from-session-start")
+        self.assertEqual(reading["count"], 2)
+        self.assertEqual(reading["threshold"], 6)
+        self.assertIs(reading["rotationMarked"], False)
+
+    def test_reaching_the_threshold_marks_the_session_and_stops_nothing(self) -> None:
+        controller = self._controller()
+        outcome = self._launch_with(controller, 6)
+        self.assertEqual(controller.rotation_marked_session_ids(), (LIFECYCLE_SESSION,))
+        self.assertIs(
+            controller.context_lifecycle()[LIFECYCLE_SESSION]["rotationMarked"], True
+        )
+        # The session is still owned, still bound, and still occupying its slot.
+        self.assertEqual(controller.owned_session_ids(), (LIFECYCLE_SESSION,))
+        self.assertEqual(
+            controller.agent_count(alive=ALWAYS_ALIVE),
+            {"permitted": 6, "current": 1, "reason": None},
+        )
+        self.assertFalse(outcome.binding.is_terminal)
+
+    def test_a_threshold_mark_adds_no_queue_row_and_no_human_attention(self) -> None:
+        controller = self._controller()
+        self._launch_with(controller, 6)
+        view, details = a_queue()
+        before = controller.page(self._run(), view, details, alive=ALWAYS_ALIVE)
+
+        payload = payload_in(before)
+        self.assertNotIn("rotationMarked", json.dumps(payload))
+        self.assertNotIn("compaction", before.lower())
+
+    def test_the_rotation_threshold_and_the_concurrency_ceiling_are_separate(self) -> None:
+        """Both default to six. The identical number is a coincidence, not a wire."""
+        controller = self._controller()
+        self.assertEqual(controller.ceiling, CONCURRENCY_CEILING_DEFAULT)
+        self.assertEqual(controller.rotation_threshold, 6)
+
+        narrow_ceiling = ManagerController(self._source(), ceiling=2, registry=SessionRegistry())
+        self.assertEqual(narrow_ceiling.ceiling, 2)
+        self.assertEqual(narrow_ceiling.rotation_threshold, 6)
+
+        early_rotation = ManagerController(self._source(), rotation_threshold=2)
+        self.assertEqual(early_rotation.rotation_threshold, 2)
+        self.assertEqual(early_rotation.ceiling, CONCURRENCY_CEILING_DEFAULT)
+
+    def test_an_early_rotation_threshold_does_not_narrow_the_ceiling(self) -> None:
+        controller = ManagerController(
+            self._source(), rotation_threshold=2,
+            registry=SessionRegistry(rotation_threshold=2),
+        )
+        self._launch_with(controller, 2)
+        self.assertEqual(controller.rotation_marked_session_ids(), (LIFECYCLE_SESSION,))
+        self.assertEqual(
+            controller.agent_count(alive=ALWAYS_ALIVE)["permitted"], CONCURRENCY_CEILING_DEFAULT
+        )
+
+    def test_a_registry_and_a_controller_may_not_state_two_rotation_policies(self) -> None:
+        with self.assertRaises(ContextLifecycleError) as caught:
+            ManagerController(
+                self._source(), rotation_threshold=3,
+                registry=SessionRegistry(rotation_threshold=4),
+            )
+        self.assertEqual(caught.exception.reason, REASON_INVALID_THRESHOLD)
 
 
 class ControllerDispatchTests(LifecycleTestBase):
@@ -1037,7 +1153,12 @@ class ProductionCompositionTests(SourcedLaunchTestCase):
         self.observed(controller)
 
         self.assertEqual(set(vars(controller)), before)
-        self.assertEqual(sorted(before), ["ceiling", "registry", "source", "store"])
+        # All four are stated inputs or owned collaborators; `rotation_threshold` is
+        # the fifth and is D9's stated policy, not anything a response observed.
+        self.assertEqual(
+            sorted(before),
+            ["ceiling", "registry", "rotation_threshold", "source", "store"],
+        )
 
     # -- the same store and the same registry, not merely equal ones -------
 

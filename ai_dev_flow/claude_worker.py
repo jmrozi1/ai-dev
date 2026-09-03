@@ -44,6 +44,7 @@ from .claude_runtime import (
     require_supported_sdk,
     resume_request,
 )
+from .context_lifecycle import decode_lifecycle_event
 from .session_binding import (
     BINDING_STATE_RESERVED,
     BindingRecord,
@@ -62,6 +63,10 @@ MESSAGE_READY = "ready"
 MESSAGE_RESULT = "result"
 MESSAGE_ERROR = "error"
 MESSAGE_STOPPED = "stopped"
+# One decoded lifecycle fact, reported while a command is still running. It rides
+# the same newline-delimited channel as everything else and carries no provider
+# message: the worker decodes, the controller decides what a decoded event means.
+MESSAGE_EVENT = "event"
 
 COMMAND_LAUNCH = "launch"
 COMMAND_RESUME = "resume"
@@ -487,9 +492,24 @@ def run_request(
             "options": build_option_fields(request),
         },
     )
-    message = _read_message(
-        handle.process.stdout, deadline=time.monotonic() + timeout, process=handle.process
-    )
+    # Lifecycle events arrive on the same stream, ahead of the result, and are
+    # collected under the command's own deadline rather than a second one -- a
+    # command that reports a compaction is still one bounded command.
+    deadline = time.monotonic() + timeout
+    events = []
+    while True:
+        message = _read_message(
+            handle.process.stdout, deadline=deadline, process=handle.process
+        )
+        if message.get("type") != MESSAGE_EVENT:
+            break
+        event = message.get("event")
+        if not isinstance(event, dict):
+            raise ClaudeWorkerError(
+                REASON_PROTOCOL_VIOLATION,
+                "the worker emitted a lifecycle message carrying no event object.",
+            )
+        events.append(event)
     if message.get("type") == MESSAGE_ERROR:
         raise ClaudeWorkerError(
             REASON_WORKER_FATAL,
@@ -507,6 +527,10 @@ def run_request(
                 message.get("session_id"), request.session_id
             ),
         )
+    # Additive, and always present: an invocation that observed no compaction says
+    # so with an empty list rather than by omitting the field, so a caller never has
+    # to read absence as either zero or unknown.
+    message["events"] = events
     return message
 
 
@@ -623,7 +647,26 @@ def _scan_markers(text: str, markers: Iterable, seen: dict) -> None:
             seen[marker] = True
 
 
-def _run_provider(command: Mapping) -> dict:
+def _event_emitter(sink):
+    """The worker's way of reporting one decoded lifecycle fact as it happens.
+
+    Reported during the command rather than folded into its result because the
+    controller owns what a compaction means and the worker owns only what the
+    provider said. Nothing of the message itself travels -- the event is the
+    decoded identity, and the transcript stays on this side of the pipe like every
+    other thing the provider says.
+    """
+
+    def emit(event: Mapping) -> None:
+        _emit(
+            {"type": MESSAGE_EVENT, "protocol": PROTOCOL_VERSION, "event": dict(event)},
+            sink,
+        )
+
+    return emit
+
+
+def _run_provider(command: Mapping, emit=None) -> dict:
     """Drive one bounded SDK call and reduce it to facts. Lazy import by design."""
     from claude_agent_sdk import ClaudeAgentOptions, query  # noqa: WPS433
 
@@ -638,6 +681,12 @@ def _run_provider(command: Mapping) -> dict:
 
     async def drive() -> None:
         async for message in query(prompt=command.get("prompt", ""), options=options):
+            if emit is not None:
+                # Decoded first, so a completed compaction is reported even if
+                # something later in this iteration goes wrong.
+                event = decode_lifecycle_event(message)
+                if event is not None:
+                    emit(event)
             for block in getattr(message, "content", []) or []:
                 text = getattr(block, "text", None)
                 if isinstance(text, str):
@@ -741,7 +790,8 @@ def serve(stdin=None, stdout=None) -> int:
             )
             continue
         try:
-            _emit(_result_payload(command, _run_provider(command)), sink)
+            produced = _run_provider(command, emit=_event_emitter(sink))
+            _emit(_result_payload(command, produced), sink)
         except (ClaudeWorkerError, ClaudeRuntimeError) as exc:
             _emit(
                 {"type": MESSAGE_ERROR, "reason": exc.reason, "detail": exc.detail}, sink
