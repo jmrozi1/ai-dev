@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import tempfile
@@ -69,6 +70,28 @@ SESSION = "1a2b3c4d-0001-4000-8000-00000000000a"
 OTHER_SESSION = "1a2b3c4d-0002-4000-8000-00000000000b"
 SKILL = "executor"
 TOOLS = ("Read", "Glob")
+# Git object names of published handoff bytes. Two of them, because currency is a
+# question about *which* publication is there, and one name can never answer it.
+PUBLICATION = "d" * 40
+NEXT_PUBLICATION = "e" * 40
+
+
+_UNSET = object()
+
+
+class _PublishedHandoff(object):
+    """The caller's control-plane read of which handoff publication currently stands.
+
+    Stands in for `rail_handoff_publication`'s object name, which is what a real
+    caller passes. It is a value the agent moves by publishing, never something the
+    lifecycle writes: nothing in the module under test can change what this returns.
+    """
+
+    def __init__(self, value=None):
+        self.value = value
+
+    def __call__(self):
+        return self.value
 
 
 class FakeHandle(object):
@@ -1359,6 +1382,39 @@ class RotationBoundaryTests(LifecycleTestBase):
 
     HANDOFF = "ai-dev/issue-55/rails/{0}/handoff.md".format(RAIL)
 
+    def setUp(self) -> None:
+        super().setUp()
+        # The caller's own fresh control-plane read, standing in for
+        # `rail_handoff_publication`. `None` is the honest starting state: this rail
+        # has no published handoff until an agent writes one.
+        self.published = _PublishedHandoff()
+
+    def _work(self, publishing=None, fail=None, reader=_UNSET):
+        """One authorized invocation of real work, bracketed exactly as production is.
+
+        `publishing` is what the agent leaves at the rail's canonical path *during*
+        the invocation, which is the only place a persistent agent can publish from.
+        Nothing about this helper reaches around `continue_session`: the currency
+        facts are established by the same call that performs the work.
+        """
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            if publishing is not None:
+                self.published.value = publishing
+            if fail is not None:
+                raise fail
+            return {"type": "result", "session_id": request.session_id,
+                    "mode": request.mode, "subtype": "success", "is_error": False}
+
+        return continue_session(
+            self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
+            registry=self.registry, session_id=SESSION,
+            request_kwargs=self._request_kwargs(), prompt="carry on",
+            send=send, alive=lambda pgid: True,
+            read_handoff_publication=(
+                self.published if reader is _UNSET else reader
+            ),
+        )
+
     def _mark(self, count=6, session_id=SESSION):
         """Drive the accepted counter to a real threshold mark. No shortcut flag."""
         events = [
@@ -1374,7 +1430,13 @@ class RotationBoundaryTests(LifecycleTestBase):
         return RailFacts(**arguments)
 
     def _handoff(self, **overrides):
-        arguments = {"rail": RAIL, "published": True, "location": self.HANDOFF}
+        """A fresh control-plane read of the rail's handoff, as it actually stands."""
+        arguments = {
+            "rail": RAIL,
+            "published": self.published.value is not None,
+            "location": self.HANDOFF,
+            "publication": self.published.value,
+        }
         arguments.update(overrides)
         return RotationHandoffFacts(**arguments)
 
@@ -1400,9 +1462,12 @@ class RotationBoundaryTests(LifecycleTestBase):
 
     # -- the transition itself --------------------------------------------------
 
-    def test_marked_at_a_safe_boundary_with_a_durable_handoff_is_rotation_ready(self) -> None:
+    def test_marked_at_a_safe_boundary_with_a_current_handoff_is_rotation_ready(self) -> None:
         self._launch()
         self._mark()
+        # The agent publishes its handoff during an authorized invocation, which is
+        # the only place a persistent agent can publish from.
+        self._work(publishing=PUBLICATION)
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_ROTATION_HANDOFF_ESTABLISHED)
@@ -1412,13 +1477,15 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_the_handoff_carries_the_exact_durable_identity_and_nothing_else(self) -> None:
         self._launch()
         self._mark()
+        self._work(publishing=PUBLICATION)
         handoff = self._evaluate().handoff
         record = self.store.read(SESSION)
         self.assertEqual(handoff.to_dict(), {
             "project": "ai-dev", "ticket": "issue-55", "rail": RAIL, "iteration": BLOB,
             "role": "executor", "workspaceKey": record.workspace_key,
             "worktreeId": self.worktree_id, "workspacePath": str(self.workspace),
-            "launchedAtHead": HEAD, "handoff": self.HANDOFF, "sessionId": SESSION,
+            "launchedAtHead": HEAD, "handoff": self.HANDOFF,
+            "handoffPublication": PUBLICATION, "sessionId": SESSION,
         })
         # Every value is the binding's own, so a replacement resolves the same rail
         # and the same workspace a fresh agent would.
@@ -1429,9 +1496,10 @@ class RotationBoundaryTests(LifecycleTestBase):
 
     def test_no_field_of_the_handoff_comes_from_a_transcript_or_the_provider(self) -> None:
         # The whole payload is reproducible from durable state alone: this rebuilds
-        # it from the store and the control-plane locator, with no session held.
+        # it from the store and the control-plane read, with no session held.
         self._launch()
         self._mark()
+        self._work(publishing=PUBLICATION)
         expected = self._evaluate().handoff.to_dict()
         record = self.store.read(SESSION)
         self.assertEqual(expected, {
@@ -1440,7 +1508,8 @@ class RotationBoundaryTests(LifecycleTestBase):
             "workspaceKey": record.workspace_key, "worktreeId": record.worktree_id,
             "workspacePath": record.workspace_path,
             "launchedAtHead": record.launched_at_head,
-            "handoff": self.HANDOFF, "sessionId": record.session_id,
+            "handoff": self.HANDOFF, "handoffPublication": self.published.value,
+            "sessionId": record.session_id,
         })
 
     # -- the safe boundary ------------------------------------------------------
@@ -1448,34 +1517,45 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_marked_but_in_flight_is_not_rotation_ready(self) -> None:
         self._launch()
         self._mark()
+        self._work(publishing=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
         self.registry.begin_invocation(SESSION)
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_INVOCATION_IN_FLIGHT)
         self.assertIsNone(readiness.handoff)
-        # And the boundary opens again the moment that invocation ends, with no
-        # timer and nothing else to wait for.
+        # The *temporal* boundary opens again the moment that invocation ends, with
+        # no timer and nothing else to wait for -- in-flight is no longer the
+        # reason. What the ended invocation leaves behind is a unit of work the
+        # published handoff does not describe, which is a separate condition and
+        # says so.
         self.registry.end_invocation(SESSION)
+        after = self._evaluate()
+        self.assertEqual(after.state, ROTATION_NOT_READY)
+        self.assertEqual(after.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        # And a handoff published across the next invocation restores it.
+        self._work(publishing=NEXT_PUBLICATION)
         self.assertEqual(self._evaluate().state, ROTATION_READY)
 
     def test_a_failed_invocation_still_closes_the_boundary_it_opened(self) -> None:
         # The failure path clears in-flight in its `finally`, so a marked session
-        # that suffered a failed turn is still reachable as a boundary.
+        # that suffered a failed turn is still reachable as a *temporal* boundary.
         self._launch()
         self._mark()
+        self._work(publishing=PUBLICATION)
         failure = claude_worker.ClaudeWorkerError(claude_worker.REASON_WORKER_FATAL, "boom")
         with self.assertRaises(claude_worker.ClaudeWorkerError):
-            continue_session(
-                self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
-                registry=self.registry, session_id=SESSION,
-                request_kwargs=self._request_kwargs(), prompt="carry on",
-                send=self._sender(fail=failure)[0], alive=lambda pgid: True,
-            )
+            self._work(fail=failure)
         self.assertEqual(self.registry.in_flight(), ())
         readiness = self._evaluate()
-        # Still marked -- the floor proved the threshold -- and still ready, even
-        # though the history is now partial.
-        self.assertEqual(readiness.state, ROTATION_READY)
+        # Still marked -- the floor proved the threshold -- and the temporal
+        # boundary is open. But the failed invocation is a unit of work whose
+        # outcome nobody can state, so the handoff published before it can no longer
+        # be called current. That is checkpoint 58's work-boundary uncertainty, and
+        # it fails closed rather than inferring that nothing changed.
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
         self.assertEqual(
             self.registry.context(SESSION).reading().health, OBSERVATION_UNHEALTHY
         )
@@ -1600,11 +1680,14 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_reaching_rotation_ready_changes_nothing_at_all(self) -> None:
         self._launch()
         self._mark()
+        self._work(publishing=PUBLICATION)
         before = (
             self.store.read(SESSION).to_dict(),
             self.registry.context_readings(),
             self.registry.in_flight(),
             sorted(owned.session_id for owned in self.registry.sessions()),
+            self.registry.work_boundary(SESSION),
+            self.registry.handoff_publication(SESSION),
         )
         self.assertEqual(self._evaluate().state, ROTATION_READY)
         after = (
@@ -1612,6 +1695,8 @@ class RotationBoundaryTests(LifecycleTestBase):
             self.registry.context_readings(),
             self.registry.in_flight(),
             sorted(owned.session_id for owned in self.registry.sessions()),
+            self.registry.work_boundary(SESSION),
+            self.registry.handoff_publication(SESSION),
         )
         self.assertEqual(before, after)
         # The worker was never asked to stop, and the session is still continuable.
@@ -1621,6 +1706,7 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_rotation_readiness_creates_no_human_attention_and_no_second_session(self) -> None:
         self._launch()
         self._mark()
+        self._work(publishing=PUBLICATION)
         with patch.object(session_lifecycle, "start_worker") as starter, \
                 patch.object(session_lifecycle, "shutdown_worker") as stopper:
             readiness = self._evaluate()
@@ -1630,6 +1716,273 @@ class RotationBoundaryTests(LifecycleTestBase):
         # Rotation readiness is system-owned: the projection carries a machine
         # reason and a locator, and nothing shaped like a human decision.
         self.assertFalse(hasattr(readiness, "human_decision"))
+
+    # -- handoff currency: which publication, and whether work outran it --------
+    #
+    # `published` says a handoff exists. These say the one that exists was written
+    # for the boundary this session is standing at. Both facts are mechanical --
+    # the object name of the published bytes, and this controller's own count of
+    # the invocations it began -- and no case here reads a word of what the handoff
+    # says.
+
+    def test_a_handoff_published_across_a_unit_of_work_is_current(self) -> None:
+        # Case A: marked, safe boundary, coherent worktree, and a handoff this
+        # controller watched appear across the invocation that produced it.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(readiness.handoff.handoff_publication, PUBLICATION)
+        self.assertEqual(readiness.handoff.handoff_location, self.HANDOFF)
+
+    def test_authorized_work_after_publication_leaves_the_handoff_insufficient(self) -> None:
+        # THE regression, exactly as the checkpoint-59 review drove it: same
+        # assignment, same rail, same iteration, three further authorized
+        # invocations that all succeed, and no new publication after them.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        ready = self._evaluate()
+        self.assertEqual(ready.state, ROTATION_READY)
+        locator = ready.handoff.handoff_location
+
+        for _ in range(3):
+            self._work()
+
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        # No locator is handed out at all now, where checkpoint 59 handed out this
+        # byte-identical one after the same three invocations.
+        self.assertIsNone(readiness.handoff)
+        self.assertEqual(locator, self.HANDOFF)
+        # The artifact is still there and still published. Existence was never the
+        # thing in doubt.
+        self.assertTrue(self._handoff().published)
+        self.assertEqual(self.published.value, PUBLICATION)
+        self.assertIn("work boundary", readiness.detail)
+
+    def test_republishing_after_that_work_restores_readiness(self) -> None:
+        # Case C, continuing from the regression above.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        for _ in range(3):
+            self._work()
+        self.assertEqual(self._evaluate().reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+        self._work(publishing=NEXT_PUBLICATION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(readiness.handoff.handoff_publication, NEXT_PUBLICATION)
+
+    def test_the_rail_iteration_is_identical_across_ready_not_ready_and_ready(self) -> None:
+        # The point of the whole checkpoint: iteration freshness could not have
+        # answered this. The blob the authorization was read from is byte-identical
+        # in all three states, and the iteration guard never fires.
+        self._launch()
+        self._mark()
+        seen = []
+
+        self._work(publishing=PUBLICATION)
+        seen.append(self._evaluate().state)
+        blobs = [self.store.read(SESSION).iteration.blob]
+
+        for _ in range(3):
+            self._work()
+        seen.append(self._evaluate().state)
+        blobs.append(self.store.read(SESSION).iteration.blob)
+
+        self._work(publishing=NEXT_PUBLICATION)
+        seen.append(self._evaluate().state)
+        blobs.append(self.store.read(SESSION).iteration.blob)
+
+        self.assertEqual(seen, [ROTATION_READY, ROTATION_NOT_READY, ROTATION_READY])
+        self.assertEqual(blobs, [BLOB, BLOB, BLOB])
+        self.assertEqual(self._rail().rail_blob, BLOB)
+        # And iteration drift is still its own separate refusal, undisturbed.
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate(rail=self._rail(rail_blob=OTHER_BLOB))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_ITERATION_DRIFT)
+
+    def test_no_work_after_publication_requires_no_republication(self) -> None:
+        # Case D: readiness is not a demand for ceremony. With nothing done since
+        # the handoff was published, repeated projections stay ready and ask for
+        # nothing.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        for _ in range(4):
+            self.assertEqual(self._evaluate().state, ROTATION_READY)
+        self.assertEqual(self.published.value, PUBLICATION)
+        self.assertEqual(
+            self.registry.handoff_publication(SESSION).publication, PUBLICATION
+        )
+
+    def test_republishing_identical_bytes_across_work_does_not_prove_currency(self) -> None:
+        # An unchanged publication is unchanged evidence. Republishing the same
+        # bytes after further work is refused rather than credited, which is the
+        # fail-closed direction.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        self._work(publishing=PUBLICATION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_a_handoff_this_controller_never_saw_published_is_not_current(self) -> None:
+        # The ticket's own documented shape: an earlier handoff lying at the rail's
+        # canonical path from work that is not this session's. It is present, it is
+        # published, and this controller never watched it appear across any unit of
+        # this session's work -- so it proves nothing about this session.
+        self._launch()
+        self._mark()
+        self.published.value = PUBLICATION
+        for _ in range(2):
+            self._work()
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self.assertIsNone(self.registry.handoff_publication(SESSION))
+
+    def test_an_observation_that_cannot_name_the_publication_fails_closed(self) -> None:
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        readiness = self._evaluate(handoff=self._handoff(publication=None))
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self.assertIsNone(readiness.handoff)
+
+    def test_a_publication_other_than_the_one_proven_current_is_refused(self) -> None:
+        # Something republished the handoff outside this session's work. The
+        # controller cannot say the bytes now on offer are the ones it proved.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        readiness = self._evaluate(handoff=self._handoff(publication=NEXT_PUBLICATION))
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_a_control_plane_read_that_fails_leaves_no_publication_standing(self) -> None:
+        # An unreadable control plane is silence, never evidence -- and it does not
+        # turn a completed invocation into a raised one.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+        def unreadable():
+            raise RuntimeError("the coordination repository could not be read")
+
+        result = self._work(reader=unreadable)
+        self.assertEqual(result["subtype"], "success")
+        self.assertIsNone(self.registry.handoff_publication(SESSION))
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_a_caller_that_reads_no_publication_at_all_is_never_ready(self) -> None:
+        # Currency is not opt-out. A caller that supplies no read establishes
+        # nothing, and readiness says so rather than falling back to existence.
+        self._launch()
+        self._mark()
+        self.published.value = PUBLICATION
+        self._work(reader=None)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_a_current_handoff_does_not_excuse_the_other_conditions(self) -> None:
+        # Dirty, mid-operation and in-flight each still prevent readiness on their
+        # own, with their own reasons, and are not reachable through currency.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+        self.assertEqual(
+            self._evaluate(worktree=self._worktree(clean=False)).reason,
+            session_lifecycle.REASON_WORKTREE_INCOHERENT,
+        )
+        self.assertEqual(
+            self._evaluate(worktree=self._worktree(active_operation="merge")).reason,
+            session_lifecycle.REASON_WORKTREE_INCOHERENT,
+        )
+        self.registry.begin_invocation(SESSION)
+        self.assertEqual(
+            self._evaluate().reason, session_lifecycle.REASON_INVOCATION_IN_FLIGHT
+        )
+        self.registry.end_invocation(SESSION)
+
+    def test_contradictory_identity_still_fails_closed_with_a_current_handoff(self) -> None:
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        for overrides, reason in (
+            ({"rail": self._rail(identifier=OTHER_RAIL)}, session_lifecycle.REASON_SCOPE_MISMATCH),
+            ({"rail": self._rail(rail_blob=OTHER_BLOB)}, session_lifecycle.REASON_ITERATION_DRIFT),
+            ({"handoff": self._handoff(rail=OTHER_RAIL)}, session_lifecycle.REASON_SCOPE_MISMATCH),
+            ({"worktree": self._worktree(path="/somewhere/else")}, session_lifecycle.REASON_SCOPE_MISMATCH),
+            ({"handoff": None}, session_lifecycle.REASON_OBSERVATION_INCOMPLETE),
+        ):
+            with self.subTest(overrides=sorted(overrides)):
+                with self.assertRaises(LifecycleError) as caught:
+                    self._evaluate(**overrides)
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_the_currency_facts_carry_no_content_and_no_second_handoff(self) -> None:
+        # The lifecycle never holds a representation of what a handoff says: the
+        # observation is a rail, a presence, a location and an object name, and the
+        # carried payload names the same one artifact.
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(RotationHandoffFacts)),
+            ("rail", "published", "location", "publication"),
+        )
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        carried = self._evaluate().handoff.to_dict()
+        self.assertEqual(carried["handoff"], self.HANDOFF)
+        self.assertEqual(carried["handoffPublication"], PUBLICATION)
+        self.assertNotIn("content", carried)
+        self.assertNotIn("status", carried)
+
+    def test_the_whole_currency_cycle_terminates_replaces_and_asks_nobody(self) -> None:
+        # Items 7 and 8, across the ready -> not ready -> ready cycle rather than a
+        # single projection: no worker is started or stopped, no second session
+        # appears, the binding stays bound and continuable, and nothing shaped like
+        # a human decision is produced at any point.
+        self._launch()
+        self._mark()
+        with patch.object(session_lifecycle, "start_worker") as starter, \
+                patch.object(session_lifecycle, "shutdown_worker") as stopper:
+            self._work(publishing=PUBLICATION)
+            first = self._evaluate()
+            for _ in range(3):
+                self._work()
+            stale = self._evaluate()
+            self._work(publishing=NEXT_PUBLICATION)
+            again = self._evaluate()
+        self.assertEqual(
+            [first.state, stale.state, again.state],
+            [ROTATION_READY, ROTATION_NOT_READY, ROTATION_READY],
+        )
+        starter.assert_not_called()
+        stopper.assert_not_called()
+        for readiness in (first, stale, again):
+            self.assertFalse(hasattr(readiness, "human_decision"))
+            self.assertIn(readiness.reason, (
+                session_lifecycle.REASON_ROTATION_HANDOFF_ESTABLISHED,
+                session_lifecycle.REASON_HANDOFF_NOT_CURRENT,
+            ))
+        self.assertEqual(
+            sorted(owned.session_id for owned in self.registry.sessions()), [SESSION]
+        )
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        self.assertIsNotNone(self.registry.get(SESSION))
 
 
 class RealWorkerFailedContinueJoinTests(LifecycleTestBase):

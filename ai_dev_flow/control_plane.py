@@ -1245,16 +1245,24 @@ def rail_blob_sha(source: ReadSource, *, project: str, ticket: str, rail: str) -
 
 def rail_handoff_publication(
     source: ReadSource, *, project: str, ticket: str, rail: str
-) -> tuple[str, bool]:
-    """Where one rail's executor handoff lives, and whether it is published.
+) -> tuple[str, bool, str | None]:
+    """Where one rail's executor handoff lives, whether it is published, and which one.
 
-    Presence and location, deliberately nothing about the content. A handoff is
-    executor-authored evidence whose contract is read by the reviewer and
-    orchestrator loop; a second reader that judged its prose would be a second
-    opinion about work this module does not own.
+    Presence, location, and the Git object name of the published bytes --
+    deliberately nothing about the content. A handoff is executor-authored evidence
+    whose contract is read by the reviewer and orchestrator loop; a second reader
+    that judged its prose would be a second opinion about work this module does not
+    own.
+
+    The object name is the *identity* of one publication, never a judgement about
+    it. It is the same `blob_sha` that already names a rail iteration, taken in the
+    same read as the presence beside it, so a caller can never pair a presence seen
+    at one instant with an identity seen at another. Republishing identical bytes
+    yields the same name, which is the honest answer: identical bytes are not a new
+    statement about the work.
     """
     relative = artifact_relative(project=project, ticket=ticket, artifact="handoff", rail=rail)
-    return relative, source.exists(relative)
+    return relative, source.exists(relative), source.blob_sha(relative)
 
 
 def resolve_read_source(repo_root: Path) -> ReadSource:

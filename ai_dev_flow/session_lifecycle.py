@@ -100,6 +100,7 @@ REASON_INVALID_TIMESTAMP = "invalid-timestamp"
 
 REASON_NOT_MARKED_FOR_ROTATION = "not-marked-for-rotation"
 REASON_HANDOFF_NOT_PUBLISHED = "durable-handoff-not-published"
+REASON_HANDOFF_NOT_CURRENT = "durable-handoff-not-current"
 REASON_WORKTREE_INCOHERENT = "worktree-incoherent"
 REASON_ROTATION_HANDOFF_ESTABLISHED = "durable-handoff-established"
 
@@ -177,6 +178,27 @@ class OwnedSession:
         return tuple(differences)
 
 
+@dataclass(frozen=True)
+class HandoffPublicationObservation:
+    """Which handoff publication this controller saw appear, and across which work boundary.
+
+    `publication` is the Git object name of the published bytes -- the identity of
+    one publication, taken from the control-plane read that already names a rail
+    iteration the same way. It says *which* handoff is being offered and nothing
+    whatever about what it says; the handoff itself remains the only carrier of
+    outcome, evidence, unresolved work and next action.
+
+    `work_boundary` is the count of invocations this controller had begun when that
+    publication appeared. It is not a time, not a sequence anything schedules on,
+    and not an event log -- it exists only to answer whether anything happened
+    after this publication.
+    """
+
+    session_id: str
+    publication: str
+    work_boundary: int
+
+
 class SessionRegistry:
     """Controller-local ownership, deliberately not durable.
 
@@ -187,6 +209,13 @@ class SessionRegistry:
     def __init__(self, *, rotation_threshold: Any = None) -> None:
         self._owned = {}
         self._in_flight = set()
+        # How many invocations of each held session this controller has begun, and
+        # which handoff publication it saw appear across one of those boundaries.
+        # Both live and die with the handle for exactly the reason ownership does:
+        # a work boundary that survived restart would be a claim about work this
+        # process never watched.
+        self._work_boundary = {}
+        self._handoff_publication = {}
         # Context lifecycle lives beside ownership because it is the same kind of
         # claim: what this controller itself observed about a process it holds. It
         # is created and dropped with the handle, which is also the only bound the
@@ -218,6 +247,8 @@ class SessionRegistry:
     def remove(self, session_id: str) -> None:
         self._owned.pop(session_id, None)
         self._in_flight.discard(session_id)
+        self._work_boundary.pop(session_id, None)
+        self._handoff_publication.pop(session_id, None)
         self._context.forget(session_id)
 
     def context(self, session_id: str) -> Optional[SessionContextLifecycle]:
@@ -246,6 +277,54 @@ class SessionRegistry:
     def in_flight(self) -> Tuple[str, ...]:
         return tuple(sorted(self._in_flight))
 
+    def work_boundary(self, session_id: str) -> int:
+        """How many invocations of this session this controller has begun.
+
+        A monotonic controller-local count and nothing more. It carries no time, no
+        content and no ordering anyone else can observe; its only question is
+        whether work happened *after* some other fact this controller recorded.
+        """
+        return self._work_boundary.get(session_id, 0)
+
+    def handoff_publication(self, session_id: str) -> Optional[HandoffPublicationObservation]:
+        """The handoff publication this controller saw appear, and where in its work."""
+        return self._handoff_publication.get(session_id)
+
+    def observe_handoff_publication(
+        self, session_id: str, publication: Optional[str], *, previous: Optional[str]
+    ) -> Optional[HandoffPublicationObservation]:
+        """Record a handoff publication that appeared across this session's current boundary.
+
+        `previous` is what the caller's read said *before* the unit of work,
+        `publication` what the same read says after it. A publication becomes
+        current only by appearing or changing across one unit of work, because that
+        crossing is the only thing that shows the bytes were written for the work
+        just performed rather than for some earlier boundary. An unchanged read is
+        therefore not an observation of currency: it deliberately leaves whatever
+        was already recorded standing at the older boundary it was established at,
+        which is what makes work performed after a publication visible at all.
+
+        No publication clears the record. A read that could not say which
+        publication stands must not leave one behind claiming to be current.
+
+        `previous` is required rather than defaulted so that no caller can record a
+        publication without having said what it replaced. `continue_session` is
+        where that pair is taken around real work, which is what makes the crossing
+        structural instead of a convention a caller has to remember.
+        """
+        if not publication:
+            self._handoff_publication.pop(session_id, None)
+            return None
+        if previous is not None and publication == previous:
+            return self._handoff_publication.get(session_id)
+        observation = HandoffPublicationObservation(
+            session_id=session_id,
+            publication=publication,
+            work_boundary=self.work_boundary(session_id),
+        )
+        self._handoff_publication[session_id] = observation
+        return observation
+
     def begin_invocation(self, session_id: str) -> None:
         if session_id in self._in_flight:
             raise LifecycleError(
@@ -253,6 +332,11 @@ class SessionRegistry:
                 "session {0} already has an invocation in flight.".format(session_id),
             )
         self._in_flight.add(session_id)
+        # One unit of work is starting, so this session is leaving the boundary any
+        # earlier publication was written for. Only a publication observed across
+        # this invocation can describe the boundary it ends at. A refused
+        # double-begin does not reach here, and so does not move the boundary.
+        self._work_boundary[session_id] = self._work_boundary.get(session_id, 0) + 1
 
     def end_invocation(self, session_id: str) -> None:
         self._in_flight.discard(session_id)
@@ -420,6 +504,28 @@ def _observe_context(registry: SessionRegistry, session_id: str, result: Any) ->
     """
     events = result.get("events") if isinstance(result, Mapping) else None
     registry.observe_context_events(session_id, events or ())
+
+
+def _read_publication(reader: Optional[Callable]) -> Optional[str]:
+    """One caller-supplied read of the current handoff publication, or nothing.
+
+    Supplied by the caller for the same reason `RailFacts` is: this module reads no
+    repository and shells out to nothing, so a lifecycle fact can never be
+    contaminated by a read taken at some other instant than the caller's.
+
+    A failed or absent read is silence, never a raise: the invocation around it
+    either happened or did not, and a control-plane read cannot change that after
+    the fact. Silence is also never mistaken for evidence -- it clears any recorded
+    publication, so an unreadable control plane leaves the boundary unproven and
+    rotation readiness fails closed.
+    """
+    if reader is None:
+        return None
+    try:
+        publication = reader()
+    except Exception:
+        return None
+    return publication or None
 
 
 def _observe_failed_invocation(registry: SessionRegistry, session_id: str, exc: Exception) -> None:
@@ -597,6 +703,7 @@ def continue_session(
     send: Optional[Callable] = None,
     alive: Optional[Callable] = None,
     command_timeout: Optional[float] = None,
+    read_handoff_publication: Optional[Callable] = None,
 ) -> Mapping:
     """Resume exactly the bound session this controller still owns, once at a time."""
     _require_decision(decision, assignment, action=ACTION_CONTINUE)
@@ -642,6 +749,14 @@ def continue_session(
     if command_timeout is not None:
         send_arguments["timeout"] = command_timeout
 
+    # Which handoff publication stood *before* this unit of work. Reading it here,
+    # inside the same bracket that already marks the invocation in flight, is what
+    # makes the pair of reads describe one unit of work rather than two moments a
+    # caller chose. A publication that is unchanged across the bracket was written
+    # for an earlier boundary; only one that appears or changes across it was
+    # written for this one.
+    publication_before = _read_publication(read_handoff_publication)
+
     registry.begin_invocation(session_id)
     try:
         result = sender(owned.handle, request, **send_arguments)
@@ -661,6 +776,16 @@ def continue_session(
     # the count carries across the resume rather than restarting, and the identity
     # pairs already seen keep a replayed boundary from counting twice.
     _observe_context(registry, session_id, result)
+    # And which one stands after it. The failure path above raises before reaching
+    # here on purpose: an invocation that failed leaves the boundary it opened
+    # unmatched by any publication, which is exactly the work-boundary uncertainty
+    # checkpoint 58 already established -- and it fails closed rather than
+    # inferring that nothing changed.
+    registry.observe_handoff_publication(
+        session_id,
+        _read_publication(read_handoff_publication),
+        previous=publication_before,
+    )
     return result
 
 
@@ -928,6 +1053,20 @@ def recover_session(
 # invents no artifact and no second collaboration model. It is the design test for
 # this slice, applied to itself: a replacement agent becomes ready by relying on
 # exactly the durable facts a fresh agent on this rail would already resolve.
+#
+# Third, an existing handoff is not the same thing as a *current* one. D9 requires
+# the handoff to carry "its current outcome and evidence", so the boundary is not
+# reached merely because some handoff sits at the rail's canonical path: an
+# earlier handoff, followed by further authorized work, is an ordinary state on a
+# persistent rail, and handing that to a replacement loses precisely the work no
+# transcript is allowed to recover. Currency is therefore proved from two
+# deterministic facts and no prose whatsoever -- the Git object name of the
+# published bytes, which says *which* publication is being offered, and this
+# controller's own count of the invocations it began, which says whether anything
+# happened after it. The handoff remains the single carrier of *what* the work
+# says; nothing here reads a word of it, and no second representation of it
+# exists. When either fact is missing, readiness fails closed, like every other
+# not-ready path here.
 
 
 @dataclass(frozen=True)
@@ -962,11 +1101,19 @@ class RotationHandoffFacts:
     orchestrator loop that reads it. Re-parsing that prose here would invent a
     schema the published handoffs in this ticket do not carry, and would make the
     lifecycle a second judge of work it does not own.
+
+    `publication` is the Git object name the same control-plane read returned for
+    those bytes. It is an identity, not content: it distinguishes one publication
+    from another without saying anything about either, which is exactly the
+    distinction currency needs and the most this layer is entitled to know. It is
+    optional because an observation that cannot name the publication must be able
+    to say so, and a readiness that cannot name it fails closed.
     """
 
     rail: str
     published: bool
     location: str
+    publication: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -991,6 +1138,7 @@ class RotationHandoff:
     workspace_path: str
     launched_at_head: str
     handoff_location: str
+    handoff_publication: str
     session_id: str
 
     def to_dict(self) -> Dict[str, Any]:
@@ -1005,6 +1153,10 @@ class RotationHandoff:
             "workspacePath": self.workspace_path,
             "launchedAtHead": self.launched_at_head,
             "handoff": self.handoff_location,
+            # Which publication was proven current, so what a replacement is handed
+            # is one exact set of bytes rather than a path that may have moved on
+            # between the projection and the reading of it.
+            "handoffPublication": self.handoff_publication,
             "sessionId": self.session_id,
         }
 
@@ -1180,13 +1332,64 @@ def evaluate_rotation_readiness(
             ),
         )
 
+    # 5. And that publication is the current one. `published` says a handoff
+    #    exists; this says the one that exists was written for the boundary this
+    #    session is standing at. Both facts are mechanical: the object name of the
+    #    published bytes, and this controller's own count of invocations begun. No
+    #    part of the handoff's text is read, here or anywhere in this module.
+    boundary = registry.work_boundary(record.session_id)
+    observation = registry.handoff_publication(record.session_id)
+    if handoff.publication is None:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_CURRENT,
+            "the observation of {0} does not name which publication is there, so "
+            "whether it is the one describing session {1}'s current work cannot be "
+            "established.".format(handoff.location, record.session_id),
+        )
+    if observation is None:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_CURRENT,
+            "a handoff is published at {0}, but this controller never observed one "
+            "appear across any of session {1}'s {2} invocations, so it cannot say "
+            "the published handoff describes work this session performed.".format(
+                handoff.location, record.session_id, boundary
+            ),
+        )
+    if observation.publication != handoff.publication:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_CURRENT,
+            "the handoff published at {0} is {1}, but the publication this "
+            "controller saw established for session {2} is {3}; the one on offer is "
+            "not the one whose currency was proven.".format(
+                handoff.location, handoff.publication, record.session_id,
+                observation.publication,
+            ),
+        )
+    if observation.work_boundary != boundary:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_CURRENT,
+            "the handoff published at {0} was established at work boundary {1} and "
+            "session {2} is at work boundary {3}; {4} further invocation(s) have "
+            "begun since, so it does not carry the outcome, evidence, unresolved "
+            "work and next action a replacement would resume from.".format(
+                handoff.location, observation.work_boundary, record.session_id,
+                boundary, boundary - observation.work_boundary,
+            ),
+        )
+
     return projected(
         ROTATION_READY,
         REASON_ROTATION_HANDOFF_ESTABLISHED,
         "session {0} is marked at {1} of {2} observed compactions, is between "
-        "invocations, has a coherent workspace, and its rail carries a published "
-        "handoff. Nothing is terminated or replaced by this.".format(
-            record.session_id, reading.observed, reading.threshold
+        "invocations, has a coherent workspace, and its rail carries handoff "
+        "publication {3}, established at the work boundary {4} this session is "
+        "still standing at. Nothing is terminated or replaced by this.".format(
+            record.session_id, reading.observed, reading.threshold,
+            handoff.publication, boundary,
         ),
         carried=RotationHandoff(
             project=record.project,
@@ -1199,6 +1402,7 @@ def evaluate_rotation_readiness(
             workspace_path=record.workspace_path,
             launched_at_head=record.launched_at_head,
             handoff_location=handoff.location,
+            handoff_publication=handoff.publication,
             session_id=record.session_id,
         ),
     )

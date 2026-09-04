@@ -759,21 +759,24 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertNotEqual(changed, first)
 
-    def test_a_rails_handoff_publication_is_reported_by_location_and_presence(self) -> None:
+    def test_a_rails_handoff_publication_is_reported_by_location_presence_and_identity(self) -> None:
         # What a rotation boundary needs to know about durable handoff evidence:
-        # exactly where a fresh agent reads it, and whether it is there yet.
+        # exactly where a fresh agent reads it, whether it is there yet, and which
+        # publication is there -- all from one read, so a caller can never pair a
+        # presence seen at one instant with an identity seen at another.
         self._publish()
         source = resolve_read_source(self.coordination)
-        location, published = rail_handoff_publication(
+        location, published, publication = rail_handoff_publication(
             source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
         )
         self.assertEqual(
             location, "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
         )
         self.assertFalse(published)
+        self.assertIsNone(publication)
 
         self._publish(artifact="handoff", role="executor", content="# Handoff\n\nnext action\n")
-        location, published = rail_handoff_publication(
+        location, published, publication = rail_handoff_publication(
             resolve_read_source(self.coordination),
             project="ai-dev", ticket="issue-51", rail="control-plane-surface",
         )
@@ -781,6 +784,53 @@ class ControlPlaneTests(unittest.TestCase):
             location, "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
         )
         self.assertTrue(published)
+        self.assertRegex(publication, r"^[0-9a-f]{40}$")
+
+    def test_the_handoff_publication_name_moves_only_when_the_published_bytes_do(self) -> None:
+        # The identity of a publication, not a judgement about it: republishing the
+        # same bytes is the same publication, and different bytes are a different
+        # one. Nothing here reads a word of what the handoff says.
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nfirst\n")
+        first = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )[2]
+
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nfirst\n")
+        unchanged = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )[2]
+        self.assertEqual(unchanged, first)
+
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nsecond\n")
+        changed = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )[2]
+        self.assertNotEqual(changed, first)
+
+        # And an unrelated publication still does not move the rail iteration, which
+        # is why iteration freshness could never have answered handoff currency.
+        self._authorize("control-plane-surface", "running")
+        iteration = rail_blob_sha(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nthird\n")
+        source = resolve_read_source(self.coordination)
+        self.assertEqual(
+            rail_blob_sha(
+                source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
+            ),
+            iteration,
+        )
+        self.assertNotEqual(
+            rail_handoff_publication(
+                source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
+            )[2],
+            changed,
+        )
 
     def test_rail_blob_sha_is_absent_for_an_unauthorized_rail(self) -> None:
         source = resolve_read_source(self.coordination)
