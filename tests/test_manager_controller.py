@@ -6,6 +6,7 @@ import ast
 import contextlib
 import dataclasses
 import http.client
+import inspect
 import io
 import json
 import unittest
@@ -29,7 +30,11 @@ from ai_dev_flow.attention_projection import (
 )
 from ai_dev_flow.authorization import CONCURRENCY_CEILING_DEFAULT
 from ai_dev_flow.claude_allowance_store import AllowanceStore
-from ai_dev_flow.context_lifecycle import REASON_INVALID_THRESHOLD, ContextLifecycleError
+from ai_dev_flow.context_lifecycle import (
+    EVENT_COMPACTION_OBSERVED,
+    REASON_INVALID_THRESHOLD,
+    ContextLifecycleError,
+)
 from ai_dev_flow.progress_store import ProgressStore
 from ai_dev_flow.decision_manager import ManagerRun
 from ai_dev_flow.decision_manager_launch import QueueSourceContext
@@ -42,6 +47,8 @@ from ai_dev_flow.manager_controller import (
 from ai_dev_flow.queue_source import REASON_OWNERSHIP_CONTRADICTORY, QueueSourceError
 from ai_dev_flow.session_binding import BINDING_STATE_RESERVED, BindingStore
 from ai_dev_flow.session_lifecycle import (
+    REASON_ROTATION_REQUIRES_RETIREMENT,
+    LifecycleError,
     ownership_evidence,
     STATE_DISCONNECTED,
     STATE_RUNNING,
@@ -284,6 +291,120 @@ class ControllerLaunchOwnershipTests(LifecycleTestBase):
 
         self.assertEqual(controller.store.root, self.store.root)
         self.assertIsNotNone(self.store.read(outcome.binding.session_id))
+
+
+class ControllerStopCategoryTests(LifecycleTestBase):
+    """`ManagerController.stop` is teardown, and a rotation cannot be asked of it.
+
+    The controller is the public door onto the accepted stop, so it is the door a
+    replacement launcher would reach for first. These cases prove it stays open for
+    the teardown it was accepted for and closed to anything rotation-shaped --
+    decided, as everywhere else, by the session's own mark rather than by anything
+    the caller says.
+    """
+
+    def _controller(self, registry=None) -> ManagerController:
+        source = QueueSourceContext(
+            control_plane=self.tmp_path / "coordination",
+            project="ai-dev",
+            ticket="issue-55",
+            binding_root=self.store.root,
+        )
+        return ManagerController(
+            source, registry=self.registry if registry is None else registry
+        )
+
+    def _launch_through(self, controller: ManagerController):
+        start, worker = self._starter()
+        send, _sent = self._sender()
+        return controller.launch(
+            self._decision(),
+            self.assignment,
+            reference=self.reference,
+            request_kwargs=self._request_kwargs(),
+            prompt="do the work",
+            package_root=self.repo_root,
+            now=lambda: self.clock,
+            new_session_id=lambda: LIFECYCLE_SESSION,
+            start=start,
+            send=send,
+        )
+
+    def _mark(self, controller, count=6):
+        controller.registry.observe_context_events(
+            LIFECYCLE_SESSION,
+            [
+                {"event": EVENT_COMPACTION_OBSERVED,
+                 "session_id": LIFECYCLE_SESSION,
+                 "uuid": "{0:08d}-0000-4000-8000-000000000000".format(index)}
+                for index in range(count)
+            ],
+        )
+
+    def _stop_arguments(self):
+        probes = []
+
+        def alive(pgid):
+            probes.append(pgid)
+            return len(probes) == 1
+
+        return {
+            "stop": lambda handle: {"process_group_gone": True, "graceful": True,
+                                    "exit_code": 0},
+            "alive": alive,
+        }
+
+    # -- D. the accepted teardown path ----------------------------------------
+
+    def test_case_d_teardown_of_an_unmarked_session_still_works(self) -> None:
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        stopped = controller.stop(outcome.binding, **self._stop_arguments())
+        self.assertTrue(stopped.process_group_gone)
+        self.assertTrue(self.store.read(outcome.binding.session_id).is_terminal)
+        self.assertEqual(controller.owned_session_ids(), ())
+
+    # -- B. the controller door, closed to rotation ---------------------------
+
+    def test_case_b_the_controller_refuses_to_stop_a_marked_session(self) -> None:
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        self._mark(controller)
+        with self.assertRaises(LifecycleError) as raised:
+            controller.stop(outcome.binding, **self._stop_arguments())
+        self.assertEqual(
+            raised.exception.reason, REASON_ROTATION_REQUIRES_RETIREMENT
+        )
+        # Nothing was destroyed: the session still holds its slot and its work.
+        self.assertFalse(self.store.read(outcome.binding.session_id).is_terminal)
+        self.assertEqual(controller.owned_session_ids(), (LIFECYCLE_SESSION,))
+        self.assertEqual(controller.agent_count(alive=ALWAYS_ALIVE)["current"], 1)
+
+    def test_case_b_the_controller_will_not_forward_a_retirement_authorization(self) -> None:
+        """The one door `**kwargs` would otherwise open, closed explicitly.
+
+        Teardown is never the retirement gate, so this refuses before it reaches the
+        lifecycle at all -- and it refuses on an unmarked session too, where the
+        lifecycle itself would have let the stop through.
+        """
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        with self.assertRaises(LifecycleError) as raised:
+            controller.stop(
+                outcome.binding, _retirement=object(), **self._stop_arguments()
+            )
+        self.assertEqual(
+            raised.exception.reason, REASON_ROTATION_REQUIRES_RETIREMENT
+        )
+        self.assertFalse(self.store.read(outcome.binding.session_id).is_terminal)
+        self.assertEqual(controller.owned_session_ids(), (LIFECYCLE_SESSION,))
+
+    def test_case_b_the_controller_adds_no_route_of_its_own_to_a_stop(self) -> None:
+        """`stop` is still a pass-through: one call, to the accepted lifecycle."""
+        source = inspect.getsource(controller_module.ManagerController.stop)
+        self.assertEqual(source.count("stop_session("), 1)
+        self.assertNotIn("shutdown_worker", source)
+        self.assertNotIn("os.kill", source)
 
 
 class ControllerContextLifecycleTests(LifecycleTestBase):

@@ -98,7 +98,9 @@ from .orchestrator_invocation import InvocationOutcome, invoke_orchestrator
 from .queue_source import QueueScope, QueueSourceError
 from .session_binding import BindingRecord, BindingStore
 from .session_lifecycle import (
+    REASON_ROTATION_REQUIRES_RETIREMENT,
     LaunchOutcome,
+    LifecycleError,
     SessionRegistry,
     StopOutcome,
     launch_session,
@@ -204,7 +206,23 @@ class ManagerController:
         )
 
     def stop(self, record: BindingRecord, **kwargs: Any) -> StopOutcome:
-        """Stop a session this controller owns, through the accepted lifecycle."""
+        """Tear down a session this controller owns, through the accepted lifecycle.
+
+        Non-rotation teardown, and only that. The lifecycle decides which this is
+        from the session's own rotation mark rather than from anything reaching it
+        through here, so a marked session is refused whoever asks and however they
+        ask. The one explicit refusal below closes the only door this signature
+        opens on top of that: `**kwargs` would otherwise let a caller forward the
+        lifecycle's private retirement authorization, and a controller-level
+        teardown is never the retirement gate. Rotation goes to
+        `retire_old_context`.
+        """
+        if "_retirement" in kwargs:
+            raise LifecycleError(
+                REASON_ROTATION_REQUIRES_RETIREMENT,
+                "this is teardown and cannot carry a retirement authorization; a "
+                "rotation must go through `retire_old_context`. Nothing was stopped.",
+            )
         return stop_session(self.store, self.registry, record, **kwargs)
 
     def dispatch(

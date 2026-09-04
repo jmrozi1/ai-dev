@@ -106,6 +106,8 @@ REASON_HANDOFF_NOT_CURRENT = "durable-handoff-not-current"
 REASON_WORKTREE_INCOHERENT = "worktree-incoherent"
 REASON_ROTATION_HANDOFF_ESTABLISHED = "durable-handoff-established"
 REASON_OLD_CONTEXT_RETIRED = "old-context-retired"
+REASON_ROTATION_REQUIRES_RETIREMENT = "rotation-requires-retirement-gate"
+REASON_STOP_CATEGORY_UNPROVEN = "stop-category-unprovable"
 
 # What one post-turn finalization attempt says about itself. These are reported
 # facts on the invocation's own result, never durable state and never authority:
@@ -1155,6 +1157,84 @@ class StopOutcome:
     process_group_gone: bool
 
 
+# ---------------------------------------------------------------------------
+# What kind of stop this is -- established from the session, never from the caller
+# ---------------------------------------------------------------------------
+#
+# D9 marks a session for graceful rotation and then forbids terminating its
+# context until a safe handoff has been left behind. That mark is the only
+# structural fact separating a rotation-shaped stop from ordinary teardown. It is
+# the session's own state, projected by the controller that holds it, so a stop
+# does not get to *say* what kind of stop it is -- it is told, from the registry,
+# in-call, immediately before anything is destroyed. No parameter carries it, no
+# name declares it, and no caller is trusted about it.
+#
+# The reading is three-valued, and already was, for reasons this module settled
+# long before rotation existed: `True` is a mark, `False` is a proof the threshold
+# has not been reached, and `None` is the case where the observed floor is under
+# the threshold but the history is not complete. Only `False` is ordinary
+# teardown. `True` must come through `retire_old_context`. `None` -- a category
+# that cannot be established -- is refused rather than read as unmarked, because
+# an unprovable category quietly defaulting to an unconditional stop is precisely
+# the fail-open this exists to prevent.
+#
+# This is a precondition, not an act: every refusal here happens before ownership
+# has been used for anything and before the stopper is called, so a refused stop
+# leaves the session exactly as it was -- owned, bound, nonterminal, continuable.
+
+STOP_CATEGORY_NON_ROTATION = "non-rotation-teardown"
+STOP_CATEGORY_ROTATION = "rotation-shaped"
+STOP_CATEGORY_UNPROVEN = "category-unprovable"
+STOP_CATEGORIES = (
+    STOP_CATEGORY_NON_ROTATION,
+    STOP_CATEGORY_ROTATION,
+    STOP_CATEGORY_UNPROVEN,
+)
+
+
+def stop_category(registry: SessionRegistry, session_id: str) -> str:
+    """Which kind of stop this session may receive, read fresh from the registry.
+
+    A session this controller holds no context observation for is `unprovable`
+    rather than unmarked: not having watched a session is not evidence about it.
+    """
+    context = registry.context(session_id)
+    if context is None:
+        return STOP_CATEGORY_UNPROVEN
+    marked = context.reading().rotation_marked
+    if marked is True:
+        return STOP_CATEGORY_ROTATION
+    if marked is False:
+        return STOP_CATEGORY_NON_ROTATION
+    return STOP_CATEGORY_UNPROVEN
+
+
+@dataclass(frozen=True)
+class _RetirementAuthorization:
+    """Proof that this exact stop is the destructive act of `retire_old_context`.
+
+    Module-private and minted in exactly one place: the line in
+    `retire_old_context` after every refusal that gate makes has already declined
+    to fire. It carries the readiness verdict that gate projected for this exact
+    session in this exact call, and `stop_session` accepts it only for the session
+    it names and only when that verdict is ready. So it cannot be kept, replayed
+    against a second session, or stand in for a projection that never said yes.
+    """
+
+    session_id: str
+    readiness: Any
+
+
+def _authorizes(authorization: Any, session_id: str) -> bool:
+    """Whether this is a live retirement's own authorization for this session."""
+    return (
+        isinstance(authorization, _RetirementAuthorization)
+        and authorization.session_id == session_id
+        and getattr(authorization.readiness, "ready", False) is True
+        and getattr(authorization.readiness, "session_id", None) == session_id
+    )
+
+
 def stop_session(
     store: BindingStore,
     registry: SessionRegistry,
@@ -1162,12 +1242,20 @@ def stop_session(
     *,
     stop: Optional[Callable] = None,
     alive: Optional[Callable] = None,
+    _retirement: Any = None,
 ) -> StopOutcome:
     """Stop the exact owned process, prove it is gone, and only then terminalize.
 
     Unbinding first would leave a terminal record asserting something about a
     process that might still be running, which is the one claim this system must
     never make.
+
+    Non-rotation teardown only. Whether this stop is a rotation is decided by the
+    session's own mark, read here rather than declared by the caller: a marked
+    session is refused and must come through `retire_old_context`, and a session
+    whose category cannot be established is refused too. `_retirement` is private
+    and is the retirement gate's own authorization for this one call; there is no
+    public way to obtain one, and it is not a way for a caller to assert anything.
     """
     if record.is_terminal:
         raise LifecycleError(
@@ -1175,6 +1263,29 @@ def stop_session(
             "session {0} is already {1}.".format(record.session_id, record.state),
         )
     owned = require_owned(registry, record, alive=alive)
+    # Category before consequence. Ownership is proven first because a session
+    # nobody can prove they hold is not actionable by any route; the category is
+    # then read fresh from the registry, and both refusals below precede the
+    # stopper, so neither can leave a half-stopped session behind.
+    category = stop_category(registry, record.session_id)
+    if category == STOP_CATEGORY_ROTATION and not _authorizes(
+        _retirement, record.session_id
+    ):
+        raise LifecycleError(
+            REASON_ROTATION_REQUIRES_RETIREMENT,
+            "session {0} is marked for rotation, so stopping it is a rotation and "
+            "not teardown; it may only be stopped through `retire_old_context`, "
+            "which proves a safe handoff was left behind first. Nothing was "
+            "stopped and the binding stays nonterminal.".format(record.session_id),
+        )
+    if category == STOP_CATEGORY_UNPROVEN:
+        raise LifecycleError(
+            REASON_STOP_CATEGORY_UNPROVEN,
+            "session {0} cannot be shown to be unmarked, so this stop cannot "
+            "establish that it is teardown rather than a rotation. An unprovable "
+            "category is refused rather than treated as unmarked. Nothing was "
+            "stopped and the binding stays nonterminal.".format(record.session_id),
+        )
     stopper = stop if stop is not None else shutdown_worker
     prober = alive if alive is not None else process_group_alive
 
@@ -1942,7 +2053,19 @@ def retire_old_context(
             readiness=readiness,
         )
 
-    stopped = stop_session(store, registry, record, stop=stop, alive=alive)
+    # The one place an authorization is minted, and it is minted only here, only
+    # after every refusal above declined to fire, and only from the verdict this
+    # call projected itself a moment ago.
+    stopped = stop_session(
+        store,
+        registry,
+        record,
+        stop=stop,
+        alive=alive,
+        _retirement=_RetirementAuthorization(
+            session_id=record.session_id, readiness=readiness
+        ),
+    )
     return ContextRetirement(
         session_id=stopped.session_id,
         rail=readiness.rail,
