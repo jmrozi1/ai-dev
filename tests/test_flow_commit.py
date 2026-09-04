@@ -320,6 +320,55 @@ class FlowCommitTests(unittest.TestCase):
         self.assertIn("\n  caf\u00e9-\u65e5\u672c.txt\n", out)
         self.assertEqual(self._boundary_paths(out), ["caf\u00e9-\u65e5\u672c.txt"])
 
+    @unittest.skipIf(os.name == "nt", "invalid UTF-8 path bytes require POSIX")
+    def test_commit_boundary_refuses_invalid_utf8_paths_after_commit(self) -> None:
+        repo_root = self._init_repo("repo-boundary-invalid-utf8")
+        parent_before = self._run_git(repo_root, "rev-parse", "HEAD")
+        raw_names = (b"caf\xe9.txt", b"caf\xea.txt")
+
+        for raw_name in raw_names:
+            path = os.fsencode(repo_root) + b"/" + raw_name
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT, 0o600)
+            try:
+                os.write(descriptor, b"invalid utf-8 path\n")
+            finally:
+                os.close(descriptor)
+
+        code, out, err = self._invoke(repo_root, "commit")
+
+        self.assertEqual(code, 1)
+        self.assertEqual(out, "")
+
+        head = self._run_git(repo_root, "rev-parse", "HEAD")
+        self.assertNotEqual(head, parent_before)
+        self.assertIn("Checkpoint 1 commit was created", err)
+        self.assertIn(head, err)
+        self.assertIn("No changed-path boundary is claimed", err)
+        self.assertIn("exact UTF-8 pathname evidence is unavailable", err)
+        self.assertNotIn("changed-paths:", err)
+
+        completed = subprocess.run(
+            [
+                b"git",
+                b"-C",
+                os.fsencode(repo_root),
+                b"diff-tree",
+                b"--no-commit-id",
+                b"-r",
+                b"--no-renames",
+                b"--name-only",
+                b"-z",
+                head.encode("ascii"),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        committed_names = tuple(
+            record for record in completed.stdout.split(b"\0") if record
+        )
+        self.assertEqual(committed_names, raw_names)
+
     def test_commit_boundary_includes_a_file_created_after_pre_check_evidence(self) -> None:
         repo_root = self._init_repo("repo-boundary-late-file")
 
@@ -458,6 +507,23 @@ class FlowCommitTests(unittest.TestCase):
             repository.read_commit_boundary(repo_root, commit=root_commit)
 
         self.assertIn("0 parents", str(caught.exception))
+
+    def test_boundary_read_rejects_a_different_reported_commit_identity(self) -> None:
+        repo_root = self._init_repo("repo-boundary-commit-identity")
+        (repo_root / "changed.txt").write_text("changed\n", encoding="utf-8")
+        self._run_git(repo_root, "add", "changed.txt")
+        self._run_git(repo_root, "commit", "-q", "-m", "changed")
+
+        commit = self._run_git(repo_root, "rev-parse", "HEAD")
+        abbreviated = commit[:12]
+
+        with self.assertRaises(cli.RepositoryError) as caught:
+            repository.read_commit_boundary(repo_root, commit=abbreviated)
+
+        self.assertIn(
+            f"Cannot read commit {abbreviated}: git reported commit {commit} instead.",
+            str(caught.exception),
+        )
 
     def test_boundary_read_rejects_a_multi_parent_commit(self) -> None:
         repo_root = self._init_repo("repo-boundary-merge-commit")

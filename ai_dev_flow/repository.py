@@ -542,9 +542,10 @@ def read_commit_boundary(repo_root: Path, *, commit: str) -> CommitBoundary:
 
     Pathnames are read NUL-separated so ``core.quotePath`` cannot mangle them,
     and rename detection stays off so a rename's old path is never collapsed
-    away. Pathnames that are not valid UTF-8 are decoded with replacement
-    characters by the shared git helper; the path is still reported, but its
-    exact bytes are not recoverable from this evidence.
+    away. The shared Git helper decodes invalid UTF-8 with a replacement
+    character. Since that is indistinguishable from a legitimate replacement
+    character in a pathname, either case is refused rather than reported as
+    exact evidence.
     """
 
     parents_output = _run_git(
@@ -584,6 +585,13 @@ def read_commit_boundary(repo_root: Path, *, commit: str) -> CommitBoundary:
         ],
         check=True,
     ).stdout
+
+    if "\ufffd" in paths_output:
+        raise RepositoryError(
+            f"Cannot report the changed-path boundary of commit {commit}: "
+            "shared Git decoding returned a replacement character, so exact "
+            "UTF-8 pathname evidence is unavailable."
+        )
 
     records = paths_output.split("\0")
     if records and records[-1] == "":
