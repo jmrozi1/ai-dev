@@ -96,6 +96,7 @@ from .decision_manager_web import serve_forever
 from .decision_queue import QueueView, SelectedDetail
 from .orchestrator_invocation import InvocationOutcome, invoke_orchestrator
 from .queue_source import QueueScope, QueueSourceError
+from .role_invocation import invoke_role
 from .session_binding import BindingRecord, BindingStore
 from .session_lifecycle import (
     REASON_ROTATION_REQUIRES_RETIREMENT,
@@ -447,6 +448,43 @@ class ManagerController:
             packet,
             observation,
             orchestrator_rail=orchestrator_rail,
+            store=self.store,
+            registry=self.registry,
+            slots=self.occupancy(records, alive=alive),
+            bindings=records,
+            in_flight_session_ids=self.registry.in_flight(),
+            **kwargs
+        )
+
+    def dispatch_role(
+        self,
+        snapshot,
+        packet,
+        observation,
+        *,
+        alive: Optional[Callable] = None,
+        **kwargs: Any
+    ) -> InvocationOutcome:
+        """One gated executor- or reviewer-role launch, admitted against what this draws.
+
+        A pass-through, exactly like `dispatch`, and deliberately identical in every
+        respect that matters: the store is read once and the same records reach both
+        the reduction and the predicate, the session lands in the registry this
+        controller counts, and every gate, refusal reason and accounting rule stays
+        in `role_invocation`. This method adds no gate and no policy of its own.
+
+        It is a second method rather than a `role` argument on `dispatch` because the
+        two doors are not the same door. `dispatch` requires a material wake and
+        starts an orchestrator; this one has no wake, cannot start an orchestrator,
+        and refuses to start anything while this controller already holds a session.
+        Collapsing them into one signature would put the wake gate behind a
+        parameter, which is how a gate stops being one.
+        """
+        records = self.store.records()
+        return invoke_role(
+            snapshot,
+            packet,
+            observation,
             store=self.store,
             registry=self.registry,
             slots=self.occupancy(records, alive=alive),
