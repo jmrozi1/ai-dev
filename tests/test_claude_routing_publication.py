@@ -702,3 +702,168 @@ class PushFailureRetryTests(_CoordinationFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+CLAUDE_FLOW_SKILL = REPO_ROOT / "skills" / "claude" / "flow" / "SKILL.md"
+
+
+class ClaudeFlowRoutingOwnershipTests(unittest.TestCase):
+    """Issue #79: a Claude rail's capabilities must route through Claude's own skill.
+
+    Claude reviewers previously crossed into the Copilot audience to satisfy
+    their own Flow and review preconditions, because the Claude Flow skill named
+    no concrete route for claim evidence, review evidence, or publication.
+    """
+
+    def _skill_text(self) -> str:
+        return CLAUDE_FLOW_SKILL.read_text(encoding="utf-8")
+
+    def _subcommands(self) -> set:
+        import argparse
+
+        parser = activation._build_parser()
+        for action in parser._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                return set(action.choices)
+        self.fail("the Claude command exposes no subcommands")
+
+    def test_skill_routes_every_capability_a_rail_requires(self) -> None:
+        text = self._skill_text()
+        for route in (
+            "ai-dev discover",
+            "ai-dev identity",
+            "ai-dev status",
+            "ai-dev review-evidence",
+            "ai-dev publish",
+            "ai-dev cache-path",
+            "ai-dev cache-sync",
+        ):
+            with self.subTest(route=route):
+                self.assertIn(route, text)
+        # Lifecycle commands stay the shared Flow runtime's launchers.
+        self.assertIn("flow-status", text)
+        self.assertIn("flow-commit", text)
+
+    def test_every_routed_command_exists_in_this_runtime(self) -> None:
+        """The skill cannot drift into naming routes the runtime does not expose."""
+        import re
+
+        named = set(re.findall(r"ai-dev ([a-z][a-z-]+)", self._skill_text()))
+        self.assertTrue(named, "the skill names no ai-dev routes")
+        unknown = named - self._subcommands()
+        self.assertEqual(unknown, set(), f"skill routes not exposed by the runtime: {unknown}")
+
+    def test_skill_does_not_send_claude_to_copilot_instructions(self) -> None:
+        text = self._skill_text()
+        self.assertNotIn("skills/copilot", text)
+        self.assertNotIn("copilot/flow", text)
+
+    def test_skill_marks_read_only_routes_as_read_only(self) -> None:
+        text = self._skill_text()
+        self.assertIn("read-only", text)
+        # The reconciliation rule a Claude executor must not resolve on its own.
+        self.assertIn("Report both identities and stop.", text)
+
+
+class DiscoveryReadOnlyTests(_CoordinationFixture):
+    """Issue #79: discovery and status resolve and report; they never mutate."""
+
+    @staticmethod
+    def _content_snapshot(root: Path) -> dict:
+        snapshot = {}
+        for path in sorted(root.rglob("*")):
+            if ".git" in path.parts:
+                continue
+            if path.is_file():
+                snapshot[str(path.relative_to(root))] = path.read_bytes()
+        return snapshot
+
+    def _coordination_commit(self) -> str:
+        return _git(self.cache, "rev-parse", "HEAD")
+
+    def _claim_files(self) -> list:
+        from ai_dev_flow.workspaces import claims_directory
+
+        directory = claims_directory(self.product)
+        if not directory.is_dir():
+            return []
+        return sorted(p.name for p in directory.iterdir())
+
+    def test_discover_does_not_mutate_product_or_coordination_state(self) -> None:
+        before_product = self._content_snapshot(self.product)
+        before_cache = self._content_snapshot(self.cache)
+        before_head = self._coordination_commit()
+        before_claims = self._claim_files()
+
+        activation.discover(self.product, cache=self.cache)
+
+        self.assertEqual(self._content_snapshot(self.product), before_product)
+        self.assertEqual(self._content_snapshot(self.cache), before_cache)
+        self.assertEqual(self._coordination_commit(), before_head)
+        # Discovery must never acquire a claim as a side effect of reporting one.
+        self.assertEqual(self._claim_files(), before_claims)
+        self._assert_no_fallback_artifacts()
+
+    def test_status_does_not_mutate_product_or_coordination_state(self) -> None:
+        before_product = self._content_snapshot(self.product)
+        before_cache = self._content_snapshot(self.cache)
+        before_head = self._coordination_commit()
+        before_claims = self._claim_files()
+
+        activation.render_status(self.product, cache=self.cache)
+
+        self.assertEqual(self._content_snapshot(self.product), before_product)
+        self.assertEqual(self._content_snapshot(self.cache), before_cache)
+        self.assertEqual(self._coordination_commit(), before_head)
+        self.assertEqual(self._claim_files(), before_claims)
+        self._assert_no_fallback_artifacts()
+
+
+class ProvenanceReportingTests(_CoordinationFixture):
+    """Issue #79: every reported value must carry the source that produced it."""
+
+    def test_status_reports_runtime_skill_workspace_and_claim_sources(self) -> None:
+        rendered = activation.render_status(self.product, cache=self.cache)
+
+        for label in ("runtime    :", "skill      :", "workspace  :", "claim      :"):
+            with self.subTest(label=label):
+                self.assertIn(label, rendered)
+        self.assertIn("git rev-parse HEAD in", rendered)
+        self.assertIn(activation.CLAUDE_FLOW_SKILL_RELATIVE, rendered)
+        self.assertIn("activeIssueNumber in", rendered)
+        self.assertIn("normalized to owner/repo", rendered)
+        # The reconciliation outcome is reported, not implied.
+        self.assertIn("  resolved :", rendered)
+
+    def test_discover_reports_a_source_for_every_reported_identity(self) -> None:
+        result = activation.discover(self.product, cache=self.cache)
+
+        sources = result["sources"]
+        for key in (
+            "repository",
+            "ticket",
+            "runtimeRevision",
+            "claudeFlowSkillRevision",
+            "workspace",
+            "branch",
+            "claim",
+            "controlPlane",
+            "rail",
+        ):
+            with self.subTest(key=key):
+                self.assertTrue(sources.get(key), f"no source recorded for {key}")
+
+        self.assertEqual(result["coordinationSource"], activation.EXPLICIT_CACHE_SOURCE)
+        self.assertTrue(result["runtimeRoot"])
+        self.assertTrue(result["claudeFlowSkill"])
+
+    def test_malformed_claim_is_reported_as_malformed_not_absent(self) -> None:
+        from ai_dev_flow.workspaces import claims_directory
+
+        directory = claims_directory(self.product)
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "broken.json").write_text("{not json", encoding="utf-8")
+
+        rendered = activation.render_status(self.product, cache=self.cache)
+
+        self.assertIn("MALFORMED", rendered)

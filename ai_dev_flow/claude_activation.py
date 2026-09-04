@@ -39,6 +39,7 @@ from .control_plane import (
     parse_proceed_sequence,
     proceed_sequence_relative,
     publish as control_plane_publish,
+    resolve_control_plane_config,
     resolve_coordination_repo,
     resolve_read_source,
 )
@@ -53,6 +54,13 @@ from .ticket_status import TicketStatusError, render_active_ticket_status
 from .ticket_providers import (
     GitRemoteGitHubCurrentRepositoryResolver,
     TicketProviderError,
+)
+from .workspaces import (
+    MalformedClaim,
+    WorkspaceError,
+    list_claim_files,
+    read_claim_file,
+    worktree_id_for_repo_root,
 )
 
 
@@ -753,6 +761,323 @@ def ensure_control_plane_cache(
     return cache, "cloned"
 
 
+# Runtime and skill provenance ------------------------------------------------
+
+CLAUDE_FLOW_SKILL_RELATIVE = "skills/claude/flow/SKILL.md"
+
+WORKSPACE_CONFIG_SOURCE = "workspace configuration (.ai-dev/config.json controlPlane.repository)"
+MANAGED_CACHE_SOURCE = "managed host cache"
+EXPLICIT_CACHE_SOURCE = "explicit --cache override"
+
+
+@dataclass(frozen=True)
+class Provenance:
+    """A reported value together with the mechanism that produced it.
+
+    Every provenance line exists to be checked against reality, so the source is
+    carried with the value rather than implied by the label. A value whose source
+    is not recorded cannot be distinguished later from conversation memory, which
+    is exactly the substitution this command must never make.
+    """
+
+    value: str
+    source: str
+
+
+def _git_capture(root: Path, arguments: list[str]) -> str | None:
+    """Run a read-only Git query, or return None when it cannot be answered."""
+    completed = subprocess.run(
+        ["git", "-C", str(root), *arguments],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+    if completed.returncode != 0:
+        return None
+    return completed.stdout.strip()
+
+
+def resolve_runtime_provenance(runtime_root: Path | None = None) -> tuple[Path, Provenance]:
+    """The revision of the AI Dev checkout whose code is actually executing.
+
+    An installed runtime is a copy outside any checkout, so a missing Git answer
+    is a normal deployment shape rather than a fault. It is reported as
+    unavailable with the reason, never guessed, because a wrong revision here
+    would misattribute behavior to code that is not running.
+    """
+    root = resolve_ai_dev_runtime_root() if runtime_root is None else runtime_root
+
+    head = _git_capture(root, ["rev-parse", "HEAD"])
+    if head is None:
+        return root, Provenance(
+            value="unavailable (runtime root is not a Git checkout)",
+            source=f"filesystem location of {__name__}",
+        )
+
+    dirty = _git_capture(root, ["status", "--porcelain"])
+    marker = " (dirty)" if dirty else ""
+    return root, Provenance(
+        value=f"{head}{marker}",
+        source=f"git rev-parse HEAD in {root}",
+    )
+
+
+def resolve_claude_flow_skill_provenance(
+    runtime_root: Path | None = None,
+) -> tuple[Path, Provenance]:
+    """Source and revision of the Claude Flow skill this runtime would route through.
+
+    The skill is the routing contract, so an absent one is an incompatible
+    runtime rather than a missing convenience: callers fail closed on it instead
+    of reporting a rail resolved by instructions that are not present.
+    """
+    root = resolve_ai_dev_runtime_root() if runtime_root is None else runtime_root
+    skill = root / CLAUDE_FLOW_SKILL_RELATIVE
+
+    if not skill.is_file():
+        raise ClaudeActivationError(
+            f"Claude Flow skill is missing from the executing runtime: {skill}. "
+            "Discovery will not report a rail it cannot prove routing instructions "
+            "for. Reinstall or repair the AI Dev claude audience."
+        )
+
+    revision = _git_capture(root, ["log", "-1", "--format=%H", "--", CLAUDE_FLOW_SKILL_RELATIVE])
+    if not revision:
+        return skill, Provenance(
+            value="unavailable (runtime root is not a Git checkout)",
+            source=f"filesystem location of {skill}",
+        )
+
+    dirty = _git_capture(root, ["status", "--porcelain", "--", CLAUDE_FLOW_SKILL_RELATIVE])
+    marker = " (dirty)" if dirty else ""
+    return skill, Provenance(
+        value=f"{revision}{marker}",
+        source=f"git log -1 -- {CLAUDE_FLOW_SKILL_RELATIVE} in {root}",
+    )
+
+
+# Workspace and claim evidence ------------------------------------------------
+
+
+def resolve_workspace_provenance(repo_root: Path) -> dict[str, Provenance]:
+    """Which working copy and branch the caller is actually standing in."""
+    branch = _git_capture(repo_root, ["rev-parse", "--abbrev-ref", "HEAD"])
+    head = _git_capture(repo_root, ["rev-parse", "HEAD"])
+
+    try:
+        worktree = worktree_id_for_repo_root(repo_root)
+    except WorkspaceError:
+        worktree = None
+
+    return {
+        "workspace": Provenance(str(repo_root), "resolved product repository root"),
+        "branch": Provenance(
+            branch or "unavailable (no Git branch resolved)",
+            f"git rev-parse --abbrev-ref HEAD in {repo_root}",
+        ),
+        "head": Provenance(
+            head or "unavailable (no Git HEAD resolved)",
+            f"git rev-parse HEAD in {repo_root}",
+        ),
+        "worktree": Provenance(
+            worktree or ":primary:",
+            "Issue #50 claim registry worktree identity",
+        ),
+    }
+
+
+def resolve_claim_provenance(repo_root: Path, identity: "ProductIdentity") -> Provenance:
+    """The active ticket claim for this workspace, read without acquiring anything.
+
+    A malformed claim is reported as malformed rather than skipped. Treating an
+    unreadable claim as absent would let a workspace look unclaimed while another
+    holds it, which is the ambiguity this evidence exists to remove.
+    """
+    try:
+        claim_files = list_claim_files(repo_root)
+    except WorkspaceError as exc:
+        return Provenance(f"unavailable ({exc})", "Issue #50 claim registry")
+
+    for path in claim_files:
+        record = read_claim_file(path)
+        if record is None:
+            continue
+        if isinstance(record, MalformedClaim):
+            return Provenance(
+                f"MALFORMED at {record.path}: {record.detail}",
+                "Issue #50 claim registry",
+            )
+        if record.repository != identity.repository:
+            continue
+        if record.ticket_id != str(identity.issue_number):
+            continue
+        return Provenance(
+            f"{record.status} by {record.intended_path or 'unknown path'} "
+            f"on {record.intended_branch or 'unknown branch'}",
+            f"Issue #50 claim registry at {path}",
+        )
+
+    return Provenance(
+        "none (no claim record for this ticket in this workspace)",
+        "Issue #50 claim registry",
+    )
+
+
+# Coordination identity reconciliation ----------------------------------------
+
+
+@dataclass(frozen=True)
+class ResolvedCoordination:
+    """The one coordination repository every Claude-side read is served from."""
+
+    cache: Path
+    identity: str
+    source: str
+    reconciliation: str
+
+
+def _normalize_remote_url(url: str) -> str:
+    """Compare remote URLs by what they address, not by how they were written."""
+    candidate = url.strip().rstrip("/")
+    if candidate.endswith(".git"):
+        candidate = candidate[: -len(".git")]
+    return candidate
+
+
+def _coordination_identity_or_path(path: Path) -> str:
+    """Identify a coordination repository by the rule products are identified by.
+
+    Two checkouts of one coordination repository must compare equal, so identity
+    is the repository they share rather than where either of them happens to sit.
+    The canonical GitHub normalization answers that first; a repository hosted
+    somewhere that normalization does not cover is still identified by its origin
+    URL. Only a repository with no origin at all has nothing to be identified by
+    except its own resolved path.
+    """
+    try:
+        resolved = resolve_coordination_repo(path)
+    except ControlPlaneError:
+        return str(path)
+    try:
+        return GitRemoteGitHubCurrentRepositoryResolver(
+            repo_root=resolved
+        ).resolve_current_repository()
+    except TicketProviderError:
+        pass
+
+    origin = _git_capture(resolved, ["remote", "get-url", "origin"])
+    if origin:
+        return _normalize_remote_url(origin)
+    return str(resolved)
+
+
+def resolve_coordination(
+    repo_root: Path,
+    *,
+    home: Path | None = None,
+    coordination_repository: str = DEFAULT_COORDINATION_REPOSITORY,
+    cache: Path | None = None,
+) -> ResolvedCoordination:
+    """Reconcile workspace-configured and managed-cache coordination identity.
+
+    The managed host cache used to be treated as authoritative on its own, so a
+    workspace that configured a different coordination repository had its rails
+    read from somewhere else entirely and reported as missing. Configuration is
+    therefore consulted first, and the two are reconciled by one rule: they agree
+    when they identify the same coordination repository.
+
+    Agreement resolves to the managed cache, which owns the fetch and
+    materialization path. Disagreement is not resolved here at all -- it is a
+    decision about which coordination repository is correct, so it stops with
+    both identities rather than silently preferring either one.
+    """
+    if cache is not None:
+        if not cache.exists():
+            raise ClaudeActivationError(
+                f"Control-plane cache is missing at {cache}. Install AI Dev for the "
+                "claude audience, or clone the coordination repository there, so "
+                "discovery has durable state to read."
+            )
+        return ResolvedCoordination(
+            cache=cache,
+            identity=_coordination_identity_or_path(cache),
+            source=EXPLICIT_CACHE_SOURCE,
+            reconciliation=(
+                "explicit override; workspace configuration and managed cache "
+                "were not consulted"
+            ),
+        )
+
+    managed = resolve_control_plane_cache(coordination_repository, home=home)
+
+    try:
+        configured = resolve_control_plane_config(repo_root)
+    except ControlPlaneError as exc:
+        raise ClaudeActivationError(
+            f"Workspace control-plane configuration is unusable. {exc}"
+        ) from exc
+
+    if configured is None:
+        if not managed.exists():
+            raise ClaudeActivationError(
+                f"Control-plane cache is missing at {managed} and this workspace "
+                "configures no control plane. Install AI Dev for the claude "
+                "audience, clone the coordination repository there, or configure "
+                "controlPlane in .ai-dev/config.json."
+            )
+        return ResolvedCoordination(
+            cache=managed,
+            identity=_coordination_identity_or_path(managed),
+            source=MANAGED_CACHE_SOURCE,
+            reconciliation="workspace configures no control plane; managed cache used",
+        )
+
+    configured_path = configured.repository
+    try:
+        resolve_coordination_repo(configured_path)
+    except ControlPlaneError as exc:
+        raise ClaudeActivationError(
+            f"Workspace configures control-plane repository {configured_path}, "
+            f"which is not usable. {exc}"
+        ) from exc
+
+    configured_identity = _coordination_identity_or_path(configured_path)
+
+    if not managed.exists():
+        return ResolvedCoordination(
+            cache=configured_path,
+            identity=configured_identity,
+            source=WORKSPACE_CONFIG_SOURCE,
+            reconciliation=(
+                f"managed host cache absent at {managed}; workspace-configured "
+                "coordination repository used"
+            ),
+        )
+
+    managed_identity = _coordination_identity_or_path(managed)
+
+    if managed_identity != configured_identity:
+        raise ClaudeActivationError(
+            "Control-plane identity disagreement: workspace configuration "
+            f"identifies {configured_identity} at {configured_path}, while the "
+            f"managed host cache identifies {managed_identity} at {managed}. "
+            "Discovery will not choose between them. Point controlPlane.repository "
+            "in .ai-dev/config.json at the intended coordination repository, or "
+            "re-sync the managed cache, so both identify the same one."
+        )
+
+    return ResolvedCoordination(
+        cache=managed,
+        identity=managed_identity,
+        source=MANAGED_CACHE_SOURCE,
+        reconciliation=(
+            f"workspace configuration at {configured_path} and managed cache at "
+            f"{managed} identify the same coordination repository"
+        ),
+    )
+
+
 # Identity --------------------------------------------------------------------
 
 
@@ -873,21 +1198,31 @@ def discover(
     home: Path | None = None,
     coordination_repository: str = DEFAULT_COORDINATION_REPOSITORY,
     cache: Path | None = None,
+    runtime_root: Path | None = None,
 ) -> dict:
+    """Resolve the authorized rail and prove what produced every reported value.
+
+    Discovery is read-only. It resolves paths, reads durable state through the
+    existing readers, and fails closed; it never acquires a claim, writes
+    coordination state, or moves anything in the product repository.
+    """
     identity = resolve_product_identity(repo_root)
-    resolved_cache = (
-        cache if cache is not None else resolve_control_plane_cache(coordination_repository, home=home)
+
+    runtime_path, runtime_revision = resolve_runtime_provenance(runtime_root)
+    skill_path, skill_revision = resolve_claude_flow_skill_provenance(runtime_root)
+
+    coordination = resolve_coordination(
+        repo_root,
+        home=home,
+        coordination_repository=coordination_repository,
+        cache=cache,
     )
 
-    if not resolved_cache.exists():
-        raise ClaudeActivationError(
-            f"Control-plane cache is missing at {resolved_cache}. Install AI Dev for the "
-            "claude audience, or clone the coordination repository there, so discovery "
-            "has durable state to read."
-        )
+    workspace = resolve_workspace_provenance(repo_root)
+    claim = resolve_claim_provenance(repo_root, identity)
 
     rail = resolve_authorized_rail(
-        resolved_cache, project=identity.project, ticket=identity.ticket
+        coordination.cache, project=identity.project, ticket=identity.ticket
     )
 
     return {
@@ -895,12 +1230,37 @@ def discover(
         "project": identity.project,
         "ticket": identity.ticket,
         "issueNumber": identity.issue_number,
-        "controlPlaneCache": str(resolved_cache),
+        "runtimeRoot": str(runtime_path),
+        "runtimeRevision": runtime_revision.value,
+        "claudeFlowSkill": str(skill_path),
+        "claudeFlowSkillRevision": skill_revision.value,
+        "workspace": workspace["workspace"].value,
+        "branch": workspace["branch"].value,
+        "workspaceHead": workspace["head"].value,
+        "worktreeId": workspace["worktree"].value,
+        "claim": claim.value,
+        "controlPlaneCache": str(coordination.cache),
+        "coordinationIdentity": coordination.identity,
+        "coordinationSource": coordination.source,
+        "coordinationReconciliation": coordination.reconciliation,
         "coordinationRepository": coordination_repository,
         "railId": rail.identifier,
         "railStatus": rail.status,
         "railPath": f"{identity.project}/{identity.ticket}/rails/{rail.identifier}/rail.md",
         "handoffPath": f"{identity.project}/{identity.ticket}/rails/{rail.identifier}/handoff.md",
+        "sources": {
+            "repository": f"git remote origin in {repo_root}, normalized to owner/repo",
+            "ticket": f"activeIssueNumber in {workflow_state_file_for_repo_root(repo_root)}",
+            "runtimeRevision": runtime_revision.source,
+            "claudeFlowSkillRevision": skill_revision.source,
+            "workspace": workspace["workspace"].source,
+            "branch": workspace["branch"].source,
+            "workspaceHead": workspace["head"].source,
+            "worktreeId": workspace["worktree"].source,
+            "claim": claim.source,
+            "controlPlane": coordination.source,
+            "rail": f"single ready rail in {identity.project}/{identity.ticket}",
+        },
     }
 
 
@@ -985,19 +1345,39 @@ def render_status(
     home: Path | None = None,
     cache: Path | None = None,
     coordination_repository: str = DEFAULT_COORDINATION_REPOSITORY,
+    runtime_root: Path | None = None,
 ) -> str:
     """Contextual status for the repository the caller is standing in.
 
-    Every fact is delegated to an existing reader. Source health is reported
-    rather than guessed, so an unreachable control plane is visible instead of
-    silently rendering a partial picture.
+    Every fact is delegated to an existing reader and reported with the source
+    that produced it. Source health is reported rather than guessed, so an
+    unreachable or disagreeing control plane is visible instead of silently
+    rendering a partial picture. Status is read-only.
     """
     lines: list[str] = []
     identity = resolve_product_identity(repo_root)
 
+    runtime_path, runtime_revision = resolve_runtime_provenance(runtime_root)
+    skill_path, skill_revision = resolve_claude_flow_skill_provenance(runtime_root)
+    workspace = resolve_workspace_provenance(repo_root)
+    claim = resolve_claim_provenance(repo_root, identity)
+
+    lines.append(f"runtime    : {runtime_path}")
+    lines.append(f"  revision : {runtime_revision.value}")
+    lines.append(f"  source   : {runtime_revision.source}")
+    lines.append(f"skill      : {skill_path}")
+    lines.append(f"  revision : {skill_revision.value}")
+    lines.append(f"  source   : {skill_revision.source}")
     lines.append(f"repository : {identity.repository}")
+    lines.append(f"  source   : git remote origin in {repo_root}, normalized to owner/repo")
+    lines.append(f"workspace  : {workspace['workspace'].value}")
+    lines.append(f"  branch   : {workspace['branch'].value} at {workspace['head'].value}")
+    lines.append(f"  worktree : {workspace['worktree'].value}")
     lines.append(f"project    : {identity.project}")
     lines.append(f"ticket     : {identity.ticket}")
+    lines.append(f"  source   : activeIssueNumber in {workflow_state_file_for_repo_root(repo_root)}")
+    lines.append(f"claim      : {claim.value}")
+    lines.append(f"  source   : {claim.source}")
 
     try:
         ticket_status = render_active_ticket_status(repo_root)
@@ -1007,15 +1387,23 @@ def render_status(
     except (TicketStatusError, OSError) as exc:
         lines.append(f"  ticket status unavailable: {exc}")
 
-    resolved_cache = (
-        cache if cache is not None else resolve_control_plane_cache(coordination_repository, home=home)
-    )
-    lines.append(f"cache      : {resolved_cache}")
-
-    if not resolved_cache.exists():
-        lines.append("source     : UNAVAILABLE - control-plane cache is missing")
+    try:
+        coordination = resolve_coordination(
+            repo_root,
+            home=home,
+            coordination_repository=coordination_repository,
+            cache=cache,
+        )
+    except ClaudeActivationError as exc:
+        lines.append(f"cache      : UNAVAILABLE - {exc}")
         lines.append("rail       : unknown until the control plane is reachable")
         return "\n".join(lines)
+
+    resolved_cache = coordination.cache
+    lines.append(f"cache      : {resolved_cache}")
+    lines.append(f"  identity : {coordination.identity}")
+    lines.append(f"  source   : {coordination.source}")
+    lines.append(f"  resolved : {coordination.reconciliation}")
 
     try:
         source = resolve_control_plane_source(resolved_cache)
@@ -1476,9 +1864,26 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
         return 0
 
+    sources = result["sources"]
+    print(f"runtime    : {result['runtimeRoot']}")
+    print(f"  revision : {result['runtimeRevision']}")
+    print(f"  source   : {sources['runtimeRevision']}")
+    print(f"skill      : {result['claudeFlowSkill']}")
+    print(f"  revision : {result['claudeFlowSkillRevision']}")
+    print(f"  source   : {sources['claudeFlowSkillRevision']}")
     print(f"repository : {result['repository']}")
+    print(f"  source   : {sources['repository']}")
+    print(f"workspace  : {result['workspace']}")
+    print(f"  branch   : {result['branch']} at {result['workspaceHead']}")
+    print(f"  worktree : {result['worktreeId']}")
     print(f"scope      : {result['project']}/{result['ticket']}")
+    print(f"  source   : {sources['ticket']}")
+    print(f"claim      : {result['claim']}")
+    print(f"  source   : {sources['claim']}")
     print(f"cache      : {result['controlPlaneCache']}")
+    print(f"  identity : {result['coordinationIdentity']}")
+    print(f"  source   : {result['coordinationSource']}")
+    print(f"  resolved : {result['coordinationReconciliation']}")
     print(f"rail       : {result['railId']} ({result['railStatus']})")
     print(f"rail file  : {result['railPath']}")
     print(f"handoff    : {result['handoffPath']}")

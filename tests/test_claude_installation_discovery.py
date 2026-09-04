@@ -1583,3 +1583,271 @@ class ControlPlaneDirectoryAccessTests(_TempHome):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CoordinationReconciliationTests(_TempHome):
+    """Issue #79: a workspace-configured control plane and the managed host cache
+    must never silently identify different coordination repositories.
+
+    The prior behavior read rails only from the managed cache, so a workspace
+    that configured a different coordination repository had its authorized rail
+    reported as missing while a valid one existed. These tests pin the rule that
+    replaced it: agreement reconciles, disagreement stops.
+    """
+
+    def _git(self, repo: Path, *args: str) -> None:
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+    def _coordination(self, name: str, *, origin: str, rail_status: str = "ready") -> Path:
+        repo = self.tmp_path / name
+        scope = repo / "proj" / "issue-7" / "rails" / "the-rail"
+        scope.mkdir(parents=True)
+        (repo / "proj" / "issue-7" / "state.md").write_text("# State\n", encoding="utf-8")
+        (scope / "rail.md").write_text(
+            f"# Rail: the-rail\n\nStatus: {rail_status}\nRole: executor\n", encoding="utf-8"
+        )
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.name", "Coordination")
+        self._git(repo, "config", "user.email", "coordination@example.com")
+        self._git(repo, "remote", "add", "origin", origin)
+        self._git(repo, "add", "-A")
+        self._git(repo, "commit", "-qm", "seed")
+        return repo
+
+    def _product(self, *, configured: Path | None) -> Path:
+        repo = self.tmp_path / "product"
+        repo.mkdir()
+        self._git(repo, "init", "-q")
+        self._git(repo, "config", "user.name", "Claude Tests")
+        self._git(repo, "config", "user.email", "claude@example.com")
+        self._git(repo, "remote", "add", "origin", "https://github.com/jmrozi1/proj.git")
+        ai_dev = repo / ".ai-dev"
+        ai_dev.mkdir()
+        (ai_dev / "workflow.json").write_text(
+            json.dumps(
+                {
+                    "mainBranch": "main",
+                    "scratchBranch": "scratch",
+                    "checkpoint": 0,
+                    "activeIssueNumber": 7,
+                }
+            ),
+            encoding="utf-8",
+        )
+        config: dict = {"tickets": {"provider": "github", "repository": "jmrozi1/proj"}}
+        if configured is not None:
+            config["controlPlane"] = {
+                "repository": str(configured),
+                "project": "proj",
+                "ticket": "issue-7",
+            }
+        (ai_dev / "config.json").write_text(json.dumps(config), encoding="utf-8")
+        return repo
+
+    def _managed_cache(self, *, origin: str) -> Path:
+        cache = activation.resolve_control_plane_cache(home=self.home)
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        return self._coordination(
+            str(cache.relative_to(self.tmp_path)), origin=origin
+        )
+
+    def _coordination_with_upstream(self, name: str) -> Path:
+        """A coordination clone that tracks a real upstream.
+
+        The shared reader proves freshness against a tracked upstream before
+        serving any rail, so an end-to-end discovery fixture needs a genuine
+        remote rather than a remote URL that merely looks plausible.
+        """
+        remote = self.tmp_path / f"{name}-remote.git"
+        subprocess.run(
+            ["git", "init", "--quiet", "--bare", "-b", "main", str(remote)], check=True
+        )
+        seed = self._coordination(f"{name}-seed", origin=str(remote))
+        self._git(seed, "branch", "-M", "main")
+        self._git(seed, "push", "--quiet", "-u", "origin", "main")
+
+        clone = self.tmp_path / name
+        subprocess.run(
+            ["git", "clone", "--quiet", str(remote), str(clone)], check=True
+        )
+        return clone
+
+    def test_missing_managed_cache_uses_valid_workspace_configuration(self) -> None:
+        """The failure that motivated this checkpoint: a valid rail reported missing."""
+        coordination = self._coordination_with_upstream("configured")
+        product = self._product(configured=coordination)
+
+        managed = activation.resolve_control_plane_cache(home=self.home)
+        self.assertFalse(managed.exists())
+
+        resolved = activation.resolve_coordination(product, home=self.home)
+
+        self.assertEqual(resolved.cache, coordination)
+        self.assertEqual(resolved.source, activation.WORKSPACE_CONFIG_SOURCE)
+        self.assertIn("managed host cache absent", resolved.reconciliation)
+
+        # The authorized rail is now found instead of reported missing.
+        result = activation.discover(product, home=self.home)
+        self.assertEqual(result["railId"], "the-rail")
+        self.assertEqual(result["railStatus"], "ready")
+        self.assertEqual(result["controlPlaneCache"], str(coordination))
+        self.assertEqual(result["coordinationSource"], activation.WORKSPACE_CONFIG_SOURCE)
+
+    def test_agreeing_identities_reconcile_to_the_managed_cache(self) -> None:
+        origin = "https://github.com/jmrozi1/coord.git"
+        coordination = self._coordination("configured", origin=origin)
+        managed = self._managed_cache(origin=origin)
+        product = self._product(configured=coordination)
+
+        resolved = activation.resolve_coordination(product, home=self.home)
+
+        self.assertEqual(resolved.cache, managed)
+        self.assertEqual(resolved.source, activation.MANAGED_CACHE_SOURCE)
+        self.assertIn("same coordination repository", resolved.reconciliation)
+
+    def test_two_clones_of_one_coordination_repository_agree(self) -> None:
+        """Identity is the repository shared, not the directory each clone sits in.
+
+        Dogfooding caught this: with a coordination repository whose origin is not
+        a GitHub URL, comparing resolved paths made two clones of the very same
+        repository look like a disagreement and stopped discovery.
+        """
+        remote = self.tmp_path / "shared-remote.git"
+        subprocess.run(
+            ["git", "init", "--quiet", "--bare", "-b", "main", str(remote)], check=True
+        )
+        seed = self._coordination("seed", origin=str(remote))
+        self._git(seed, "branch", "-M", "main")
+        self._git(seed, "push", "--quiet", "-u", "origin", "main")
+
+        configured = self.tmp_path / "configured"
+        subprocess.run(["git", "clone", "--quiet", str(remote), str(configured)], check=True)
+
+        managed = activation.resolve_control_plane_cache(home=self.home)
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "--quiet", str(remote), str(managed)], check=True)
+
+        product = self._product(configured=configured)
+        resolved = activation.resolve_coordination(product, home=self.home)
+
+        self.assertEqual(resolved.cache, managed)
+        self.assertIn("same coordination repository", resolved.reconciliation)
+        self.assertEqual(resolved.identity, str(remote)[: -len(".git")])
+
+    def test_disagreeing_identities_fail_closed_reporting_both(self) -> None:
+        coordination = self._coordination(
+            "configured", origin="https://github.com/jmrozi1/coord-a.git"
+        )
+        self._managed_cache(origin="https://github.com/jmrozi1/coord-b.git")
+        product = self._product(configured=coordination)
+
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.resolve_coordination(product, home=self.home)
+
+        message = str(caught.exception)
+        # Both identities and both locations, so the decision is actionable.
+        self.assertIn("jmrozi1/coord-a", message)
+        self.assertIn("jmrozi1/coord-b", message)
+        self.assertIn(str(coordination), message)
+        self.assertIn("will not choose between them", message)
+
+    def test_disagreement_stops_discovery_rather_than_preferring_the_cache(self) -> None:
+        coordination = self._coordination(
+            "configured", origin="https://github.com/jmrozi1/coord-a.git"
+        )
+        self._managed_cache(origin="https://github.com/jmrozi1/coord-b.git")
+        product = self._product(configured=coordination)
+
+        with self.assertRaises(ClaudeActivationError):
+            activation.discover(product, home=self.home)
+
+    def test_unconfigured_workspace_without_cache_fails_closed(self) -> None:
+        product = self._product(configured=None)
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.resolve_coordination(product, home=self.home)
+        self.assertIn("configures no control plane", str(caught.exception))
+
+    def test_unconfigured_workspace_uses_the_managed_cache(self) -> None:
+        managed = self._managed_cache(origin="https://github.com/jmrozi1/coord.git")
+        product = self._product(configured=None)
+
+        resolved = activation.resolve_coordination(product, home=self.home)
+
+        self.assertEqual(resolved.cache, managed)
+        self.assertEqual(resolved.source, activation.MANAGED_CACHE_SOURCE)
+
+    def test_configured_repository_that_is_not_a_repository_fails_closed(self) -> None:
+        not_a_repo = self.tmp_path / "not-a-repo"
+        not_a_repo.mkdir()
+        product = self._product(configured=not_a_repo)
+
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.resolve_coordination(product, home=self.home)
+
+        self.assertIn("not usable", str(caught.exception))
+        self.assertIn(str(not_a_repo), str(caught.exception))
+
+    def test_malformed_workspace_configuration_fails_closed(self) -> None:
+        product = self._product(configured=None)
+        (product / ".ai-dev" / "config.json").write_text(
+            json.dumps({"controlPlane": {"project": "proj"}}), encoding="utf-8"
+        )
+
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.resolve_coordination(product, home=self.home)
+
+        self.assertIn("unusable", str(caught.exception))
+
+
+class RuntimeAndSkillProvenanceTests(_TempHome):
+    """Issue #79: discovery must report the runtime and skill actually executing."""
+
+    def test_runtime_revision_matches_the_executing_checkout(self) -> None:
+        root, provenance = activation.resolve_runtime_provenance()
+
+        self.assertEqual(root, Path(activation.__file__).resolve().parents[1])
+        head = subprocess.run(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False,
+        )
+        if head.returncode == 0:
+            self.assertTrue(provenance.value.startswith(head.stdout.strip()))
+            self.assertIn(str(root), provenance.source)
+
+    def test_skill_provenance_names_the_routing_file_and_its_revision(self) -> None:
+        skill, provenance = activation.resolve_claude_flow_skill_provenance()
+
+        self.assertTrue(skill.is_file())
+        self.assertEqual(skill.name, "SKILL.md")
+        self.assertEqual(
+            skill,
+            Path(activation.__file__).resolve().parents[1]
+            / activation.CLAUDE_FLOW_SKILL_RELATIVE,
+        )
+        self.assertTrue(provenance.value)
+        self.assertIn(activation.CLAUDE_FLOW_SKILL_RELATIVE, provenance.source)
+
+    def test_runtime_without_git_reports_unavailable_rather_than_guessing(self) -> None:
+        bare = self.tmp_path / "installed-runtime"
+        (bare / "skills" / "claude" / "flow").mkdir(parents=True)
+        (bare / activation.CLAUDE_FLOW_SKILL_RELATIVE).write_text("# Flow\n", encoding="utf-8")
+
+        _, provenance = activation.resolve_runtime_provenance(bare)
+        self.assertIn("unavailable", provenance.value)
+        self.assertIn("not a Git checkout", provenance.value)
+
+    def test_runtime_without_the_claude_flow_skill_fails_closed(self) -> None:
+        bare = self.tmp_path / "incomplete-runtime"
+        bare.mkdir()
+
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.resolve_claude_flow_skill_provenance(bare)
+
+        message = str(caught.exception)
+        self.assertIn("Claude Flow skill is missing", message)
+        self.assertIn(activation.CLAUDE_FLOW_SKILL_RELATIVE, message)
