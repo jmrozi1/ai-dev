@@ -2763,3 +2763,791 @@ def replace_old_context(
             request=bound.request,
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# Continuation: a bound replacement resumes the work from durable state alone
+# ---------------------------------------------------------------------------
+#
+# D9's sentence ends "and launch a fresh agent against durable state, and the
+# replacement must continue without the predecessor's transcript." Checkpoint 63
+# terminated the old context. Checkpoint 66 launched and bound the successor and
+# stopped there, deliberately taking no prompt and no sender so that continuing was
+# unreachable from it. This is the act it stopped short of, and it is the first
+# production caller of `continue_session`.
+#
+# Four things make it the smallest seam that is still honest.
+#
+# First, the successor is told locators, not content. `ContinuationBrief` carries
+# the rail, the iteration, the workspace, and the Git object name of the published
+# handoff -- pointers to durable artifacts a fresh reader opens for itself. It
+# carries no sentence of the handoff, no result, no terminal payload, and no
+# provider message, so "continue without the predecessor's transcript" is not a
+# rule the manager is asked to follow: there is nothing transcript-shaped in the
+# brief to break it with. `continuation_brief` takes no registry, which is what
+# makes that structural rather than careful -- the one object holding this
+# session's observations, work boundary, finalization and events is not in its
+# signature, so no field of the brief can be derived from any of them.
+#
+# Second, every fact the brief is built from is read at this call site. There is no
+# `rail=`, `handoff=`, `worktree=`, `slots=`, `decision=`, `brief=` or `prompt=`
+# parameter: the readers are the parameters and the facts are not, exactly as
+# `replace_old_context` established, so a value that was true earlier in some flow
+# is not something a caller must remember not to pass -- it is something this
+# signature cannot accept. Checkpoint 63 made a stale *verdict* unrepresentable;
+# stale *inputs* stay caller-supplied, and this is where they stop being able to
+# reach a gate. `continuation_brief` then refuses every disagreement between them:
+# a rail at a different iteration than the binding, a handoff observation for
+# another rail or naming no publication, a workspace observation of somewhere else,
+# and a publication written against a product state the workspace has since left.
+#
+# Third, the successor is the one that was bound, and the predecessor cannot be
+# continued. A retired predecessor's binding is terminal, and this refuses a
+# terminal binding before it reads anything at all -- so the refusal touches
+# nothing, and the predecessor stays exactly as terminal as retirement left it.
+# `continue_session` refuses it a second time, independently, and the accepted
+# authorizer refuses a third: a rail carrying one live binding yields a
+# continuation decision for that binding or a refusal, never one for a session that
+# is gone.
+#
+# Fourth, a failed continuation stays fail-closed the way checkpoint 58 requires. A
+# failed invocation deliberately leaves the session continuable, and it degrades
+# the observation the session's stop category is read from -- which is precisely
+# what makes `category-unprovable` reachable in production for the first time. So
+# this slice also owes the route that handles that state, and owes D8 its delivery:
+# `release_continued_context` below.
+
+
+CONTINUATION_CONTINUED = "continuation-continued"
+CONTINUATION_REFUSED = "continuation-refused"
+CONTINUATION_FAILED = "continuation-failed"
+CONTINUATION_STATES = (
+    CONTINUATION_CONTINUED,
+    CONTINUATION_REFUSED,
+    CONTINUATION_FAILED,
+)
+
+REASON_CONTINUATION_CONTINUED = "continuation-continued"
+REASON_CONTINUATION_BINDING_MISSING = "continuation-binding-missing"
+REASON_CONTINUATION_CLAIMS_TERMINAL = "continuation-claims-a-terminal-binding"
+REASON_CONTINUATION_NOT_AUTHORIZED = "continuation-not-authorized"
+REASON_CONTINUATION_INVOCATION_FAILED = "continuation-invocation-failed"
+
+
+@dataclass(frozen=True)
+class ContinuationBrief:
+    """Exactly what the replacement is told, and every field's durable source.
+
+    Each value is copied from one of three durable reads and nothing else: the
+    successor's own binding record in this controller's store, the control plane's
+    rail and handoff observations taken at the call site, and the fresh read of the
+    workspace. Nothing here is derived from a provider message, a result, a
+    terminal payload, an event, or any observation only the predecessor's session
+    could have produced -- and nothing here is a field only a rotating agent could
+    supply. A fresh reader holding the same three durable facts resolves the
+    identical brief, which is the whole of D9's "without the predecessor's
+    transcript".
+
+    `handoff_publication` is the Git object name of the published bytes, so what
+    the successor is pointed at is one exact publication rather than a path that
+    may have moved on since the projection. `prompt` is a deterministic rendering
+    of these fields and holds no other text.
+    """
+
+    project: str
+    ticket: str
+    rail: str
+    role: str
+    iteration_blob: str
+    workspace_key: str
+    worktree_id: str
+    workspace_path: str
+    worktree_head: str
+    handoff_location: str
+    handoff_publication: str
+    session_id: str
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "project": self.project,
+            "ticket": self.ticket,
+            "rail": self.rail,
+            "role": self.role,
+            "iteration": self.iteration_blob,
+            "workspaceKey": self.workspace_key,
+            "worktreeId": self.worktree_id,
+            "workspacePath": self.workspace_path,
+            "worktreeHead": self.worktree_head,
+            "handoff": self.handoff_location,
+            "handoffPublication": self.handoff_publication,
+            "sessionId": self.session_id,
+        }
+
+    @property
+    def prompt(self) -> str:
+        """The successor's instruction: where to read, and nothing about what it says.
+
+        Rendered from this brief's own fields only. It names the artifacts and the
+        workspace, and it deliberately carries no summary, no next action and no
+        outcome -- those live in the published handoff, which is the single carrier
+        of what the work says, and the replacement reads them there.
+        """
+        return (
+            "You are the replacement {role} on rail {rail} in {project}/{ticket}, "
+            "session {session}. There is no predecessor transcript and none is "
+            "needed. Resolve the work from durable state only: the rail "
+            "authorization at iteration {iteration}, and the published handoff at "
+            "{handoff}, which is publication {publication}. Your workspace is "
+            "{workspace} (worktree {worktree}) and it stands at {head}. Continue "
+            "the unresolved work and the exact next action those artifacts state, "
+            "and nothing else.".format(
+                role=self.role,
+                rail=self.rail,
+                project=self.project,
+                ticket=self.ticket,
+                session=self.session_id,
+                iteration=self.iteration_blob,
+                handoff=self.handoff_location,
+                publication=self.handoff_publication,
+                workspace=self.workspace_path,
+                worktree=self.worktree_id,
+                head=self.worktree_head,
+            )
+        )
+
+
+def continuation_brief(
+    rail: Optional[RailFacts],
+    record: Optional[BindingRecord],
+    handoff: Optional[RotationHandoffFacts],
+    worktree: Optional[WorktreeFacts],
+) -> ContinuationBrief:
+    """Resolve what a replacement is told, from durable facts, or refuse to resolve.
+
+    Takes no registry on purpose: the object that holds this session's results,
+    events, work boundary and finalization is not reachable from here, so no field
+    of the brief can be derived from one. It is the same discipline
+    `evaluate_rotation_readiness` applies to *observations*, applied to *content*.
+
+    Every refusal below is a disagreement between two durable reads, and each one
+    is exactly a stale fact arriving at a gate: a rail read before the orchestrator
+    rewrote it, a handoff observation from another rail or naming no publication, a
+    workspace observation of somewhere else, or a publication written against a
+    product state the workspace has since left. A brief resolved from any of those
+    would point a fresh agent at a description of somewhere it is not.
+    """
+    if rail is None or record is None or handoff is None or worktree is None:
+        raise LifecycleError(
+            REASON_OBSERVATION_INCOMPLETE,
+            "a continuation brief needs a rail observation, a binding, a handoff "
+            "observation and a worktree observation; got rail={0!r} binding={1!r} "
+            "handoff={2!r} worktree={3!r}.".format(rail, record, handoff, worktree),
+        )
+    if record.is_terminal:
+        raise LifecycleError(
+            REASON_BINDING_TERMINAL,
+            "session {0} is {1}; a terminal binding has no work to continue.".format(
+                record.session_id, record.state
+            ),
+        )
+    if record.state != BINDING_STATE_BOUND:
+        raise LifecycleError(
+            REASON_BINDING_NOT_BOUND,
+            "session {0} is {1}; only a bound session can be continued.".format(
+                record.session_id, record.state
+            ),
+        )
+    if record.rail != rail.identifier:
+        raise LifecycleError(
+            REASON_SCOPE_MISMATCH,
+            "binding names rail {0}, the observation names {1}.".format(
+                record.rail, rail.identifier
+            ),
+        )
+    if record.iteration.blob != rail.rail_blob:
+        raise LifecycleError(
+            REASON_ITERATION_DRIFT,
+            "session {0} is bound at iteration {1} but rail {2} is now {3}; the "
+            "durable next action this brief would point at is not the one this "
+            "session was bound for.".format(
+                record.session_id, record.iteration.blob, rail.identifier,
+                rail.rail_blob,
+            ),
+        )
+    if handoff.rail != record.rail:
+        raise LifecycleError(
+            REASON_SCOPE_MISMATCH,
+            "the handoff observation is for rail {0}, the binding for {1}.".format(
+                handoff.rail, record.rail
+            ),
+        )
+    if (worktree.worktree_id, worktree.path) != (record.worktree_id, record.workspace_path):
+        raise LifecycleError(
+            REASON_SCOPE_MISMATCH,
+            "the worktree observation is of {0} at {1}, the binding names {2} at "
+            "{3}.".format(
+                worktree.worktree_id, worktree.path,
+                record.worktree_id, record.workspace_path,
+            ),
+        )
+    if not handoff.published:
+        raise LifecycleError(
+            REASON_HANDOFF_NOT_PUBLISHED,
+            "rail {0} has no published handoff at {1}, so the outcome, unresolved "
+            "work and next action a replacement would resume are not durable and "
+            "there is nothing to point it at.".format(record.rail, handoff.location),
+        )
+    if handoff.publication is None:
+        raise LifecycleError(
+            REASON_HANDOFF_NOT_CURRENT,
+            "the observation of {0} does not name which publication is there, so a "
+            "replacement could be pointed at one set of bytes and read "
+            "another.".format(handoff.location),
+        )
+    if not worktree.coherent:
+        raise LifecycleError(
+            REASON_WORKTREE_INCOHERENT,
+            "workspace {0} is {1}; a replacement cannot be handed a repository "
+            "state only the predecessor could explain.".format(
+                record.workspace_path,
+                "mid-{0}".format(worktree.active_operation)
+                if worktree.active_operation
+                else "not clean",
+            ),
+        )
+    if worktree.head is None:
+        raise LifecycleError(
+            REASON_OBSERVATION_INCOMPLETE,
+            "the observation of workspace {0} does not name where the repository "
+            "stands, so the brief cannot say what the replacement is resuming "
+            "against.".format(record.workspace_path),
+        )
+    if handoff.work_state is None:
+        raise LifecycleError(
+            REASON_HANDOFF_NOT_CURRENT,
+            "the handoff published at {0} does not record which product state it "
+            "was written against, so it cannot be shown to describe the workspace "
+            "a replacement would resume in.".format(handoff.location),
+        )
+    if handoff.work_state != worktree.head:
+        raise LifecycleError(
+            REASON_HANDOFF_NOT_CURRENT,
+            "the handoff published at {0} was written against product state {1} "
+            "and workspace {2} now stands at {3}; pointing a replacement at it "
+            "would point it at a description of somewhere else.".format(
+                handoff.location, handoff.work_state,
+                record.workspace_path, worktree.head,
+            ),
+        )
+    return ContinuationBrief(
+        project=record.project,
+        ticket=record.ticket,
+        rail=record.rail,
+        role=record.role,
+        iteration_blob=record.iteration.blob,
+        workspace_key=record.workspace_key,
+        worktree_id=record.worktree_id,
+        workspace_path=record.workspace_path,
+        worktree_head=worktree.head,
+        handoff_location=handoff.location,
+        handoff_publication=handoff.publication,
+        session_id=record.session_id,
+    )
+
+
+@dataclass(frozen=True)
+class Continuation:
+    """One continuation attempt: what it resolved, and what became of it.
+
+    `brief` is present whenever one could be resolved at all, including on the
+    failure path, because it is the record of what the replacement was pointed at.
+    `result` is present only when an invocation actually returned, so a caller
+    cannot read work out of a run that performed none. `next_action` is present on
+    every path that is not a success and says what the manager does next.
+    """
+
+    session_id: str
+    rail: str
+    state: str
+    reason: str
+    detail: str
+    brief: Optional[ContinuationBrief] = None
+    result: Optional[Mapping] = None
+    next_action: str = ""
+
+    @property
+    def continued(self) -> bool:
+        return self.state == CONTINUATION_CONTINUED
+
+
+def continue_from_durable_state(
+    store: BindingStore,
+    registry: SessionRegistry,
+    *,
+    session_id: str,
+    assignment: Assignment,
+    read_rail: Callable,
+    read_handoff: Callable,
+    read_worktree: Callable,
+    read_slots: Callable,
+    read_observation: Callable,
+    request_kwargs: Mapping,
+    markers: Sequence = (),
+    send: Optional[Callable] = None,
+    alive: Optional[Callable] = None,
+    command_timeout: Optional[float] = None,
+    finalize_handoff: Optional[Callable] = None,
+) -> Continuation:
+    """Resume a bound replacement's rail work from durable state alone.
+
+    The first production call site of `continue_session`, and it owns its own
+    facts. The durable binding, the rail, the published handoff, the workspace,
+    manager-wide occupancy and the control-plane observation an invocation is
+    authorized against are all obtained *here*, inside this call, immediately
+    before the decision that consumes each one. There is no parameter through which
+    any of them can be handed in already-decided, and no `prompt` parameter either:
+    what the replacement is told is resolved by `continuation_brief` from those
+    reads, so a caller cannot smuggle a predecessor's transcript in as work.
+
+    A terminal binding is refused before anything is read, so a continuation aimed
+    at a retired predecessor touches nothing and the predecessor stays terminal.
+
+    A failed invocation is reported, never raised past this as a success and never
+    silently swallowed: `continue_session` has already kept the session bound,
+    owned and continuable and degraded the observation its stop category is read
+    from, so the session survives truthfully and this says what the manager does
+    next. Nothing is launched, bound, reserved or stopped on any path here.
+    """
+    # Fact one, read here: which durable binding this session actually has, now.
+    record = store.read(session_id)
+    if record is None:
+        return Continuation(
+            session_id=session_id,
+            rail=assignment.rail,
+            state=CONTINUATION_REFUSED,
+            reason=REASON_CONTINUATION_BINDING_MISSING,
+            detail=(
+                "no binding for session {0}, so there is no bound replacement to "
+                "continue. Nothing was sent.".format(session_id)
+            ),
+            next_action=(
+                "establish which session this rail's replacement actually is before "
+                "continuing anything."
+            ),
+        )
+    if record.is_terminal:
+        return Continuation(
+            session_id=session_id,
+            rail=record.rail,
+            state=CONTINUATION_REFUSED,
+            reason=REASON_CONTINUATION_CLAIMS_TERMINAL,
+            detail=(
+                "session {0} is {1}. A replacement continues its own work, and a "
+                "terminal binding is the predecessor a rotation retired: continuing "
+                "it would be this manager claiming the identity of an agent that is "
+                "gone. Nothing was read, sent, or changed, and the binding is still "
+                "{1}.".format(session_id, record.state)
+            ),
+            next_action=(
+                "continue the successor the replacement bound, whose binding is the "
+                "live one on this rail."
+            ),
+        )
+
+    # Facts two, three and four, read here, in the order the brief consumes them
+    # and at the instant it consumes them.
+    rail = read_rail()
+    handoff = read_handoff()
+    worktree = read_worktree()
+    # What the replacement is told, resolved rather than handed in. A `LifecycleError`
+    # from here is a disagreement between two durable reads and propagates untouched:
+    # nothing has been sent, and a brief that cannot be resolved is not one to guess at.
+    brief = continuation_brief(rail, record, handoff, worktree)
+
+    # Fact five: manager-wide occupancy, over the store as it stands now, from the
+    # single production home that draws the figure.
+    records = store.records()
+    slots = read_slots(records)
+    # Fact six: the control-plane observation, read now and turned into a decision
+    # here rather than accepted as one. A caller cannot hand this route an
+    # authorization, which is what keeps a decision taken before the rotation --
+    # when the rail still carried the predecessor's live binding -- from reaching an
+    # invocation. The accepted authorizer is the second guard on the identity
+    # requirement too: it reads the one live binding on the rail for itself and
+    # refuses anything else, so a decision authorizing a continuation of a session
+    # this store does not hold live cannot be produced here at all.
+    decision = authorize(
+        read_observation(),
+        project=assignment.project,
+        ticket=assignment.ticket,
+        rail=assignment.rail,
+        role=assignment.role,
+        expected_head=assignment.head,
+        rail_blob=assignment.iteration.blob,
+        slots=slots,
+        bindings=records,
+        in_flight_session_ids=registry.in_flight(),
+    )
+    if not decision.authorized or decision.action != ACTION_CONTINUE:
+        return Continuation(
+            session_id=session_id,
+            rail=record.rail,
+            state=CONTINUATION_REFUSED,
+            reason=REASON_CONTINUATION_NOT_AUTHORIZED,
+            detail=(
+                "no continuation is authorized for session {0} on rail {1} ({2}: "
+                "{3}). Nothing was sent and the session is exactly as it "
+                "was.".format(session_id, record.rail, decision.reason, decision.detail)
+            ),
+            brief=brief,
+            next_action=(
+                "clear what the authorizer refused on, then ask again; the durable "
+                "handoff at {0} is what a later continuation resumes from.".format(
+                    brief.handoff_location
+                )
+            ),
+        )
+    _require_decision(decision, assignment, action=ACTION_CONTINUE)
+
+    try:
+        result = continue_session(
+            decision,
+            assignment,
+            store=store,
+            registry=registry,
+            session_id=session_id,
+            request_kwargs=request_kwargs,
+            prompt=brief.prompt,
+            markers=markers,
+            send=send,
+            alive=alive,
+            command_timeout=command_timeout,
+            finalize_handoff=finalize_handoff,
+        )
+    except LifecycleError:
+        # A contradiction between the durable records, not a failed invocation. It
+        # is the accepted route's own refusal and is never softened into a report.
+        raise
+    except Exception as exc:
+        # The accepted checkpoint-58 semantics already ran inside `continue_session`:
+        # in-flight was cleared, the events the invocation did report were kept, the
+        # health of the observation was degraded because nobody finished watching
+        # it, and no handoff was finalized from a turn that produced no terminal
+        # result. So the session is still bound, still owned and still continuable,
+        # and the one thing left to do here is say so rather than let a failure read
+        # as a continuation that happened.
+        return Continuation(
+            session_id=session_id,
+            rail=record.rail,
+            state=CONTINUATION_FAILED,
+            reason=REASON_CONTINUATION_INVOCATION_FAILED,
+            detail=(
+                "the continuation of session {0} on rail {1} failed ({2}: {3}). The "
+                "session is deliberately left bound, owned and continuable, nothing "
+                "was launched or stopped, and no handoff was credited from a turn "
+                "that produced no terminal result. Its compaction history is no "
+                "longer advertised as complete, so its stop category can no longer "
+                "be established.".format(
+                    session_id, record.rail, type(exc).__name__, exc
+                )
+            ),
+            brief=brief,
+            next_action=(
+                "continue session {0} again from the same durable handoff at {1}, or "
+                "release it through `release_continued_context`, which is the only "
+                "route that may stop a session whose rotation category cannot be "
+                "established and which publishes the human-attention record that "
+                "stop owes a person.".format(session_id, brief.handoff_location)
+            ),
+        )
+    return Continuation(
+        session_id=session_id,
+        rail=record.rail,
+        state=CONTINUATION_CONTINUED,
+        reason=REASON_CONTINUATION_CONTINUED,
+        detail=(
+            "session {0} continued the work of rail {1} from durable state alone: "
+            "the rail authorization at iteration {2} and handoff publication {3} at "
+            "{4}, in workspace {5} standing at {6}. No transcript of the predecessor "
+            "was read, held, or required.".format(
+                session_id, record.rail, brief.iteration_blob,
+                brief.handoff_publication, brief.handoff_location,
+                brief.workspace_path, brief.worktree_head,
+            )
+        ),
+        brief=brief,
+        result=result,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Release: the D8 delivery the continuation above finally owes a person
+# ---------------------------------------------------------------------------
+#
+# `category-unprovable` was unreachable in production until the route above
+# existed, because the only thing that degrades a session's observation is a failed
+# `continue_session`, and nothing called it. It is reachable now, so the state has
+# to be handled -- and D8 has to be paid.
+#
+# D8 requires a human-attention item to be actionable on its own: what failed,
+# which agent, project, ticket and rail, the missing capability, what the human
+# must change, whether any product or worktree state changed, and the exact next
+# action -- without opening a transcript, a raw log or a session inspector.
+# `SupervisedTeardown.human_action` has said all of that since checkpoint 65. It
+# said it into a dataclass field that was returned to a caller and then fell on the
+# floor, which is delivery to nobody. `attention_record` turns it into the
+# system's own durable human-attention record -- the same bounded shape
+# `control_plane.validate_decision_record` accepts and `queue_source.read_decisions`
+# projects in front of a person -- and this route publishes it.
+#
+# Three boundaries.
+#
+# First, this module still reads no repository and shells out to nothing. The
+# record is built here and written by a caller-supplied `publish_attention`, for
+# exactly the reason `RailFacts` and `WorktreeFacts` are supplied rather than read:
+# a lifecycle that wrote to a coordination repository itself would be taking an
+# instant of its own and could contaminate a projection with it.
+#
+# Second, a supervised teardown whose record could not be made durable is not a
+# supervised teardown that happened quietly. The publication failing raises, with
+# the whole `human_action` in the refusal, so the one thing that cannot occur is a
+# stop performed under an unresolved category with nothing left in front of a
+# person. It fails loudly rather than fails back: the process is already gone by
+# then and pretending otherwise would be the worse lie.
+#
+# Third, the category is read here, at the instant it is acted on, and it decides
+# the route rather than the caller deciding it. A marked session is refused to the
+# retirement gate, a provably unmarked one goes to the ordinary teardown that
+# already handles it and raises no human-attention item at all -- D8 says routine
+# acceptance creates none -- and only `category-unprovable` reaches the supervised
+# route. That is the accepted category rule, called rather than restated.
+
+RELEASE_STOPPED = "released-ordinary-teardown"
+RELEASE_SUPERVISED = "released-under-supervision"
+RELEASE_REFUSED = "release-refused"
+RELEASE_STATES = (RELEASE_STOPPED, RELEASE_SUPERVISED, RELEASE_REFUSED)
+
+REASON_RELEASE_BINDING_MISSING = "release-binding-missing"
+REASON_RELEASED_ORDINARY_TEARDOWN = "released-ordinary-teardown"
+REASON_ATTENTION_NOT_DURABLE = "human-attention-record-not-durable"
+
+ATTENTION_SCHEMA_VERSION = 1
+ATTENTION_TITLE = "Supervised teardown under an unprovable rotation category"
+
+
+def attention_record(
+    teardown: SupervisedTeardown,
+    record: BindingRecord,
+    *,
+    decision_id: str,
+    raised_at: str,
+) -> Dict[str, Any]:
+    """One supervised teardown, as the durable human-attention record D8 requires.
+
+    `explanation` is `human_action` **verbatim**. It is not summarised, rephrased,
+    or folded into the blocker: it is already the sentence D8 asks for -- what
+    failed, on which rail, whether state changed, and the exact next action -- and
+    a manager that rewrote it here would be inventing the very text a person is
+    supposed to read. The bounded blocker block beside it carries the same facts in
+    the fixed shape a queue renders, and holds no variable-length value except the
+    session identity, so a long rail name can never push a required D8 field past
+    the bound and out of the record.
+
+    Every field comes from the teardown and the durable binding. Nothing here reads
+    a transcript, a log, or a session inspector, which is the whole point of D8:
+    the person reading this needs none of them.
+    """
+    stopped = teardown.torn_down
+    return {
+        "schemaVersion": ATTENTION_SCHEMA_VERSION,
+        "decisionId": decision_id,
+        "project": record.project,
+        "ticket": record.ticket,
+        "rail": teardown.rail,
+        "raisedAt": raised_at,
+        "title": ATTENTION_TITLE,
+        "explanation": teardown.human_action,
+        "evidence": [
+            {"label": "session", "locator": teardown.session_id},
+            {"label": "workspace", "locator": record.workspace_path},
+            {"label": "binding state", "locator": teardown.state},
+        ],
+        "blocker": {
+            "kind": "environment",
+            "whatFailed": (
+                "the rotation category of session {0} could not be "
+                "established, so its stop had to be supervised.".format(
+                    teardown.session_id
+                )
+            ),
+            "missingCapability": (
+                "a complete compaction history for session {0}: an invocation this "
+                "manager's observation depended on did not finish.".format(
+                    teardown.session_id
+                )
+            ),
+            "humanChange": (
+                "restore whatever stopped that invocation from finishing, so this "
+                "manager can establish a session's rotation category again."
+                if stopped else
+                "end the process group named in the explanation, then decide "
+                "whether to unbind the session."
+            ),
+            # D8 asks whether any product or worktree state changed. Neither route
+            # touches either, so what this answers is the honest wider question a
+            # person is actually asking: did this manager change durable state it
+            # owns. A proven teardown terminalized a binding and ended a process
+            # group; a refused one changed nothing at all.
+            "stateChanged": stopped,
+            "nextAction": (
+                "confirm this rail carries a current published handoff before "
+                "treating the session's work as carried forward; no process action "
+                "is required."
+                if stopped else
+                "establish on the host whether that process group is still running "
+                "and end it if it is, then decide whether to unbind the session."
+            ),
+        },
+    }
+
+
+@dataclass(frozen=True)
+class ContextRelease:
+    """One release of a session this controller holds, and what it owed a person.
+
+    `attention` and `attention_locator` are present only on the supervised route,
+    because that is the only one that raises a human-attention item: an ordinary
+    teardown of a provably unmarked session is routine, and D8 says routine work
+    creates no item. `teardown` and `stopped` are each present only when the
+    corresponding route actually ran.
+    """
+
+    session_id: str
+    rail: str
+    state: str
+    reason: str
+    detail: str
+    category: str
+    teardown: Optional[SupervisedTeardown] = None
+    stopped: Optional[StopOutcome] = None
+    attention: Optional[Mapping] = None
+    attention_locator: Optional[str] = None
+
+    @property
+    def released(self) -> bool:
+        return self.state in (RELEASE_STOPPED, RELEASE_SUPERVISED)
+
+
+def release_continued_context(
+    store: BindingStore,
+    registry: SessionRegistry,
+    *,
+    session_id: str,
+    decision_id: str,
+    now: str,
+    publish_attention: Callable,
+    stop: Optional[Callable] = None,
+    alive: Optional[Callable] = None,
+) -> ContextRelease:
+    """Release a session this controller is running, by the category it proves now.
+
+    The production caller of `supervised_teardown`, and the act that finally
+    delivers its `human_action` to a person instead of returning it. The category
+    is read here, at the instant it is acted on, from the registry rather than from
+    anything a caller could hand in -- there is no `category=`, `teardown=` or
+    `record=` parameter to pass one that was true earlier.
+
+    A marked session is refused and named to the retirement gate; a provably
+    unmarked one goes to ordinary teardown and raises no human-attention item,
+    because D8 says routine work creates none; and a session whose category cannot
+    be established goes to the supervised route, whose report is published as the
+    durable human-attention record before this returns.
+
+    Raises `LifecycleError` when that publication fails, carrying the whole
+    `human_action` in the refusal. A supervised teardown that left nothing in front
+    of a person is the one outcome this route may not report as done.
+    """
+    record = store.read(session_id)
+    if record is None:
+        return ContextRelease(
+            session_id=session_id,
+            rail="",
+            state=RELEASE_REFUSED,
+            reason=REASON_RELEASE_BINDING_MISSING,
+            detail=(
+                "no binding for session {0}, so there is nothing to release and "
+                "nothing whose stop this manager could categorise. Nothing was "
+                "stopped.".format(session_id)
+            ),
+            category="",
+        )
+    category = stop_category(registry, session_id)
+    if category == STOP_CATEGORY_ROTATION:
+        return ContextRelease(
+            session_id=session_id,
+            rail=record.rail,
+            state=RELEASE_REFUSED,
+            reason=REASON_ROTATION_REQUIRES_RETIREMENT,
+            detail=(
+                "session {0} is marked for rotation, so its stop is a rotation and "
+                "may only go through `retire_old_context`, which proves a safe "
+                "handoff was left behind first. Nothing was stopped and the binding "
+                "stays nonterminal.".format(session_id)
+            ),
+            category=category,
+        )
+    if category == STOP_CATEGORY_NON_ROTATION:
+        stopped = stop_session(store, registry, record, stop=stop, alive=alive)
+        return ContextRelease(
+            session_id=session_id,
+            rail=record.rail,
+            state=RELEASE_STOPPED,
+            reason=REASON_RELEASED_ORDINARY_TEARDOWN,
+            detail=(
+                "session {0} is provably below the rotation threshold, so its stop "
+                "is ordinary teardown: process group {1} is gone and the binding is "
+                "{2}. This is routine work and raises no human-attention "
+                "item.".format(session_id, stopped.pgid, stopped.binding.state)
+            ),
+            category=category,
+            stopped=stopped,
+        )
+    teardown = supervised_teardown(
+        store, registry, record, now=now, stop=stop, alive=alive
+    )
+    payload = attention_record(
+        teardown, record, decision_id=decision_id, raised_at=now
+    )
+    try:
+        locator = publish_attention(payload)
+    except Exception as exc:
+        raise LifecycleError(
+            REASON_ATTENTION_NOT_DURABLE,
+            "session {0} on rail {1} was put through supervised teardown and its "
+            "human-attention record could not be made durable ({2}: {3}). The "
+            "record is not published, so this is reported as a failure rather than "
+            "as a release: a stop performed under an unresolved category with "
+            "nothing left in front of a person is the one outcome this route may "
+            "not report as done. The record's text, in full, is: {4}".format(
+                teardown.session_id, teardown.rail, type(exc).__name__, exc,
+                teardown.human_action,
+            ),
+        ) from exc
+    return ContextRelease(
+        session_id=teardown.session_id,
+        rail=teardown.rail,
+        state=RELEASE_SUPERVISED,
+        reason=teardown.reason,
+        detail=(
+            "session {0} was released under supervision because its rotation "
+            "category could not be established ({1}), and what that leaves a human "
+            "to do is published as human-attention record {2} at {3} rather than "
+            "returned to this caller and lost.".format(
+                teardown.session_id, teardown.state, decision_id, locator,
+            )
+        ),
+        category=category,
+        teardown=teardown,
+        attention=payload,
+        attention_locator=locator,
+    )

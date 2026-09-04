@@ -99,14 +99,18 @@ from .queue_source import QueueScope, QueueSourceError
 from .session_binding import BindingRecord, BindingStore
 from .session_lifecycle import (
     REASON_ROTATION_REQUIRES_RETIREMENT,
+    ContextRelease,
     ContextReplacement,
+    Continuation,
     LaunchOutcome,
     LifecycleError,
     SessionRegistry,
     StopOutcome,
     SupervisedTeardown,
+    continue_from_durable_state,
     launch_session,
     ownership_evidence,
+    release_continued_context,
     replace_old_context,
     single_liveness_snapshot,
     stop_session,
@@ -318,6 +322,94 @@ class ManagerController:
             stop=stop,
             alive=alive,
             ready_timeout=ready_timeout,
+        )
+
+    def continue_from_durable_state(
+        self,
+        session_id: str,
+        assignment,
+        *,
+        read_rail: Callable,
+        read_handoff: Callable,
+        read_worktree: Callable,
+        read_observation: Callable,
+        request_kwargs,
+        markers=(),
+        send: Optional[Callable] = None,
+        alive: Optional[Callable] = None,
+        command_timeout: Optional[float] = None,
+        finalize_handoff: Optional[Callable] = None,
+    ) -> Continuation:
+        """Resume a bound replacement's work from durable state, through this controller.
+
+        A pass-through, like `launch` and `replace_old_context`. What the
+        replacement is told, the refusal of a terminal predecessor, the
+        authorization, and the fail-closed handling of a failed invocation all stay
+        in the accepted lifecycle. What this adds is that the session continued here
+        is one this controller holds a handle for and counts, so the invocation is
+        admitted against the same occupancy the page beside it draws.
+
+        Occupancy is this controller's own reduction, handed over as the reader the
+        lifecycle calls at the moment it needs the figure -- one manager states one
+        concurrency policy, and a continuation is not an occasion to run a different
+        one.
+
+        It states its parameters rather than taking `**kwargs`, and there is no
+        `prompt` among them: what a replacement is told is resolved from durable
+        state by the lifecycle, so nothing a caller holds in memory can become the
+        work.
+        """
+        return continue_from_durable_state(
+            self.store,
+            self.registry,
+            session_id=session_id,
+            assignment=assignment,
+            read_rail=read_rail,
+            read_handoff=read_handoff,
+            read_worktree=read_worktree,
+            read_slots=lambda records: self.occupancy(records, alive=alive),
+            read_observation=read_observation,
+            request_kwargs=request_kwargs,
+            markers=markers,
+            send=send,
+            alive=alive,
+            command_timeout=command_timeout,
+            finalize_handoff=finalize_handoff,
+        )
+
+    def release_continued_context(
+        self,
+        session_id: str,
+        *,
+        decision_id: str,
+        now: str,
+        publish_attention: Callable,
+        stop: Optional[Callable] = None,
+        alive: Optional[Callable] = None,
+    ) -> ContextRelease:
+        """Release a session this controller runs, by the category it proves now.
+
+        A pass-through, like the rest. The category rule, the refusal of a marked
+        session to the retirement gate, the supervised route, and the durable
+        human-attention record that route owes a person all stay in the accepted
+        lifecycle. What this adds is that the slot released is one this controller
+        was counting.
+
+        `publish_attention` is the caller's durable publication act, for the same
+        reason every other durable read and write reaches the lifecycle as a
+        collaborator: nothing under `session_lifecycle` opens a repository, and a
+        controller that wrote one on its behalf would be moving that boundary rather
+        than composing across it.
+        """
+        return release_continued_context(
+            self.store,
+            self.registry,
+            session_id=session_id,
+            decision_id=decision_id,
+            now=now,
+            publish_attention=publish_attention,
+            stop=stop,
+            alive=alive,
         )
 
     def dispatch(

@@ -5,13 +5,15 @@ import dataclasses
 import inspect
 import json
 import subprocess
+import sys
 import tempfile
+import textwrap
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from ai_dev_flow import claude_worker, session_lifecycle, workspaces
+from ai_dev_flow import claude_worker, manager_controller, session_lifecycle, workspaces
 from ai_dev_flow.authorization import (
     ACTION_CONTINUE,
     ACTION_LAUNCH,
@@ -4174,23 +4176,14 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class ReplacementLaunchTests(RotationHarness):
-    """retired old context -> A REPLACEMENT LAUNCHED AND BOUND, and nothing past it.
+class ReplacementHarness(RotationHarness):
+    """The fixtures a rotation swap is performed on: the world, the readers, the states.
 
-    Checkpoint 63 implemented the first half of D9's terminate-and-replace sentence
-    and stopped, launching nothing. This is the second half. It is deliberately not
-    the third: a successor is brought into existence and bound to the rail, and no
-    work is invoked through it, because resuming from the durable handoff is a
-    separate act that these cases prove is not reachable from here.
-
-    The fixtures are the accepted retirement ones, on purpose: the same launch, the
-    same real threshold mark, the same published handoff, the same injected handle
-    and the same process group modelled as a value these tests move. So a swap
-    permitted here is permitted on exactly the facts a retirement was permitted on
-    there, and a process proven gone is proven by an observation the code took
-    rather than by a report it was handed.
-
-    No case starts a real process.
+    Moved verbatim out of `ReplacementLaunchTests` so the continuation cases are
+    composed from exactly the fixtures a replacement is, rather than from a second
+    set that could drift from them -- the same move `RotationHarness` records above,
+    and for the same reason. No assertion moved with it: every case that was in
+    `ReplacementLaunchTests` is still in it, unchanged.
     """
 
     RETIREMENT_CLOCK = "2026-08-26T12:10:03Z"
@@ -4424,6 +4417,26 @@ class ReplacementLaunchTests(RotationHarness):
         self.assertIsNotNone(self.registry.get(SESSION))
         self.assertTrue(self.group_alive[self.PREDECESSOR_PGID])
         self.assertEqual(self._slots().occupants, (SESSION,))
+
+
+class ReplacementLaunchTests(ReplacementHarness):
+    """retired old context -> A REPLACEMENT LAUNCHED AND BOUND, and nothing past it.
+
+    Checkpoint 63 implemented the first half of D9's terminate-and-replace sentence
+    and stopped, launching nothing. This is the second half. It is deliberately not
+    the third: a successor is brought into existence and bound to the rail, and no
+    work is invoked through it, because resuming from the durable handoff is a
+    separate act that these cases prove is not reachable from here.
+
+    The fixtures are the accepted retirement ones, on purpose: the same launch, the
+    same real threshold mark, the same published handoff, the same injected handle
+    and the same process group modelled as a value these tests move. So a swap
+    permitted here is permitted on exactly the facts a retirement was permitted on
+    there, and a process proven gone is proven by an observation the code took
+    rather than by a report it was handed.
+
+    No case starts a real process.
+    """
 
     # -- A. retired -> replacement launched and bound --------------------------
 
@@ -4997,39 +5010,77 @@ class ReplacementLaunchTests(RotationHarness):
         Path(holder.name, "wired.py").write_text(source, encoding="utf-8")
         return holder.name
 
-    def test_case_g_no_production_continue_session_caller_is_created_here(self) -> None:
-        """Checkpoint 66 does not create the first one, so the D8 delivery
-        obligation is not triggered and carries to the slice that does.
+    def test_case_g_the_one_production_continue_session_caller_is_named(self) -> None:
+        """Restated, because the world this asserted a fact about has changed.
 
-        `category-unprovable` is reachable only through degraded observation, and
-        the sole degrader is `continue_session`'s failure path. While no production
-        code calls it, no production supervised teardown can occur.
+        Checkpoints 66 and 67 recorded that `continue_session` had no production
+        caller, and that this was why the D8 delivery obligation was not yet
+        triggered. Checkpoint 68 creates the first one, so that sentence is no
+        longer true and is replaced by the stronger one it becomes: there is
+        exactly one, it is in the lifecycle, and it is the continuation route.
+
+        Pinning *which* function holds it is what keeps this discriminating. A
+        bare non-empty check would go on passing if a second, unrelated caller
+        appeared somewhere; this fails on that, and it fails on the caller moving
+        or being renamed, so the antecedent of the obligation below stays a fact
+        somebody has to restate rather than one that quietly drifts.
         """
-        self.assertEqual(self._production_callers("continue_session"), {})
+        self.assertEqual(
+            self._production_callers("continue_session"), {"session_lifecycle.py": 1}
+        )
+        self.assertEqual(
+            sorted(
+                container
+                for _path, called, container in self._call_sites()
+                if called == "continue_session"
+            ),
+            ["continue_from_durable_state"],
+        )
 
     def test_case_g_the_counter_agrees_with_the_accepted_finding(self) -> None:
         """What "production caller" means here is what checkpoint 65 accepted.
 
-        The accepted checkpoint-65 finding records that `supervised_teardown`,
-        `retire_old_context` and `continue_session` all have no production caller
-        and that the rotation surface is unwired. A plain count contradicts that on
-        two of the three: it reports the controller's own re-export as a caller of
-        `supervised_teardown`, and `replace_old_context`'s internal use as a caller
-        of `retire_old_context` -- while `replace_old_context` is itself reachable
-        from nothing. Both are calls inside the surface, not ways into it.
+        The accepted checkpoint-65 finding recorded that the whole rotation surface
+        was unwired. Checkpoint 68 wires two of the four and leaves two exactly as
+        they were, so the finding survives on the half it still describes, and this
+        states both halves rather than either alone.
+
+        The reconciliation itself is unchanged and still visible here. A plain count
+        reports the controller's own same-name re-export of `supervised_teardown`
+        as a caller and `replace_old_context`'s internal use as a caller of
+        `retire_old_context`; the reconciled count drops a call made from inside a
+        surface route nothing drives. That is why `retire_old_context` still
+        reconciles to nothing -- `replace_old_context` genuinely calls it, and
+        `replace_old_context` is still reachable from nothing -- while
+        `supervised_teardown`'s re-export now counts, because checkpoint 68 gave
+        the route a driven caller and a driven route's re-export is a real second
+        way in.
         """
-        for route in ("continue_session", "supervised_teardown",
-                      "retire_old_context", "replace_old_context"):
-            self.assertEqual(self._production_callers(route), {}, route)
-        # And the plain count is what it was, so the reconciliation is visible
-        # rather than asserted: these are the two answers that disagreed.
         self.assertEqual(
-            self._every_call_site("supervised_teardown"), {"manager_controller.py": 1}
+            self._production_callers("continue_session"), {"session_lifecycle.py": 1}
+        )
+        self.assertEqual(
+            self._production_callers("supervised_teardown"),
+            {"manager_controller.py": 1, "session_lifecycle.py": 1},
+        )
+        # Untouched by this slice, and still the accepted checkpoint-65 finding.
+        for route in ("retire_old_context", "replace_old_context"):
+            self.assertEqual(self._production_callers(route), {}, route)
+        # And the plain counts, so the reconciliation stays visible rather than
+        # asserted: these are the answers that disagree with the reconciled ones.
+        self.assertEqual(
+            self._every_call_site("supervised_teardown"),
+            {"manager_controller.py": 1, "session_lifecycle.py": 1},
         )
         self.assertEqual(
             self._every_call_site("retire_old_context"), {"session_lifecycle.py": 1}
         )
-        self.assertEqual(self._every_call_site("continue_session"), {})
+        self.assertEqual(
+            self._every_call_site("replace_old_context"), {"manager_controller.py": 1}
+        )
+        self.assertEqual(
+            self._every_call_site("continue_session"), {"session_lifecycle.py": 1}
+        )
 
     def test_case_g_a_thin_re_export_is_not_a_production_caller(self) -> None:
         """The distinction, on the smallest source that shows it.
@@ -5053,13 +5104,16 @@ class ReplacementLaunchTests(RotationHarness):
     def test_case_g_wiring_continue_session_obliges_wiring_the_supervised_route(self) -> None:
         """The obligation, stated as something the code must keep true.
 
-        This passes today because `continue_session` has no production caller: the
-        antecedent is false, and the case above proves that rather than assuming
-        it. It will still pass when a later slice wires both. It fails if a slice
+        It passed at checkpoints 66 and 67 because `continue_session` had no
+        production caller and the antecedent was false. It passes at checkpoint 68
+        for the opposite and much stronger reason: **both** are wired, and the two
+        cases above name exactly which callers hold them. It still fails if a slice
         makes a real supervised teardown possible -- by giving `continue_session` a
         production caller -- without giving the route that reports it one, which is
-        the shape the checkpoint-65 review named as a genuine D8 failure. The two
-        cases below hold it to both halves of that.
+        the shape the checkpoint-65 review named as a genuine D8 failure; that this
+        is still true of the shipped tree, and not merely of a synthetic package,
+        is proved by removing the supervised caller from a copy of the real sources
+        in `ContinuationFromDurableStateTests`.
 
         It constrains the *caller*, not the delivery: that `human_action` reaches a
         durable human-attention record is a property of the surface that slice
@@ -5202,3 +5256,690 @@ class ReplacementLaunchTests(RotationHarness):
         self.assertEqual(outcome.owned.pgid, worker.pgid)
         self.assertEqual([entry["session_id"] for entry in sent], [SESSION])
         self.assertEqual(outcome.result["session_id"], SESSION)
+
+
+class ContinuationFromDurableStateTests(ReplacementHarness):
+    """replacement bound -> CONTINUES THE WORK FROM DURABLE STATE ALONE.
+
+    Checkpoint 66 bound a successor and sent it nothing. This is the act it stopped
+    short of, and it is the first production caller of `continue_session` -- which
+    is what finally makes `category-unprovable` reachable in production, and why
+    the same slice owes D8 its delivery.
+
+    Every case here starts from a real swap performed by the accepted
+    `replace_old_context`, on the accepted fixtures, so what is continued is a
+    successor a rotation actually bound rather than a session these cases invented.
+
+    No case starts a real process, and the one subprocess any case runs is a
+    bounded, foreground `python -c` that reads a file and exits.
+    """
+
+    DECISION_ID = "supervised-teardown-category-unprovable"
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.sent = []
+        self.attention_root = self.tmp_path / "control-plane"
+
+    # -- the world these cases observe ----------------------------------------
+
+    def _continuation_sender(self, fail=None):
+        """One resumed invocation of the successor. Records exactly what it was told."""
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            self.sent.append(
+                {"session_id": request.session_id, "mode": request.mode, "prompt": prompt}
+            )
+            if fail is not None:
+                raise fail
+            return {
+                "type": "result", "session_id": request.session_id,
+                "mode": request.mode, "subtype": "success", "is_error": False,
+                "terminal_payload": None,
+            }
+        return send
+
+    def _swap(self):
+        """A real rotation: the predecessor retired, a successor launched and bound."""
+        self._ready()
+        replacement = self._replace()
+        self.assertTrue(replacement.launched)
+        self.assertEqual(replacement.replacement.session_id, SUCCESSOR)
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertEqual(self.store.read(SUCCESSOR).state, BINDING_STATE_BOUND)
+        return replacement
+
+    def _continue(self, **overrides):
+        arguments = {
+            "session_id": SUCCESSOR,
+            "assignment": self.assignment,
+            "read_rail": self._read_rail,
+            "read_handoff": self._read_handoff,
+            "read_worktree": self._read_worktree,
+            "read_slots": self._read_slots,
+            "read_observation": self._read_observation,
+            "request_kwargs": self._request_kwargs(),
+            "send": self._continuation_sender(),
+            "alive": self._alive,
+        }
+        arguments.update(overrides)
+        return session_lifecycle.continue_from_durable_state(
+            self.store, self.registry, **arguments
+        )
+
+    def _controller(self):
+        """The production controller surface, over this test's own store and registry.
+
+        `ManagerController` reads exactly one thing from its source -- where the
+        bindings live -- so pointing it at the store these cases already hold is
+        enough to make the release below the real production path rather than a
+        direct call dressed up as one.
+        """
+        source = types.SimpleNamespace(binding_root=self.tmp_path / "controller-state")
+        controller = manager_controller.ManagerController(source, registry=self.registry)
+        self.assertIs(controller.registry, self.registry)
+        return controller
+
+    def _attention_writer(self, fail=None):
+        """The durable publication act: a real file, at the real artifact location."""
+        from ai_dev_flow import control_plane
+
+        def publish(payload):
+            if fail is not None:
+                raise fail
+            relative = control_plane.artifact_relative(
+                project=payload["project"], ticket=payload["ticket"],
+                artifact="decision", rail=payload["rail"],
+            )
+            path = self.attention_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+            return relative
+
+        return publish
+
+    def _guard(self):
+        """The accepted checkpoint-67 guard itself, not a copy of its logic.
+
+        Constructed off `ReplacementLaunchTests` so the obligation these cases
+        exercise is the shipped one, reached through the shipped
+        `_assert_wiring_obligation`. A re-implementation here could agree with the
+        guard about this tree and disagree about the next one.
+        """
+        return ReplacementLaunchTests(
+            methodName="test_case_g_wiring_continue_session_obliges_wiring_the_supervised_route"
+        )
+
+    def _shipped_copy(self):
+        """A disposable copy of the shipped package, to mutate and count."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        root = Path(session_lifecycle.__file__).parent
+        for path in sorted(root.glob("*.py")):
+            (Path(holder.name) / path.name).write_text(
+                path.read_text(encoding="utf-8"), encoding="utf-8"
+            )
+        return Path(holder.name)
+
+    # -- A. continues from the published handoff and the rail ALONE ------------
+
+    def test_case_a_a_bound_replacement_continues_from_durable_state(self) -> None:
+        self._swap()
+        outcome = self._continue()
+
+        self.assertTrue(outcome.continued)
+        self.assertEqual(outcome.session_id, SUCCESSOR)
+        self.assertEqual(outcome.reason, session_lifecycle.REASON_CONTINUATION_CONTINUED)
+        self.assertEqual([entry["session_id"] for entry in self.sent], [SUCCESSOR])
+        self.assertEqual(outcome.result["session_id"], SUCCESSOR)
+        # The successor was told the brief and nothing else.
+        self.assertEqual(self.sent[0]["prompt"], outcome.brief.prompt)
+
+    def test_case_a_the_payload_is_resolvable_by_a_fresh_reader(self) -> None:
+        """The whole of D9's "without the predecessor's transcript", proved.
+
+        The brief is rebuilt from durable state by a reader holding nothing this
+        run holds: a *new* `BindingStore` opened over the same durable root, and
+        control-plane reads of the same rail, handoff and workspace. It is given no
+        registry, no result, no terminal payload and no reference to the session
+        that produced any of them, and it resolves the identical brief.
+        """
+        self._swap()
+        outcome = self._continue()
+
+        def fresh_reader():
+            store = BindingStore(self.tmp_path / "controller-state")
+            return session_lifecycle.continuation_brief(
+                RailFacts(identifier=RAIL, status="running", rail_blob=BLOB),
+                store.read(SUCCESSOR),
+                RotationHandoffFacts(
+                    rail=RAIL, published=True, location=self.HANDOFF,
+                    publication=PUBLICATION, work_state=PRODUCT_HEAD,
+                ),
+                WorktreeFacts(
+                    worktree_id=self.worktree_id, path=str(self.workspace),
+                    clean=True, active_operation=None, head=PRODUCT_HEAD,
+                ),
+            )
+
+        self.assertEqual(fresh_reader(), outcome.brief)
+        self.assertEqual(fresh_reader().prompt, self.sent[0]["prompt"])
+
+    def test_case_a_no_field_of_the_brief_can_come_from_a_transcript(self) -> None:
+        """Structural, not careful: the resolver cannot see any of it.
+
+        `continuation_brief` takes no registry, so the one object holding this
+        session's results, events, work boundary and terminal finalization is not
+        in its signature. And `continue_from_durable_state` takes no `prompt`, so
+        what the replacement is told cannot be handed in by a caller who does hold
+        those things.
+        """
+        self.assertEqual(
+            list(inspect.signature(session_lifecycle.continuation_brief).parameters),
+            ["rail", "record", "handoff", "worktree"],
+        )
+        # No transcript-shaped state is reachable in the body. Read from the
+        # parsed function rather than from its text, so the docstring explaining
+        # why these are absent cannot defeat its own assertion.
+        tree = ast.parse(
+            textwrap.dedent(inspect.getsource(session_lifecycle.continuation_brief))
+        ).body[0]
+        names = {
+            getattr(node, "id", None) or getattr(node, "attr", None)
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Name, ast.Attribute))
+        }
+        for absent in ("registry", "result", "terminal_payload", "events",
+                       "work_boundary", "terminal_finalization", "context",
+                       "reading", "observe_context"):
+            self.assertNotIn(absent, names, absent)
+        route = inspect.signature(session_lifecycle.continue_from_durable_state)
+        self.assertNotIn("prompt", route.parameters)
+        # And nothing of the predecessor's turn reaches the successor's prompt.
+        self._swap()
+        self._continue()
+        prompt = self.sent[0]["prompt"]
+        for leaked in ("Done. Handoff below.", "Stopping here.",
+                       session_lifecycle.HANDOFF_ENVELOPE_BEGIN):
+            self.assertNotIn(leaked, prompt)
+
+    # -- B. the replacement is the one that was bound -------------------------
+
+    def test_case_b_the_continuation_acts_on_the_successor_not_the_predecessor(self) -> None:
+        self._swap()
+        outcome = self._continue()
+        self.assertEqual(outcome.brief.session_id, SUCCESSOR)
+        self.assertIn(SUCCESSOR, outcome.brief.prompt)
+        self.assertNotIn(SESSION, outcome.brief.prompt)
+        self.assertEqual([entry["session_id"] for entry in self.sent], [SUCCESSOR])
+        # The predecessor is exactly as retirement left it.
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertIsNone(self.registry.get(SESSION))
+
+    def test_case_b_no_continuation_may_claim_the_predecessors_identity(self) -> None:
+        """A continuation aimed at the retired predecessor is refused before any read."""
+        self._swap()
+        marker = len(self.observations)
+        outcome = self._continue(session_id=SESSION)
+
+        self.assertFalse(outcome.continued)
+        self.assertEqual(outcome.state, session_lifecycle.CONTINUATION_REFUSED)
+        self.assertEqual(
+            outcome.reason, session_lifecycle.REASON_CONTINUATION_CLAIMS_TERMINAL
+        )
+        self.assertIsNone(outcome.brief)
+        self.assertIsNone(outcome.result)
+        self.assertEqual(self.sent, [])
+        # Nothing was even read: the refusal precedes every observation.
+        self.assertEqual(self.observations[marker:], [])
+        # And the predecessor's binding stays terminal.
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+
+    def test_case_b_the_authorizer_is_the_second_guard_on_identity(self) -> None:
+        """Independent of the refusal above: the accepted authorizer reads the one
+        live binding on the rail for itself, so a terminal predecessor cannot be
+        the session a continuation is authorized for."""
+        self._swap()
+        decision = authorize(
+            self._observation(),
+            project="ai-dev", ticket="issue-55", rail=RAIL, role="executor",
+            expected_head=HEAD, rail_blob=BLOB, slots=self._slots(),
+            bindings=self.store.records(),
+            in_flight_session_ids=self.registry.in_flight(),
+        )
+        self.assertTrue(decision.authorized)
+        self.assertEqual(decision.action, ACTION_CONTINUE)
+        live = [r.session_id for r in self.store.records() if not r.is_terminal]
+        self.assertEqual(live, [SUCCESSOR])
+
+    # -- C. the D8 obligation is discharged -----------------------------------
+
+    def test_case_c_the_supervised_route_has_a_genuine_production_caller(self) -> None:
+        """Driven end to end, through the production controller, on the state this
+        slice creates: a real failed continuation degrades the successor's
+        observation, its rotation category becomes unprovable, and the release
+        route is then the only one that may stop it."""
+        self._swap()
+        failed = self._continue(
+            send=self._continuation_sender(fail=ClaudeRuntimeError("provider-transport-failed", "the worker channel closed mid-turn"))
+        )
+        self.assertEqual(failed.state, session_lifecycle.CONTINUATION_FAILED)
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SUCCESSOR),
+            session_lifecycle.STOP_CATEGORY_UNPROVEN,
+        )
+
+        release = self._controller().release_continued_context(
+            SUCCESSOR,
+            decision_id=self.DECISION_ID,
+            now=self.RETIREMENT_CLOCK,
+            publish_attention=self._attention_writer(),
+            stop=self._stopper(),
+            alive=self._alive,
+        )
+        self.assertEqual(release.state, session_lifecycle.RELEASE_SUPERVISED)
+        self.assertEqual(release.category, session_lifecycle.STOP_CATEGORY_UNPROVEN)
+        self.assertTrue(release.teardown.torn_down)
+        self.assertTrue(self.store.read(SUCCESSOR).is_terminal)
+        self.assertFalse(self.group_alive[self.SUCCESSOR_PGID])
+
+    def test_case_c_the_human_action_lands_as_a_durable_readable_record(self) -> None:
+        """`human_action` reaches a person, not a caller's local variable.
+
+        Durable is proved by a *fresh process*: this one exits, another one opens
+        the file it left behind and validates it with the accepted
+        `control_plane.validate_decision_record`, which is the same gate the real
+        publication path applies and the shape `queue_source.read_decisions`
+        projects. Readable is proved by comparing the text that came back out of
+        that file with the teardown's own `human_action`, character for character.
+        """
+        self._swap()
+        self._continue(
+            send=self._continuation_sender(fail=ClaudeRuntimeError("provider-transport-failed", "the worker channel closed mid-turn"))
+        )
+        release = self._controller().release_continued_context(
+            SUCCESSOR,
+            decision_id=self.DECISION_ID,
+            now=self.RETIREMENT_CLOCK,
+            publish_attention=self._attention_writer(),
+            stop=self._stopper(),
+            alive=self._alive,
+        )
+
+        path = self.attention_root / release.attention_locator
+        self.assertTrue(path.is_file())
+        self.assertIn("/rails/{0}/".format(RAIL), release.attention_locator)
+
+        # D8's list, in the bounded blocker a queue renders: all six or none.
+        blocker = release.attention["blocker"]
+        self.assertEqual(
+            sorted(blocker),
+            ["humanChange", "kind", "missingCapability", "nextAction",
+             "stateChanged", "whatFailed"],
+        )
+        self.assertIs(blocker["stateChanged"], True)
+
+        probe = (
+            "import json,sys;"
+            "from pathlib import Path;"
+            "sys.path.insert(0, sys.argv[1]);"
+            "from ai_dev_flow import control_plane;"
+            "payload = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'));"
+            "control_plane.validate_decision_record(payload);"
+            "sys.stdout.write(payload['explanation'])"
+        )
+        completed = subprocess.run(
+            [sys.executable, "-c", probe,
+             str(Path(session_lifecycle.__file__).parent.parent), str(path)],
+            check=False, text=True, encoding="utf-8", timeout=120,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        # The exact bytes a person reads are the exact bytes the route produced.
+        self.assertEqual(completed.stdout, release.teardown.human_action)
+        self.assertIn("rail {0}".format(RAIL), completed.stdout)
+
+    def test_case_c_a_record_that_cannot_be_made_durable_is_not_reported_as_done(self) -> None:
+        """Fail-closed on the delivery itself, and never silently."""
+        self._swap()
+        self._continue(
+            send=self._continuation_sender(fail=ClaudeRuntimeError("provider-transport-failed", "the worker channel closed mid-turn"))
+        )
+        with self.assertRaises(LifecycleError) as raised:
+            self._controller().release_continued_context(
+                SUCCESSOR,
+                decision_id=self.DECISION_ID,
+                now=self.RETIREMENT_CLOCK,
+                publish_attention=self._attention_writer(fail=OSError("read-only")),
+                stop=self._stopper(),
+                alive=self._alive,
+            )
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_ATTENTION_NOT_DURABLE
+        )
+        # Nothing of what a person needs is lost: the whole `human_action` is
+        # carried in the refusal rather than dropped with the failed publication.
+        detail = raised.exception.detail
+        self.assertIn("The record's text, in full, is:", detail)
+        self.assertIn(SUCCESSOR, detail)
+        self.assertIn("a human should check rail {0}".format(RAIL), detail)
+        self.assertIn("D9's safe handoff was never proven", detail)
+
+    def test_case_c_routine_work_still_raises_no_human_attention_item(self) -> None:
+        """D8 exempts routine work, and the release route honours that."""
+        self._swap()
+        self.registry.observe_context_events(
+            SUCCESSOR,
+            [{"event": EVENT_COMPACTION_OBSERVED, "session_id": SUCCESSOR,
+              "uuid": "10000000-0000-4000-8000-000000000000"}],
+        )
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SUCCESSOR),
+            session_lifecycle.STOP_CATEGORY_NON_ROTATION,
+        )
+        published = []
+        release = self._controller().release_continued_context(
+            SUCCESSOR,
+            decision_id=self.DECISION_ID,
+            now=self.RETIREMENT_CLOCK,
+            publish_attention=lambda payload: published.append(payload),
+            stop=self._stopper(),
+            alive=self._alive,
+        )
+        self.assertEqual(release.state, session_lifecycle.RELEASE_STOPPED)
+        self.assertIsNone(release.attention)
+        self.assertIsNone(release.teardown)
+        self.assertEqual(published, [])
+
+    # -- D. the checkpoint-67 guard passes for the RIGHT REASON ----------------
+
+    def test_case_d_the_rotation_surface_list_is_exactly_what_it_was(self) -> None:
+        """Prohibition one, asserted rather than promised.
+
+        The checkpoint-67 reviewer reproduced that adding one route name to this
+        frozenset takes `continue_session` from wired to `{}` and mutes the guard.
+        This slice added none, and pins the set so that a later slice which does
+        must also visibly override this line.
+        """
+        self.assertEqual(
+            self._guard().ROTATION_SURFACE,
+            frozenset({
+                "continue_session",
+                "supervised_teardown",
+                "retire_old_context",
+                "replace_old_context",
+            }),
+        )
+
+    def test_case_d_the_guard_would_still_fire_without_the_supervised_caller(self) -> None:
+        """Prohibition two, proved by mutating the real shipped sources.
+
+        A dead caller would satisfy the guard and prove nothing. So the supervised
+        caller is *removed* from a copy of the shipped package and the shipped
+        guard is pointed at the copy: `continue_session` is still wired, the
+        supervised route is not, and the obligation fails. The guard is therefore
+        green on the real tree because both are wired, and not because the
+        antecedent went away or a name was excused.
+        """
+        guard = self._guard()
+        package = self._shipped_copy()
+
+        # Control: the unmutated copy is the shipped tree, and the guard is green.
+        self.assertEqual(
+            guard._production_callers("continue_session", package),
+            {"session_lifecycle.py": 1},
+        )
+        self.assertEqual(
+            guard._production_callers("supervised_teardown", package),
+            {"manager_controller.py": 1, "session_lifecycle.py": 1},
+        )
+        guard._assert_wiring_obligation(package)
+
+        # The mutation: the one production call to the supervised route, removed.
+        module = package / "session_lifecycle.py"
+        source = module.read_text(encoding="utf-8")
+        call = (
+            "    teardown = supervised_teardown(\n"
+            "        store, registry, record, now=now, stop=stop, alive=alive\n"
+            "    )\n"
+        )
+        self.assertEqual(source.count(call), 1)
+        module.write_text(source.replace(call, "    teardown = None\n"), encoding="utf-8")
+
+        # The antecedent is untouched; only the consequent went away.
+        self.assertEqual(
+            guard._production_callers("continue_session", package),
+            {"session_lifecycle.py": 1},
+        )
+        self.assertEqual(guard._production_callers("supervised_teardown", package), {})
+        with self.assertRaises(AssertionError) as raised:
+            guard._assert_wiring_obligation(package)
+        self.assertIn("human-attention record", str(raised.exception))
+
+    def test_case_d_the_supervised_caller_is_one_something_actually_drives(self) -> None:
+        """And it is not merely present: the production controller reaches it.
+
+        The path is the one the slice itself creates -- a failed continuation, a
+        degraded observation, an unprovable category -- and it ends in a process
+        group proven gone. A caller nothing calls could not produce any of this.
+        """
+        self._swap()
+        self._continue(
+            send=self._continuation_sender(fail=ClaudeRuntimeError("provider-transport-failed", "the worker channel closed mid-turn"))
+        )
+        release = self._controller().release_continued_context(
+            SUCCESSOR,
+            decision_id=self.DECISION_ID,
+            now=self.RETIREMENT_CLOCK,
+            publish_attention=self._attention_writer(),
+            stop=self._stopper(),
+            alive=self._alive,
+        )
+        self.assertIsInstance(release.teardown, session_lifecycle.SupervisedTeardown)
+        self.assertEqual(
+            release.teardown.reason, session_lifecycle.REASON_SUPERVISED_TEARDOWN
+        )
+        self.assertTrue(release.teardown.stopped.process_group_gone)
+        self.assertIn(("stop", self.SUCCESSOR_PGID), self.observations)
+
+    # -- E. a failed continuation is fail-closed ------------------------------
+
+    def test_case_e_a_failed_continuation_leaves_the_successor_continuable(self) -> None:
+        self._swap()
+        before = sorted(record.session_id for record in self.store.records())
+        marker = len(self.observations)
+        outcome = self._continue(
+            send=self._continuation_sender(fail=ClaudeRuntimeError("provider-transport-failed", "the worker channel closed mid-turn"))
+        )
+
+        self.assertFalse(outcome.continued)
+        self.assertEqual(outcome.state, session_lifecycle.CONTINUATION_FAILED)
+        self.assertEqual(
+            outcome.reason, session_lifecycle.REASON_CONTINUATION_INVOCATION_FAILED
+        )
+        self.assertIsNone(outcome.result)
+        self.assertIsNotNone(outcome.brief)
+
+        # Truthfully continuable: bound, owned, not in flight, nothing credited.
+        self.assertEqual(self.store.read(SUCCESSOR).state, BINDING_STATE_BOUND)
+        self.assertFalse(self.store.read(SUCCESSOR).is_terminal)
+        self.assertIsNotNone(self.registry.get(SUCCESSOR))
+        self.assertNotIn(SUCCESSOR, self.registry.in_flight())
+        self.assertIsNone(self.registry.terminal_finalization(SUCCESSOR))
+        # It does not silently degrade: the category can no longer be established,
+        # and the outcome names the only route that may act on that.
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SUCCESSOR),
+            session_lifecycle.STOP_CATEGORY_UNPROVEN,
+        )
+        self.assertIn("release_continued_context", outcome.next_action)
+        # And nothing was launched, bound or stopped by the continuation. The
+        # window starts after the swap, whose retirement legitimately stopped the
+        # predecessor a moment earlier.
+        self.assertEqual(
+            sorted(record.session_id for record in self.store.records()), before
+        )
+        self.assertEqual(
+            [entry for entry in self.observations[marker:] if entry[0] in ("stop", "start")],
+            [],
+        )
+
+    def test_case_e_a_failed_continuation_can_be_continued_again(self) -> None:
+        """"Truthfully continuable" means it: the same route resumes it."""
+        self._swap()
+        self._continue(
+            send=self._continuation_sender(fail=ClaudeRuntimeError("provider-transport-failed", "the worker channel closed mid-turn"))
+        )
+        again = self._continue()
+        self.assertTrue(again.continued)
+        self.assertEqual([entry["session_id"] for entry in self.sent], [SUCCESSOR, SUCCESSOR])
+        self.assertEqual(self.sent[0]["prompt"], self.sent[1]["prompt"])
+
+    def test_case_e_an_unresolvable_brief_sends_nothing(self) -> None:
+        """No published handoff means nothing to point a replacement at."""
+        self._swap()
+        with self.assertRaises(LifecycleError) as raised:
+            self._continue(
+                read_handoff=lambda: self._handoff(published=False, publication=None)
+            )
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_HANDOFF_NOT_PUBLISHED
+        )
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.store.read(SUCCESSOR).state, BINDING_STATE_BOUND)
+
+    # -- F. call-site read discipline -----------------------------------------
+
+    def test_case_f_no_fact_can_be_handed_to_this_route(self) -> None:
+        self._swap()
+        for carried in ("rail", "handoff", "worktree", "slots", "decision", "record",
+                        "brief", "prompt", "observation", "readiness", "category"):
+            with self.assertRaises(TypeError):
+                self._continue(**{carried: object()})
+        for carried in ("category", "teardown", "record", "attention"):
+            with self.assertRaises(TypeError):
+                session_lifecycle.release_continued_context(
+                    self.store, self.registry, session_id=SUCCESSOR,
+                    decision_id=self.DECISION_ID, now=self.RETIREMENT_CLOCK,
+                    publish_attention=lambda payload: "", **{carried: object()}
+                )
+
+    def test_case_f_a_stale_fact_handed_to_a_gate_is_refused(self) -> None:
+        """Checkpoint 63 made a stale verdict unrepresentable; inputs stay
+        caller-supplied, and this is where a stale one stops."""
+        self._swap()
+        for reader, reason in (
+            ({"read_rail": lambda: self._rail(rail_blob=OTHER_BLOB)},
+             session_lifecycle.REASON_ITERATION_DRIFT),
+            ({"read_handoff": lambda: self._handoff(publication=NEXT_PUBLICATION,
+                                                    work_state=NEXT_PRODUCT_HEAD)},
+             session_lifecycle.REASON_HANDOFF_NOT_CURRENT),
+            ({"read_worktree": lambda: self._worktree(head=NEXT_PRODUCT_HEAD)},
+             session_lifecycle.REASON_HANDOFF_NOT_CURRENT),
+            ({"read_worktree": lambda: self._worktree(clean=False)},
+             session_lifecycle.REASON_WORKTREE_INCOHERENT),
+            ({"read_rail": lambda: self._rail(identifier=OTHER_RAIL)},
+             session_lifecycle.REASON_SCOPE_MISMATCH),
+        ):
+            with self.assertRaises(LifecycleError) as raised:
+                self._continue(**reader)
+            self.assertEqual(raised.exception.reason, reason)
+            self.assertEqual(self.sent, [])
+
+    def test_case_f_the_call_site_reads_each_fact_once_where_it_is_used(self) -> None:
+        """Stated as something the source must keep true, not asserted in prose.
+
+        Every reader is called exactly once, and the control-plane observation is
+        never even bound to a name -- it is read inside the `authorize` call that
+        consumes it, so there is no local for a later line to reuse.
+        """
+        source = inspect.getsource(session_lifecycle.continue_from_durable_state)
+        for reader in ("read_rail()", "read_handoff()", "read_worktree()",
+                       "read_observation()", "read_slots(records)"):
+            self.assertEqual(source.count(reader), 1, reader)
+        self.assertIn("decision = authorize(\n        read_observation(),", source)
+        self.assertEqual(source.count("store.read(session_id)"), 1)
+        # The category the release route acts on is read the same way.
+        release = inspect.getsource(session_lifecycle.release_continued_context)
+        self.assertEqual(release.count("stop_category(registry, session_id)"), 1)
+        self.assertEqual(release.count("store.read(session_id)"), 1)
+
+    # -- G. checkpoints 59 to 67 intact ---------------------------------------
+
+    def test_case_g_the_continuation_route_launches_and_terminates_nothing(self) -> None:
+        source = inspect.getsource(session_lifecycle.continue_from_durable_state)
+        for absent in ("reserve_binding", "_reserve_and_bind", "start_worker",
+                       "stop_session", "supervised_teardown", "retire_old_context",
+                       "replace_old_context", "_RetirementAuthorization", "_retirement"):
+            self.assertEqual(source.count(absent), 0, absent)
+        parameters = list(
+            inspect.signature(session_lifecycle.continue_from_durable_state).parameters
+        )
+        for absent in ("start", "stop", "reference", "package_root", "new_session_id"):
+            self.assertNotIn(absent, parameters)
+
+    def test_case_g_new_bindings_still_come_into_existence_in_exactly_one_place(self) -> None:
+        tree = ast.parse(Path(session_lifecycle.__file__).read_text(encoding="utf-8"))
+        reservers = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "reserve_binding"
+        ]
+        self.assertEqual(len(reservers), 1)
+        module = Path(session_lifecycle.__file__).read_text(encoding="utf-8")
+        self.assertEqual(module.count("_RetirementAuthorization("), 1)
+
+    def test_case_g_the_rotation_chokepoint_still_stands_beneath_the_release(self) -> None:
+        """A marked session is still refused to the retirement gate, whoever asks."""
+        self._swap()
+        self._mark(session_id=SUCCESSOR)
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SUCCESSOR),
+            session_lifecycle.STOP_CATEGORY_ROTATION,
+        )
+        marker = len(self.observations)
+        release = self._controller().release_continued_context(
+            SUCCESSOR,
+            decision_id=self.DECISION_ID,
+            now=self.RETIREMENT_CLOCK,
+            publish_attention=self._attention_writer(),
+            stop=self._stopper(),
+            alive=self._alive,
+        )
+        self.assertEqual(release.state, session_lifecycle.RELEASE_REFUSED)
+        self.assertEqual(
+            release.reason, session_lifecycle.REASON_ROTATION_REQUIRES_RETIREMENT
+        )
+        self.assertIn("retire_old_context", release.detail)
+        self.assertEqual(
+            [entry for entry in self.observations[marker:] if entry[0] == "stop"], []
+        )
+        self.assertFalse(self.store.read(SUCCESSOR).is_terminal)
+        self.assertIsNone(release.attention)
+
+    def test_case_g_the_accepted_post_turn_finalization_still_governs(self) -> None:
+        """Checkpoint 62's credit rule is unchanged: the continuation route hands
+        the finalizer through and credits nothing itself."""
+        self._swap()
+        published = _PublishedHandoff()
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            self.sent.append({"session_id": request.session_id, "prompt": prompt})
+            return {
+                "type": "result", "session_id": request.session_id,
+                "mode": request.mode, "subtype": "success", "is_error": False,
+                "terminal_payload": self._envelope(NEXT_PUBLICATION),
+            }
+
+        outcome = self._continue(
+            send=send,
+            finalize_handoff=session_lifecycle.terminal_finalizer(
+                publish=lambda payload: published.publish(payload, self.product_head) or payload
+            ),
+        )
+        self.assertTrue(outcome.continued)
+        finalization = self.registry.terminal_finalization(SUCCESSOR)
+        self.assertIsNotNone(finalization)
+        self.assertEqual(finalization.publication, NEXT_PUBLICATION)
+        self.assertEqual(published.value, NEXT_PUBLICATION)
+        source = inspect.getsource(session_lifecycle.continue_from_durable_state)
+        self.assertEqual(source.count("finalize_terminal_handoff"), 0)
