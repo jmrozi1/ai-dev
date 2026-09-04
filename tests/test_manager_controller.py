@@ -47,7 +47,9 @@ from ai_dev_flow.manager_controller import (
 from ai_dev_flow.queue_source import REASON_OWNERSHIP_CONTRADICTORY, QueueSourceError
 from ai_dev_flow.session_binding import BINDING_STATE_RESERVED, BindingStore
 from ai_dev_flow.session_lifecycle import (
+    REASON_CATEGORY_IS_PROVABLE,
     REASON_ROTATION_REQUIRES_RETIREMENT,
+    REASON_SUPERVISED_TEARDOWN,
     LifecycleError,
     ownership_evidence,
     STATE_DISCONNECTED,
@@ -405,6 +407,141 @@ class ControllerStopCategoryTests(LifecycleTestBase):
         self.assertEqual(source.count("stop_session("), 1)
         self.assertNotIn("shutdown_worker", source)
         self.assertNotIn("os.kill", source)
+
+
+class ControllerSupervisedTeardownTests(LifecycleTestBase):
+    """The third route, through the controller that holds the handle and the count.
+
+    A session whose rotation category cannot be established was refused by every
+    door, and a refusal that can never succeed holds one of D6's six slots for the
+    life of the controller. This is the door that releases it -- and the cases below
+    are as much about what it still refuses.
+    """
+
+    def _controller(self, registry=None) -> ManagerController:
+        source = QueueSourceContext(
+            control_plane=self.tmp_path / "coordination",
+            project="ai-dev",
+            ticket="issue-55",
+            binding_root=self.store.root,
+        )
+        return ManagerController(
+            source, registry=self.registry if registry is None else registry
+        )
+
+    def _launch_through(self, controller: ManagerController):
+        start, worker = self._starter()
+        send, _sent = self._sender()
+        return controller.launch(
+            self._decision(),
+            self.assignment,
+            reference=self.reference,
+            request_kwargs=self._request_kwargs(),
+            prompt="do the work",
+            package_root=self.repo_root,
+            now=lambda: self.clock,
+            new_session_id=lambda: LIFECYCLE_SESSION,
+            start=start,
+            send=send,
+        )
+
+    def _mark(self, controller, count=6):
+        controller.registry.observe_context_events(
+            LIFECYCLE_SESSION,
+            [
+                {"event": EVENT_COMPACTION_OBSERVED,
+                 "session_id": LIFECYCLE_SESSION,
+                 "uuid": "{0:08d}-0000-4000-8000-000000000000".format(index)}
+                for index in range(count)
+            ],
+        )
+
+    def _degrade(self, controller):
+        """The only accepted way a category becomes unprovable: a failed invocation."""
+        controller.registry.observe_failed_invocation(
+            LIFECYCLE_SESSION, "the invocation watching this session did not finish"
+        )
+
+    def _stop_arguments(self):
+        probes = []
+
+        def alive(pgid):
+            probes.append(pgid)
+            return len(probes) == 1
+
+        return {
+            "stop": lambda handle: {"process_group_gone": True, "graceful": True,
+                                    "exit_code": 0},
+            "alive": alive,
+        }
+
+    # -- the slot this controller was holding, released -------------------------
+
+    def test_the_controller_releases_the_slot_of_an_unprovable_session(self) -> None:
+        """D6 accounting, proven through the production reduction the page draws."""
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        self._degrade(controller)
+        self.assertEqual(controller.agent_count(alive=ALWAYS_ALIVE)["current"], 1)
+
+        result = controller.supervised_teardown(
+            outcome.binding, now="2026-08-26T12:10:03Z", **self._stop_arguments()
+        )
+        self.assertTrue(result.torn_down)
+        self.assertEqual(result.reason, REASON_SUPERVISED_TEARDOWN)
+        self.assertTrue(self.store.read(LIFECYCLE_SESSION).is_terminal)
+        self.assertEqual(controller.owned_session_ids(), ())
+        count = controller.agent_count(alive=ALWAYS_ALIVE)
+        self.assertEqual(count["current"], 0)
+        self.assertIsNone(count["reason"])
+        self.assertEqual(count["permitted"], CONCURRENCY_CEILING_DEFAULT)
+
+    # -- and everything it still refuses ---------------------------------------
+
+    def test_the_controller_refuses_a_marked_session_to_the_retirement_gate(self) -> None:
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        self._mark(controller)
+        with self.assertRaises(LifecycleError) as raised:
+            controller.supervised_teardown(
+                outcome.binding, now="2026-08-26T12:10:03Z", **self._stop_arguments()
+            )
+        self.assertEqual(
+            raised.exception.reason, REASON_ROTATION_REQUIRES_RETIREMENT
+        )
+        self.assertFalse(self.store.read(LIFECYCLE_SESSION).is_terminal)
+        self.assertEqual(controller.owned_session_ids(), (LIFECYCLE_SESSION,))
+        self.assertEqual(controller.agent_count(alive=ALWAYS_ALIVE)["current"], 1)
+
+    def test_the_controller_refuses_a_provable_category_to_the_accepted_teardown(self) -> None:
+        controller = self._controller()
+        outcome = self._launch_through(controller)
+        with self.assertRaises(LifecycleError) as raised:
+            controller.supervised_teardown(
+                outcome.binding, now="2026-08-26T12:10:03Z", **self._stop_arguments()
+            )
+        self.assertEqual(raised.exception.reason, REASON_CATEGORY_IS_PROVABLE)
+        self.assertFalse(self.store.read(LIFECYCLE_SESSION).is_terminal)
+        stopped = controller.stop(outcome.binding, **self._stop_arguments())
+        self.assertTrue(stopped.process_group_gone)
+
+    def test_the_controller_adds_no_route_of_its_own_to_a_supervised_teardown(self) -> None:
+        """A pass-through, like `stop`: one call, to the accepted lifecycle."""
+        source = inspect.getsource(
+            controller_module.ManagerController.supervised_teardown
+        )
+        # Its own definition, and exactly one call: the accepted lifecycle route.
+        self.assertEqual(source.count("supervised_teardown("), 2)
+        self.assertEqual(source.count("return supervised_teardown("), 1)
+        self.assertNotIn("shutdown_worker", source)
+        self.assertNotIn("os.kill", source)
+        self.assertNotIn("stop_category", source)
+        self.assertEqual(
+            [name for name in inspect.signature(
+                controller_module.ManagerController.supervised_teardown
+            ).parameters if name.startswith("_")],
+            [],
+        )
 
 
 class ControllerContextLifecycleTests(LifecycleTestBase):

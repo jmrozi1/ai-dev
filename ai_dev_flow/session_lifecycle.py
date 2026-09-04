@@ -108,6 +108,8 @@ REASON_ROTATION_HANDOFF_ESTABLISHED = "durable-handoff-established"
 REASON_OLD_CONTEXT_RETIRED = "old-context-retired"
 REASON_ROTATION_REQUIRES_RETIREMENT = "rotation-requires-retirement-gate"
 REASON_STOP_CATEGORY_UNPROVEN = "stop-category-unprovable"
+REASON_SUPERVISED_TEARDOWN = "supervised-teardown-category-unprovable"
+REASON_CATEGORY_IS_PROVABLE = "stop-category-provable"
 
 # What one post-turn finalization attempt says about itself. These are reported
 # facts on the invocation's own result, never durable state and never authority:
@@ -1235,55 +1237,40 @@ def _authorizes(authorization: Any, session_id: str) -> bool:
     )
 
 
-def stop_session(
+def _stop_owned_process(
     store: BindingStore,
     registry: SessionRegistry,
     record: BindingRecord,
+    owned: OwnedSession,
     *,
     stop: Optional[Callable] = None,
     alive: Optional[Callable] = None,
     _retirement: Any = None,
 ) -> StopOutcome:
-    """Stop the exact owned process, prove it is gone, and only then terminalize.
+    """End one proven-owned process group, prove it gone, and only then terminalize.
 
-    Unbinding first would leave a terminal record asserting something about a
-    process that might still be running, which is the one claim this system must
-    never make.
+    Module-private, and the only place in this module that destroys anything. Every
+    route that stops a session -- ordinary teardown, the retirement gate, and the
+    supervised teardown of a session whose category cannot be established -- reaches
+    termination through here, which is exactly why the rotation refusal lives here
+    rather than in any of them. A route that forgot to ask, or a route added later
+    that never thought to, still cannot stop a marked session: the primitive asks
+    again, for itself, immediately before the stopper.
 
-    Non-rotation teardown only. Whether this stop is a rotation is decided by the
-    session's own mark, read here rather than declared by the caller: a marked
-    session is refused and must come through `retire_old_context`, and a session
-    whose category cannot be established is refused too. `_retirement` is private
-    and is the retirement gate's own authorization for this one call; there is no
-    public way to obtain one, and it is not a way for a caller to assert anything.
+    It re-reads the category from the registry rather than being handed one, for the
+    same reason `stop_session` reads it in-call: a category carried across a seam is
+    a caller's claim about a session, and this module trusts none. The caller has
+    already proven ownership -- that is what `owned` is -- so nothing here re-proves
+    it, and nothing here is reached by a session this controller cannot hold.
     """
-    if record.is_terminal:
-        raise LifecycleError(
-            REASON_BINDING_TERMINAL,
-            "session {0} is already {1}.".format(record.session_id, record.state),
-        )
-    owned = require_owned(registry, record, alive=alive)
-    # Category before consequence. Ownership is proven first because a session
-    # nobody can prove they hold is not actionable by any route; the category is
-    # then read fresh from the registry, and both refusals below precede the
-    # stopper, so neither can leave a half-stopped session behind.
-    category = stop_category(registry, record.session_id)
-    if category == STOP_CATEGORY_ROTATION and not _authorizes(
-        _retirement, record.session_id
+    if stop_category(registry, record.session_id) == STOP_CATEGORY_ROTATION and (
+        not _authorizes(_retirement, record.session_id)
     ):
         raise LifecycleError(
             REASON_ROTATION_REQUIRES_RETIREMENT,
             "session {0} is marked for rotation, so stopping it is a rotation and "
             "not teardown; it may only be stopped through `retire_old_context`, "
             "which proves a safe handoff was left behind first. Nothing was "
-            "stopped and the binding stays nonterminal.".format(record.session_id),
-        )
-    if category == STOP_CATEGORY_UNPROVEN:
-        raise LifecycleError(
-            REASON_STOP_CATEGORY_UNPROVEN,
-            "session {0} cannot be shown to be unmarked, so this stop cannot "
-            "establish that it is teardown rather than a rotation. An unprovable "
-            "category is refused rather than treated as unmarked. Nothing was "
             "stopped and the binding stays nonterminal.".format(record.session_id),
         )
     stopper = stop if stop is not None else shutdown_worker
@@ -1313,6 +1300,56 @@ def stop_session(
         graceful=bool(report.get("graceful")),
         exit_code=report.get("exit_code"),
         process_group_gone=True,
+    )
+
+
+def stop_session(
+    store: BindingStore,
+    registry: SessionRegistry,
+    record: BindingRecord,
+    *,
+    stop: Optional[Callable] = None,
+    alive: Optional[Callable] = None,
+    _retirement: Any = None,
+) -> StopOutcome:
+    """Stop the exact owned process, prove it is gone, and only then terminalize.
+
+    Unbinding first would leave a terminal record asserting something about a
+    process that might still be running, which is the one claim this system must
+    never make.
+
+    Non-rotation teardown only. Whether this stop is a rotation is decided by the
+    session's own mark, read here rather than declared by the caller: a marked
+    session is refused and must come through `retire_old_context`, and a session
+    whose category cannot be established is refused too, and must come through
+    `supervised_teardown`, which stops it while reporting the ambiguity rather than
+    calling it teardown. `_retirement` is private and is the retirement gate's own
+    authorization for this one call; there is no public way to obtain one, and it is
+    not a way for a caller to assert anything.
+    """
+    if record.is_terminal:
+        raise LifecycleError(
+            REASON_BINDING_TERMINAL,
+            "session {0} is already {1}.".format(record.session_id, record.state),
+        )
+    owned = require_owned(registry, record, alive=alive)
+    # Category before consequence. Ownership is proven first because a session
+    # nobody can prove they hold is not actionable by any route; the category is
+    # then read fresh from the registry, and the refusal below precedes the stopper,
+    # as does the rotation refusal the primitive makes for itself, so neither can
+    # leave a half-stopped session behind.
+    if stop_category(registry, record.session_id) == STOP_CATEGORY_UNPROVEN:
+        raise LifecycleError(
+            REASON_STOP_CATEGORY_UNPROVEN,
+            "session {0} cannot be shown to be unmarked, so this stop cannot "
+            "establish that it is teardown rather than a rotation. An unprovable "
+            "category is refused rather than treated as unmarked; "
+            "`supervised_teardown` is the one route that acts on it, and it reports "
+            "the ambiguity rather than resolving it. Nothing was stopped and the "
+            "binding stays nonterminal.".format(record.session_id),
+        )
+    return _stop_owned_process(
+        store, registry, record, owned, stop=stop, alive=alive, _retirement=_retirement
     )
 
 
@@ -1375,6 +1412,237 @@ def recover_session(
     raise LifecycleError(
         REASON_HANDLE_MISMATCH,
         "session {0} has a live owned handle; it is not disconnected.".format(record.session_id),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Supervised teardown -- the third route, for a category that cannot be established
+# ---------------------------------------------------------------------------
+#
+# Two routes stop a session, and each requires the category to be *established*:
+# ordinary teardown requires a session provably below the rotation threshold, and
+# the retirement gate requires one provably marked. That is right, and it leaves a
+# third state with no route at all. A session whose observation history is not
+# complete reads `category-unprovable`, and until now every door refused it: the
+# stop refuses an unprovable category, the retirement gate refuses it as
+# `not-marked-for-rotation`, and `recover_session` refuses it as not disconnected,
+# because its handle is live and owned. Refusing it everywhere is not neutral.
+# `reconcile_agent_slots` counts *every* nonterminal binding against D6's ceiling
+# of six, so a stop that can never succeed holds a manager slot for as long as the
+# controller lives, with no accepted way to release it.
+#
+# So this route stops it. It is not a bypass, and three separate things make that
+# true rather than merely intended.
+#
+# First, it is a *distinct category*, not a distinct caller. It acts on exactly one
+# reading -- `category-unprovable` -- and refuses both established ones: a marked
+# session is sent to `retire_old_context`, and a provably unmarked one to the
+# ordinary teardown that already accepts it. Nothing about who is asking, or which
+# name they called, moves that.
+#
+# Second, the refusal that matters is below it, not in it. `_stop_owned_process`
+# re-reads the category for itself and refuses a marked session without the
+# retirement gate's own authorization, so even a defect in the check above cannot
+# make this a way to stop a marked session. This route mints no authorization and
+# carries none; `retire_old_context` remains the single producer.
+#
+# Third, it launches and binds nothing -- like every route in this module -- so it
+# can never *perform* a rotation. A rotation is a stop followed by a replacement
+# continuing from durable state; this is a stop that reports why it could not tell
+# what kind of stop it was, and stops there.
+#
+# What it cannot do is resolve the ambiguity, and it does not pretend to. The
+# session it stops *might* have been due for rotation, and if it was, D9's safe
+# handoff was never proven. That is precisely what the report says, in the words a
+# human needs to act on: the ambiguity, and what to check. Reporting it is the
+# honest half of a route that exists because the alternative -- refusing forever --
+# strands the session and its slot without reporting anything at all.
+#
+# Ownership is proven the same way every destructive path here proves it, and a
+# session this controller cannot prove it owns still goes to recovery rather than
+# to a stop. Termination is proven, never asserted. And when the stop cannot be
+# proven, this fails closed exactly as the accepted stop does -- the session
+# survives, truthfully nonterminal, still holding its slot -- and says what a human
+# must do about it.
+
+SUPERVISED_STOPPED = "supervised-teardown-stopped"
+SUPERVISED_REFUSED = "supervised-teardown-refused"
+SUPERVISED_STATES = (SUPERVISED_STOPPED, SUPERVISED_REFUSED)
+
+
+@dataclass(frozen=True)
+class SupervisedTeardown:
+    """What one supervised teardown did, and the ambiguity it could not resolve.
+
+    `ambiguity` is present on every path, including success: it is the whole reason
+    this route exists, and a route that swallowed it would be the bypass this one is
+    not. `human_action` is present on every path too, because a stop performed under
+    an unresolved category always leaves a human something to check -- and a stop
+    that failed leaves them a process to deal with.
+
+    `stopped` is present only when a process group was proven gone, and `recovery`
+    only when the session was handed to a human as disconnected instead. Nothing
+    carries a replacement, a reservation, or a launch, because this performs none.
+    """
+
+    session_id: str
+    rail: str
+    state: str
+    reason: str
+    detail: str
+    ambiguity: str
+    human_action: str
+    stopped: Optional[StopOutcome] = None
+    recovery: Optional[RecoveryReport] = None
+
+    @property
+    def torn_down(self) -> bool:
+        return self.state == SUPERVISED_STOPPED
+
+
+def _ambiguity(registry: SessionRegistry, session_id: str) -> str:
+    """Why this controller cannot say what kind of stop this session's stop would be."""
+    context = registry.context(session_id)
+    if context is None:
+        return (
+            "this controller holds no context observation for session {0} at all, so "
+            "nothing can be said about whether it reached the rotation "
+            "threshold.".format(session_id)
+        )
+    return context.reading().detail
+
+
+def supervised_teardown(
+    store: BindingStore,
+    registry: SessionRegistry,
+    record: BindingRecord,
+    *,
+    now: str,
+    stop: Optional[Callable] = None,
+    alive: Optional[Callable] = None,
+) -> SupervisedTeardown:
+    """Stop a session whose rotation category cannot be established, and report it.
+
+    For `category-unprovable` and nothing else: a marked session is refused to the
+    retirement gate, and a provably unmarked one to the ordinary teardown that
+    already handles it. Routes a session it cannot prove it owns to
+    `recover_session` rather than stopping it, proves the process group gone rather
+    than asserting it, and leaves the binding terminal -- which is what releases the
+    D6 slot the refusal was holding. Launches nothing and binds nothing.
+
+    Fails closed on a stop it cannot prove: the session survives exactly as it was,
+    nonterminal and still occupying its slot, and the report says what a human must
+    do. Raises `LifecycleError` when the category is established, because then this
+    is the wrong route and the right one is named in the refusal.
+    """
+    if record.is_terminal:
+        raise LifecycleError(
+            REASON_BINDING_TERMINAL,
+            "session {0} is {1}; there is no live context left to tear "
+            "down.".format(record.session_id, record.state),
+        )
+    # One liveness instant for the pre-flight, for the reason the retirement gate
+    # takes one: proving ownership and then describing a disconnection are two
+    # consumers of the same question. Deliberately not reused across the stop below,
+    # whose termination proof must be a new observation.
+    preflight = single_liveness_snapshot(alive)
+    try:
+        owned = require_owned(registry, record, alive=preflight)
+    except LifecycleError as exc:
+        if exc.reason in (REASON_HANDLE_MISSING, REASON_HANDLE_MISMATCH):
+            report = recover_session(record, registry, now=now, alive=preflight)
+            return SupervisedTeardown(
+                session_id=record.session_id,
+                rail=record.rail,
+                state=SUPERVISED_REFUSED,
+                reason=report.reason,
+                detail=report.detail,
+                ambiguity=_ambiguity(registry, record.session_id),
+                human_action=report.human_decision,
+                recovery=report,
+            )
+        raise
+    category = stop_category(registry, record.session_id)
+    if category == STOP_CATEGORY_ROTATION:
+        raise LifecycleError(
+            REASON_ROTATION_REQUIRES_RETIREMENT,
+            "session {0} is marked for rotation, so its category is established and "
+            "this is not the route for it: supervised teardown acts only on a "
+            "category that cannot be established. Stopping a marked session is a "
+            "rotation and may only go through `retire_old_context`, which proves a "
+            "safe handoff was left behind first. Nothing was stopped and the binding "
+            "stays nonterminal.".format(record.session_id),
+        )
+    if category == STOP_CATEGORY_NON_ROTATION:
+        raise LifecycleError(
+            REASON_CATEGORY_IS_PROVABLE,
+            "session {0} is provably below the rotation threshold, so its stop is "
+            "ordinary teardown and needs no supervision; `stop_session` performs it "
+            "unchanged. Nothing was stopped and the binding stays "
+            "nonterminal.".format(record.session_id),
+        )
+    ambiguity = _ambiguity(registry, record.session_id)
+    try:
+        stopped = _stop_owned_process(
+            store, registry, record, owned, stop=stop, alive=alive
+        )
+    except LifecycleError as exc:
+        if exc.reason == REASON_ROTATION_REQUIRES_RETIREMENT:
+            # The primitive's own refusal, and never softened into a report: a
+            # rotation-shaped stop is refused, not described.
+            raise
+        return SupervisedTeardown(
+            session_id=record.session_id,
+            rail=record.rail,
+            state=SUPERVISED_REFUSED,
+            reason=exc.reason,
+            detail=exc.detail,
+            ambiguity=ambiguity,
+            human_action=(
+                "Supervised teardown of session {0} on rail {1} could not be "
+                "completed: {2} The binding is deliberately left nonterminal and "
+                "still occupies one of this manager's agent slots, because a "
+                "terminal record would claim this process group is gone when it "
+                "cannot be shown to be. Nothing was launched in its place. A human "
+                "must establish on the host whether process group {3} (pid {4}) is "
+                "still running, end it if it is, and only then decide whether to "
+                "unbind session {0}. The rotation category was never established "
+                "either ({5}), so the work this session held may not have been "
+                "handed off.".format(
+                    record.session_id, record.rail, exc.detail, owned.pgid, owned.pid,
+                    ambiguity,
+                )
+            ),
+        )
+    return SupervisedTeardown(
+        session_id=stopped.session_id,
+        rail=record.rail,
+        state=SUPERVISED_STOPPED,
+        reason=REASON_SUPERVISED_TEARDOWN,
+        detail=(
+            "session {0} was stopped under supervision because its rotation category "
+            "could not be established; this controller's own handle for pid {1} was "
+            "proven to be the process the binding names, process group {2} is gone "
+            "({3} shutdown, exit code {4}), the binding is {5} and no longer occupies "
+            "an agent slot, and nothing was launched or bound in its place.".format(
+                stopped.session_id, stopped.pid, stopped.pgid,
+                "acknowledged" if stopped.graceful else "escalated",
+                stopped.exit_code, stopped.binding.state,
+            )
+        ),
+        ambiguity=ambiguity,
+        human_action=(
+            "No process action is required: process group {0} is proven gone and the "
+            "agent slot session {1} held is released. The ambiguity was not resolved "
+            "by stopping it ({2}). If this session had in fact reached the rotation "
+            "threshold, D9's safe handoff was never proven for it, so a human should "
+            "check rail {3} for a current published handoff before treating its work "
+            "as carried forward, and should treat a recurrence as a fault in "
+            "observation rather than as routine.".format(
+                stopped.pgid, stopped.session_id, ambiguity, record.rail,
+            )
+        ),
+        stopped=stopped,
     )
 
 

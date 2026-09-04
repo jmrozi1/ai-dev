@@ -103,10 +103,12 @@ from .session_lifecycle import (
     LifecycleError,
     SessionRegistry,
     StopOutcome,
+    SupervisedTeardown,
     launch_session,
     ownership_evidence,
     single_liveness_snapshot,
     stop_session,
+    supervised_teardown,
 )
 
 __all__ = [
@@ -224,6 +226,32 @@ class ManagerController:
                 "rotation must go through `retire_old_context`. Nothing was stopped.",
             )
         return stop_session(self.store, self.registry, record, **kwargs)
+
+    def supervised_teardown(
+        self,
+        record: BindingRecord,
+        *,
+        now: str,
+        stop: Optional[Callable] = None,
+        alive: Optional[Callable] = None,
+    ) -> SupervisedTeardown:
+        """Stop a held session whose rotation category cannot be established.
+
+        A pass-through, like `stop`, onto the accepted lifecycle route: the store
+        and the registry are this controller's own, so the session released here is
+        one this controller was counting. It states its parameters rather than
+        taking `**kwargs`, which is the same door `stop` has to close explicitly --
+        there is nothing private to forward through a signature that accepts
+        nothing private.
+
+        This controller adds no category rule of its own. The lifecycle refuses a
+        marked session to `retire_old_context` and a provably unmarked one to
+        ordinary teardown, and that decision is read from the session, here as
+        everywhere else.
+        """
+        return supervised_teardown(
+            self.store, self.registry, record, now=now, stop=stop, alive=alive
+        )
 
     def dispatch(
         self,

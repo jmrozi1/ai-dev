@@ -15,6 +15,7 @@ from ai_dev_flow.authorization import (
     ACTION_CONTINUE,
     ACTION_LAUNCH,
     AuthorizationDecision,
+    reconcile_agent_slots,
 )
 from ai_dev_flow.claude_runtime import ClaudeRuntimeError
 from ai_dev_flow.context_lifecycle import (
@@ -3600,6 +3601,564 @@ class StopCategoryReconciliationTests(RotationHarness):
         self.assertEqual([r.session_id for r in self.store.records()], [SESSION])
         self.assertEqual(self.registry.sessions(), [])
         self.assertEqual(self.registry.in_flight(), ())
+
+
+class SupervisedTeardownTests(RotationHarness):
+    """A session whose category cannot be established is stopped, not stranded.
+
+    Checkpoint 64 made a rotation-shaped stop impossible outside the retirement
+    gate, and in doing so left `category-unprovable` refused by every route: the
+    stop refuses it, the gate refuses it as `not-marked-for-rotation`, and recovery
+    refuses it as not disconnected. A refusal that can never succeed is not neutral
+    -- the reconciler counts every nonterminal binding against D6's ceiling, so it
+    holds an agent slot for the life of the controller.
+
+    These cases are about the third route and, just as much, about what it must not
+    become. The fixtures are the accepted retirement ones, deliberately: the same
+    launch, the same real threshold mark, the same injected handle, so a stop
+    refused here is refused on exactly the facts a stop permitted there was
+    permitted on.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.group_alive = {4242: True}
+        self.observations = []
+
+    def _alive(self, pgid):
+        answer = bool(self.group_alive.get(pgid, False))
+        self.observations.append(("alive", pgid, answer))
+        return answer
+
+    def _stopper(self, report=None, kills=True):
+        def stop(handle):
+            self.observations.append(("stop", handle.pgid))
+            if kills:
+                self.group_alive[handle.pgid] = False
+            if report is not None:
+                return report
+            return {"graceful": True, "exit_code": 0, "process_group_gone": True}
+        return stop
+
+    def _unprovable(self):
+        """A launched, owned, live session whose compaction history is not complete.
+
+        Exactly the state checkpoint 64's review traced: the observation floor is
+        below the threshold, but a failed invocation means the history cannot be
+        called complete, so the reading refuses to say whether the threshold was
+        reached. Reached through the accepted observation path, not by setting a
+        flag.
+        """
+        outcome, worker, _sent = self._launch()
+        self.registry.observe_failed_invocation(
+            SESSION, "the invocation watching this session did not finish"
+        )
+        self.assertIsNone(self.registry.context(SESSION).reading().rotation_marked)
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SESSION),
+            session_lifecycle.STOP_CATEGORY_UNPROVEN,
+        )
+        return outcome, worker
+
+    def _marked(self):
+        """A genuinely rotation-ready session, by the accepted route only."""
+        outcome, worker, _sent = self._launch()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        return outcome, worker
+
+    def _supervise(self, **overrides):
+        arguments = {
+            "now": "2026-08-26T12:10:03Z", "stop": self._stopper(), "alive": self._alive,
+        }
+        arguments.update(overrides)
+        return session_lifecycle.supervised_teardown(
+            self.store, self.registry, self.store.read(SESSION), **arguments
+        )
+
+    def _retire(self, **overrides):
+        arguments = {
+            "handoff": self._handoff(), "worktree": self._worktree(),
+            "now": "2026-08-26T12:10:03Z", "stop": self._stopper(), "alive": self._alive,
+        }
+        arguments.update(overrides)
+        return retire_old_context(
+            self.store, self.registry, self._rail(), self.store.read(SESSION),
+            **arguments
+        )
+
+    def _slots(self):
+        """What D6's reconciler makes of this controller, right now.
+
+        The production reduction, not a restatement of it: the same durable records
+        the manager admits against, and the same ownership evidence its registry can
+        prove. A separate prober, so asking the question leaves no trace in the
+        observation sequence the stop cases assert on.
+        """
+        records = list(self.store.records())
+        return reconcile_agent_slots(
+            records,
+            ownership=session_lifecycle.ownership_evidence(
+                self.registry, records,
+                alive=lambda pgid: bool(self.group_alive.get(pgid, False)),
+            ),
+        )
+
+    def _assert_untouched(self):
+        """The session survived this refusal exactly as it was: nothing destroyed."""
+        self.assertEqual(
+            [entry for entry in self.observations if entry[0] == "stop"], []
+        )
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertTrue(self.group_alive[4242])
+
+    # -- A. the state that had no route at all ---------------------------------
+
+    def test_case_a_an_unprovable_category_is_stopped_rather_than_refused_forever(self) -> None:
+        """The whole point: it stops, and the binding is truthfully terminal.
+
+        Every other door refuses this session, and each of those refusals is right
+        for the route it belongs to. This one acts, and says why it could not tell
+        what kind of stop it was performing.
+        """
+        self._unprovable()
+        result = self._supervise()
+        self.assertTrue(result.torn_down)
+        self.assertEqual(result.state, session_lifecycle.SUPERVISED_STOPPED)
+        self.assertEqual(result.reason, session_lifecycle.REASON_SUPERVISED_TEARDOWN)
+        self.assertIsNotNone(result.stopped)
+        self.assertTrue(result.stopped.process_group_gone)
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertEqual(self.registry.sessions(), [])
+        self.assertIsNone(result.recovery)
+
+    def test_case_a_the_process_group_is_proven_gone_and_not_asserted(self) -> None:
+        """The proof is a fresh observation taken after the stopper, as everywhere."""
+        self._unprovable()
+        self.assertTrue(self._supervise().torn_down)
+        self.assertFalse(self.group_alive[4242])
+        self.assertEqual(
+            self.observations,
+            [("alive", 4242, True), ("stop", 4242), ("alive", 4242, False)],
+        )
+
+    def test_case_a_the_ambiguity_is_reported_rather_than_swallowed(self) -> None:
+        """The report names the unresolved question and what a human should check."""
+        self._unprovable()
+        result = self._supervise()
+        reading = "whether the rotation threshold of 6 was reached is undetermined"
+        self.assertIn(reading, result.ambiguity)
+        self.assertIn(result.ambiguity, result.human_action)
+        self.assertIn(RAIL, result.human_action)
+        self.assertIn("handoff", result.human_action)
+        self.assertIn("nothing was launched", result.detail)
+
+    def test_case_a_the_supervised_route_launches_and_binds_nothing(self) -> None:
+        """It stops. A rotation is a stop plus a replacement, and there is none."""
+        self._unprovable()
+        with patch.object(session_lifecycle, "start_worker") as worker, \
+                patch.object(session_lifecycle, "reserve_binding") as reserve:
+            self.assertTrue(self._supervise().torn_down)
+        worker.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual([r.session_id for r in self.store.records()], [SESSION])
+        self.assertEqual(self.registry.in_flight(), ())
+
+    def test_case_a_a_session_this_controller_never_watched_is_also_stoppable(self) -> None:
+        """The other producer of an unprovable category, through the same route."""
+        self._launch()
+        self.registry._context.forget(SESSION)
+        self.assertIsNone(self.registry.context(SESSION))
+        result = self._supervise()
+        self.assertTrue(result.torn_down)
+        self.assertIn("no context observation", result.ambiguity)
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+
+    # -- B. the load-bearing case: this must not become a bypass ---------------
+
+    def test_case_b_a_rotation_marked_session_is_refused_by_the_supervised_route(self) -> None:
+        """Marked, ready, owned and live -- and still not this route's business.
+
+        Supervised teardown acts on a category that cannot be established. This one
+        is established, so the refusal names the route that owns it.
+        """
+        self._marked()
+        with self.assertRaises(LifecycleError) as raised:
+            self._supervise()
+        self.assertEqual(
+            raised.exception.reason,
+            session_lifecycle.REASON_ROTATION_REQUIRES_RETIREMENT,
+        )
+        # Two independent refusals stand between this route and a marked session,
+        # and this is the outer one: the route's own precondition, which says why
+        # this is the wrong route rather than only that the stop is refused.
+        self.assertIn("its category is established", raised.exception.detail)
+        self.assertIn("retire_old_context", raised.exception.detail)
+        self._assert_untouched()
+
+    def test_case_b_the_rotation_refusal_lives_below_every_route(self) -> None:
+        """Structural, not procedural: the primitive refuses for itself.
+
+        This reaches past both public routes to the one place that destroys
+        anything, holding a proven owned handle for a marked session, and it is
+        still refused. So a route that forgot to check the category -- this one, or
+        one written later -- could not become a way to stop a marked session.
+        """
+        self._marked()
+        record = self.store.read(SESSION)
+        owned = require_owned(self.registry, record, alive=self._alive)
+        with self.assertRaises(LifecycleError) as raised:
+            session_lifecycle._stop_owned_process(
+                self.store, self.registry, record, owned,
+                stop=self._stopper(), alive=self._alive,
+            )
+        self.assertEqual(
+            raised.exception.reason,
+            session_lifecycle.REASON_ROTATION_REQUIRES_RETIREMENT,
+        )
+        self._assert_untouched()
+
+    def test_case_b_the_supervised_route_mints_no_authorization_and_carries_none(self) -> None:
+        """It has nowhere to put one, and nothing in it makes one."""
+        source = inspect.getsource(session_lifecycle.supervised_teardown)
+        self.assertNotIn("_RetirementAuthorization", source)
+        self.assertNotIn("_retirement=", source)
+        self.assertEqual(
+            [name for name in
+             inspect.signature(session_lifecycle.supervised_teardown).parameters
+             if name.startswith("_")],
+            [],
+        )
+        self._unprovable()
+        with self.assertRaises(TypeError):
+            self._supervise(_retirement=object())
+        self._assert_untouched()
+
+    def test_case_b_the_two_routes_cannot_be_confused_at_the_seam(self) -> None:
+        """One route per established category, and neither answers for the other."""
+        self._marked()
+        with self.assertRaises(LifecycleError) as supervised:
+            self._supervise()
+        self.assertEqual(
+            supervised.exception.reason,
+            session_lifecycle.REASON_ROTATION_REQUIRES_RETIREMENT,
+        )
+        self._assert_untouched()
+        # And the gate is still the only thing that can stop it -- unchanged by the
+        # refusal it just made.
+        retirement = self._retire()
+        self.assertTrue(retirement.retired)
+        self.assertEqual(
+            retirement.reason, session_lifecycle.REASON_OLD_CONTEXT_RETIRED
+        )
+        self.assertFalse(self.group_alive[4242])
+
+    def test_case_b_a_raw_stop_of_a_marked_session_is_still_refused(self) -> None:
+        """Checkpoint 64's own case, re-asserted through the refactored primitive."""
+        self._marked()
+        with self.assertRaises(LifecycleError) as raised:
+            stop_session(
+                self.store, self.registry, self.store.read(SESSION),
+                stop=self._stopper(), alive=self._alive,
+            )
+        self.assertEqual(
+            raised.exception.reason,
+            session_lifecycle.REASON_ROTATION_REQUIRES_RETIREMENT,
+        )
+        self._assert_untouched()
+
+    # -- C. the accepted teardown, unchanged -----------------------------------
+
+    def test_case_c_ordinary_teardown_of_a_provably_unmarked_session_still_works(self) -> None:
+        self._launch()
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SESSION),
+            session_lifecycle.STOP_CATEGORY_NON_ROTATION,
+        )
+        outcome = stop_session(
+            self.store, self.registry, self.store.read(SESSION),
+            stop=self._stopper(), alive=self._alive,
+        )
+        self.assertTrue(outcome.process_group_gone)
+        self.assertTrue(outcome.binding.is_terminal)
+        self.assertFalse(self.group_alive[4242])
+        self.assertEqual(self.registry.sessions(), [])
+
+    def test_case_c_the_supervised_route_refuses_an_established_category(self) -> None:
+        """A provable category needs no supervision, and does not get any here."""
+        self._launch()
+        with self.assertRaises(LifecycleError) as raised:
+            self._supervise()
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_CATEGORY_IS_PROVABLE
+        )
+        self.assertIn("stop_session", raised.exception.detail)
+        self._assert_untouched()
+        # And the route that does own it still works, after the refusal.
+        self.assertTrue(
+            stop_session(
+                self.store, self.registry, self.store.read(SESSION),
+                stop=self._stopper(), alive=self._alive,
+            ).binding.is_terminal
+        )
+
+    # -- D. disconnection still goes to a human --------------------------------
+
+    def test_case_d_a_disconnected_session_still_routes_to_recovery(self) -> None:
+        """Supervised teardown is not a new way to skip the disconnected reading."""
+        self._unprovable()
+        self.group_alive[4242] = False
+        result = self._supervise()
+        self.assertFalse(result.torn_down)
+        self.assertEqual(result.state, session_lifecycle.SUPERVISED_REFUSED)
+        self.assertEqual(
+            result.reason, session_lifecycle.REASON_DISCONNECTED_NOT_LIVE
+        )
+        self.assertIsNotNone(result.recovery)
+        self.assertIsNone(result.stopped)
+        self.assertEqual(result.recovery.state, STATE_DISCONNECTED)
+        self.assertIn("A human decides", result.human_action)
+        self.assertEqual(
+            [entry for entry in self.observations if entry[0] == "stop"], []
+        )
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+
+    def test_case_d_a_session_with_no_owned_handle_routes_to_recovery(self) -> None:
+        """Ownership is proven before the category is even asked for."""
+        self._unprovable()
+        self.registry.remove(SESSION)
+        result = self._supervise()
+        self.assertFalse(result.torn_down)
+        self.assertEqual(
+            result.reason, session_lifecycle.REASON_DISCONNECTED_NO_HANDLE
+        )
+        self.assertIsNotNone(result.recovery)
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+        self.assertEqual(
+            [entry for entry in self.observations if entry[0] == "stop"], []
+        )
+
+    # -- E. failure fails closed -----------------------------------------------
+
+    def test_case_e_a_shutdown_that_proves_nothing_fails_closed(self) -> None:
+        """The session survives truthfully, and the report says what a human must do."""
+        self._unprovable()
+        result = self._supervise(
+            stop=self._stopper(
+                report={"graceful": False, "exit_code": None,
+                        "process_group_gone": False},
+                kills=False,
+            )
+        )
+        self.assertFalse(result.torn_down)
+        self.assertEqual(result.reason, session_lifecycle.REASON_SHUTDOWN_INCOMPLETE)
+        self.assertIsNone(result.stopped)
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertTrue(self.group_alive[4242])
+        self.assertIn("4242", result.human_action)
+        self.assertIn("still occupies one of this manager's agent slots",
+                      result.human_action)
+        self.assertIn("Nothing was launched", result.human_action)
+
+    def test_case_e_a_stopper_that_claims_more_than_it_proves_fails_closed(self) -> None:
+        """It said the group was gone; the fresh observation disagreed."""
+        self._unprovable()
+        result = self._supervise(stop=self._stopper(kills=False))
+        self.assertFalse(result.torn_down)
+        self.assertEqual(result.reason, session_lifecycle.REASON_SHUTDOWN_INCOMPLETE)
+        self.assertIn("still alive after shutdown", result.detail)
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+        self.assertTrue(self.group_alive[4242])
+
+    def test_case_e_nothing_is_launched_on_the_failed_path(self) -> None:
+        self._unprovable()
+        with patch.object(session_lifecycle, "start_worker") as worker, \
+                patch.object(session_lifecycle, "reserve_binding") as reserve:
+            result = self._supervise(
+                stop=self._stopper(
+                    report={"graceful": False, "exit_code": None,
+                            "process_group_gone": False},
+                    kills=False,
+                )
+            )
+        self.assertFalse(result.torn_down)
+        worker.assert_not_called()
+        reserve.assert_not_called()
+        self.assertEqual([r.session_id for r in self.store.records()], [SESSION])
+
+    def test_case_e_the_ambiguity_is_still_reported_on_the_failed_path(self) -> None:
+        self._unprovable()
+        result = self._supervise(stop=self._stopper(kills=False))
+        self.assertIn("undetermined", result.ambiguity)
+        self.assertIn(result.ambiguity, result.human_action)
+
+    # -- F. the D6 slot, proven behaviourally ----------------------------------
+
+    def test_case_f_the_supervised_teardown_releases_the_d6_slot(self) -> None:
+        """The accepted-requirement half, through the production reconciler.
+
+        Before: one nonterminal binding this controller can prove it owns, and the
+        reconciler counts it against the ceiling of six. After: the binding is
+        terminal, so the reconciler no longer counts it -- and does not count it as
+        unprovable either, which would be the same slot held under another name.
+        """
+        self._unprovable()
+        before = self._slots()
+        self.assertEqual(before.occupants, (SESSION,))
+        self.assertEqual(before.occupied, 1)
+        self.assertTrue(before.provable)
+
+        self.assertTrue(self._supervise().torn_down)
+
+        after = self._slots()
+        self.assertEqual(after.occupants, ())
+        self.assertEqual(after.occupied, 0)
+        self.assertEqual(after.unprovable, ())
+        self.assertTrue(after.provable)
+        self.assertEqual(after.ceiling, before.ceiling)
+
+    def test_case_f_a_refused_stop_keeps_holding_the_slot_it_holds(self) -> None:
+        """The hazard, stated as a fact rather than as a fear -- and its boundary.
+
+        A stop that cannot be proven leaves the binding nonterminal, so the slot
+        stays occupied. That is correct: the process may still be running. What was
+        wrong was a refusal no route could ever get past, and that is what the
+        supervised route removes -- not the fail-closed behaviour of a stop that
+        genuinely failed.
+        """
+        self._unprovable()
+        refused = self._supervise(stop=self._stopper(kills=False))
+        self.assertFalse(refused.torn_down)
+        self.assertEqual(self._slots().occupied, 1)
+        # The same session, stopped successfully on a later attempt, releases it.
+        self.assertTrue(self._supervise().torn_down)
+        self.assertEqual(self._slots().occupied, 0)
+
+    def test_case_f_the_release_is_the_accepted_terminalization_and_not_a_new_one(self) -> None:
+        """No second way to make a binding terminal was invented for this route."""
+        self.assertEqual(
+            inspect.getsource(session_lifecycle.supervised_teardown).count(
+                "unbind_session("
+            ),
+            0,
+        )
+        self._unprovable()
+        result = self._supervise()
+        self.assertEqual(result.stopped.binding.state, BINDING_STATE_UNBOUND)
+        self.assertTrue(result.stopped.binding.is_terminal)
+
+    # -- G. checkpoint 63 and 64 properties ------------------------------------
+
+    def test_case_g_the_retirement_gate_is_unchanged_end_to_end(self) -> None:
+        self._marked()
+        retirement = self._retire()
+        self.assertTrue(retirement.retired)
+        self.assertEqual(
+            self.observations,
+            [("alive", 4242, True), ("alive", 4242, True), ("stop", 4242),
+             ("alive", 4242, False)],
+        )
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertEqual(self.registry.sessions(), [])
+
+    def test_case_g_readiness_is_still_projected_in_call(self) -> None:
+        """A verdict taken before further work does not survive that work."""
+        self._marked()
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        self._work()
+        self.assertEqual(self._evaluate().state, ROTATION_NOT_READY)
+        self.assertEqual(
+            self._retire().reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT
+        )
+        self._assert_untouched()
+
+    def test_case_g_the_single_producer_and_the_private_surface_are_unchanged(self) -> None:
+        """Checkpoint 64's self-maintaining assertions, re-asserted beside the new route."""
+        source = inspect.getsource(session_lifecycle)
+        self.assertEqual(source.count("_RetirementAuthorization("), 1)
+        self.assertEqual(
+            [name for name in
+             inspect.signature(session_lifecycle.stop_session).parameters
+             if name.startswith("_")],
+            ["_retirement"],
+        )
+        public = [name for name in vars(session_lifecycle) if not name.startswith("_")]
+        self.assertNotIn("RetirementAuthorization", public)
+        for name in public:
+            self.assertNotIsInstance(
+                getattr(session_lifecycle, name),
+                session_lifecycle._RetirementAuthorization,
+            )
+
+    def test_case_g_exactly_two_routes_reach_the_one_destructive_primitive(self) -> None:
+        """One definition, two call sites, and both of them are the guarded routes."""
+        self.assertEqual(
+            inspect.getsource(session_lifecycle).count("_stop_owned_process("), 3
+        )
+        for route in (session_lifecycle.stop_session,
+                      session_lifecycle.supervised_teardown):
+            with self.subTest(route=route.__name__):
+                self.assertIn(
+                    "_stop_owned_process(", inspect.getsource(route)
+                )
+        self.assertNotIn(
+            "shutdown_worker",
+            inspect.getsource(session_lifecycle.supervised_teardown),
+        )
+
+    def test_case_g_ownership_is_still_proven_independently_of_the_category(self) -> None:
+        self._unprovable()
+        self.registry.remove(SESSION)
+        with self.assertRaises(LifecycleError) as raised:
+            stop_session(
+                self.store, self.registry, self.store.read(SESSION),
+                stop=self._stopper(), alive=self._alive,
+            )
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_HANDLE_MISSING
+        )
+
+    def test_case_g_a_terminal_binding_is_refused_by_the_new_route_too(self) -> None:
+        self._unprovable()
+        self.assertTrue(self._supervise().torn_down)
+        with self.assertRaises(LifecycleError) as raised:
+            self._supervise()
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_BINDING_TERMINAL
+        )
+
+    # -- H. the counting the category is read from -----------------------------
+
+    def test_case_h_marking_counting_and_degradation_are_unchanged(self) -> None:
+        """The three readings this route depends on, none of them touched here."""
+        self._launch()
+        self.assertIs(self.registry.context(SESSION).reading().rotation_marked, False)
+        self.registry.observe_failed_invocation(SESSION, "history is not provable")
+        self.assertIsNone(self.registry.context(SESSION).reading().rotation_marked)
+        self._mark()
+        self.assertIs(self.registry.context(SESSION).reading().rotation_marked, True)
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SESSION),
+            session_lifecycle.STOP_CATEGORY_ROTATION,
+        )
+
+    def test_case_h_a_marked_session_is_never_supervised_however_it_got_marked(self) -> None:
+        """Degraded first, then marked: the mark wins, and the gate owns it."""
+        self._launch()
+        self.registry.observe_failed_invocation(SESSION, "history is not provable")
+        self._mark()
+        with self.assertRaises(LifecycleError) as raised:
+            self._supervise()
+        self.assertEqual(
+            raised.exception.reason,
+            session_lifecycle.REASON_ROTATION_REQUIRES_RETIREMENT,
+        )
+        self._assert_untouched()
 
 
 if __name__ == "__main__":
