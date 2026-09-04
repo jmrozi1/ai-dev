@@ -74,6 +74,11 @@ TOOLS = ("Read", "Glob")
 # question about *which* publication is there, and one name can never answer it.
 PUBLICATION = "d" * 40
 NEXT_PUBLICATION = "e" * 40
+# Where the product repository stands, before and after one commit lands. Two of
+# them for the same reason: whether a publication is current is a question about
+# *which* state it was written against, and one name can never answer it.
+PRODUCT_HEAD = "1" * 40
+NEXT_PRODUCT_HEAD = "2" * 40
 
 
 _UNSET = object()
@@ -85,10 +90,21 @@ class _PublishedHandoff(object):
     Stands in for `rail_handoff_publication`'s object name, which is what a real
     caller passes. It is a value the agent moves by publishing, never something the
     lifecycle writes: nothing in the module under test can change what this returns.
+
+    `work_state` models the one thing the real `publish` does that a bare value
+    cannot: it captures the product state *at the instant of publication*, which is
+    the fact this module has no way to take for itself. That the real helper
+    actually captures it there, against a real repository, is proved in
+    `tests/test_control_plane.py`, not assumed here.
     """
 
     def __init__(self, value=None):
         self.value = value
+        self.work_state = None
+
+    def publish(self, value, work_state):
+        self.value = value
+        self.work_state = work_state
 
     def __call__(self):
         return self.value
@@ -1388,18 +1404,32 @@ class RotationBoundaryTests(LifecycleTestBase):
         # `rail_handoff_publication`. `None` is the honest starting state: this rail
         # has no published handoff until an agent writes one.
         self.published = _PublishedHandoff()
+        # Where the product repository stands. A commit name and nothing else: it is
+        # only ever compared for equality, never ordered or dated.
+        self.product_head = PRODUCT_HEAD
 
-    def _work(self, publishing=None, fail=None, reader=_UNSET):
+    def _work(self, publishing=None, fail=None, reader=_UNSET,
+              commits_before=(), commits_after=()):
         """One authorized invocation of real work, bracketed exactly as production is.
 
         `publishing` is what the agent leaves at the rail's canonical path *during*
         the invocation, which is the only place a persistent agent can publish from.
         Nothing about this helper reaches around `continue_session`: the currency
         facts are established by the same call that performs the work.
+
+        `commits_before` and `commits_after` are product commits landing inside the
+        same turn, on either side of that publication. They are what makes work
+        *after* a publication expressible at all: the controller sees one opaque
+        `sender` call either way, so the two orderings differ in nothing it can
+        observe from out here -- only in what the publication was written against.
         """
         def send(handle, request, *, prompt, markers=(), timeout=None):
+            for head in commits_before:
+                self.product_head = head
             if publishing is not None:
-                self.published.value = publishing
+                self.published.publish(publishing, self.product_head)
+            for head in commits_after:
+                self.product_head = head
             if fail is not None:
                 raise fail
             return {"type": "result", "session_id": request.session_id,
@@ -1436,6 +1466,7 @@ class RotationBoundaryTests(LifecycleTestBase):
             "published": self.published.value is not None,
             "location": self.HANDOFF,
             "publication": self.published.value,
+            "work_state": self.published.work_state,
         }
         arguments.update(overrides)
         return RotationHandoffFacts(**arguments)
@@ -1443,7 +1474,7 @@ class RotationBoundaryTests(LifecycleTestBase):
     def _worktree(self, **overrides):
         arguments = {
             "worktree_id": self.worktree_id, "path": str(self.workspace),
-            "clean": True, "active_operation": None,
+            "clean": True, "active_operation": None, "head": self.product_head,
         }
         arguments.update(overrides)
         return WorktreeFacts(**arguments)
@@ -1473,6 +1504,128 @@ class RotationBoundaryTests(LifecycleTestBase):
         self.assertEqual(readiness.reason, session_lifecycle.REASON_ROTATION_HANDOFF_ESTABLISHED)
         self.assertTrue(readiness.ready)
         self.assertEqual((readiness.observed, readiness.threshold), (6, 6))
+
+    def test_work_after_the_publication_inside_one_invocation_is_not_rotation_ready(self) -> None:
+        # The load-bearing case, and the exact shape a bracket around one invocation
+        # cannot see: the agent works, publishes its handoff, and then goes on
+        # working -- committing, so the tree it leaves is clean and every other
+        # condition here is satisfied. The handoff on the rail no longer describes
+        # the outcome, evidence, unresolved work or next action a replacement would
+        # resume from, and nothing about the invocation says so.
+        self._launch()
+        self._mark()
+        self._work(
+            commits_before=(PRODUCT_HEAD,),
+            publishing=PUBLICATION,
+            commits_after=(NEXT_PRODUCT_HEAD,),
+        )
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self.assertFalse(readiness.ready)
+        self.assertIsNone(readiness.handoff)
+        self.assertIn(NEXT_PRODUCT_HEAD, readiness.detail)
+
+    def test_the_two_orderings_differ_in_nothing_the_bracket_itself_records(self) -> None:
+        # The control this is measured against: same session, same mark, same single
+        # invocation, same published bytes, same successful return -- work then
+        # publish instead of publish then work. Every fact the invocation bracket
+        # records is identical across the two, which is precisely why the bracket
+        # could never have answered the question, and why the answer has to come
+        # from what the publication was written against.
+        self._launch()
+        self._mark()
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        good = self._evaluate()
+
+        boundary = self.registry.work_boundary(SESSION)
+        observation = self.registry.handoff_publication(SESSION)
+
+        self.tearDown()
+        self.setUp()
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION, commits_after=(NEXT_PRODUCT_HEAD,))
+        stale = self._evaluate()
+
+        self.assertEqual(self.registry.work_boundary(SESSION), boundary)
+        self.assertEqual(
+            (observation.publication, observation.work_boundary),
+            (
+                self.registry.handoff_publication(SESSION).publication,
+                self.registry.handoff_publication(SESSION).work_boundary,
+            ),
+        )
+        # Identical controller-local facts, opposite answers.
+        self.assertEqual(good.state, ROTATION_READY)
+        self.assertEqual(stale.state, ROTATION_NOT_READY)
+        self.assertEqual(stale.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_several_units_of_work_then_a_publication_is_current(self) -> None:
+        # Work accumulating over more than one invocation is the ordinary shape of a
+        # persistent rail. Nothing about that makes the handoff stale: what matters
+        # is only that the publication was written against the state the last of it
+        # left behind.
+        self._launch()
+        self._mark()
+        self._work(commits_before=("3" * 40,))
+        self._work(commits_before=("4" * 40,))
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(self.registry.work_boundary(SESSION), 3)
+        self.assertEqual(readiness.handoff.handoff_publication, PUBLICATION)
+
+    def test_a_publication_recording_no_product_state_is_not_current(self) -> None:
+        # Fails closed rather than assuming nothing moved: a handoff published
+        # before this fact existed, or against a checkout too incoherent to identify,
+        # records no state, and an unproven ordering is not a proven one.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        readiness = self._evaluate(handoff=self._handoff(work_state=None))
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_a_workspace_read_that_cannot_name_its_head_is_not_current(self) -> None:
+        # The same refusal from the other side. One half of a comparison is not a
+        # comparison.
+        self._launch()
+        self._mark()
+        self._work(publishing=PUBLICATION)
+        readiness = self._evaluate(worktree=self._worktree(head=None))
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_coordination_work_after_the_publication_leaves_it_current(self) -> None:
+        # The supported executor path publishes and pushes first, *then* allocates a
+        # receipt -- so a rule reading "nothing at all after publication" would break
+        # the documented normal path. Allocating that receipt moves the coordination
+        # repository, not the product one; it changes no outcome, evidence,
+        # unresolved work or next action a replacement resumes, and it must not
+        # invalidate a handoff that is otherwise current.
+        self._launch()
+        self._mark()
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+        # Whatever the coordination repository does next, the product state the
+        # handoff was written against is still where the workspace stands.
+        self.assertEqual(self._handoff().work_state, self._worktree().head)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    def test_a_publication_with_no_work_after_it_needs_no_republication(self) -> None:
+        # Nothing happened, so nothing has to be said again: the standing
+        # publication is still the current one, evaluated twice with no second
+        # publication and no second invocation in between.
+        self._launch()
+        self._mark()
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        first = self._evaluate()
+        second = self._evaluate()
+        self.assertEqual(first.state, ROTATION_READY)
+        self.assertEqual(second.state, ROTATION_READY)
+        self.assertEqual(self.published.value, PUBLICATION)
 
     def test_the_handoff_carries_the_exact_durable_identity_and_nothing_else(self) -> None:
         self._launch()
@@ -1939,7 +2092,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # carried payload names the same one artifact.
         self.assertEqual(
             tuple(field.name for field in dataclasses.fields(RotationHandoffFacts)),
-            ("rail", "published", "location", "publication"),
+            ("rail", "published", "location", "publication", "work_state"),
         )
         self._launch()
         self._mark()

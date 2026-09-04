@@ -1067,6 +1067,24 @@ def recover_session(
 # says; nothing here reads a word of it, and no second representation of it
 # exists. When either fact is missing, readiness fails closed, like every other
 # not-ready path here.
+#
+# Fourth, those two facts bracket a publication but do not order it. They are both
+# taken from outside a provider turn, and a turn is opaque: a handoff published
+# midway through one, with further work after it, presents this controller with
+# exactly the observations a handoff published at the end of one does. The
+# distinguishing fact does not exist out here to be taken, so it is taken where it
+# does exist -- at the instant of publication, by the publishing act, which records
+# the product state those bytes were written against. Readiness then asks one
+# question of it: does the repository still stand there? A commit after publication
+# moves it; work carrying no commit leaves the tree dirty, which the coherent-
+# workspace requirement already refuses. That pair is the ordering proof, and it is
+# structural in the only place a structure could hold it.
+#
+# What it deliberately does not do is treat every act after publication as work.
+# The boundary is the product repository, because that is what a replacement
+# resumes from and what D9 names first. Allocating a receipt in the coordination
+# repository -- which the supported executor path performs *after* publishing --
+# moves no product state and invalidates nothing.
 
 
 @dataclass(frozen=True)
@@ -1085,6 +1103,12 @@ class WorktreeFacts:
     # repository is mid-operation, which is exactly the ambiguous state a rotation
     # must not hand to a replacement.
     active_operation: Optional[str] = None
+    # Where this repository stands now: the commit name a fresh read returned. An
+    # identity, like every other fact here -- it is only ever compared with another
+    # commit name for equality, never ordered, dated, or counted. Optional because a
+    # read that could not name the head must be able to say so, and a readiness that
+    # cannot name it fails closed.
+    head: Optional[str] = None
 
     @property
     def coherent(self) -> bool:
@@ -1108,12 +1132,22 @@ class RotationHandoffFacts:
     distinction currency needs and the most this layer is entitled to know. It is
     optional because an observation that cannot name the publication must be able
     to say so, and a readiness that cannot name it fails closed.
+
+    `work_state` is the product-repository state those bytes were published
+    *against*, recorded by the publishing act itself at the instant it made them
+    durable. It is the same kind of fact as `publication` -- a commit name compared
+    only for equality -- and it is the one fact this controller cannot take for
+    itself, because the moment it describes is inside a provider turn this
+    controller cannot see into. Optional for the same reason as `publication`: a
+    publication that made no such claim must be able to say so, and readiness then
+    fails closed.
     """
 
     rail: str
     published: bool
     location: str
     publication: Optional[str] = None
+    work_state: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -1381,15 +1415,65 @@ def evaluate_rotation_readiness(
             ),
         )
 
+    # 6. And nothing was done after it. Every check above brackets the publication
+    #    between two moments this controller chose, which is the most it can see:
+    #    one provider turn is opaque, so a handoff published in the middle of a turn
+    #    and a handoff published at the end of one are the same two observations. The
+    #    fact that separates them cannot be taken from out here at all -- it has to
+    #    be taken at the instant of publication, by the act that publishes.
+    #
+    #    So the publication carries the product state it was written against, and
+    #    this compares it with where the repository stands now. Equal means no
+    #    commit landed after those bytes were written; and work that landed no
+    #    commit leaves the tree dirty, which check 3 already refused. Between them
+    #    the two cover every way product work survives a turn, which is why this is
+    #    an ordering proof and not an ordering convention.
+    #
+    #    It is deliberately the *product* repository and not "anything that ran".
+    #    The supported path allocates a receipt after publishing, in the
+    #    coordination repository; that changes no product state, alters nothing a
+    #    replacement resumes, and must not invalidate a handoff that is otherwise
+    #    current.
+    if worktree.head is None:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_CURRENT,
+            "the observation of workspace {0} does not name where the repository "
+            "stands, so whether work followed the handoff published at {1} cannot "
+            "be established.".format(record.workspace_path, handoff.location),
+        )
+    if handoff.work_state is None:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_CURRENT,
+            "the handoff published at {0} does not record which product state it "
+            "was written against, so it cannot be shown to follow the last work of "
+            "session {1}'s boundary.".format(handoff.location, record.session_id),
+        )
+    if handoff.work_state != worktree.head:
+        return projected(
+            ROTATION_NOT_READY,
+            REASON_HANDOFF_NOT_CURRENT,
+            "the handoff published at {0} was written against product state {1} "
+            "and workspace {2} now stands at {3}; work landed after that "
+            "publication, so it does not carry the outcome, evidence, unresolved "
+            "work and next action a replacement would resume from.".format(
+                handoff.location, handoff.work_state,
+                record.workspace_path, worktree.head,
+            ),
+        )
+
     return projected(
         ROTATION_READY,
         REASON_ROTATION_HANDOFF_ESTABLISHED,
         "session {0} is marked at {1} of {2} observed compactions, is between "
         "invocations, has a coherent workspace, and its rail carries handoff "
         "publication {3}, established at the work boundary {4} this session is "
-        "still standing at. Nothing is terminated or replaced by this.".format(
+        "still standing at and written against product state {5}, which is where "
+        "the workspace still stands. Nothing is terminated or replaced by "
+        "this.".format(
             record.session_id, reading.observed, reading.threshold,
-            handoff.publication, boundary,
+            handoff.publication, boundary, handoff.work_state,
         ),
         carried=RotationHandoff(
             project=record.project,

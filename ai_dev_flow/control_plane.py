@@ -677,6 +677,36 @@ def worktree_is_clean(repo_root: Path) -> bool:
     return not completed.stdout.strip()
 
 
+# The name of the trailer one publication carries to say which product-repository
+# state it was written against. A trailer rather than artifact content because the
+# handoff's bytes are executor-authored prose whose contract belongs to the reviewer
+# and orchestrator loop: nothing here writes into them, and nothing reads them. This
+# is metadata on the publishing *act*, written by this helper and by nothing else.
+WORK_STATE_TRAILER = "Work-State"
+
+
+def work_state(repo_root: Path) -> str | None:
+    """The exact product-repository state a publication is being made against.
+
+    One commit name, or nothing. It is an identity, never a time and never a
+    sequence: two reads of the same unchanged repository give the same answer, and
+    any commit landing in between gives a different one. That is the whole of what
+    it has to do -- say whether the repository still stands where it stood when
+    these bytes were written.
+
+    `None` is returned, rather than a head, whenever the checkout is not coherent:
+    mid-operation, or carrying staged, unstaged or untracked change. A head alone
+    does not identify such a checkout, so recording one would be a claim this
+    function cannot support. Silence is the honest answer, and every reader of this
+    fact treats absence as unproven rather than as unchanged.
+    """
+    if active_git_operation(repo_root) is not None:
+        return None
+    if not worktree_is_clean(repo_root):
+        return None
+    return resolve_current_head(repo_root) or None
+
+
 def _reconcile_strictly_behind(repo_root: Path, *, branch: str, upstream: str, remote_head: str) -> None:
     """Fast-forward a clean, strictly behind branch onto freshly fetched upstream state.
 
@@ -752,6 +782,7 @@ def publish(
     content: str,
     rail: str | None = None,
     expected_head: str | None = None,
+    work_repo: Path | None = None,
 ) -> tuple[Path, str]:
     """Replace one owned artifact with current state and commit only that path.
 
@@ -759,6 +790,15 @@ def publish(
     acceptance, and `accept` writes it together with the accepted state in a single
     commit; letting it be published alone would restore exactly the drift that
     pairing them removes.
+
+    `work_repo` names the product repository these bytes describe, and is the one
+    thing this action records that is not the bytes themselves. It is read *here*,
+    at the instant the publication is made, because that instant is the only one at
+    which the state a publication describes and the publication itself are the same
+    moment. A reader taking that state afterwards would be describing whatever
+    happened next instead. It is optional because most artifacts describe no product
+    state; when it is absent the publication simply carries no such claim, and every
+    reader treats that as unproven.
     """
     if artifact == "progress":
         raise ControlPlaneError(
@@ -802,7 +842,20 @@ def publish(
         return target, current_head
     scope = f"{project}/{ticket}"
     subject = f"{role}: {artifact}" + (f" {rail}" if rail else "") + f" ({scope})"
-    _git(repo_root, ["commit", "--quiet", "-m", subject, "--", relative])
+    message = [subject]
+    if work_repo is not None:
+        # Captured after the bytes are written and staged, so nothing this action
+        # does can land between the state being read and the publication recording
+        # it. An incoherent product checkout yields no state and therefore no
+        # trailer: the publication is still made, and still says nothing it cannot
+        # prove.
+        observed = work_state(work_repo)
+        if observed:
+            message.append(f"{WORK_STATE_TRAILER}: {observed}")
+    _git(
+        repo_root,
+        ["commit", "--quiet", "-m", "\n\n".join(message), "--", relative],
+    )
     return target, resolve_current_head(repo_root)
 
 
@@ -1222,6 +1275,31 @@ class ReadSource:
             check=False,
         ) or None
 
+    def work_state(self, relative: str) -> str | None:
+        """The product state the publication standing at one path was made against.
+
+        Taken from the commit that last touched that path at the revision this read
+        already serves, so presence, identity and this claim all come from one
+        revision rather than three instants a caller happened to sample. `publish`
+        commits one path per commit, which is what makes "the commit that last
+        touched it" the commit that wrote these exact bytes.
+
+        `None` whenever the publication recorded no such claim -- an older
+        publication, one made against an incoherent checkout, or bytes that were
+        never committed at all. Absence is never read as unchanged.
+        """
+        revision = self.revision or "HEAD"
+        message = _git(
+            self.repo_root,
+            ["log", "-1", "--format=%B", revision, "--", relative],
+            check=False,
+        )
+        prefix = f"{WORK_STATE_TRAILER}: "
+        for line in reversed(message.splitlines()):
+            if line.startswith(prefix):
+                return line[len(prefix):].strip() or None
+        return None
+
     def rails(self, scope: str) -> list[str]:
         if self.revision is None:
             rails_root = self.repo_root / scope / "rails"
@@ -1245,8 +1323,8 @@ def rail_blob_sha(source: ReadSource, *, project: str, ticket: str, rail: str) -
 
 def rail_handoff_publication(
     source: ReadSource, *, project: str, ticket: str, rail: str
-) -> tuple[str, bool, str | None]:
-    """Where one rail's executor handoff lives, whether it is published, and which one.
+) -> tuple[str, bool, str | None, str | None]:
+    """Where one rail's handoff lives, whether it is published, which one, and against what.
 
     Presence, location, and the Git object name of the published bytes --
     deliberately nothing about the content. A handoff is executor-authored evidence
@@ -1260,9 +1338,20 @@ def rail_handoff_publication(
     at one instant with an identity seen at another. Republishing identical bytes
     yields the same name, which is the honest answer: identical bytes are not a new
     statement about the work.
+
+    The fourth element is the product-repository state that publication was made
+    against, or `None` when it made no such claim. It says nothing about the work
+    either; it exists so a reader can tell whether the repository still stands where
+    it stood when these bytes were written -- the one question presence and identity
+    together cannot answer.
     """
     relative = artifact_relative(project=project, ticket=ticket, artifact="handoff", rail=rail)
-    return relative, source.exists(relative), source.blob_sha(relative)
+    return (
+        relative,
+        source.exists(relative),
+        source.blob_sha(relative),
+        source.work_state(relative),
+    )
 
 
 def resolve_read_source(repo_root: Path) -> ReadSource:
@@ -1604,6 +1693,12 @@ def _build_parser() -> argparse.ArgumentParser:
     publish_parser.add_argument("--file", required=True, help="File holding the current content to publish.")
     publish_parser.add_argument("--rail", help="Stable semantic rail identifier for rail-scoped artifacts.")
     publish_parser.add_argument("--expected-head", help="Head the caller last read; publication fails closed if stale.")
+    publish_parser.add_argument(
+        "--work-repo",
+        dest="work_repo",
+        help="Product repository these bytes describe; its state is recorded at the instant "
+             "of publication so a later reader can tell whether work followed.",
+    )
 
     accept_parser = subparsers.add_parser(
         "accept",
@@ -1743,6 +1838,7 @@ def main(argv: list[str] | None = None) -> int:
         content=content,
         rail=arguments.rail,
         expected_head=arguments.expected_head,
+        work_repo=Path(arguments.work_repo).expanduser() if arguments.work_repo else None,
     )
     print(f"published: {target.relative_to(repo_root).as_posix()}")
     print(f"head: {head or 'empty history'}")

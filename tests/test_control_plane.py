@@ -766,7 +766,7 @@ class ControlPlaneTests(unittest.TestCase):
         # presence seen at one instant with an identity seen at another.
         self._publish()
         source = resolve_read_source(self.coordination)
-        location, published, publication = rail_handoff_publication(
+        location, published, publication, work_state = rail_handoff_publication(
             source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
         )
         self.assertEqual(
@@ -774,9 +774,10 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertFalse(published)
         self.assertIsNone(publication)
+        self.assertIsNone(work_state)
 
         self._publish(artifact="handoff", role="executor", content="# Handoff\n\nnext action\n")
-        location, published, publication = rail_handoff_publication(
+        location, published, publication, work_state = rail_handoff_publication(
             resolve_read_source(self.coordination),
             project="ai-dev", ticket="issue-51", rail="control-plane-surface",
         )
@@ -785,6 +786,9 @@ class ControlPlaneTests(unittest.TestCase):
         )
         self.assertTrue(published)
         self.assertRegex(publication, r"^[0-9a-f]{40}$")
+        # Published without naming a product repository, so it claims nothing about
+        # one. Absence, never "unchanged".
+        self.assertIsNone(work_state)
 
     def test_the_handoff_publication_name_moves_only_when_the_published_bytes_do(self) -> None:
         # The identity of a publication, not a judgement about it: republishing the
@@ -831,6 +835,134 @@ class ControlPlaneTests(unittest.TestCase):
             )[2],
             changed,
         )
+
+    # -- what a publication was written against ---------------------------------
+    #
+    # The ordering fact, at the only instant it exists. Everything below runs
+    # against a real product repository and the real `publish`, because the claim
+    # being tested is exactly that the helper reads that state *when it publishes*
+    # rather than whenever someone later asks.
+
+    def _work_repo(self) -> Path:
+        return self._init_repo("product")
+
+    def _product_commit(self, product: Path, text: str) -> str:
+        (product / "work.py").write_text(text, encoding="utf-8")
+        self._git(product, "add", "work.py")
+        self._git(product, "commit", "-q", "-m", "work")
+        return self._git(product, "rev-parse", "HEAD")
+
+    def _handoff_facts(self):
+        return rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )
+
+    def test_a_handoff_publication_records_the_product_state_it_was_written_against(self) -> None:
+        product = self._work_repo()
+        head = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nfirst\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], head)
+
+    def test_a_commit_landing_after_the_publication_leaves_it_naming_the_older_state(self) -> None:
+        # The whole invariant, at the seam that can actually hold it: the agent
+        # works, publishes its handoff, and then commits again. The publication
+        # names where the repository stood when those bytes were written, so the
+        # later commit is visible as a difference rather than being invisible as an
+        # ordering inside one opaque turn.
+        product = self._work_repo()
+        published_against = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nfirst\n", work_repo=product,
+        )
+        after = self._product_commit(product, "second\n")
+
+        self.assertNotEqual(after, published_against)
+        self.assertEqual(self._handoff_facts()[3], published_against)
+        self.assertNotEqual(self._handoff_facts()[3], after)
+
+        # And republishing against the state that now stands says so, which is the
+        # only way the claim becomes true again: by being made again.
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nsecond\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], after)
+
+    def test_republishing_identical_bytes_does_not_refresh_the_recorded_state(self) -> None:
+        # No commit is made for identical bytes, so no new claim is recorded. That
+        # is the conservative answer and the correct one: identical bytes are not a
+        # new statement about the work, and a republication that changed nothing
+        # must not be able to certify work it never described.
+        product = self._work_repo()
+        published_against = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nsame\n", work_repo=product,
+        )
+        after = self._product_commit(product, "second\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nsame\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], published_against)
+        self.assertNotEqual(self._handoff_facts()[3], after)
+
+    def test_a_publication_made_against_an_incoherent_checkout_records_no_state(self) -> None:
+        # A head does not identify a checkout carrying uncommitted change, so
+        # recording one would be a claim this helper cannot support. The publication
+        # is still made; it simply says nothing it cannot prove.
+        product = self._work_repo()
+        self._product_commit(product, "first\n")
+        (product / "work.py").write_text("uncommitted\n", encoding="utf-8")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\ndirty\n", work_repo=product,
+        )
+        self.assertTrue(self._handoff_facts()[1])
+        self.assertIsNone(self._handoff_facts()[3])
+
+        # Same refusal for a repository mid-operation, with a clean tree.
+        self._git(product, "checkout", "-q", "--", "work.py")
+        (Path(self._git(product, "rev-parse", "--absolute-git-dir")) / "MERGE_HEAD").write_text(
+            self._git(product, "rev-parse", "HEAD") + "\n", encoding="utf-8"
+        )
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nmid-merge\n", work_repo=product,
+        )
+        self.assertIsNone(self._handoff_facts()[3])
+
+    def test_coordination_activity_after_the_publication_changes_nothing_it_recorded(self) -> None:
+        # The boundary is the product repository, deliberately. The supported
+        # executor path publishes and pushes first and *then* allocates a receipt,
+        # which moves the coordination repository; a rule that read "nothing after
+        # publication" would break that documented path. Everything the coordination
+        # repository does here leaves the recorded product state exactly where it
+        # was, so an otherwise current handoff stays current.
+        product = self._work_repo()
+        head = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nfirst\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], head)
+
+        # Exactly the supported ordering: publish, push, *then* allocate the
+        # receipt. The allocation commits and pushes into the coordination
+        # repository, which is the act a naive "nothing after publication" rule
+        # would have to reject.
+        upstream = self._attach_shared_upstream("upstream")
+        self._git(self.coordination, "push", "-q", "origin", "main")
+        self._seed_counter(upstream)
+        allocate_proceed_number(self.coordination, project="ai-dev", ticket="issue-51")
+
+        self.assertEqual(self._handoff_facts()[3], head)
+        self.assertEqual(self._git(product, "rev-parse", "HEAD"), head)
 
     def test_rail_blob_sha_is_absent_for_an_unauthorized_rail(self) -> None:
         source = resolve_read_source(self.coordination)
