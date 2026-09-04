@@ -29,7 +29,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import (
+    Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple,
+)
 import uuid
 
 from .authorization import ACTION_CONTINUE, ACTION_LAUNCH, AuthorizationDecision
@@ -103,6 +105,19 @@ REASON_HANDOFF_NOT_PUBLISHED = "durable-handoff-not-published"
 REASON_HANDOFF_NOT_CURRENT = "durable-handoff-not-current"
 REASON_WORKTREE_INCOHERENT = "worktree-incoherent"
 REASON_ROTATION_HANDOFF_ESTABLISHED = "durable-handoff-established"
+
+# What one post-turn finalization attempt says about itself. These are reported
+# facts on the invocation's own result, never durable state and never authority:
+# only `FINALIZATION_ESTABLISHED` records anything at all, and every other value
+# leaves the session exactly as un-credited as it was before the turn.
+FINALIZATION_ESTABLISHED = "terminal-handoff-established"
+FINALIZATION_NOT_ATTEMPTED = "no-finalizer-supplied"
+FINALIZATION_ERRORED_TURN = "invocation-reported-an-error"
+FINALIZATION_NO_PAYLOAD = "no-terminal-handoff-payload"
+FINALIZATION_AMBIGUOUS_PAYLOAD = "ambiguous-terminal-handoff-payload"
+FINALIZATION_PUBLICATION_FAILED = "durable-publication-failed"
+FINALIZATION_BOOKKEEPING_FAILED = "required-bookkeeping-failed"
+FINALIZATION_UNIDENTIFIED = "publication-not-identified"
 
 REASON_DISCONNECTED_NO_HANDLE = "disconnected-no-owned-handle"
 REASON_DISCONNECTED_NOT_LIVE = "disconnected-process-group-gone"
@@ -179,19 +194,31 @@ class OwnedSession:
 
 
 @dataclass(frozen=True)
-class HandoffPublicationObservation:
-    """Which handoff publication this controller saw appear, and across which work boundary.
+class TerminalFinalization:
+    """One handoff *this controller published itself*, after a turn had ended.
 
-    `publication` is the Git object name of the published bytes -- the identity of
-    one publication, taken from the control-plane read that already names a rail
-    iteration the same way. It says *which* handoff is being offered and nothing
-    whatever about what it says; the handoff itself remains the only carrier of
-    outcome, evidence, unresolved work and next action.
+    The distinction from an observation is the whole point, and it is the fact
+    checkpoints 59-61 could not obtain. An observation says a publication appeared
+    somewhere between two reads a controller took; it cannot say whether the agent
+    went on working afterwards, because a provider turn is opaque and both
+    orderings present the same two reads. This record is not an observation at all:
+    it exists only because this controller performed the publishing act, at a
+    moment it chose, and that moment is strictly after the agent's provider turn
+    ended. Nothing the agent did can follow it inside that invocation, because the
+    invocation is over -- and that is an ordering fact about the act, not an
+    inference from repository state.
 
-    `work_boundary` is the count of invocations this controller had begun when that
-    publication appeared. It is not a time, not a sequence anything schedules on,
-    and not an event log -- it exists only to answer whether anything happened
-    after this publication.
+    `publication` is the Git object name of the published bytes, from the same
+    control-plane read that already names a rail iteration the same way. It says
+    *which* handoff is being offered and nothing about what it says; the handoff
+    remains the only carrier of outcome, evidence, unresolved work and next action,
+    and nothing here reads a word of it.
+
+    `work_boundary` is checkpoint 60's counter, unchanged: the count of invocations
+    this controller had begun when the finalization happened. Not a time, not a
+    schedulable sequence, not an event log. It answers one question -- has a further
+    invocation begun since -- which is what keeps a finalization from being credited
+    across the next unit of work.
     """
 
     session_id: str
@@ -215,7 +242,7 @@ class SessionRegistry:
         # a work boundary that survived restart would be a claim about work this
         # process never watched.
         self._work_boundary = {}
-        self._handoff_publication = {}
+        self._terminal_finalization = {}
         # Context lifecycle lives beside ownership because it is the same kind of
         # claim: what this controller itself observed about a process it holds. It
         # is created and dropped with the handle, which is also the only bound the
@@ -248,7 +275,7 @@ class SessionRegistry:
         self._owned.pop(session_id, None)
         self._in_flight.discard(session_id)
         self._work_boundary.pop(session_id, None)
-        self._handoff_publication.pop(session_id, None)
+        self._terminal_finalization.pop(session_id, None)
         self._context.forget(session_id)
 
     def context(self, session_id: str) -> Optional[SessionContextLifecycle]:
@@ -286,44 +313,45 @@ class SessionRegistry:
         """
         return self._work_boundary.get(session_id, 0)
 
-    def handoff_publication(self, session_id: str) -> Optional[HandoffPublicationObservation]:
-        """The handoff publication this controller saw appear, and where in its work."""
-        return self._handoff_publication.get(session_id)
+    def terminal_finalization(self, session_id: str) -> Optional[TerminalFinalization]:
+        """The handoff this controller published after this session's turn ended."""
+        return self._terminal_finalization.get(session_id)
 
-    def observe_handoff_publication(
-        self, session_id: str, publication: Optional[str], *, previous: Optional[str]
-    ) -> Optional[HandoffPublicationObservation]:
-        """Record a handoff publication that appeared across this session's current boundary.
+    def clear_terminal_finalization(self, session_id: str) -> None:
+        """Drop any standing credit for this session. Used only to fail closed.
 
-        `previous` is what the caller's read said *before* the unit of work,
-        `publication` what the same read says after it. A publication becomes
-        current only by appearing or changing across one unit of work, because that
-        crossing is the only thing that shows the bytes were written for the work
-        just performed rather than for some earlier boundary. An unchanged read is
-        therefore not an observation of currency: it deliberately leaves whatever
-        was already recorded standing at the older boundary it was established at,
-        which is what makes work performed after a publication visible at all.
+        Called at the start of every post-turn finalization, before any attempt is
+        made, so that a turn which produces no creditable finalization can never
+        leave an earlier one standing. That earlier record would already fail the
+        work-boundary check, so this is belt to that brace -- but the fail-closed
+        direction is worth being redundant about.
+        """
+        self._terminal_finalization.pop(session_id, None)
 
-        No publication clears the record. A read that could not say which
-        publication stands must not leave one behind claiming to be current.
+    def record_terminal_finalization(
+        self, session_id: str, publication: Optional[str]
+    ) -> Optional[TerminalFinalization]:
+        """Credit one publication this controller made after the turn that produced it.
 
-        `previous` is required rather than defaulted so that no caller can record a
-        publication without having said what it replaced. `continue_session` is
-        where that pair is taken around real work, which is what makes the crossing
-        structural instead of a convention a caller has to remember.
+        This is the only way a session becomes rotation-creditable, and it is
+        deliberately not reachable from anything an agent does. It records no
+        publication it merely *saw*: `finalize_terminal_handoff` is its single
+        caller, it runs only after the invocation bracket has closed, and it passes
+        the identity returned by the publishing act it just performed.
+
+        A falsy identity records nothing. A publishing act that cannot name what it
+        published has not established a boundary, and silence is never evidence.
         """
         if not publication:
-            self._handoff_publication.pop(session_id, None)
+            self._terminal_finalization.pop(session_id, None)
             return None
-        if previous is not None and publication == previous:
-            return self._handoff_publication.get(session_id)
-        observation = HandoffPublicationObservation(
+        finalization = TerminalFinalization(
             session_id=session_id,
             publication=publication,
             work_boundary=self.work_boundary(session_id),
         )
-        self._handoff_publication[session_id] = observation
-        return observation
+        self._terminal_finalization[session_id] = finalization
+        return finalization
 
     def begin_invocation(self, session_id: str) -> None:
         if session_id in self._in_flight:
@@ -506,26 +534,242 @@ def _observe_context(registry: SessionRegistry, session_id: str, result: Any) ->
     registry.observe_context_events(session_id, events or ())
 
 
-def _read_publication(reader: Optional[Callable]) -> Optional[str]:
-    """One caller-supplied read of the current handoff publication, or nothing.
+# ---------------------------------------------------------------------------
+# Terminal handoff finalization
+# ---------------------------------------------------------------------------
+#
+# The permission this implements is exactly one sentence wide: the controller may
+# use the terminal result of a *completed* invocation as transient input to
+# deterministic durable handoff finalization. Everything below is an attempt to
+# spend no more than that.
+#
+# It authorizes no transcript replay, no provider-message history, no tool-use
+# auditing, no command log, no timestamp, no global sequence, and no second durable
+# representation of a handoff. Exactly one string crosses from the provider side,
+# it belongs to the one message that ends a turn, it is published verbatim without
+# being read, and it is not retained anywhere afterwards. The published handoff
+# stays the single canonical artifact and the replacement still reads only that.
+#
+# One integration requirement is recorded here and deliberately not performed,
+# because the surface it lands on belongs to an isolated parallel lane:
+#
+#   Executor and orchestrator publication must use this supported
+#   terminal-finalization path rather than self-certifying rotation currency from
+#   an arbitrary mid-turn handoff publication.
+#
+# Until that is done, the documented executor path publishes mid-turn and this
+# controller finalizes nothing, so no session is credited at all. The wiring is
+# absent in the fail-closed direction, which is the right place for it to be
+# absent while it waits.
 
-    Supplied by the caller for the same reason `RailFacts` is: this module reads no
-    repository and shells out to nothing, so a lifecycle fact can never be
-    contaminated by a read taken at some other instant than the caller's.
+# The delimiters the agent wraps its final handoff in. A delimiter, not a schema:
+# the controller finds the boundaries and publishes what lies between them without
+# parsing, validating or interpreting a word of it. Anything outside them -- an
+# agent's closing remarks to its manager, say -- is simply not the handoff, and is
+# discarded with the rest of the turn.
+HANDOFF_ENVELOPE_BEGIN = "<<<AI-DEV-HANDOFF-BEGIN>>>"
+HANDOFF_ENVELOPE_END = "<<<AI-DEV-HANDOFF-END>>>"
 
-    A failed or absent read is silence, never a raise: the invocation around it
-    either happened or did not, and a control-plane read cannot change that after
-    the fact. Silence is also never mistaken for evidence -- it clears any recorded
-    publication, so an unreadable control plane leaves the boundary unproven and
-    rotation readiness fails closed.
+
+def extract_terminal_handoff(payload: Optional[str]) -> Optional[str]:
+    """The exact handoff bytes one terminal result carried, or nothing.
+
+    Deliberately the dullest function that can do this. It locates two delimiters
+    and returns what is between them; it does not parse the handoff, does not
+    validate it, does not normalise it, and could not tell a handoff from a
+    shopping list. That is the property that matters: the controller publishes what
+    the agent wrote, byte for byte, so no second representation of the handoff
+    exists and nothing here becomes a judge of the work.
+
+    More than one envelope is refused rather than resolved. Choosing the first or
+    the last would be a guess about which set of bytes the agent meant to be
+    durable, and D9 forbids guessing about exactly this. An ambiguous final message
+    yields no payload, which yields no finalization, which fails closed.
     """
-    if reader is None:
+    if not isinstance(payload, str):
         return None
+    if payload.count(HANDOFF_ENVELOPE_BEGIN) != 1:
+        return None
+    if payload.count(HANDOFF_ENVELOPE_END) != 1:
+        return None
+    start = payload.index(HANDOFF_ENVELOPE_BEGIN) + len(HANDOFF_ENVELOPE_BEGIN)
+    end = payload.index(HANDOFF_ENVELOPE_END)
+    if end < start:
+        return None
+    body = payload[start:end].strip("\n")
+    return body if body.strip() else None
+
+
+def terminal_finalizer(*, publish: Callable, bookkeeping: Optional[Callable] = None):
+    """Compose the deterministic durable finalization: publish, then finish the job.
+
+    Two steps, in this order, and the order is the point. `publish` makes the bytes
+    durable and returns the identity of what it published. `bookkeeping` is whatever
+    the supported path *requires* after that -- pushing the coordination repository,
+    allocating a receipt -- and it runs second because it can only run second.
+
+    Publication alone is not enough. The checkpoint-61 review's third scenario is
+    precisely this: publish succeeds, the push or the receipt then fails closed, and
+    the exact next action and unresolved work have changed while the standing handoff
+    still claims otherwise. So a bookkeeping failure is a finalization failure. The
+    credit is not awarded, the old context stays alive and continuable, and the
+    correct recovery is another bounded invocation whose terminal result carries a
+    handoff that says what actually happened. Nothing here terminates anything, so
+    "the old context survives" is not a promise this makes but a property it cannot
+    violate.
+
+    Neither callable is defaulted. This module reads no repository and shells out to
+    nothing, for the same reason `RailFacts` is supplied rather than fetched: a
+    durable act taken from in here could not be the caller's own instant.
+    """
+
+    def finalize(handoff_bytes: str) -> str:
+        try:
+            publication = publish(handoff_bytes)
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            raise LifecycleError(
+                FINALIZATION_PUBLICATION_FAILED,
+                "the handoff could not be made durable ({0}: {1}).".format(
+                    type(exc).__name__, exc
+                ),
+            ) from exc
+        if bookkeeping is not None:
+            try:
+                bookkeeping()
+            except Exception as exc:  # noqa: BLE001 - the same, one step later
+                raise LifecycleError(
+                    FINALIZATION_BOOKKEEPING_FAILED,
+                    "the handoff was published but required bookkeeping after it "
+                    "failed ({0}: {1}), so the unresolved work and next action a "
+                    "replacement would resume have changed.".format(
+                        type(exc).__name__, exc
+                    ),
+                ) from exc
+        return publication
+
+    return finalize
+
+
+def finalize_terminal_handoff(
+    registry: SessionRegistry,
+    session_id: str,
+    result: Any,
+    finalize: Optional[Callable],
+) -> Dict[str, Any]:
+    """Publish the handoff a completed turn ended with, and credit it -- or credit nothing.
+
+    Called once, from exactly one place: after `continue_session`'s invocation
+    bracket has closed. That placement is the whole mechanism. The agent's provider
+    turn has ended before the first line of this function runs, so no product work,
+    no evidence work and no publication of the agent's own can occur after the
+    publication this makes, inside this invocation. The next invocation is the next
+    invocation, and the work-boundary counter already refuses a finalization
+    credited across one.
+
+    Every path other than a complete success credits nothing, and each says which
+    path it took. A missing finalizer, an errored turn, a final message with no
+    envelope or with two, a publish that raises, bookkeeping that raises, a publish
+    that cannot name what it published: all of them leave the session exactly as
+    un-credited as it was, and the standing handoff -- if any -- is dropped first so
+    that a failed finalization can never coast on an earlier one.
+
+    This never raises. The invocation it follows genuinely happened and genuinely
+    succeeded; turning a finalization failure into an invocation failure would
+    misreport the work. It reports instead, and readiness fails closed on the
+    absence of a credit rather than on an exception.
+    """
+    registry.clear_terminal_finalization(session_id)
+
+    def reported(state: str, detail: str, publication: Optional[str] = None) -> Dict[str, Any]:
+        fact = {"state": state, "detail": detail}
+        if publication:
+            fact["publication"] = publication
+        if isinstance(result, MutableMapping):
+            result["finalization"] = fact
+        return fact
+
+    if finalize is None:
+        return reported(
+            FINALIZATION_NOT_ATTEMPTED,
+            "no finalizer was supplied, so nothing about session {0}'s handoff was "
+            "made durable by this controller.".format(session_id),
+        )
+
+    # An invocation that reported a provider error did not complete, and the
+    # permission being spent is over the terminal result of a *completed* one.
+    # `interpret_result` already drops the payload on that path; this refuses it
+    # again here, because a fail-closed condition that only one layer enforces is
+    # one refactor away from not being enforced at all.
+    if isinstance(result, Mapping) and result.get("is_error"):
+        return reported(
+            FINALIZATION_ERRORED_TURN,
+            "session {0}'s invocation reported a provider error, so it has no "
+            "completed turn whose terminal handoff could be made durable.".format(
+                session_id
+            ),
+        )
+
+    payload = result.get("terminal_payload") if isinstance(result, Mapping) else None
+    handoff_bytes = extract_terminal_handoff(payload)
+    if handoff_bytes is None:
+        ambiguous = isinstance(payload, str) and (
+            payload.count(HANDOFF_ENVELOPE_BEGIN) > 1
+            or payload.count(HANDOFF_ENVELOPE_END) > 1
+        )
+        return reported(
+            FINALIZATION_AMBIGUOUS_PAYLOAD if ambiguous else FINALIZATION_NO_PAYLOAD,
+            "session {0}'s terminal result carried {1}, so there is no handoff to "
+            "make durable.".format(
+                session_id,
+                "more than one handoff envelope" if ambiguous
+                else "no single delimited handoff",
+            ),
+        )
+
     try:
-        publication = reader()
-    except Exception:
-        return None
-    return publication or None
+        publication = finalize(handoff_bytes)
+    except LifecycleError as exc:
+        # The composed finalizer already named which of its two steps failed, and
+        # that difference is worth keeping: a failed publication left nothing
+        # durable, while failed bookkeeping left a publication whose surrounding
+        # facts have since moved. Neither is credited; both are reported as
+        # themselves rather than flattened.
+        state = (
+            FINALIZATION_BOOKKEEPING_FAILED
+            if exc.reason == FINALIZATION_BOOKKEEPING_FAILED
+            else FINALIZATION_PUBLICATION_FAILED
+        )
+        return reported(
+            state,
+            "the durable finalization of session {0}'s terminal handoff failed: "
+            "{1} Nothing is credited and the context stays alive.".format(
+                session_id, exc.detail
+            ),
+        )
+    except Exception as exc:  # noqa: BLE001 - a failed finalization is a fact, not a crash
+        return reported(
+            FINALIZATION_PUBLICATION_FAILED,
+            "the durable finalization of session {0}'s terminal handoff failed "
+            "({1}: {2}); nothing is credited and the context stays alive.".format(
+                session_id, type(exc).__name__, exc
+            ),
+        )
+
+    finalization = registry.record_terminal_finalization(session_id, publication)
+    if finalization is None:
+        return reported(
+            FINALIZATION_UNIDENTIFIED,
+            "session {0}'s handoff was published but the act could not name what it "
+            "published, so no publication can be proven current.".format(session_id),
+        )
+    return reported(
+        FINALIZATION_ESTABLISHED,
+        "session {0}'s terminal handoff was published as {1} at work boundary "
+        "{2}, after its provider turn ended.".format(
+            session_id, finalization.publication, finalization.work_boundary
+        ),
+        publication=finalization.publication,
+    )
 
 
 def _observe_failed_invocation(registry: SessionRegistry, session_id: str, exc: Exception) -> None:
@@ -703,7 +947,7 @@ def continue_session(
     send: Optional[Callable] = None,
     alive: Optional[Callable] = None,
     command_timeout: Optional[float] = None,
-    read_handoff_publication: Optional[Callable] = None,
+    finalize_handoff: Optional[Callable] = None,
 ) -> Mapping:
     """Resume exactly the bound session this controller still owns, once at a time."""
     _require_decision(decision, assignment, action=ACTION_CONTINUE)
@@ -749,14 +993,6 @@ def continue_session(
     if command_timeout is not None:
         send_arguments["timeout"] = command_timeout
 
-    # Which handoff publication stood *before* this unit of work. Reading it here,
-    # inside the same bracket that already marks the invocation in flight, is what
-    # makes the pair of reads describe one unit of work rather than two moments a
-    # caller chose. A publication that is unchanged across the bracket was written
-    # for an earlier boundary; only one that appears or changes across it was
-    # written for this one.
-    publication_before = _read_publication(read_handoff_publication)
-
     registry.begin_invocation(session_id)
     try:
         result = sender(owned.handle, request, **send_arguments)
@@ -776,16 +1012,19 @@ def continue_session(
     # the count carries across the resume rather than restarting, and the identity
     # pairs already seen keep a replayed boundary from counting twice.
     _observe_context(registry, session_id, result)
-    # And which one stands after it. The failure path above raises before reaching
-    # here on purpose: an invocation that failed leaves the boundary it opened
-    # unmatched by any publication, which is exactly the work-boundary uncertainty
-    # checkpoint 58 already established -- and it fails closed rather than
-    # inferring that nothing changed.
-    registry.observe_handoff_publication(
-        session_id,
-        _read_publication(read_handoff_publication),
-        previous=publication_before,
-    )
+    # The turn is over. `sender` returned, which means the provider emitted its
+    # terminal result and this worker is idle awaiting the next command; the
+    # `finally` above has already cleared in-flight. Only now does the controller
+    # publish, and that placement -- not a rule the agent is asked to follow -- is
+    # what makes the credited publication follow the agent's last act. There is no
+    # ordering left to prove afterwards, because there is no "afterwards" inside
+    # this invocation.
+    #
+    # The failure path above raises before reaching here on purpose: an invocation
+    # that failed leaves the boundary it opened with no terminal result to finalize
+    # from, which is exactly the work-boundary uncertainty checkpoint 58
+    # established, and it fails closed rather than inferring that nothing changed.
+    finalize_terminal_handoff(registry, session_id, result, finalize_handoff)
     return result
 
 
@@ -1068,23 +1307,46 @@ def recover_session(
 # exists. When either fact is missing, readiness fails closed, like every other
 # not-ready path here.
 #
-# Fourth, those two facts bracket a publication but do not order it. They are both
-# taken from outside a provider turn, and a turn is opaque: a handoff published
-# midway through one, with further work after it, presents this controller with
-# exactly the observations a handoff published at the end of one does. The
-# distinguishing fact does not exist out here to be taken, so it is taken where it
-# does exist -- at the instant of publication, by the publishing act, which records
-# the product state those bytes were written against. Readiness then asks one
-# question of it: does the repository still stand there? A commit after publication
-# moves it; work carrying no commit leaves the tree dirty, which the coherent-
-# workspace requirement already refuses. That pair is the ordering proof, and it is
-# structural in the only place a structure could hold it.
+# Fourth -- and this is where checkpoints 59 to 61 stopped short -- neither of
+# those facts orders the publication against the work. Both are taken from outside
+# a provider turn, and a turn is opaque: a handoff published midway through one,
+# with further work after it, presents this controller with exactly the
+# observations a handoff published at the end of one does. Checkpoint 61 tried to
+# recover the ordering from repository state, by having the publishing act record
+# the product head it was written against and comparing that with where the
+# workspace now stands. For work that commits, that does distinguish the two
+# orderings. For work that does not, it distinguishes nothing at all: on a
+# reviewer, orchestrator or evidence-only rail the recorded state and the observed
+# state are the same commit name from the session's first instant to its last, and
+# a constant cannot order anything. D10 puts orchestrators in scope for the same
+# invariant, so that was not a residual sliver but a whole role.
 #
-# What it deliberately does not do is treat every act after publication as work.
-# The boundary is the product repository, because that is what a replacement
+# The distinguishing fact was never going to be an observation. It is an act. The
+# controller does not watch for a publication and try to date it; it *performs* the
+# publication, from the terminal result of an invocation that has already ended,
+# and credits only what it published itself. The turn is over before the credited
+# bytes become durable, so nothing the agent did -- committing or not, producing
+# evidence or not, publishing something of its own mid-turn or not -- can follow
+# them inside that invocation. That is structural in the strongest available sense:
+# it is not a rule the agent is asked to obey, and it holds identically for a rail
+# that never touches the product repository.
+#
+# The permission this rests on is narrow and worth restating where it is spent: the
+# terminal result of a completed invocation may be transient input to deterministic
+# durable finalization. One string, from the one message that ends a turn,
+# published verbatim without being interpreted, retained nowhere. It is not
+# transcript replay, not provider-message history, not a tool-use audit, not a
+# command log, not a timestamp, not a sequence number, and not a second durable
+# representation of the handoff. The published handoff is still the only canonical
+# artifact, and a replacement still reads only that.
+#
+# What this deliberately does not do is treat every act after publication as work.
+# The boundary is still the product repository, because that is what a replacement
 # resumes from and what D9 names first. Allocating a receipt in the coordination
 # repository -- which the supported executor path performs *after* publishing --
-# moves no product state and invalidates nothing.
+# moves no product state and invalidates nothing when it succeeds. When it fails,
+# it is not the repository comparison that catches it: the finalization required
+# that bookkeeping, the bookkeeping failed, and so nothing was credited at all.
 
 
 @dataclass(frozen=True)
@@ -1366,13 +1628,30 @@ def evaluate_rotation_readiness(
             ),
         )
 
-    # 5. And that publication is the current one. `published` says a handoff
-    #    exists; this says the one that exists was written for the boundary this
-    #    session is standing at. Both facts are mechanical: the object name of the
-    #    published bytes, and this controller's own count of invocations begun. No
-    #    part of the handoff's text is read, here or anywhere in this module.
+    # 5. And that publication is the current one -- which now means: this controller
+    #    published it itself, from the terminal result of a completed invocation,
+    #    after that invocation's provider turn had ended, and no further invocation
+    #    has begun since.
+    #
+    #    This is the check checkpoints 59-61 were reaching for and could not hold.
+    #    Their currency facts were all *observations*: a publication seen to appear
+    #    between two reads, and later the product state it was written against. Both
+    #    are taken from outside a provider turn, and the checkpoint-61 review proved
+    #    what that costs -- for any rail whose remaining work produces evidence
+    #    without a product commit (every read-only reviewer and orchestrator rail
+    #    included, which D10 places in scope), the discriminator is constant from
+    #    first instant to last, and a constant orders nothing.
+    #
+    #    The fact that does order it is not an observation at all. It is the
+    #    controller's own act: `finalize_terminal_handoff` publishes the handoff
+    #    *after* `sender` has returned, so the agent's turn is provably over before
+    #    the credited bytes become durable. No product work, no evidence work, no
+    #    coordination act and no publication of the agent's own can follow it inside
+    #    that invocation, whether or not anything was committed. Nothing about the
+    #    repository has to move for this to hold, which is exactly the class that was
+    #    unreachable before.
     boundary = registry.work_boundary(record.session_id)
-    observation = registry.handoff_publication(record.session_id)
+    finalization = registry.terminal_finalization(record.session_id)
     if handoff.publication is None:
         return projected(
             ROTATION_NOT_READY,
@@ -1381,59 +1660,64 @@ def evaluate_rotation_readiness(
             "whether it is the one describing session {1}'s current work cannot be "
             "established.".format(handoff.location, record.session_id),
         )
-    if observation is None:
+    if finalization is None:
         return projected(
             ROTATION_NOT_READY,
             REASON_HANDOFF_NOT_CURRENT,
-            "a handoff is published at {0}, but this controller never observed one "
-            "appear across any of session {1}'s {2} invocations, so it cannot say "
-            "the published handoff describes work this session performed.".format(
-                handoff.location, record.session_id, boundary
-            ),
+            "a handoff is published at {0}, but this controller never finalized one "
+            "from the terminal result of any of session {1}'s {2} invocations, so "
+            "it cannot say the published handoff followed that session's last "
+            "act.".format(handoff.location, record.session_id, boundary),
         )
-    if observation.publication != handoff.publication:
+    if finalization.publication != handoff.publication:
         return projected(
             ROTATION_NOT_READY,
             REASON_HANDOFF_NOT_CURRENT,
             "the handoff published at {0} is {1}, but the publication this "
-            "controller saw established for session {2} is {3}; the one on offer is "
-            "not the one whose currency was proven.".format(
+            "controller finalized for session {2} is {3}; the one on offer is not "
+            "the one whose currency was proven.".format(
                 handoff.location, handoff.publication, record.session_id,
-                observation.publication,
+                finalization.publication,
             ),
         )
-    if observation.work_boundary != boundary:
+    if finalization.work_boundary != boundary:
         return projected(
             ROTATION_NOT_READY,
             REASON_HANDOFF_NOT_CURRENT,
-            "the handoff published at {0} was established at work boundary {1} and "
+            "the handoff published at {0} was finalized at work boundary {1} and "
             "session {2} is at work boundary {3}; {4} further invocation(s) have "
             "begun since, so it does not carry the outcome, evidence, unresolved "
             "work and next action a replacement would resume from.".format(
-                handoff.location, observation.work_boundary, record.session_id,
-                boundary, boundary - observation.work_boundary,
+                handoff.location, finalization.work_boundary, record.session_id,
+                boundary, boundary - finalization.work_boundary,
             ),
         )
 
-    # 6. And nothing was done after it. Every check above brackets the publication
-    #    between two moments this controller chose, which is the most it can see:
-    #    one provider turn is opaque, so a handoff published in the middle of a turn
-    #    and a handoff published at the end of one are the same two observations. The
-    #    fact that separates them cannot be taken from out here at all -- it has to
-    #    be taken at the instant of publication, by the act that publishes.
+    # 6. And the product repository still stands where the publication said it did.
     #
-    #    So the publication carries the product state it was written against, and
-    #    this compares it with where the repository stands now. Equal means no
-    #    commit landed after those bytes were written; and work that landed no
-    #    commit leaves the tree dirty, which check 3 already refused. Between them
-    #    the two cover every way product work survives a turn, which is why this is
-    #    an ordering proof and not an ordering convention.
+    #    Checkpoint 61 introduced this as *the* ordering proof. It is no longer that,
+    #    and saying so plainly is the honest thing to do: check 5 now proves the
+    #    ordering structurally, for every rail rather than only for rails that
+    #    commit. What this check still does is real but smaller -- it refuses a
+    #    boundary where the product repository moved after the finalization, in the
+    #    gap between the turn ending and this projection being asked. Nothing inside
+    #    the invocation can produce that any more, but a human, another session, or
+    #    a controller-side act outside any invocation can, and a replacement handed
+    #    a handoff written against a state the workspace has since left would be
+    #    resuming from a description of somewhere else.
     #
-    #    It is deliberately the *product* repository and not "anything that ran".
-    #    The supported path allocates a receipt after publishing, in the
+    #    It is kept for that residual guard, and for nothing else. It is retained
+    #    rather than deleted because it costs one comparison and closes a real gap;
+    #    it is demoted rather than relied upon because the review proved it cannot
+    #    order work that lands no commit.
+    #
+    #    It remains deliberately the *product* repository and not "anything that
+    #    ran". The supported path allocates a receipt after publishing, in the
     #    coordination repository; that changes no product state, alters nothing a
     #    replacement resumes, and must not invalidate a handoff that is otherwise
-    #    current.
+    #    current. When the receipt or the push *fails*, the finalization that
+    #    required it was never credited in the first place, so the failure is caught
+    #    at check 5 rather than here.
     if worktree.head is None:
         return projected(
             ROTATION_NOT_READY,

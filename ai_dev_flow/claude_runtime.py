@@ -652,10 +652,19 @@ def build_option_fields(request: RuntimeRequest) -> dict:
 
 @dataclass(frozen=True)
 class RuntimeResult:
-    """What a run is allowed to leave behind: identity, outcome, and spend.
+    """What a run is allowed to leave behind: identity, outcome, spend, and its last word.
 
-    No transcript, no assistant text, no tool log. Provider output is not
-    collaboration state, and the handoff the executor publishes is.
+    No transcript, no tool log, and no assistant message before the last one.
+    Provider output is not collaboration state, and the handoff the executor
+    publishes is.
+
+    `terminal_payload` is the exception, and it is exactly one field of exactly one
+    message: the text the provider's terminal result carried when this invocation
+    completed. It is here so that the controller can publish the handoff the agent
+    ended its turn by writing -- transported, not interpreted, and never stored.
+    Nothing reads it as history: it exists only for the duration of the
+    finalization that follows the turn, and it is `None` on a failed invocation,
+    because a turn that did not complete has no last word to carry.
     """
 
     session_id: str
@@ -664,6 +673,7 @@ class RuntimeResult:
     is_error: bool
     num_turns: Optional[int] = None
     total_cost_usd: Optional[float] = None
+    terminal_payload: Optional[str] = None
 
 
 def interpret_result(request: RuntimeRequest, observed: Mapping) -> RuntimeResult:
@@ -683,11 +693,20 @@ def interpret_result(request: RuntimeRequest, observed: Mapping) -> RuntimeResul
             ),
         )
     subtype = observed.get("subtype")
+    is_error = bool(observed.get("is_error", False)) or subtype != "success"
+    terminal = observed.get("terminal_text")
     return RuntimeResult(
         session_id=request.session_id,
         mode=request.mode,
         subtype=subtype if isinstance(subtype, str) else None,
-        is_error=bool(observed.get("is_error", False)) or subtype != "success",
+        is_error=is_error,
+        # An errored invocation carries no payload forward. Checkpoint 58's
+        # fail-closed semantics are that a turn which did not complete leaves
+        # nothing that can be credited, and dropping the text here means the
+        # finalization path downstream has nothing to be tempted by.
+        terminal_payload=(
+            terminal if isinstance(terminal, str) and not is_error else None
+        ),
         num_turns=observed.get("num_turns") if isinstance(observed.get("num_turns"), int) else None,
         total_cost_usd=(
             float(observed["total_cost_usd"])

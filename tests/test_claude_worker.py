@@ -615,12 +615,16 @@ class ProviderReductionTests(WorkerTestBase):
             {"MARKER-P": True, "MARKER-S": True, "MARKER-ABSENT": False},
         )
 
-    def test_no_assistant_text_or_transcript_crosses_the_protocol(self) -> None:
+    def test_no_mid_turn_text_or_transcript_crosses_the_protocol(self) -> None:
+        # Narrowed, not abandoned. Everything the provider says *before* its last
+        # message is still reduced to marker booleans, and no transcript locator or
+        # usage accounting travels at all. The single exception is the terminal
+        # result, which the next tests pin exactly.
         secret = "assistant prose that must not travel"
         self._install_fake_sdk(
             result={
                 "session_id": SESSION, "subtype": "success", "is_error": False,
-                "result": secret, "transcript_path": "/tmp/session.jsonl",
+                "result": "final word", "transcript_path": "/tmp/session.jsonl",
                 "usage": {"input_tokens": 99},
             },
             texts=[secret],
@@ -632,6 +636,84 @@ class ProviderReductionTests(WorkerTestBase):
         rendered = json.dumps(payload, sort_keys=True)
         for leaked in (secret, "transcript", "usage", "input_tokens", "prose"):
             self.assertNotIn(leaked, rendered)
+
+    def test_the_terminal_result_crosses_verbatim_and_nothing_accumulates(self) -> None:
+        # The one deliberate exception, and its exact bounds. The terminal result
+        # travels byte for byte, because the controller publishes those bytes as the
+        # durable handoff without interpreting them, and anything short of verbatim
+        # would make the published artifact something other than what the agent
+        # wrote. Two earlier assistant messages are present in the same turn and
+        # neither appears anywhere in the payload: the field belongs to the result
+        # message, so there is nothing here that accumulates.
+        handoff = (
+            "# Handoff: issue-55\n\nRole: executor\n\n```\nproduct: pass\n```\n"
+            "Trailing prose with unicode -- and \"quotes\".\n"
+        )
+        terminal = "Finished.\n<<<AI-DEV-HANDOFF-BEGIN>>>\n{0}<<<AI-DEV-HANDOFF-END>>>\n".format(
+            handoff
+        )
+        self._install_fake_sdk(
+            result={
+                "session_id": SESSION, "subtype": "success", "is_error": False,
+                "result": terminal,
+            },
+            texts=["a draft handoff mid-turn", "and some more thinking"],
+        )
+        command = self._command()
+        payload = claude_worker._result_payload(
+            command, claude_worker._run_provider(command)
+        )
+        self.assertEqual(payload["terminal_payload"], terminal)
+        self.assertNotIn("mid-turn", json.dumps(payload))
+        self.assertNotIn("thinking", json.dumps(payload))
+        self.assertEqual(
+            json.loads(json.dumps(payload, sort_keys=True))["terminal_payload"], terminal
+        )
+
+    def test_a_handoff_sized_terminal_result_crosses_whole(self) -> None:
+        # A real handoff on this ticket runs 200-450 lines. A bounded live probe of
+        # the installed runtime returned 252 lines and 20,551 characters in this one
+        # field, unelided. This pins the transport rather than the provider: nothing
+        # between the worker and the controller truncates, chunks or reflows it, and
+        # it stays one newline-delimited JSON message, which is what `_read_message`
+        # reads.
+        body = "\n".join(
+            "LINE {0:03d} | {1}".format(index, "0123456789" * 7) for index in range(450)
+        )
+        terminal = "<<<AI-DEV-HANDOFF-BEGIN>>>\n{0}\n<<<AI-DEV-HANDOFF-END>>>".format(body)
+        self._install_fake_sdk(
+            result={
+                "session_id": SESSION, "subtype": "success", "is_error": False,
+                "result": terminal,
+            },
+        )
+        command = self._command()
+        payload = claude_worker._result_payload(
+            command, claude_worker._run_provider(command)
+        )
+        self.assertGreater(len(terminal), 35000)
+        self.assertEqual(payload["terminal_payload"], terminal)
+        line = json.dumps(payload, sort_keys=True)
+        self.assertNotIn("\n", line)
+        self.assertEqual(json.loads(line)["terminal_payload"], terminal)
+
+    def test_an_errored_turn_carries_no_terminal_payload(self) -> None:
+        # Checkpoint 58's fail-closed semantics, applied to the new field: a turn
+        # that did not complete successfully has no last word to hand forward, so
+        # the finalization path downstream is left with nothing to be tempted by.
+        self._install_fake_sdk(
+            result={
+                "session_id": SESSION, "subtype": "error_during_execution",
+                "is_error": True,
+                "result": "<<<AI-DEV-HANDOFF-BEGIN>>>x<<<AI-DEV-HANDOFF-END>>>",
+            },
+        )
+        command = self._command()
+        payload = claude_worker._result_payload(
+            command, claude_worker._run_provider(command)
+        )
+        self.assertTrue(payload["is_error"])
+        self.assertIsNone(payload["terminal_payload"])
 
     def test_a_provider_session_mismatch_is_refused_inside_the_worker(self) -> None:
         self._install_fake_sdk(

@@ -1407,41 +1407,86 @@ class RotationBoundaryTests(LifecycleTestBase):
         # Where the product repository stands. A commit name and nothing else: it is
         # only ever compared for equality, never ordered or dated.
         self.product_head = PRODUCT_HEAD
+        # Evidence-producing work that moves no repository at all: a test run, a
+        # read-only review, an orchestrator reading durable state. This is the class
+        # a product-head comparison is blind to, and the reason checkpoint 61's
+        # discriminator was constant end to end on a read-only rail.
+        self.evidence = []
 
-    def _work(self, publishing=None, fail=None, reader=_UNSET,
-              commits_before=(), commits_after=()):
+    def _envelope(self, payload):
+        """One final assistant message carrying a delimited handoff, as a turn ends.
+
+        Prose on both sides of the delimiters, because a real one has it: the
+        controller publishes what lies between them and discards the rest without
+        reading either.
+        """
+        return "Done. Handoff below.\n{0}\n{1}\n{2}\nStopping here.\n".format(
+            session_lifecycle.HANDOFF_ENVELOPE_BEGIN,
+            payload,
+            session_lifecycle.HANDOFF_ENVELOPE_END,
+        )
+
+    def _publish(self, handoff_bytes):
+        """The durable publishing act, standing in for `control_plane.publish`.
+
+        Returns the identity of what it published, which is what makes a
+        finalization creditable at all. The real act captures the product state at
+        the same instant, which is proved against real repositories in
+        `tests/test_control_plane.py`.
+        """
+        self.published.publish(handoff_bytes, self.product_head)
+        return handoff_bytes
+
+    def _finalizer(self, publish=None, bookkeeping=None):
+        """The deterministic post-turn finalization the manager composes."""
+        return session_lifecycle.terminal_finalizer(
+            publish=publish if publish is not None else self._publish,
+            bookkeeping=bookkeeping,
+        )
+
+    def _work(self, terminal=None, raw_terminal=_UNSET, mid_turn=None, fail=None,
+              finalizer=_UNSET, commits_before=(), commits_after=(),
+              evidence_after=(), is_error=False):
         """One authorized invocation of real work, bracketed exactly as production is.
 
-        `publishing` is what the agent leaves at the rail's canonical path *during*
-        the invocation, which is the only place a persistent agent can publish from.
-        Nothing about this helper reaches around `continue_session`: the currency
-        facts are established by the same call that performs the work.
+        `terminal` is the handoff the agent's *final* assistant message carries --
+        the last thing it produces before the turn ends. `mid_turn` is a publication
+        the agent makes for itself partway through, which is the shape checkpoints
+        59 to 61 could not tell apart from a publication at the end. Nothing here
+        reaches around `continue_session`: the credit, if any, is established by the
+        same call that performs the work, after that call's turn has ended.
 
-        `commits_before` and `commits_after` are product commits landing inside the
-        same turn, on either side of that publication. They are what makes work
-        *after* a publication expressible at all: the controller sees one opaque
-        `sender` call either way, so the two orderings differ in nothing it can
-        observe from out here -- only in what the publication was written against.
+        `commits_before`/`commits_after` are product commits landing inside the same
+        turn; `evidence_after` is work that produces evidence and moves no
+        repository at all.
         """
         def send(handle, request, *, prompt, markers=(), timeout=None):
             for head in commits_before:
                 self.product_head = head
-            if publishing is not None:
-                self.published.publish(publishing, self.product_head)
+            if mid_turn is not None:
+                self.published.publish(mid_turn, self.product_head)
             for head in commits_after:
                 self.product_head = head
+            self.evidence.extend(evidence_after)
             if fail is not None:
                 raise fail
+            if raw_terminal is not _UNSET:
+                payload = raw_terminal
+            else:
+                payload = self._envelope(terminal) if terminal is not None else None
             return {"type": "result", "session_id": request.session_id,
-                    "mode": request.mode, "subtype": "success", "is_error": False}
+                    "mode": request.mode,
+                    "subtype": "error_during_execution" if is_error else "success",
+                    "is_error": is_error,
+                    "terminal_payload": payload}
 
         return continue_session(
             self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
             registry=self.registry, session_id=SESSION,
             request_kwargs=self._request_kwargs(), prompt="carry on",
             send=send, alive=lambda pgid: True,
-            read_handoff_publication=(
-                self.published if reader is _UNSET else reader
+            finalize_handoff=(
+                self._finalizer() if finalizer is _UNSET else finalizer
             ),
         )
 
@@ -1498,25 +1543,26 @@ class RotationBoundaryTests(LifecycleTestBase):
         self._mark()
         # The agent publishes its handoff during an authorized invocation, which is
         # the only place a persistent agent can publish from.
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_ROTATION_HANDOFF_ESTABLISHED)
         self.assertTrue(readiness.ready)
         self.assertEqual((readiness.observed, readiness.threshold), (6, 6))
 
-    def test_work_after_the_publication_inside_one_invocation_is_not_rotation_ready(self) -> None:
-        # The load-bearing case, and the exact shape a bracket around one invocation
-        # cannot see: the agent works, publishes its handoff, and then goes on
-        # working -- committing, so the tree it leaves is clean and every other
-        # condition here is satisfied. The handoff on the rail no longer describes
-        # the outcome, evidence, unresolved work or next action a replacement would
-        # resume from, and nothing about the invocation says so.
+    def test_work_after_the_agents_own_publication_is_not_rotation_ready(self) -> None:
+        # THE load-bearing case, in the shape the mechanism now refuses structurally.
+        # The agent works, publishes its handoff for itself partway through the turn,
+        # then goes on working -- committing, so the tree it leaves is clean and every
+        # other condition is satisfied -- and its turn ends carrying no handoff. The
+        # artifact on the rail is real, published and byte-identical to one that
+        # would have been credited; it is simply not one this controller finalized
+        # after the turn, so nothing proves it followed the agent's last act.
         self._launch()
         self._mark()
         self._work(
             commits_before=(PRODUCT_HEAD,),
-            publishing=PUBLICATION,
+            mid_turn=PUBLICATION,
             commits_after=(NEXT_PRODUCT_HEAD,),
         )
         readiness = self._evaluate()
@@ -1524,39 +1570,46 @@ class RotationBoundaryTests(LifecycleTestBase):
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
         self.assertFalse(readiness.ready)
         self.assertIsNone(readiness.handoff)
-        self.assertIn(NEXT_PRODUCT_HEAD, readiness.detail)
+        self.assertTrue(self._handoff().published)
+        self.assertIn("never finalized", readiness.detail)
 
-    def test_the_two_orderings_differ_in_nothing_the_bracket_itself_records(self) -> None:
-        # The control this is measured against: same session, same mark, same single
-        # invocation, same published bytes, same successful return -- work then
-        # publish instead of publish then work. Every fact the invocation bracket
-        # records is identical across the two, which is precisely why the bracket
-        # could never have answered the question, and why the answer has to come
-        # from what the publication was written against.
+    def test_the_two_orderings_are_separated_by_who_published_and_when(self) -> None:
+        # The control the mechanism is measured against, and the reason it is
+        # structural rather than conventional. Same session, same mark, same single
+        # invocation, same published bytes, same successful return, and -- this is
+        # the point -- the same product commit in both arms, so the checkpoint-61
+        # discriminator is identical across them and answers nothing.
+        #
+        # GOOD: the bytes arrive as the turn's terminal result and the controller
+        # publishes them once the turn has ended.
+        # BAD: the agent publishes exactly those bytes itself, mid-turn, and keeps
+        # working.
         self._launch()
         self._mark()
-        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), terminal=PUBLICATION)
         good = self._evaluate()
 
         boundary = self.registry.work_boundary(SESSION)
-        observation = self.registry.handoff_publication(SESSION)
+        good_publication = self.published.value
+        good_work_state = self._handoff().work_state
+        good_head = self._worktree().head
 
         self.tearDown()
         self.setUp()
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION, commits_after=(NEXT_PRODUCT_HEAD,))
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), mid_turn=PUBLICATION)
         stale = self._evaluate()
 
+        # Every fact checkpoint 61 had to work with is identical across the two.
         self.assertEqual(self.registry.work_boundary(SESSION), boundary)
-        self.assertEqual(
-            (observation.publication, observation.work_boundary),
-            (
-                self.registry.handoff_publication(SESSION).publication,
-                self.registry.handoff_publication(SESSION).work_boundary,
-            ),
-        )
-        # Identical controller-local facts, opposite answers.
+        self.assertEqual(self.published.value, good_publication)
+        self.assertEqual(self._handoff().work_state, good_work_state)
+        self.assertEqual(self._worktree().head, good_head)
+        self.assertEqual(self._handoff().work_state, self._worktree().head)
+        # The one fact that differs is the one this checkpoint adds: whether this
+        # controller performed the publication itself, after the turn ended.
+        self.assertIsNone(self.registry.terminal_finalization(SESSION))
         self.assertEqual(good.state, ROTATION_READY)
         self.assertEqual(stale.state, ROTATION_NOT_READY)
         self.assertEqual(stale.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
@@ -1570,7 +1623,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         self._mark()
         self._work(commits_before=("3" * 40,))
         self._work(commits_before=("4" * 40,))
-        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), terminal=PUBLICATION)
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_READY)
         self.assertEqual(self.registry.work_boundary(SESSION), 3)
@@ -1582,7 +1635,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # records no state, and an unproven ordering is not a proven one.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         readiness = self._evaluate(handoff=self._handoff(work_state=None))
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
@@ -1592,7 +1645,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # comparison.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         readiness = self._evaluate(worktree=self._worktree(head=None))
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
@@ -1606,7 +1659,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # invalidate a handoff that is otherwise current.
         self._launch()
         self._mark()
-        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), terminal=PUBLICATION)
         self.assertEqual(self._evaluate().state, ROTATION_READY)
 
         # Whatever the coordination repository does next, the product state the
@@ -1620,7 +1673,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # publication and no second invocation in between.
         self._launch()
         self._mark()
-        self._work(commits_before=(NEXT_PRODUCT_HEAD,), publishing=PUBLICATION)
+        self._work(commits_before=(NEXT_PRODUCT_HEAD,), terminal=PUBLICATION)
         first = self._evaluate()
         second = self._evaluate()
         self.assertEqual(first.state, ROTATION_READY)
@@ -1630,7 +1683,7 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_the_handoff_carries_the_exact_durable_identity_and_nothing_else(self) -> None:
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         handoff = self._evaluate().handoff
         record = self.store.read(SESSION)
         self.assertEqual(handoff.to_dict(), {
@@ -1652,7 +1705,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # it from the store and the control-plane read, with no session held.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         expected = self._evaluate().handoff.to_dict()
         record = self.store.read(SESSION)
         self.assertEqual(expected, {
@@ -1670,7 +1723,7 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_marked_but_in_flight_is_not_rotation_ready(self) -> None:
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         self.assertEqual(self._evaluate().state, ROTATION_READY)
 
         self.registry.begin_invocation(SESSION)
@@ -1688,7 +1741,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         self.assertEqual(after.state, ROTATION_NOT_READY)
         self.assertEqual(after.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
         # And a handoff published across the next invocation restores it.
-        self._work(publishing=NEXT_PUBLICATION)
+        self._work(terminal=NEXT_PUBLICATION)
         self.assertEqual(self._evaluate().state, ROTATION_READY)
 
     def test_a_failed_invocation_still_closes_the_boundary_it_opened(self) -> None:
@@ -1696,7 +1749,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # that suffered a failed turn is still reachable as a *temporal* boundary.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         failure = claude_worker.ClaudeWorkerError(claude_worker.REASON_WORKER_FATAL, "boom")
         with self.assertRaises(claude_worker.ClaudeWorkerError):
             self._work(fail=failure)
@@ -1833,14 +1886,14 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_reaching_rotation_ready_changes_nothing_at_all(self) -> None:
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         before = (
             self.store.read(SESSION).to_dict(),
             self.registry.context_readings(),
             self.registry.in_flight(),
             sorted(owned.session_id for owned in self.registry.sessions()),
             self.registry.work_boundary(SESSION),
-            self.registry.handoff_publication(SESSION),
+            self.registry.terminal_finalization(SESSION),
         )
         self.assertEqual(self._evaluate().state, ROTATION_READY)
         after = (
@@ -1849,7 +1902,7 @@ class RotationBoundaryTests(LifecycleTestBase):
             self.registry.in_flight(),
             sorted(owned.session_id for owned in self.registry.sessions()),
             self.registry.work_boundary(SESSION),
-            self.registry.handoff_publication(SESSION),
+            self.registry.terminal_finalization(SESSION),
         )
         self.assertEqual(before, after)
         # The worker was never asked to stop, and the session is still continuable.
@@ -1859,7 +1912,7 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_rotation_readiness_creates_no_human_attention_and_no_second_session(self) -> None:
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         with patch.object(session_lifecycle, "start_worker") as starter, \
                 patch.object(session_lifecycle, "shutdown_worker") as stopper:
             readiness = self._evaluate()
@@ -1883,7 +1936,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # controller watched appear across the invocation that produced it.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_READY)
         self.assertEqual(readiness.handoff.handoff_publication, PUBLICATION)
@@ -1895,7 +1948,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # invocations that all succeed, and no new publication after them.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         ready = self._evaluate()
         self.assertEqual(ready.state, ROTATION_READY)
         locator = ready.handoff.handoff_location
@@ -1914,18 +1967,21 @@ class RotationBoundaryTests(LifecycleTestBase):
         # thing in doubt.
         self.assertTrue(self._handoff().published)
         self.assertEqual(self.published.value, PUBLICATION)
-        self.assertIn("work boundary", readiness.detail)
+        # Three later turns each ended carrying no handoff, and each cleared the
+        # standing credit as it went, so what is refused now is the absence of any
+        # finalization rather than a stale one.
+        self.assertIn("never finalized", readiness.detail)
 
     def test_republishing_after_that_work_restores_readiness(self) -> None:
         # Case C, continuing from the regression above.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         for _ in range(3):
             self._work()
         self.assertEqual(self._evaluate().reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
 
-        self._work(publishing=NEXT_PUBLICATION)
+        self._work(terminal=NEXT_PUBLICATION)
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_READY)
         self.assertEqual(readiness.handoff.handoff_publication, NEXT_PUBLICATION)
@@ -1938,7 +1994,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         self._mark()
         seen = []
 
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         seen.append(self._evaluate().state)
         blobs = [self.store.read(SESSION).iteration.blob]
 
@@ -1947,7 +2003,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         seen.append(self._evaluate().state)
         blobs.append(self.store.read(SESSION).iteration.blob)
 
-        self._work(publishing=NEXT_PUBLICATION)
+        self._work(terminal=NEXT_PUBLICATION)
         seen.append(self._evaluate().state)
         blobs.append(self.store.read(SESSION).iteration.blob)
 
@@ -1965,25 +2021,39 @@ class RotationBoundaryTests(LifecycleTestBase):
         # nothing.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         for _ in range(4):
             self.assertEqual(self._evaluate().state, ROTATION_READY)
         self.assertEqual(self.published.value, PUBLICATION)
         self.assertEqual(
-            self.registry.handoff_publication(SESSION).publication, PUBLICATION
+            self.registry.terminal_finalization(SESSION).publication, PUBLICATION
         )
 
-    def test_republishing_identical_bytes_across_work_does_not_prove_currency(self) -> None:
-        # An unchanged publication is unchanged evidence. Republishing the same
-        # bytes after further work is refused rather than credited, which is the
-        # fail-closed direction.
+    def test_identical_bytes_finalized_again_after_work_are_current(self) -> None:
+        # Deliberately the opposite of what checkpoint 60 asserted here, and the
+        # supersession is the point. Checkpoint 60 refused a republication of
+        # identical bytes because, working only from two reads either side of a
+        # turn, unchanged bytes were unchanged *evidence* -- it could not tell a
+        # stale artifact from a freshly restated one, so it failed closed on byte
+        # novelty as a proxy for recency.
+        #
+        # Recency is no longer a proxy. The second turn ended, this controller
+        # published what that turn's terminal result carried, and the finalization
+        # is recorded at the second turn's own work boundary. That the agent's
+        # second handoff says what its first one said is a statement about the work,
+        # which this layer does not judge and never reads. Byte novelty was never
+        # the invariant; the ordering was, and the ordering holds.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
+        first = self.registry.terminal_finalization(SESSION)
+        self._work(terminal=PUBLICATION)
+        second = self.registry.terminal_finalization(SESSION)
         readiness = self._evaluate()
-        self.assertEqual(readiness.state, ROTATION_NOT_READY)
-        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(first.publication, second.publication)
+        self.assertEqual((first.work_boundary, second.work_boundary), (1, 2))
+        self.assertEqual(self.registry.work_boundary(SESSION), 2)
 
     def test_a_handoff_this_controller_never_saw_published_is_not_current(self) -> None:
         # The ticket's own documented shape: an earlier handoff lying at the rail's
@@ -1998,12 +2068,12 @@ class RotationBoundaryTests(LifecycleTestBase):
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
-        self.assertIsNone(self.registry.handoff_publication(SESSION))
+        self.assertIsNone(self.registry.terminal_finalization(SESSION))
 
     def test_an_observation_that_cannot_name_the_publication_fails_closed(self) -> None:
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         readiness = self._evaluate(handoff=self._handoff(publication=None))
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
@@ -2014,36 +2084,46 @@ class RotationBoundaryTests(LifecycleTestBase):
         # controller cannot say the bytes now on offer are the ones it proved.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         readiness = self._evaluate(handoff=self._handoff(publication=NEXT_PUBLICATION))
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
 
-    def test_a_control_plane_read_that_fails_leaves_no_publication_standing(self) -> None:
-        # An unreadable control plane is silence, never evidence -- and it does not
+    def test_a_durable_publication_that_fails_leaves_nothing_standing(self) -> None:
+        # An unwritable control plane is silence, never evidence -- and it does not
         # turn a completed invocation into a raised one.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         self.assertEqual(self._evaluate().state, ROTATION_READY)
 
-        def unreadable():
-            raise RuntimeError("the coordination repository could not be read")
+        def unwritable(handoff_bytes):
+            raise RuntimeError("the coordination repository could not be written")
 
-        result = self._work(reader=unreadable)
+        result = self._work(
+            terminal=NEXT_PUBLICATION, finalizer=self._finalizer(publish=unwritable)
+        )
         self.assertEqual(result["subtype"], "success")
-        self.assertIsNone(self.registry.handoff_publication(SESSION))
+        self.assertEqual(
+            result["finalization"]["state"],
+            session_lifecycle.FINALIZATION_PUBLICATION_FAILED,
+        )
+        self.assertIsNone(self.registry.terminal_finalization(SESSION))
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
 
-    def test_a_caller_that_reads_no_publication_at_all_is_never_ready(self) -> None:
-        # Currency is not opt-out. A caller that supplies no read establishes
+    def test_a_caller_that_finalizes_nothing_at_all_is_never_ready(self) -> None:
+        # Currency is not opt-out. A caller that supplies no finalizer establishes
         # nothing, and readiness says so rather than falling back to existence.
         self._launch()
         self._mark()
         self.published.value = PUBLICATION
-        self._work(reader=None)
+        result = self._work(terminal=PUBLICATION, finalizer=None)
+        self.assertEqual(
+            result["finalization"]["state"],
+            session_lifecycle.FINALIZATION_NOT_ATTEMPTED,
+        )
         readiness = self._evaluate()
         self.assertEqual(readiness.state, ROTATION_NOT_READY)
         self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
@@ -2053,7 +2133,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         # own, with their own reasons, and are not reachable through currency.
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         self.assertEqual(self._evaluate().state, ROTATION_READY)
 
         self.assertEqual(
@@ -2073,7 +2153,7 @@ class RotationBoundaryTests(LifecycleTestBase):
     def test_contradictory_identity_still_fails_closed_with_a_current_handoff(self) -> None:
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         for overrides, reason in (
             ({"rail": self._rail(identifier=OTHER_RAIL)}, session_lifecycle.REASON_SCOPE_MISMATCH),
             ({"rail": self._rail(rail_blob=OTHER_BLOB)}, session_lifecycle.REASON_ITERATION_DRIFT),
@@ -2096,7 +2176,7 @@ class RotationBoundaryTests(LifecycleTestBase):
         )
         self._launch()
         self._mark()
-        self._work(publishing=PUBLICATION)
+        self._work(terminal=PUBLICATION)
         carried = self._evaluate().handoff.to_dict()
         self.assertEqual(carried["handoff"], self.HANDOFF)
         self.assertEqual(carried["handoffPublication"], PUBLICATION)
@@ -2112,12 +2192,12 @@ class RotationBoundaryTests(LifecycleTestBase):
         self._mark()
         with patch.object(session_lifecycle, "start_worker") as starter, \
                 patch.object(session_lifecycle, "shutdown_worker") as stopper:
-            self._work(publishing=PUBLICATION)
+            self._work(terminal=PUBLICATION)
             first = self._evaluate()
             for _ in range(3):
                 self._work()
             stale = self._evaluate()
-            self._work(publishing=NEXT_PUBLICATION)
+            self._work(terminal=NEXT_PUBLICATION)
             again = self._evaluate()
         self.assertEqual(
             [first.state, stale.state, again.state],
@@ -2136,6 +2216,316 @@ class RotationBoundaryTests(LifecycleTestBase):
         )
         self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
         self.assertIsNotNone(self.registry.get(SESSION))
+
+    # -- terminal handoff finalization: the eight load-bearing shapes -----------
+    #
+    # Each of these is a shape the mechanism must distinguish *structurally* -- by
+    # which act happened and where in the invocation lifecycle, never by reading a
+    # word of a handoff and never by a rule an agent is asked to follow.
+
+    def test_case_a_work_then_evidence_then_a_terminal_handoff_may_become_ready(self) -> None:
+        self._launch()
+        self._mark()
+        result = self._work(
+            commits_before=(NEXT_PRODUCT_HEAD,),
+            evidence_after=("test suite green",),
+            terminal=PUBLICATION,
+        )
+        self.assertEqual(
+            result["finalization"]["state"], session_lifecycle.FINALIZATION_ESTABLISHED
+        )
+        self.assertEqual(result["finalization"]["publication"], PUBLICATION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(readiness.handoff.handoff_publication, PUBLICATION)
+        self.assertEqual(self.evidence, ["test suite green"])
+
+    def test_case_b_readiness_uses_only_the_final_payload(self) -> None:
+        # Handoff-shaped text produced mid-turn, then more product work, then more
+        # evidence work, then the real final handoff. The controller never saw the
+        # mid-turn text at all -- only the result message carries a payload -- so
+        # what becomes durable is the last thing the agent wrote and nothing else.
+        self._launch()
+        self._mark()
+        result = self._work(
+            commits_before=(NEXT_PRODUCT_HEAD,),
+            mid_turn=None,
+            evidence_after=("a second test run",),
+            terminal=NEXT_PUBLICATION,
+        )
+        self.assertEqual(result["finalization"]["publication"], NEXT_PUBLICATION)
+        self.assertEqual(self.published.value, NEXT_PUBLICATION)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(readiness.handoff.handoff_publication, NEXT_PUBLICATION)
+
+    def test_case_b_a_mid_turn_publication_is_superseded_by_the_final_payload(self) -> None:
+        # The same case with the mid-turn text actually published by the agent. The
+        # bytes that end up credited are still the final ones, and the durable
+        # artifact is the finalized publication rather than the agent's own.
+        self._launch()
+        self._mark()
+        self._work(
+            mid_turn=PUBLICATION,
+            commits_after=(NEXT_PRODUCT_HEAD,),
+            evidence_after=("more evidence",),
+            terminal=NEXT_PUBLICATION,
+        )
+        self.assertEqual(self.published.value, NEXT_PUBLICATION)
+        self.assertEqual(
+            self.registry.terminal_finalization(SESSION).publication, NEXT_PUBLICATION
+        )
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    def test_case_c_a_mid_turn_publication_is_not_the_crediting_publication(self) -> None:
+        # Publish-like activity by the agent partway through, then further work,
+        # then a turn that ends with no handoff at all. The artifact is published,
+        # the tree is clean, the mark is real -- and none of that is a finalization.
+        self._launch()
+        self._mark()
+        result = self._work(
+            mid_turn=PUBLICATION,
+            commits_after=(NEXT_PRODUCT_HEAD,),
+            evidence_after=("work after the agent published",),
+        )
+        self.assertEqual(
+            result["finalization"]["state"], session_lifecycle.FINALIZATION_NO_PAYLOAD
+        )
+        self.assertTrue(self._handoff().published)
+        self.assertIsNone(self.registry.terminal_finalization(SESSION))
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+
+    def test_case_d_read_only_work_can_become_ready_with_no_product_movement(self) -> None:
+        # The class checkpoint 61 could not reach, and the whole reason for this
+        # checkpoint. A reviewer or orchestrator invocation: evidence produced, no
+        # commit, no product movement whatsoever. Checkpoint 61's discriminator is
+        # the same commit name at every instant -- it is asserted constant here, so
+        # the pass cannot be coming from it -- and readiness is nonetheless
+        # established, because the credited publication was made after the turn.
+        self._launch()
+        self._mark()
+        head_before = self.product_head
+        self._work(
+            evidence_after=("read the diff", "ran two focused test classes"),
+            terminal=PUBLICATION,
+        )
+        self.assertEqual(self.product_head, head_before)
+        self.assertEqual(self._handoff().work_state, head_before)
+        self.assertEqual(self._worktree().head, head_before)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_READY)
+        self.assertEqual(readiness.handoff.handoff_publication, PUBLICATION)
+
+        # And the same rail, with the agent publishing for itself mid-turn and then
+        # doing more read-only work, is refused -- which is precisely the pair
+        # checkpoint 61 answered identically.
+        self.tearDown()
+        self.setUp()
+        self._launch()
+        self._mark()
+        self._work(mid_turn=PUBLICATION, evidence_after=("more review after it",))
+        self.assertEqual(self._handoff().work_state, self._worktree().head)
+        self.assertEqual(self._evaluate().state, ROTATION_NOT_READY)
+
+    def test_case_e_a_failed_durable_finalization_is_not_ready(self) -> None:
+        self._launch()
+        self._mark()
+
+        def refuses(handoff_bytes):
+            raise RuntimeError("publish refused: coordination upstream is ahead")
+
+        result = self._work(
+            terminal=PUBLICATION, finalizer=self._finalizer(publish=refuses)
+        )
+        self.assertEqual(result["subtype"], "success")
+        self.assertEqual(
+            result["finalization"]["state"],
+            session_lifecycle.FINALIZATION_PUBLICATION_FAILED,
+        )
+        self.assertIsNone(self.published.value)
+        self.assertEqual(self._evaluate().state, ROTATION_NOT_READY)
+
+    def test_case_e_an_ambiguous_terminal_payload_finalizes_nothing(self) -> None:
+        # Two envelopes in one final message. Choosing between them would be a guess
+        # about which bytes the agent meant to be durable, so nothing is published.
+        self._launch()
+        self._mark()
+        result = self._work(raw_terminal=(
+            self._envelope(PUBLICATION) + self._envelope(NEXT_PUBLICATION)
+        ))
+        self.assertEqual(
+            result["finalization"]["state"],
+            session_lifecycle.FINALIZATION_AMBIGUOUS_PAYLOAD,
+        )
+        self.assertIsNone(self.published.value)
+        self.assertEqual(self._evaluate().state, ROTATION_NOT_READY)
+
+    def test_case_f_bookkeeping_failure_fails_closed_and_the_old_context_survives(self) -> None:
+        # Publication succeeds; the push or the receipt then fails, which changes the
+        # unresolved work and the exact next action while the standing handoff still
+        # claims otherwise. Not ready -- and the old context is untouched: still
+        # owned, still bound, still continuable, never asked to stop.
+        self._launch()
+        self._mark()
+        allocated = []
+
+        def receipt():
+            allocated.append("attempted")
+            raise RuntimeError("proceed refused: the control plane was not pushed")
+
+        with patch.object(session_lifecycle, "shutdown_worker") as stopper:
+            result = self._work(
+                terminal=PUBLICATION, finalizer=self._finalizer(bookkeeping=receipt)
+            )
+        self.assertEqual(
+            result["finalization"]["state"],
+            session_lifecycle.FINALIZATION_BOOKKEEPING_FAILED,
+        )
+        self.assertEqual(allocated, ["attempted"])
+        # The bytes really did become durable -- that is what makes this the hard
+        # case -- and they are still not credited.
+        self.assertEqual(self.published.value, PUBLICATION)
+        self.assertIsNone(self.registry.terminal_finalization(SESSION))
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        stopper.assert_not_called()
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        # And another bounded invocation, whose terminal handoff says what actually
+        # happened, is the recovery -- not termination first.
+        self._work(terminal=NEXT_PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    def test_case_g_a_failed_provider_invocation_keeps_the_fail_closed_semantics(self) -> None:
+        self._launch()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+        failure = claude_worker.ClaudeWorkerError(claude_worker.REASON_WORKER_FATAL, "boom")
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._work(terminal=NEXT_PUBLICATION, fail=failure)
+        # The finalization never ran, so the earlier credit survives -- and is
+        # refused anyway, because a further invocation has begun since it.
+        self.assertEqual(self.registry.in_flight(), ())
+        self.assertEqual(self.registry.terminal_finalization(SESSION).work_boundary, 1)
+        self.assertEqual(self.registry.work_boundary(SESSION), 2)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self.assertIn("work boundary", readiness.detail)
+        self.assertEqual(
+            self.registry.context(SESSION).reading().health, OBSERVATION_UNHEALTHY
+        )
+
+    def test_case_g_a_turn_reporting_an_error_finalizes_nothing(self) -> None:
+        # The other half: an invocation that returns rather than raises, carrying a
+        # provider error. The worker already drops the payload on that path; this
+        # pins the lifecycle behaviour if a payload ever arrived anyway.
+        self._launch()
+        self._mark()
+        result = self._work(terminal=PUBLICATION, is_error=True)
+        self.assertTrue(result["is_error"])
+        self.assertEqual(
+            result["finalization"]["state"], session_lifecycle.FINALIZATION_ERRORED_TURN
+        )
+        self.assertIsNone(self.published.value)
+        self.assertIsNone(self.registry.terminal_finalization(SESSION))
+        self.assertEqual(self._evaluate().state, ROTATION_NOT_READY)
+
+    def test_case_h_a_finalization_is_never_credited_across_the_next_invocation(self) -> None:
+        # Checkpoint 60's protection, preserved on the new record. A finalization
+        # belongs to the boundary it was made at; a later invocation moves the
+        # boundary past it, whether or not that invocation touched the repository.
+        self._launch()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        credited = self.registry.terminal_finalization(SESSION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+        self._work(evidence_after=("further review work, no commit",))
+        self.assertEqual(self.registry.work_boundary(SESSION), 2)
+        self.assertEqual(credited.work_boundary, 1)
+        readiness = self._evaluate()
+        self.assertEqual(readiness.state, ROTATION_NOT_READY)
+        self.assertEqual(readiness.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        # The artifact never moved; only the boundary did.
+        self.assertEqual(self.published.value, PUBLICATION)
+
+    def test_the_finalization_is_the_controllers_own_act_and_follows_the_turn(self) -> None:
+        # The ordering property, asserted rather than described. The publishing act
+        # is recorded against the invocation bracket: it cannot run while the
+        # invocation is in flight, and the agent's `send` has already returned when
+        # it does. There is no arrangement of agent behaviour that reorders this,
+        # because the agent is not the one publishing.
+        self._launch()
+        self._mark()
+        seen = []
+
+        def publish(handoff_bytes):
+            seen.append(("published", self.registry.in_flight(), tuple(self.evidence)))
+            self.published.publish(handoff_bytes, self.product_head)
+            return handoff_bytes
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            self.evidence.append("last act of the turn")
+            seen.append(("agent acted", self.registry.in_flight(), tuple(self.evidence)))
+            return {"type": "result", "session_id": request.session_id,
+                    "mode": request.mode, "subtype": "success", "is_error": False,
+                    "terminal_payload": self._envelope(PUBLICATION)}
+
+        continue_session(
+            self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
+            registry=self.registry, session_id=SESSION,
+            request_kwargs=self._request_kwargs(), prompt="carry on",
+            send=send, alive=lambda pgid: True,
+            finalize_handoff=self._finalizer(publish=publish),
+        )
+        self.assertEqual(
+            [step for step, _, _ in seen], ["agent acted", "published"]
+        )
+        # In flight during the agent's act, and provably not during the publication.
+        self.assertEqual(seen[0][1], (SESSION,))
+        self.assertEqual(seen[1][1], ())
+        # Everything the agent did is already behind the publication.
+        self.assertEqual(seen[1][2], ("last act of the turn",))
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    def test_the_finalizer_publishes_exact_bytes_without_reading_them(self) -> None:
+        # No second representation of the handoff exists, and no part of this layer
+        # parses one. What is published is exactly what lay between the delimiters.
+        body = "# Handoff\n\n```\nproduct: action-required\n```\n\nUnresolved: none.\n"
+        self._launch()
+        self._mark()
+        captured = []
+
+        def publish(handoff_bytes):
+            captured.append(handoff_bytes)
+            self.published.publish("blob-of-" + str(len(handoff_bytes)), self.product_head)
+            return "blob-of-" + str(len(handoff_bytes))
+
+        self._work(terminal=body, finalizer=self._finalizer(publish=publish))
+        self.assertEqual(captured, [body.strip("\n")])
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    def test_nothing_of_the_terminal_payload_is_retained_by_the_lifecycle(self) -> None:
+        # The permission is transport, not memory. After finalization the registry
+        # holds a session id, an object name and a boundary count -- and no prose.
+        self._launch()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        finalization = self.registry.terminal_finalization(SESSION)
+        self.assertEqual(
+            tuple(field.name for field in dataclasses.fields(finalization)),
+            ("session_id", "publication", "work_boundary"),
+        )
+        self.assertEqual(
+            dataclasses.asdict(finalization),
+            {"session_id": SESSION, "publication": PUBLICATION, "work_boundary": 1},
+        )
 
 
 class RealWorkerFailedContinueJoinTests(LifecycleTestBase):

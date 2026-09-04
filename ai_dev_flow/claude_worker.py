@@ -19,10 +19,21 @@ from __future__ import annotations
 # the worker reports readiness -- before that moment there is no process identity to
 # record, and inventing one would make every later liveness answer fiction.
 #
-# The protocol carries validated request data in and compact facts out. Assistant
-# text, tool logs, and transcripts stay inside the worker and are reduced to
-# booleans before they cross the pipe, because durable collaboration state is the
-# handoff an executor publishes, not what a provider happened to say.
+# The protocol carries validated request data in and compact facts out. Tool logs,
+# transcripts and every assistant message *before the last one* stay inside the
+# worker and are reduced to booleans before they cross the pipe, because durable
+# collaboration state is the handoff an executor publishes, not what a provider
+# happened to say.
+#
+# There is exactly one deliberate exception, and its narrowness is the whole of its
+# justification. The terminal result of a completed invocation -- the single
+# `result` field of the one `ResultMessage` the SDK ends a turn with -- crosses the
+# pipe verbatim, so the controller can publish the handoff the agent finished its
+# turn by writing. It is not a transcript: no earlier message survives it, no tool
+# use survives it, nothing is retained across invocations, and this worker neither
+# reads nor interprets a word of it. It is a payload in transit; the durable
+# artifact is still the publication the controller makes from it, the replacement
+# still reads only that publication, and the transcript is still not canonical.
 
 from dataclasses import dataclass
 import errno
@@ -727,6 +738,14 @@ def _run_provider(command: Mapping, emit=None) -> dict:
                 text = getattr(message, "result", None)
                 if isinstance(text, str):
                     _scan_markers(text, markers, seen)
+                    # The one field that is kept rather than reduced. It belongs to
+                    # the *result* message, so it exists only once per invocation
+                    # and only at its end; there is no accumulation here and no
+                    # earlier message to accumulate. Kept verbatim because the
+                    # controller publishes these bytes without interpreting them,
+                    # and any normalisation would make the published handoff
+                    # something other than what the agent wrote.
+                    observed["terminal_text"] = text
 
     asyncio.run(drive())
     if not observed:
@@ -749,6 +768,9 @@ def _result_payload(command: Mapping, produced: Mapping) -> dict:
         "num_turns": reduced.num_turns,
         "total_cost_usd": reduced.total_cost_usd,
         "markers": produced["markers"],
+        # Always present, `None` when the turn ended with no terminal text at all,
+        # so a caller never has to read absence as either "empty" or "unknown".
+        "terminal_payload": reduced.terminal_payload,
     }
 
 
