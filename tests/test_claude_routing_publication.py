@@ -867,3 +867,121 @@ class ProvenanceReportingTests(_CoordinationFixture):
         rendered = activation.render_status(self.product, cache=self.cache)
 
         self.assertIn("MALFORMED", rendered)
+
+
+class ConfigOnlyPublicationTests(_CoordinationFixture):
+    """Issue #79: the advertised Claude publication route must work config-only.
+
+    Checkpoint 1 reconciled discovery and status onto ``resolve_coordination``
+    but left publication resolving the managed host cache directly, so a
+    workspace that configured its coordination repository could discover its
+    rail and then fail to publish to it. The skill advertises
+    ``ai-dev publish --file --rail`` without ``--cache``, so that gap made the
+    documented route unusable in exactly the workspace shape the checkpoint
+    exists to support.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        # A HOME with no managed cache in it: the config-only shape.
+        self.home = self.tmp_path / "home"
+        self.home.mkdir()
+        (self.product / ".ai-dev" / "config.json").write_text(
+            json.dumps(
+                {
+                    "tickets": {"provider": "github", "repository": "jmrozi1/proj"},
+                    "controlPlane": {
+                        "repository": str(self.cache),
+                        "project": "proj",
+                        "ticket": "issue-1",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+    def test_publication_succeeds_with_configuration_and_no_managed_cache(self) -> None:
+        """The reviewer's control: the real route, no ``--cache``, no managed cache."""
+        managed = activation.resolve_control_plane_cache(home=self.home)
+        self.assertFalse(managed.exists())
+
+        result = activation.publish_executor_handoff(
+            self.product, content_file=self.handoff, rail="the-rail", home=self.home
+        )
+
+        self.assertEqual(result["railId"], "the-rail")
+        self.assertEqual(result["proceed"], 5)
+        self.assertEqual(result["handoffPath"], "proj/issue-1/rails/the-rail/handoff.md")
+
+        # Durably published, not merely committed locally.
+        published = _git(self.remote, "show", "main:proj/issue-1/rails/the-rail/handoff.md")
+        self.assertIn("Status: completed", published)
+        self.assertEqual(self._remote_receipt(), "5")
+        self._assert_no_fallback_artifacts()
+
+    def test_publication_reads_authorization_from_the_repository_it_publishes_to(
+        self,
+    ) -> None:
+        """Authorization and publication must resolve to one coordination repository."""
+        discovered = activation.discover(self.product, home=self.home)
+
+        self.assertEqual(discovered["controlPlaneCache"], str(self.cache))
+        self.assertEqual(
+            discovered["coordinationSource"], activation.WORKSPACE_CONFIG_SOURCE
+        )
+
+        result = activation.publish_executor_handoff(
+            self.product, content_file=self.handoff, home=self.home
+        )
+
+        self.assertEqual(result["railId"], discovered["railId"])
+        self.assertEqual(
+            _git(self.cache, "rev-parse", "HEAD"), result["remoteHead"]
+        )
+
+    def test_disagreeing_identities_stop_publication_without_choosing(self) -> None:
+        """Failing closed matters more here than in a read: publication writes."""
+        # A second, genuinely readable coordination repository, so identity is
+        # the only thing that can stop this publication.
+        other_remote = self.tmp_path / "other-remote.git"
+        subprocess.run(
+            ["git", "init", "--quiet", "--bare", "-b", "main", str(other_remote)], check=True
+        )
+        _git(self.cache, "push", "--quiet", str(other_remote), "main")
+
+        managed = activation.resolve_control_plane_cache(home=self.home)
+        managed.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            ["git", "clone", "--quiet", str(other_remote), str(managed)], check=True
+        )
+
+        with self.assertRaises(ClaudeActivationError) as raised:
+            activation.publish_executor_handoff(
+                self.product, content_file=self.handoff, home=self.home
+            )
+
+        message = str(raised.exception)
+        self.assertIn("identity disagreement", message)
+        self.assertIn(str(self.cache), message)
+        self.assertIn(str(managed), message)
+        # Nothing was written to either coordination repository.
+        self.assertEqual(self._remote_receipt(), "4")
+        self._assert_no_fallback_artifacts()
+
+    def test_explicit_cache_remains_an_override(self) -> None:
+        """``--cache`` keeps its existing meaning and is not weakened by the fix."""
+        other = self.tmp_path / "explicit"
+        subprocess.run(
+            ["git", "clone", "--quiet", str(self.remote), str(other)], check=True
+        )
+        _git(other, "config", "user.name", "Executor")
+        _git(other, "config", "user.email", "executor@example.com")
+
+        result = activation.publish_executor_handoff(
+            self.product, content_file=self.handoff, home=self.home, cache=other
+        )
+
+        self.assertEqual(result["proceed"], 5)
+        # The override, not the configured repository, carried the transaction.
+        self.assertEqual(_git(other, "rev-parse", "HEAD"), result["remoteHead"])
+        self.assertNotEqual(_git(self.cache, "rev-parse", "HEAD"), result["remoteHead"])

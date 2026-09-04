@@ -1529,13 +1529,13 @@ def publish_executor_handoff(
     stops with an actionable error; nothing is ever written to a product
     repository as a fallback and no receipt is invented.
     """
-    resolved_cache = (
-        cache if cache is not None else resolve_control_plane_cache(coordination_repository, home=home)
-    )
-
-    # 1. Fresh authorization, never the caller's assumption.
+    # 1. Fresh authorization, never the caller's assumption. Discovery owns
+    #    coordination resolution, so the repository publication writes to is the
+    #    same one authorization was read from -- including the config-only
+    #    workspace, where resolving the managed cache here instead forced an
+    #    explicit override and lost the workspace's configured control plane.
     discovered = discover(
-        repo_root, home=home, coordination_repository=coordination_repository, cache=resolved_cache
+        repo_root, home=home, coordination_repository=coordination_repository, cache=cache
     )
     authorized_rail = discovered["railId"]
     if rail is not None and rail != authorized_rail:
@@ -1551,7 +1551,7 @@ def publish_executor_handoff(
 
     project = discovered["project"]
     ticket = discovered["ticket"]
-    coordination = resolve_coordination_repo(resolved_cache)
+    coordination = resolve_coordination_repo(Path(discovered["controlPlaneCache"]))
 
     branch = _coordination_git(coordination, ["rev-parse", "--abbrev-ref", "HEAD"])
     # Remembered so a failed push can undo exactly the commit this invocation
