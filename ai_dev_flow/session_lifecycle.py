@@ -105,6 +105,7 @@ REASON_HANDOFF_NOT_PUBLISHED = "durable-handoff-not-published"
 REASON_HANDOFF_NOT_CURRENT = "durable-handoff-not-current"
 REASON_WORKTREE_INCOHERENT = "worktree-incoherent"
 REASON_ROTATION_HANDOFF_ESTABLISHED = "durable-handoff-established"
+REASON_OLD_CONTEXT_RETIRED = "old-context-retired"
 
 # What one post-turn finalization attempt says about itself. These are reported
 # facts on the invocation's own result, never durable state and never authority:
@@ -1773,4 +1774,195 @@ def evaluate_rotation_readiness(
             handoff_publication=handoff.publication,
             session_id=record.session_id,
         ),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Old-context retirement -- D9's "only after that safe handoff", and nothing past it
+# ---------------------------------------------------------------------------
+#
+# D9 permits exactly one destructive act, and only in one place: "Only after that
+# safe handoff may the manager terminate the old context and launch a fresh agent
+# against durable state." This is the first half of that sentence and deliberately
+# not the second. It retires; it does not replace. There is no launcher, no
+# runtime request, no starter and no binding reservation anywhere in this section,
+# and that absence is the mechanism rather than a convention: a caller cannot ask
+# this to launch a replacement, because there is nothing here to ask.
+#
+# Three things make it the smallest seam that is still safe.
+#
+# First, it takes *observations*, never a verdict. There is no `readiness`
+# parameter, so a caller physically cannot hand it a rotation-ready answer computed
+# a moment ago and have that authorize a termination. It projects readiness itself,
+# from the caller's fresh rail, handoff and worktree reads plus the registry's own
+# current facts, immediately before it acts. Readiness was built as a fresh
+# mechanical projection with nothing stored precisely so it could be re-asked at
+# the instant it matters, and this is that instant. If anything moved since the
+# caller last looked -- a further invocation began, the workspace moved, the
+# finalization no longer stands -- the projection says so now and retirement
+# refuses. A stale ready is not merely rejected here; it is unrepresentable.
+#
+# Second, ownership is proven separately, before readiness is even asked.
+# Readiness deliberately says nothing about process liveness, which is exactly why
+# it cannot be allowed to authorize a kill on its own: a session can be perfectly
+# ready by every durable fact while the process this controller believes it holds
+# is already gone, or is no longer the process the binding names. So the ownership
+# proof is `require_owned`, unweakened and unbypassed -- the same proof `stop_session`
+# demands -- and a session that fails it is not retired at all. It is routed to
+# `recover_session`, which describes the disconnection for a human and performs
+# nothing. Retiring on the durable record alone would be the one claim this system
+# must never make: terminalizing a binding for a process nobody could prove
+# anything about.
+#
+# Ownership is asked first for that reason. A restarted controller holds no handle
+# and therefore no context observation either, so a readiness-first order would
+# answer such a session with "not marked for rotation" -- true, and a description of
+# the wrong problem. The session is disconnected, that is a human decision, and
+# saying so is the useful refusal. Readiness is then asked last, so the gap between
+# the projection and the destructive act is as small as this composition can make
+# it.
+#
+# Third, termination is proven rather than asserted. `stop_session` already refuses
+# to terminalize a binding until the shutdown reports the process group gone *and*
+# an independent probe agrees, and it removes the registry entry -- ownership, work
+# boundary, terminal finalization and the context-lifecycle observation together --
+# only after that proof. Nothing is added to that here. What retirement adds is the
+# order in which it is allowed to happen at all.
+#
+# `graceful` on the outcome is a reported fact about how the worker went, not a
+# precondition: it says the worker acknowledged the shutdown command before its
+# group was proven gone. D9's "graceful rotation" is about rotating at a safe
+# boundary with durable state left behind -- which is what readiness proves -- and
+# not about which signal ended the process. A stop that had to escalate is still a
+# retirement, and the outcome says plainly that it escalated.
+#
+# Failure is fail-closed in the only direction that matters: never half-retired.
+# Every refusal here happens before anything is stopped, and the one failure that
+# can happen after the stop is attempted -- a shutdown that cannot be proven --
+# already leaves `stop_session`'s binding nonterminal and the registry entry
+# intact, so the session survives owned, bound and continuable. A session that
+# could not be retired is emphatically not a session that may be replaced: this
+# raises, terminalizes nothing, and still launches nothing.
+
+RETIREMENT_RETIRED = "old-context-retired"
+RETIREMENT_REFUSED = "retirement-refused"
+RETIREMENT_STATES = (RETIREMENT_RETIRED, RETIREMENT_REFUSED)
+
+
+@dataclass(frozen=True)
+class ContextRetirement:
+    """What one retirement attempt did, and the exact facts it did it on.
+
+    `readiness` is the projection this attempt took itself, not one it was given.
+    It is absent only on the disconnected route, where ownership failed before
+    readiness was asked -- which is the honest record of that path: no readiness
+    value existed, so none could have authorized anything.
+
+    `stopped` is present only when a process group was proven gone, and `recovery`
+    only when the session was handed to a human instead. Nothing carries a
+    replacement, a reservation, or a launch, because retirement performs none.
+    """
+
+    session_id: str
+    rail: str
+    state: str
+    reason: str
+    detail: str
+    readiness: Optional[RotationReadiness] = None
+    stopped: Optional[StopOutcome] = None
+    recovery: Optional[RecoveryReport] = None
+
+    @property
+    def retired(self) -> bool:
+        return self.state == RETIREMENT_RETIRED
+
+
+def retire_old_context(
+    store: BindingStore,
+    registry: SessionRegistry,
+    rail: Optional[RailFacts],
+    record: Optional[BindingRecord],
+    *,
+    handoff: Optional[RotationHandoffFacts],
+    worktree: Optional[WorktreeFacts],
+    now: str,
+    stop: Optional[Callable] = None,
+    alive: Optional[Callable] = None,
+) -> ContextRetirement:
+    """Terminate the exact owned context of a session that is rotation-ready *now*.
+
+    Refuses -- touching nothing -- when the session is not ready at this instant,
+    and routes a session it cannot prove it owns to `recover_session` rather than
+    retiring it. Launches nothing and binds nothing on any path, including success.
+
+    Raises `LifecycleError` on a contradiction between the durable records, and on
+    a shutdown that cannot be proven; in both cases the session is left exactly as
+    it was.
+    """
+    if record is not None and record.is_terminal:
+        raise LifecycleError(
+            REASON_BINDING_TERMINAL,
+            "session {0} is {1}; there is no live context left to retire.".format(
+                record.session_id, record.state
+            ),
+        )
+
+    # One liveness instant for the pre-flight, because proving ownership and then
+    # describing the disconnection are two consumers of the same question and must
+    # not answer it twice. Deliberately *not* reused across the stop below: the
+    # post-shutdown proof has to be a new observation, and a memoized one would
+    # report the liveness this read began with.
+    preflight = single_liveness_snapshot(alive)
+    if record is not None:
+        try:
+            require_owned(registry, record, alive=preflight)
+        except LifecycleError as exc:
+            if exc.reason in (REASON_HANDLE_MISSING, REASON_HANDLE_MISMATCH):
+                report = recover_session(record, registry, now=now, alive=preflight)
+                return ContextRetirement(
+                    session_id=record.session_id,
+                    rail=record.rail,
+                    state=RETIREMENT_REFUSED,
+                    reason=report.reason,
+                    detail=report.human_decision,
+                    recovery=report,
+                )
+            raise
+
+    readiness = evaluate_rotation_readiness(
+        rail, record, registry, handoff=handoff, worktree=worktree
+    )
+    if not readiness.ready:
+        return ContextRetirement(
+            session_id=readiness.session_id,
+            rail=readiness.rail,
+            state=RETIREMENT_REFUSED,
+            reason=readiness.reason,
+            detail=readiness.detail,
+            readiness=readiness,
+        )
+
+    stopped = stop_session(store, registry, record, stop=stop, alive=alive)
+    return ContextRetirement(
+        session_id=stopped.session_id,
+        rail=readiness.rail,
+        state=RETIREMENT_RETIRED,
+        reason=REASON_OLD_CONTEXT_RETIRED,
+        detail=(
+            "session {0} was rotation-ready at the instant of retirement on handoff "
+            "publication {1}, and this controller's own handle for pid {2} was proven "
+            "to be the process the binding names; process group {3} is gone "
+            "({4} shutdown, exit code {5}), the binding is {6}, and nothing was "
+            "launched or bound in its place.".format(
+                stopped.session_id,
+                readiness.handoff.handoff_publication if readiness.handoff else "",
+                stopped.pid,
+                stopped.pgid,
+                "acknowledged" if stopped.graceful else "escalated",
+                stopped.exit_code,
+                stopped.binding.state,
+            )
+        ),
+        readiness=readiness,
+        stopped=stopped,
     )

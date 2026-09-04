@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import inspect
 import json
 import subprocess
 import tempfile
@@ -36,6 +37,8 @@ from ai_dev_flow.session_binding import (
     unbind_session,
 )
 from ai_dev_flow.session_lifecycle import (
+    RETIREMENT_REFUSED,
+    RETIREMENT_RETIRED,
     ROTATION_NOT_READY,
     ROTATION_READY,
     STATE_DISCONNECTED,
@@ -55,6 +58,7 @@ from ai_dev_flow.session_lifecycle import (
     observe_session,
     recover_session,
     require_owned,
+    retire_old_context,
     single_liveness_snapshot,
     stop_session,
 )
@@ -1388,12 +1392,12 @@ class FailedInvocationObservationTests(LifecycleTestBase):
         self.assertEqual(self.registry.context_readings(), {})
 
 
-class RotationBoundaryTests(LifecycleTestBase):
-    """marked -> safe boundary -> durable handoff -> rotation-ready, and nothing past it.
+class RotationHarness(LifecycleTestBase):
+    """The fixtures a rotation boundary is projected from: rail, handoff, worktree, work.
 
-    Every case here projects. Nothing in this class terminates a context, stops a
-    worker, launches or binds a replacement, or writes a durable record, and the
-    last two cases prove that rather than assert it.
+    Moved verbatim out of the accepted rotation cases so the retirement cases are
+    composed from exactly the fixtures readiness is, rather than from a second set
+    that could drift from them. No accepted case is altered by the move.
     """
 
     HANDOFF = "ai-dev/issue-55/rails/{0}/handoff.md".format(RAIL)
@@ -1535,6 +1539,15 @@ class RotationBoundaryTests(LifecycleTestBase):
         record = arguments.pop("record")
         registry = arguments.pop("registry")
         return evaluate_rotation_readiness(rail, record, registry, **arguments)
+
+
+class RotationBoundaryTests(RotationHarness):
+    """marked -> safe boundary -> durable handoff -> rotation-ready, and nothing past it.
+
+    Every case here projects. Nothing in this class terminates a context, stops a
+    worker, launches or binds a replacement, or writes a durable record, and the
+    last two cases prove that rather than assert it.
+    """
 
     # -- the transition itself --------------------------------------------------
 
@@ -2581,6 +2594,572 @@ class RealWorkerFailedContinueJoinTests(LifecycleTestBase):
         self.assertEqual(reading.observed, 1)
         self.assertIsNone(reading.count)
         self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+
+
+class OldContextRetirementTests(RotationHarness):
+    """rotation-ready -> OLD CONTEXT RETIRED, and deliberately nothing past it.
+
+    The first destructive cases in this suite. Every one of them proves what was
+    terminated and what was not, and the class as a whole proves that nothing here
+    launches, binds, or continues a replacement -- the half of D9's sentence this
+    slice does not implement.
+
+    No case starts a process. The worker handle is injected exactly as it is in the
+    accepted stop cases, and the process group is a value these tests move, so a
+    proof that the group is gone is a proof about an observation the code actually
+    took rather than about a report it was handed.
+    """
+
+    RETIREMENT_CLOCK = "2026-08-26T12:10:03Z"
+
+    def setUp(self) -> None:
+        super().setUp()
+        # The process group, as something observable that a stop actually changes.
+        self.group_alive = {4242: True}
+        # Every liveness observation and every stop, in the order they happened.
+        # Ordering is the whole subject here: an ownership proof that reused an
+        # older instant, or a gone-ness claim taken before the stop, would both be
+        # invisible in a boolean and are plain in this list.
+        self.observations = []
+
+    def _alive(self, pgid):
+        answer = bool(self.group_alive.get(pgid, False))
+        self.observations.append(("alive", pgid, answer))
+        return answer
+
+    def _stopper(self, report=None, kills=True):
+        """The accepted shutdown mechanism's contract, and nothing more.
+
+        `kills` is separable from `report` on purpose: a stop that reports success
+        without ending the group is exactly the claim retirement must refuse to
+        take on trust.
+        """
+        def stop(handle):
+            self.observations.append(("stop", handle.pgid))
+            if kills:
+                self.group_alive[handle.pgid] = False
+            if report is not None:
+                return report
+            return {"graceful": True, "exit_code": 0, "process_group_gone": True}
+        return stop
+
+    def _ready(self):
+        """A session that is genuinely rotation-ready, by the accepted route only."""
+        outcome, worker, _sent = self._launch()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        return outcome, worker
+
+    def _retire(self, **overrides):
+        arguments = {
+            "store": self.store, "registry": self.registry, "rail": self._rail(),
+            "record": self.store.read(SESSION), "handoff": self._handoff(),
+            "worktree": self._worktree(), "now": self.RETIREMENT_CLOCK,
+            "stop": self._stopper(), "alive": self._alive,
+        }
+        arguments.update(overrides)
+        store = arguments.pop("store")
+        registry = arguments.pop("registry")
+        rail = arguments.pop("rail")
+        record = arguments.pop("record")
+        return retire_old_context(store, registry, rail, record, **arguments)
+
+    def _assert_untouched(self, *, still_owned=True):
+        """The session survived this refusal exactly as it was."""
+        self.assertEqual([entry for entry in self.observations if entry[0] == "stop"], [])
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+        if still_owned:
+            self.assertIsNotNone(self.registry.get(SESSION))
+            self.assertIsNotNone(self.registry.context(SESSION))
+        # Nothing was reserved, bound, or replaced by the refusal.
+        self.assertEqual([record.session_id for record in self.store.records()], [SESSION])
+
+    # -- A. rotation-ready and owned ------------------------------------------
+
+    def test_case_a_a_ready_owned_session_is_retired_and_proven_gone(self) -> None:
+        _outcome, worker = self._ready()
+        retirement = self._retire()
+
+        self.assertTrue(retirement.retired)
+        self.assertEqual(retirement.state, RETIREMENT_RETIRED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_OLD_CONTEXT_RETIRED)
+        self.assertEqual(retirement.session_id, SESSION)
+        self.assertIsNone(retirement.recovery)
+        # The readiness that authorized it is the one this call took itself.
+        self.assertTrue(retirement.readiness.ready)
+        self.assertEqual(retirement.readiness.handoff.handoff_publication, PUBLICATION)
+        # And the process group is gone as a matter of observation.
+        self.assertTrue(retirement.stopped.process_group_gone)
+        self.assertTrue(retirement.stopped.graceful)
+        self.assertEqual(retirement.stopped.exit_code, 0)
+        self.assertEqual(retirement.stopped.pgid, worker.pgid)
+        self.assertFalse(self.group_alive[worker.pgid])
+
+    def test_case_a_the_group_is_proven_gone_by_a_probe_taken_after_the_stop(self) -> None:
+        # The distinction this whole slice turns on: `process_group_gone: True` in
+        # the report is a claim, and the refusal below proves the code does not stop
+        # there. Three observations, in one order: ownership proved live, the stop
+        # ran, and the group was observed again afterwards and found gone.
+        _outcome, worker = self._ready()
+        self._retire()
+
+        self.assertEqual(
+            self.observations,
+            [("alive", worker.pgid, True), ("alive", worker.pgid, True),
+             ("stop", worker.pgid), ("alive", worker.pgid, False)],
+        )
+        # The last observation is a new one. A pre-flight snapshot reused across the
+        # destructive act would have answered `True` here and the retirement would
+        # have been refused, so this passing is the proof it was not reused.
+        self.assertEqual(self.observations[-1], ("alive", worker.pgid, False))
+
+    def test_case_a_lifecycle_state_is_truthful_after_a_retirement(self) -> None:
+        self._ready()
+        self.assertIsNotNone(self.registry.terminal_finalization(SESSION))
+        self.assertEqual(self.registry.rotation_marked_session_ids(), (SESSION,))
+
+        retirement = self._retire()
+
+        # Not live-owned.
+        self.assertIsNone(self.registry.get(SESSION))
+        self.assertEqual(self.registry.sessions(), [])
+        # Not rotation-ready, and not rotation-marked.
+        self.assertEqual(self.registry.rotation_marked_session_ids(), ())
+        # The context-lifecycle observation is released exactly as `remove` does.
+        self.assertIsNone(self.registry.context(SESSION))
+        self.assertEqual(self.registry.context_readings(), {})
+        # And so is every other fact that only meant something while the handle did.
+        self.assertIsNone(self.registry.terminal_finalization(SESSION))
+        self.assertEqual(self.registry.work_boundary(SESSION), 0)
+        self.assertEqual(self.registry.in_flight(), ())
+        # The durable record says terminated rather than running.
+        self.assertEqual(retirement.stopped.binding.state, BINDING_STATE_UNBOUND)
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_UNBOUND)
+        # A retired session no longer projects a rotation boundary at all.
+        with self.assertRaises(LifecycleError) as caught:
+            self._evaluate()
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_BINDING_TERMINAL)
+
+    def test_case_a_a_retirement_touches_no_real_process_and_no_provider(self) -> None:
+        self._ready()
+        with patch.object(subprocess, "Popen") as popen, \
+                patch.object(claude_worker, "shutdown_worker") as shutdown, \
+                patch.object(claude_worker, "process_group_alive") as probe, \
+                patch("os.kill") as kill, patch("os.killpg") as killpg:
+            retirement = self._retire()
+        self.assertTrue(retirement.retired)
+        popen.assert_not_called()
+        shutdown.assert_not_called()
+        probe.assert_not_called()
+        kill.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_the_ownership_proof_and_a_fresh_readiness_both_precede_the_stop(self) -> None:
+        # Order is the mechanism: prove the exact process is ours, project readiness
+        # from the caller's fresh observations, and only then destroy anything.
+        self._ready()
+        order = []
+        original_owned = session_lifecycle.require_owned
+        original_ready = session_lifecycle.evaluate_rotation_readiness
+        original_stop = session_lifecycle.stop_session
+
+        def owned(*args, **kwargs):
+            order.append("require_owned")
+            return original_owned(*args, **kwargs)
+
+        def ready(*args, **kwargs):
+            order.append("evaluate_rotation_readiness")
+            return original_ready(*args, **kwargs)
+
+        def stop(*args, **kwargs):
+            order.append("stop_session")
+            return original_stop(*args, **kwargs)
+
+        with patch.object(session_lifecycle, "require_owned", owned), \
+                patch.object(session_lifecycle, "evaluate_rotation_readiness", ready), \
+                patch.object(session_lifecycle, "stop_session", stop):
+            self.assertTrue(self._retire().retired)
+        self.assertEqual(
+            order,
+            ["require_owned", "evaluate_rotation_readiness", "stop_session",
+             "require_owned"],
+        )
+
+    # -- B. not rotation-ready --------------------------------------------------
+
+    def test_case_b_an_unmarked_session_is_not_retired(self) -> None:
+        self._launch()
+        self._work(terminal=PUBLICATION)
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(
+            retirement.reason, session_lifecycle.REASON_NOT_MARKED_FOR_ROTATION
+        )
+        self.assertIsNone(retirement.stopped)
+        self.assertFalse(retirement.readiness.ready)
+        self._assert_untouched()
+
+    def test_case_b_a_marked_session_with_no_published_handoff_is_not_retired(self) -> None:
+        self._launch()
+        self._mark()
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(
+            retirement.reason, session_lifecycle.REASON_HANDOFF_NOT_PUBLISHED
+        )
+        self.assertIsNone(retirement.stopped)
+        self._assert_untouched()
+
+    def test_case_b_an_incoherent_workspace_is_not_retired(self) -> None:
+        self._ready()
+        retirement = self._retire(worktree=self._worktree(clean=False))
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_WORKTREE_INCOHERENT)
+        self._assert_untouched()
+
+    def test_case_b_a_refused_session_is_still_continuable_afterwards(self) -> None:
+        self._launch()
+        self._mark()
+        self._retire()
+        # Untouched means untouched: the session goes on working normally.
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    # -- C. stale readiness -- the load-bearing case ----------------------------
+
+    def test_case_c_a_readiness_taken_before_further_work_never_authorizes_a_stop(self) -> None:
+        # The reason checkpoints 59 to 62 exist. A caller observes rotation-ready,
+        # the session then does more authorized work, and the caller acts on the
+        # answer it is still holding. Retirement re-projects at the moment it acts,
+        # so what the caller holds is irrelevant.
+        self._ready()
+        stale = self._evaluate()
+        self.assertTrue(stale.ready)
+
+        self._work(terminal=None, commits_after=(NEXT_PRODUCT_HEAD,))
+
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self.assertIsNone(retirement.stopped)
+        self._assert_untouched()
+        # The value the caller held still says ready. It was true when it was taken
+        # and it is worthless now, which is exactly why it is not what authorizes.
+        self.assertTrue(stale.ready)
+
+    def test_case_c_there_is_no_parameter_a_stale_readiness_could_arrive_through(self) -> None:
+        # Structural rather than conventional: retirement takes observations, and a
+        # readiness verdict is not among them, so no caller can supply one.
+        parameters = inspect.signature(retire_old_context).parameters
+        self.assertEqual(
+            tuple(parameters),
+            ("store", "registry", "rail", "record", "handoff", "worktree", "now",
+             "stop", "alive"),
+        )
+        self.assertNotIn("readiness", parameters)
+        self.assertNotIn("ready", parameters)
+
+    def test_case_c_the_projection_is_taken_from_the_callers_observations_at_call_time(self) -> None:
+        # The same session, the same registry, two different fresh reads: one
+        # retires and the other refuses. Nothing about the session is stored that
+        # could have decided this.
+        self._ready()
+        moved = self._retire(worktree=self._worktree(head=NEXT_PRODUCT_HEAD))
+        self.assertEqual(moved.state, RETIREMENT_REFUSED)
+        self.assertEqual(moved.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self._assert_untouched()
+        self.assertTrue(self._retire().retired)
+
+    # -- D. disconnected or unprovable ownership --------------------------------
+
+    def test_case_d_a_ready_session_whose_group_is_gone_routes_to_recovery(self) -> None:
+        # Readiness deliberately says nothing about liveness, so this session is
+        # rotation-ready by every durable fact while the process it names is gone.
+        # Retiring it would terminalize a binding on a durable claim alone.
+        _outcome, worker = self._ready()
+        self.group_alive[worker.pgid] = False
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_DISCONNECTED_NOT_LIVE)
+        self.assertIsNone(retirement.stopped)
+        # Ownership was proved independently of readiness, and failed before any
+        # readiness value existed to be consulted.
+        self.assertIsNone(retirement.readiness)
+        # It is a human decision, described rather than acted on.
+        self.assertEqual(retirement.recovery.state, STATE_DISCONNECTED)
+        self.assertEqual(retirement.recovery.session_id, SESSION)
+        self.assertEqual(retirement.recovery.elapsed_seconds, 601)
+        self.assertIn("human decides", retirement.recovery.human_decision)
+        self.assertEqual(retirement.detail, retirement.recovery.human_decision)
+        self._assert_untouched()
+
+    def test_case_d_a_handle_that_disagrees_with_its_binding_routes_to_recovery(self) -> None:
+        self._ready()
+        owned = self.registry.get(SESSION)
+        # Re-taking ownership never resets an observation, so the session stays
+        # marked and every readiness fact stays exactly where it was.
+        self.registry.add(dataclasses.replace(owned, pid=owned.pid + 1))
+
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_DISCONNECTED_MISMATCH)
+        self.assertIsNone(retirement.stopped)
+        self.assertIsNone(retirement.readiness)
+        self.assertIn("human decides", retirement.recovery.human_decision)
+        self._assert_untouched()
+
+    def test_case_d_a_restarted_controller_retires_nothing_on_the_durable_record(self) -> None:
+        self._ready()
+        restarted = SessionRegistry()  # a fresh controller owns nothing
+
+        retirement = self._retire(registry=restarted)
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_DISCONNECTED_NO_HANDLE)
+        self.assertIsNone(retirement.stopped)
+        self.assertIsNone(retirement.readiness)
+        self.assertIn("human decides", retirement.recovery.human_decision)
+        self._assert_untouched()
+
+    def test_case_d_the_recovery_route_performs_no_process_action_at_all(self) -> None:
+        _outcome, worker = self._ready()
+        self.group_alive[worker.pgid] = False
+        with patch.object(subprocess, "Popen") as popen, \
+                patch.object(claude_worker, "shutdown_worker") as shutdown, \
+                patch("os.kill") as kill, patch("os.killpg") as killpg:
+            retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        popen.assert_not_called()
+        shutdown.assert_not_called()
+        kill.assert_not_called()
+        killpg.assert_not_called()
+
+    def test_case_d_retirement_never_reaches_the_stop_without_an_owned_handle(self) -> None:
+        # `stop_session` demands `require_owned` and retirement does not get to
+        # decide otherwise: the same proof is taken before it, and the stop is not
+        # reached at all when it fails.
+        self._ready()
+        self.registry.remove(SESSION)
+        reached = []
+        original_stop = session_lifecycle.stop_session
+
+        def stop(*args, **kwargs):
+            reached.append(True)
+            return original_stop(*args, **kwargs)
+
+        with patch.object(session_lifecycle, "stop_session", stop):
+            retirement = self._retire()
+        self.assertEqual(reached, [])
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_DISCONNECTED_NO_HANDLE)
+
+    # -- E. an invocation in flight ---------------------------------------------
+
+    def test_case_e_an_invocation_in_flight_is_never_interrupted(self) -> None:
+        self._ready()
+        self.registry.begin_invocation(SESSION)
+        try:
+            retirement = self._retire()
+        finally:
+            self.registry.end_invocation(SESSION)
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_INVOCATION_IN_FLIGHT)
+        self.assertIsNone(retirement.stopped)
+        self._assert_untouched()
+
+    def test_case_e_a_retirement_asked_during_a_turn_stops_nothing(self) -> None:
+        # The refusal is taken from inside a real invocation bracket, which is the
+        # only instant at which the question is dangerous.
+        self._launch()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        attempts = []
+
+        def send(handle, request, *, prompt, markers=(), timeout=None):
+            attempts.append(self._retire())
+            return {"type": "result", "session_id": request.session_id,
+                    "mode": request.mode, "subtype": "success", "is_error": False,
+                    "terminal_payload": self._envelope(NEXT_PUBLICATION)}
+
+        continue_session(
+            self._decision(action=ACTION_CONTINUE), self.assignment, store=self.store,
+            registry=self.registry, session_id=SESSION,
+            request_kwargs=self._request_kwargs(), prompt="carry on",
+            send=send, alive=lambda pgid: True, finalize_handoff=self._finalizer(),
+        )
+        self.assertEqual(len(attempts), 1)
+        self.assertEqual(attempts[0].reason, session_lifecycle.REASON_INVOCATION_IN_FLIGHT)
+        self.assertEqual([entry for entry in self.observations if entry[0] == "stop"], [])
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        self.assertIsNotNone(self.registry.get(SESSION))
+
+    # -- F. retirement failure --------------------------------------------------
+
+    def test_case_f_a_shutdown_that_reports_failure_leaves_the_session_whole(self) -> None:
+        self._ready()
+        with self.assertRaises(LifecycleError) as caught:
+            self._retire(stop=self._stopper(
+                report={"graceful": False, "process_group_gone": False}, kills=False
+            ))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_SHUTDOWN_INCOMPLETE)
+        self._assert_still_owned_bound_and_continuable()
+
+    def test_case_f_a_shutdown_that_claims_success_it_cannot_prove_is_refused(self) -> None:
+        # The report says the group is gone and the group is still there. This is the
+        # half-retired state in its most tempting form, and it is refused.
+        self._ready()
+        with self.assertRaises(LifecycleError) as caught:
+            self._retire(stop=self._stopper(
+                report={"graceful": True, "exit_code": 0, "process_group_gone": True},
+                kills=False,
+            ))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_SHUTDOWN_INCOMPLETE)
+        self._assert_still_owned_bound_and_continuable()
+
+    def test_case_f_a_shutdown_that_raises_leaves_the_session_whole(self) -> None:
+        self._ready()
+
+        def stop(handle):
+            self.observations.append(("stop", handle.pgid))
+            raise claude_worker.ClaudeWorkerError("shutdown-incomplete", "boom")
+
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._retire(stop=stop)
+        self._assert_still_owned_bound_and_continuable(stopped=True)
+
+    def _assert_still_owned_bound_and_continuable(self, *, stopped=False) -> None:
+        """A failure to retire leaves a session, not a half-retired remnant."""
+        record = self.store.read(SESSION)
+        self.assertEqual(record.state, BINDING_STATE_BOUND)
+        self.assertFalse(record.is_terminal)
+        # Still owned, with every fact the handle carried still standing.
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertIsNotNone(self.registry.context(SESSION))
+        self.assertIsNotNone(self.registry.terminal_finalization(SESSION))
+        self.assertEqual(self.registry.work_boundary(SESSION), 1)
+        self.assertEqual(self.registry.rotation_marked_session_ids(), (SESSION,))
+        # Nothing was launched or reserved in its place.
+        self.assertEqual([entry.session_id for entry in self.store.records()], [SESSION])
+        self.assertEqual([owned.session_id for owned in self.registry.sessions()], [SESSION])
+        if stopped:
+            self.assertIn(("stop", 4242), self.observations)
+        # And it is still continuable: a failure to retire is not a dead session.
+        self._work(terminal=NEXT_PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+
+    # -- G. no replacement, on any path ----------------------------------------
+
+    def test_case_g_a_successful_retirement_launches_and_binds_nothing(self) -> None:
+        self._ready()
+        # Every route to a new context, held shut across the destructive act.
+        with patch.object(session_lifecycle, "start_worker") as start, \
+                patch.object(session_lifecycle, "reserve_binding") as reserve, \
+                patch.object(session_lifecycle, "launch_request") as launch, \
+                patch.object(session_lifecycle, "resume_request") as resume, \
+                patch.object(session_lifecycle, "run_request") as run:
+            retirement = self._retire()
+        self.assertTrue(retirement.retired)
+        start.assert_not_called()
+        reserve.assert_not_called()
+        launch.assert_not_called()
+        resume.assert_not_called()
+        run.assert_not_called()
+        # Exactly one durable record exists, and it is the one that was retired.
+        records = self.store.records()
+        self.assertEqual([entry.session_id for entry in records], [SESSION])
+        self.assertEqual(records[0].state, BINDING_STATE_UNBOUND)
+        # Nothing is owned, nothing is reserved, nothing is bound.
+        self.assertEqual(self.registry.sessions(), [])
+        self.assertEqual(self.registry.in_flight(), ())
+
+    def test_case_g_the_retirement_outcome_carries_no_replacement(self) -> None:
+        self._ready()
+        retirement = self._retire()
+        fields = {field.name for field in dataclasses.fields(retirement)}
+        self.assertEqual(
+            fields,
+            {"session_id", "rail", "state", "reason", "detail", "readiness",
+             "stopped", "recovery"},
+        )
+        # The durable identity a later slice would resume from is reported, and
+        # resuming from it is not something this slice can do.
+        self.assertEqual(retirement.readiness.handoff.session_id, SESSION)
+        self.assertNotIn("replacement", retirement.detail)
+
+    def test_case_g_retiring_an_already_retired_session_is_refused(self) -> None:
+        self._ready()
+        self.assertTrue(self._retire().retired)
+        with self.assertRaises(LifecycleError) as caught:
+            self._retire()
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_BINDING_TERMINAL)
+        self.assertEqual([entry.session_id for entry in self.store.records()], [SESSION])
+
+    # -- H. the accepted properties are still exactly what they were ------------
+
+    def test_case_h_58_a_failed_invocation_invalidates_the_currency_retirement_needs(self) -> None:
+        self._ready()
+        with self.assertRaises(claude_worker.ClaudeWorkerError):
+            self._work(fail=claude_worker.ClaudeWorkerError("worker-fatal", "boom"))
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self._assert_untouched()
+
+    def test_case_h_60_a_finalization_is_never_credited_across_the_next_invocation(self) -> None:
+        self._ready()
+        boundary = self.registry.work_boundary(SESSION)
+        self._work(terminal=None)
+        self.assertEqual(self.registry.work_boundary(SESSION), boundary + 1)
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self._assert_untouched()
+
+    def test_case_h_61_product_state_moving_outside_any_invocation_still_refuses(self) -> None:
+        # The residual guard: nothing inside a turn can produce this any more, but a
+        # human or another session can, and a handoff written against a state the
+        # workspace has left is not what a replacement would resume from.
+        self._ready()
+        self.product_head = NEXT_PRODUCT_HEAD
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self._assert_untouched()
+
+    def test_case_h_62_only_a_post_turn_finalization_can_authorize_a_retirement(self) -> None:
+        # The agent publishes a real handoff for itself midway through its turn and
+        # keeps working. The bytes on the rail are genuine and every other condition
+        # holds; nothing proves they followed the agent's last act, so the old
+        # context is not retired.
+        self._launch()
+        self._mark()
+        self._work(mid_turn=PUBLICATION, terminal=None,
+                   commits_after=(NEXT_PRODUCT_HEAD,))
+        self.assertTrue(self._handoff().published)
+        retirement = self._retire()
+        self.assertEqual(retirement.state, RETIREMENT_REFUSED)
+        self.assertEqual(retirement.reason, session_lifecycle.REASON_HANDOFF_NOT_CURRENT)
+        self._assert_untouched()
+
+    def test_case_h_an_identity_contradiction_still_fails_closed_before_any_stop(self) -> None:
+        self._ready()
+        for override, reason in (
+            ({"rail": self._rail(identifier=OTHER_RAIL)},
+             session_lifecycle.REASON_SCOPE_MISMATCH),
+            ({"rail": self._rail(rail_blob=OTHER_BLOB)},
+             session_lifecycle.REASON_ITERATION_DRIFT),
+            ({"handoff": self._handoff(rail=OTHER_RAIL)},
+             session_lifecycle.REASON_SCOPE_MISMATCH),
+            ({"worktree": self._worktree(path="/somewhere/else")},
+             session_lifecycle.REASON_SCOPE_MISMATCH),
+        ):
+            with self.subTest(reason=reason):
+                with self.assertRaises(LifecycleError) as caught:
+                    self._retire(**override)
+                self.assertEqual(caught.exception.reason, reason)
+                self._assert_untouched()
 
 
 if __name__ == "__main__":
