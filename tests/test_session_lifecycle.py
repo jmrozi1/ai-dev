@@ -5943,3 +5943,601 @@ class ContinuationFromDurableStateTests(ReplacementHarness):
         self.assertEqual(published.value, NEXT_PUBLICATION)
         source = inspect.getsource(session_lifecycle.continue_from_durable_state)
         self.assertEqual(source.count("finalize_terminal_handoff"), 0)
+
+
+# ---------------------------------------------------------------------------
+# The replacement's provider conversation
+# ---------------------------------------------------------------------------
+#
+# The composition defect a real rotation found, and the class of test that could
+# not see it. Checkpoint 66 bound a successor and sent it nothing; checkpoint 68
+# continued a bound replacement by *resuming* it. Each is right in its own terms.
+# Composed, every replacement was bound into a state from which the only available
+# continuation must fail, because no provider conversation under the successor's id
+# had ever been created:
+#
+#     No conversation found with session ID: 323fbf58-3694-42f2-ad0f-3f6226d2c955
+#
+# `tests.test_session_lifecycle` ran 276 tests, all green, against that. The suite
+# missed it because every sender in it is a *stub*: it records what it was handed
+# and answers success, so it cannot tell a resume of a conversation that exists
+# from a resume of one that never did. No amount of that kind of test would have
+# caught this, which is the lesson, and the reason the sender below is not one.
+
+
+class _ProviderConversations:
+    """A model of the provider's conversation rule -- deliberately not a stub.
+
+    A stub answers success to whatever it is handed. This answers the way the
+    provider answered, and it keys off `build_option_fields` -- the exact
+    `ClaudeAgentOptions` the SDK is actually given -- rather than off anything the
+    product says about itself, so a request that *calls* itself a launch but hands
+    the SDK a resume is judged as a resume.
+
+    Two rules, and nothing else:
+
+      * `session_id=<id>, resume=None` CREATES conversation `<id>`, and is refused
+        if one already exists under that id;
+      * `session_id=None, resume=<id>` REOPENS conversation `<id>`, and is refused
+        -- with the provider's own message -- when no conversation under that id
+        was ever created.
+
+    Neither rule is invented. Both are the observed behaviour of the real run
+    recorded in `docs/issue-55-rotation-dogfood-checkpoint69.md`, where a successor
+    that had been bound and never launched was resumed and the provider refused it
+    with exactly that sentence, and where the provider wrote a transcript for the
+    predecessor and none for the successor.
+
+    What this can catch: a composition that never creates a conversation, and one
+    that creates it under the wrong id. What it cannot catch: anything about the
+    provider this model does not contain, the SDK, the worker protocol, or the
+    process. It is a faithful model of one rule, not the provider.
+    """
+
+    def __init__(self, refuse_creation=None, terminal_payload=None) -> None:
+        from ai_dev_flow.claude_runtime import build_option_fields
+
+        self._options = build_option_fields
+        # Conversations that exist, in the order they came into being.
+        self.created = []
+        # Every invocation, as the SDK would have received it.
+        self.calls = []
+        self._refuse_creation = refuse_creation
+        self._terminal_payload = terminal_payload
+
+    def __call__(self, handle, request, *, prompt, markers=(), timeout=None):
+        options = self._options(request)
+        creating = options["session_id"] is not None
+        identity = options["session_id"] if creating else options["resume"]
+        self.calls.append(
+            {
+                "creating": creating,
+                "session_id": options["session_id"],
+                "resume": options["resume"],
+                "prompt": prompt,
+            }
+        )
+        if creating:
+            if identity in self.created:
+                raise claude_worker.ClaudeWorkerError(
+                    claude_worker.REASON_WORKER_FATAL,
+                    "ResultError: Claude Code returned an error result: "
+                    "Session ID {0} is already in use (exit code: 1)".format(identity),
+                )
+            if self._refuse_creation is not None:
+                raise self._refuse_creation
+            self.created.append(identity)
+        elif identity not in self.created:
+            raise claude_worker.ClaudeWorkerError(
+                claude_worker.REASON_WORKER_FATAL,
+                "ResultError: Claude Code returned an error result: "
+                "No conversation found with session ID: {0} (exit code: 1)".format(
+                    identity
+                ),
+            )
+        return {
+            "type": "result", "session_id": identity, "mode": request.mode,
+            "subtype": "success", "is_error": False,
+            "terminal_payload": self._terminal_payload,
+        }
+
+
+class ReplacementConversationTests(ReplacementHarness):
+    """bound replacement -> ITS PROVIDER CONVERSATION EXISTS -> it can be continued.
+
+    Every case starts from a real swap performed by the accepted
+    `replace_old_context` on the accepted fixtures, and drives the accepted
+    `continue_from_durable_state`. Nothing here starts a process, imports the SDK,
+    or contacts a provider.
+    """
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.provider = _ProviderConversations()
+
+    def _swap(self):
+        """A real rotation: predecessor retired, successor launched and bound."""
+        self._ready()
+        replacement = self._replace()
+        self.assertTrue(replacement.launched)
+        self.assertEqual(replacement.replacement.session_id, SUCCESSOR)
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertEqual(self.store.read(SUCCESSOR).state, BINDING_STATE_BOUND)
+        # The whole defect in one assertion: the successor is bound, owned and
+        # counted, and the provider has never heard of it.
+        self.assertNotIn(SUCCESSOR, self.provider.created)
+        return replacement
+
+    def _continue(self, session_id=SUCCESSOR, send=None, **overrides):
+        arguments = {
+            "session_id": session_id,
+            "assignment": self.assignment,
+            "read_rail": self._read_rail,
+            "read_handoff": self._read_handoff,
+            "read_worktree": self._read_worktree,
+            "read_slots": self._read_slots,
+            "read_observation": self._read_observation,
+            "request_kwargs": self._request_kwargs(),
+            "send": self.provider if send is None else send,
+            "alive": self._alive,
+        }
+        arguments.update(overrides)
+        return session_lifecycle.continue_from_durable_state(
+            self.store, self.registry, **arguments
+        )
+
+    def _launch_conversation(self):
+        """An ordinary launch, driven through the same provider model.
+
+        The predecessor's conversation has to be created by the ordinary route for
+        the rotation cases to start from a world the provider agrees with.
+        """
+        outcome, worker, _sent = self._launch(sender=(self.provider, []))
+        self.assertEqual(self.provider.created, [SESSION])
+        return outcome, worker
+
+    # -- A. a bound replacement CAN be continued -------------------------------
+
+    def test_case_a_a_bound_replacement_can_actually_be_continued(self) -> None:
+        """The load-bearing case, against a sender that models the provider's rule.
+
+        A stubbed sender cannot prove this: it would have answered success to the
+        resume that failed for real. This one refuses a resume of a conversation
+        that was never created, so the assertion below is about provider reality
+        as far as that rule describes it, and about nothing further.
+        """
+        self._swap()
+        outcome = self._continue()
+
+        self.assertTrue(outcome.continued)
+        self.assertEqual(outcome.session_id, SUCCESSOR)
+        # The conversation the successor needs now exists.
+        self.assertIn(SUCCESSOR, self.provider.created)
+        self.assertEqual(outcome.result["session_id"], SUCCESSOR)
+
+    def test_case_a_the_conversation_is_created_by_the_continuation_not_the_bind(
+        self,
+    ) -> None:
+        """Checkpoint 66's stop boundary is preserved, not traded away.
+
+        The replacement still sends nothing: no conversation exists when it
+        returns. The creating act belongs to the route that wants work done.
+        """
+        self._swap()
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.provider.created, [])
+        outcome = self._continue()
+        self.assertTrue(outcome.continued)
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertTrue(self.provider.calls[0]["creating"])
+
+    def test_case_a_the_replacement_continues_and_then_resumes(self) -> None:
+        """One rotation, then ordinary work: create once, resume ever after."""
+        self._swap()
+        self.assertTrue(self._continue().continued)
+        self.assertTrue(self._continue().continued)
+        self.assertTrue(self._continue().continued)
+        self.assertEqual(self.provider.created, [SUCCESSOR])
+        self.assertEqual(
+            [call["creating"] for call in self.provider.calls], [True, False, False]
+        )
+
+    # -- B. under its OWN minted id --------------------------------------------
+
+    def test_case_b_the_conversation_is_created_under_the_successors_own_id(
+        self,
+    ) -> None:
+        self._swap()
+        self.assertTrue(self._continue().continued)
+        # Exactly one conversation was created, and it is the successor's.
+        self.assertEqual(self.provider.created, [SUCCESSOR])
+        self.assertNotEqual(SUCCESSOR, SESSION)
+        call = self.provider.calls[0]
+        # What the SDK was actually handed: the successor's id as the session to
+        # create, and nothing to resume.
+        self.assertEqual(call["session_id"], SUCCESSOR)
+        self.assertIsNone(call["resume"])
+
+    def test_case_b_the_creating_request_names_the_binding_it_was_built_from(
+        self,
+    ) -> None:
+        from ai_dev_flow.claude_runtime import build_option_fields
+
+        self._swap()
+        record = self.store.read(SUCCESSOR)
+        request = session_lifecycle.create_conversation_request(
+            record, **self._request_kwargs()
+        )
+        options = build_option_fields(request)
+        self.assertEqual(request.session_id, SUCCESSOR)
+        self.assertEqual(options["session_id"], SUCCESSOR)
+        self.assertIsNone(options["resume"])
+        # Never a fallback route, on this request as on every other.
+        self.assertFalse(options["continue_conversation"])
+        self.assertFalse(options["fork_session"])
+
+    def test_case_b_a_creating_launch_is_authorized_only_by_a_bound_binding(
+        self,
+    ) -> None:
+        self._swap()
+        for state in (BINDING_STATE_RESERVED, BINDING_STATE_UNBOUND):
+            record = dataclasses.replace(self.store.read(SUCCESSOR), state=state)
+            with self.assertRaises(ClaudeRuntimeError) as caught:
+                session_lifecycle.create_conversation_request(
+                    record, **self._request_kwargs()
+                )
+            self.assertEqual(caught.exception.reason, "binding-not-bound")
+
+    # -- C. continuation still reads DURABLE STATE ALONE -----------------------
+
+    def test_case_c_the_fresh_reader_proof_still_holds(self) -> None:
+        """The identical brief, rebuilt by a reader holding nothing this run holds."""
+        self._swap()
+        outcome = self._continue()
+        self.assertTrue(outcome.continued)
+
+        store = BindingStore(self.tmp_path / "controller-state")
+        fresh = session_lifecycle.continuation_brief(
+            RailFacts(identifier=RAIL, status="running", rail_blob=BLOB),
+            store.read(SUCCESSOR),
+            RotationHandoffFacts(
+                rail=RAIL, published=True, location=self.HANDOFF,
+                publication=PUBLICATION, work_state=PRODUCT_HEAD,
+            ),
+            WorktreeFacts(
+                worktree_id=self.worktree_id, path=str(self.workspace),
+                clean=True, active_operation=None, head=PRODUCT_HEAD,
+            ),
+        )
+        self.assertEqual(fresh.to_dict(), outcome.brief.to_dict())
+        self.assertEqual(fresh.prompt, self.provider.calls[0]["prompt"])
+
+    def test_case_c_the_signatures_that_make_it_structural_are_unchanged(self) -> None:
+        brief = list(inspect.signature(session_lifecycle.continuation_brief).parameters)
+        self.assertNotIn("registry", brief)
+        route = list(
+            inspect.signature(session_lifecycle.continue_from_durable_state).parameters
+        )
+        for absent in ("prompt", "brief", "rail", "handoff", "worktree", "decision"):
+            self.assertNotIn(absent, route)
+        # And no mode selector was added either: which invocation this is comes
+        # from what this controller has sent, never from a caller.
+        invocation = list(inspect.signature(continue_session).parameters)
+        for absent in ("prompt", "mode", "creating", "launch"):
+            if absent == "prompt":
+                # `continue_session` legitimately takes the resolved prompt; the
+                # route above is the one that must not.
+                continue
+            self.assertNotIn(absent, invocation)
+
+    def test_case_c_the_brief_carries_no_transcript_and_no_conversation(self) -> None:
+        self._swap()
+        outcome = self._continue()
+        payload = outcome.brief.to_dict()
+        rendered = " ".join(
+            "{0} {1}".format(key, value) for key, value in payload.items()
+        ).lower()
+        for forbidden in ("transcript", "message", "conversation", "resume"):
+            self.assertNotIn(forbidden, rendered, forbidden)
+        # And the successor was told the brief's own prompt and nothing else.
+        self.assertEqual(self.provider.calls[0]["prompt"], outcome.brief.prompt)
+
+    # -- D. the predecessor's binding stays TERMINAL ---------------------------
+
+    def test_case_d_no_conversation_is_ever_created_under_the_predecessors_id(
+        self,
+    ) -> None:
+        self._launch_conversation()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        replacement = self._replace()
+        self.assertTrue(replacement.launched)
+        created_before = list(self.provider.created)
+
+        self.assertTrue(self._continue().continued)
+        # The predecessor's conversation is the one the ordinary launch made, and
+        # nothing since has touched it.
+        self.assertEqual(created_before, [SESSION])
+        self.assertEqual(self.provider.created, [SESSION, SUCCESSOR])
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertIsNone(self.registry.get(SESSION))
+
+    def test_case_d_continuing_the_retired_predecessor_is_refused_and_sends_nothing(
+        self,
+    ) -> None:
+        self._swap()
+        outcome = self._continue(session_id=SESSION)
+        self.assertEqual(outcome.state, session_lifecycle.CONTINUATION_REFUSED)
+        self.assertEqual(
+            outcome.reason, session_lifecycle.REASON_CONTINUATION_CLAIMS_TERMINAL
+        )
+        self.assertEqual(self.provider.calls, [])
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_UNBOUND)
+
+    # -- E. D6 accounting across the swap --------------------------------------
+
+    def test_case_e_the_swap_passes_through_n_minus_one_and_never_two(self) -> None:
+        self._launch_conversation()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        self.assertEqual(self._slots().occupants, (SESSION,))
+
+        replacement = self._replace()
+        self.assertTrue(replacement.launched)
+        # The slot the predecessor held was released before the successor's was
+        # taken: exactly one occupant, and it is the successor.
+        self.assertEqual(self._slots().occupants, (SUCCESSOR,))
+        self.assertEqual(self._slots().occupied, 1)
+
+        self.assertTrue(self._continue().continued)
+        # Creating the conversation reserves nothing, binds nothing and starts no
+        # process, so the figure is exactly what the swap left.
+        self.assertEqual(self._slots().occupants, (SUCCESSOR,))
+        self.assertEqual(self._slots().occupied, 1)
+        self.assertEqual(self._slots().unprovable, ())
+        self.assertEqual(
+            sorted(record.session_id for record in self.store.records()),
+            sorted([SESSION, SUCCESSOR]),
+        )
+
+    def test_case_e_a_rotation_at_the_ceiling_still_authorizes(self) -> None:
+        """N-1, never N+1: five others plus the predecessor is six, and it rotates."""
+        self._launch_conversation()
+        self._fill(5)
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._slots().occupied, 6)
+        replacement = self._replace()
+        self.assertTrue(replacement.launched)
+        self.assertEqual(self._slots().occupied, 6)
+        self.assertTrue(self._continue().continued)
+        self.assertEqual(self._slots().occupied, 6)
+
+    # -- F. failure paths stay fail-closed -------------------------------------
+
+    def test_case_f_a_failed_creation_leaves_nothing_half_bound(self) -> None:
+        self._swap()
+        refusing = _ProviderConversations(
+            refuse_creation=claude_worker.ClaudeWorkerError(
+                claude_worker.REASON_WORKER_FATAL, "the provider was unreachable"
+            )
+        )
+        outcome = self._continue(send=refusing)
+
+        self.assertEqual(outcome.state, session_lifecycle.CONTINUATION_FAILED)
+        self.assertEqual(refusing.created, [])
+        # Nothing was launched, reserved, stopped or unbound by the failure.
+        self.assertEqual(
+            sorted(record.session_id for record in self.store.records()),
+            sorted([SESSION, SUCCESSOR]),
+        )
+        self.assertEqual(self.store.read(SUCCESSOR).state, BINDING_STATE_BOUND)
+        self.assertIsNotNone(self.registry.get(SUCCESSOR))
+        self.assertEqual(self.registry.in_flight(), ())
+        # And the conversation is still unestablished, so a retry creates it
+        # rather than resuming one that may never have existed.
+        self.assertFalse(self.registry.conversation_established(SUCCESSOR))
+
+    def test_case_f_a_failed_creation_is_retried_as_a_creation(self) -> None:
+        self._swap()
+        refusing = _ProviderConversations(
+            refuse_creation=claude_worker.ClaudeWorkerError(
+                claude_worker.REASON_WORKER_FATAL, "the provider was unreachable"
+            )
+        )
+        self.assertEqual(
+            self._continue(send=refusing).state, session_lifecycle.CONTINUATION_FAILED
+        )
+        outcome = self._continue()
+        self.assertTrue(outcome.continued)
+        self.assertEqual(self.provider.created, [SUCCESSOR])
+        self.assertTrue(self.provider.calls[0]["creating"])
+
+    def test_case_f_a_failed_creation_credits_no_handoff_and_degrades_the_reading(
+        self,
+    ) -> None:
+        self._swap()
+        refusing = _ProviderConversations(
+            refuse_creation=claude_worker.ClaudeWorkerError(
+                claude_worker.REASON_WORKER_FATAL, "the provider was unreachable"
+            )
+        )
+        self.assertEqual(
+            self._continue(send=refusing).state, session_lifecycle.CONTINUATION_FAILED
+        )
+        self.assertIsNone(self.registry.terminal_finalization(SUCCESSOR))
+        reading = self.registry.context(SUCCESSOR).reading()
+        self.assertIsNone(reading.count)
+        self.assertEqual(reading.health, OBSERVATION_UNHEALTHY)
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SUCCESSOR),
+            session_lifecycle.STOP_CATEGORY_UNPROVEN,
+        )
+
+    def test_case_f_a_failed_ordinary_launch_establishes_no_conversation(self) -> None:
+        refusing = _ProviderConversations(
+            refuse_creation=claude_worker.ClaudeWorkerError(
+                claude_worker.REASON_WORKER_FATAL, "the provider was unreachable"
+            )
+        )
+        with self.assertRaises(LifecycleError) as caught:
+            self._launch(sender=(refusing, []))
+        self.assertEqual(caught.exception.reason, session_lifecycle.REASON_LAUNCH_FAILED)
+        self.assertEqual(refusing.created, [])
+        self.assertFalse(self.registry.conversation_established(SESSION))
+        self.assertIsNone(self.registry.get(SESSION))
+
+    # -- G. the accepted gates and both prohibitions ---------------------------
+
+    def test_case_g_neither_prohibition_is_violated(self) -> None:
+        guard = ReplacementLaunchTests(
+            methodName="test_case_g_wiring_continue_session_obliges_wiring_the_supervised_route"
+        )
+        # Prohibition one: no name was added to the rotation surface.
+        self.assertEqual(
+            guard.ROTATION_SURFACE,
+            frozenset(
+                {
+                    "continue_session",
+                    "supervised_teardown",
+                    "retire_old_context",
+                    "replace_old_context",
+                }
+            ),
+        )
+        # Prohibition two: the obligation still holds over the shipped package,
+        # asserted by the shipped guard rather than by a copy of its logic.
+        guard._assert_wiring_obligation()
+
+    def test_case_g_the_creating_builder_is_not_a_caller_nothing_calls(self) -> None:
+        """The second prohibition, applied to what this slice added.
+
+        `create_conversation_request` discharges the obligation only if something
+        production can actually reach calls it. It is called from
+        `continue_session`, which is itself driven by `continue_from_durable_state`.
+        """
+        guard = ReplacementLaunchTests(
+            methodName="test_case_g_wiring_continue_session_obliges_wiring_the_supervised_route"
+        )
+        callers = guard._production_callers("create_conversation_request")
+        self.assertEqual(callers, {"session_lifecycle.py": 1})
+        self.assertTrue(guard._production_callers("continue_session"))
+
+    def test_case_g_the_replacement_route_still_has_nothing_to_invoke_work_with(
+        self,
+    ) -> None:
+        parameters = list(
+            inspect.signature(session_lifecycle.replace_old_context).parameters
+        )
+        for absent in ("send", "prompt", "markers", "command_timeout", "finalize_handoff"):
+            self.assertNotIn(absent, parameters)
+        source = inspect.getsource(session_lifecycle.replace_old_context)
+        for token in (
+            "run_request", "resume_request", "continue_session", "_observe_context",
+            "create_conversation_request", "record_conversation_established",
+        ):
+            self.assertEqual(source.count(token), 0, token)
+
+    def test_case_g_the_accepted_gates_survive(self) -> None:
+        module = Path(session_lifecycle.__file__).read_text(encoding="utf-8")
+        # The single producer of a retirement authorization.
+        producers = {
+            container
+            for _path, called, container in ReplacementLaunchTests(
+                methodName="test_case_g_wiring_continue_session_obliges_wiring_the_supervised_route"
+            )._call_sites()
+            if called == "_RetirementAuthorization"
+        }
+        self.assertEqual(producers, {"retire_old_context"})
+        # Readiness is projected in-call by the retirement gate, and the chokepoint
+        # reads the session's own mark for itself.
+        self.assertIn(
+            "evaluate_rotation_readiness",
+            inspect.getsource(session_lifecycle.retire_old_context),
+        )
+        self.assertIn(
+            "stop_category", inspect.getsource(session_lifecycle._stop_owned_process)
+        )
+        # Finalization is still a post-turn controller act inside the invocation.
+        invocation = inspect.getsource(continue_session)
+        self.assertLess(
+            invocation.index("registry.end_invocation"),
+            invocation.index("finalize_terminal_handoff"),
+        )
+        # And nothing in this module reaches a process or the SDK.
+        for forbidden in ("claude_agent_sdk", "subprocess", "Popen", "os.kill", "killpg"):
+            self.assertNotIn(forbidden, module)
+
+    def test_case_g_an_ordinary_launch_is_unchanged(self) -> None:
+        """Checkpoint 66's ordering, and the launch route, exactly as accepted."""
+        seen = []
+        start, _ = self._starter(record_calls=seen)
+        outcome, _worker, _sent = self._launch(
+            starter=(start, None), sender=(self.provider, [])
+        )
+        self.assertEqual(seen, [{"session_id": SESSION, "state": BINDING_STATE_RESERVED}])
+        self.assertEqual(outcome.request.mode, "launch")
+        self.assertEqual(self.provider.created, [SESSION])
+        self.assertTrue(self.provider.calls[0]["creating"])
+        # And its second invocation is the exact resume it always was.
+        self._work()
+        self.assertEqual([call["creating"] for call in self.provider.calls], [True])
+
+    # -- H. the regression that would have caught the defect -------------------
+
+    def test_case_h_reverting_the_fix_reproduces_the_observed_failure(self) -> None:
+        """The mutation proof: with the seam reverted, this case fails as it did.
+
+        The mutation is the shipped-at-69 behaviour itself -- `continue_session`
+        building a resume for a session nothing has been sent to. The failure it
+        produces is the sentence the real provider produced, naming the successor.
+        """
+        self._swap()
+        with patch.object(
+            session_lifecycle,
+            "create_conversation_request",
+            session_lifecycle.resume_request,
+        ):
+            outcome = self._continue()
+
+        self.assertFalse(outcome.continued)
+        self.assertEqual(outcome.state, session_lifecycle.CONTINUATION_FAILED)
+        self.assertIn(
+            "No conversation found with session ID: {0}".format(SUCCESSOR),
+            outcome.detail,
+        )
+        self.assertEqual(self.provider.created, [])
+        # The reverted route asked to resume, which is exactly what failed.
+        self.assertEqual(len(self.provider.calls), 1)
+        self.assertFalse(self.provider.calls[0]["creating"])
+        self.assertEqual(self.provider.calls[0]["resume"], SUCCESSOR)
+
+    def test_case_h_the_unmutated_route_passes_the_same_case(self) -> None:
+        """The other half of discrimination: without the mutation it succeeds."""
+        self._swap()
+        outcome = self._continue()
+        self.assertTrue(outcome.continued)
+        self.assertEqual(self.provider.created, [SUCCESSOR])
+
+    def test_case_h_a_stubbed_sender_cannot_discriminate(self) -> None:
+        """Why 276 green tests proved nothing -- executably.
+
+        The same reverted seam, driven by the suite's own stubbed sender. It
+        passes. That is the defect class this suite could not see, and the reason
+        the cases above use a sender that models the provider's rule instead.
+        """
+        self._swap()
+        stub, sent = self._sender()
+        with patch.object(
+            session_lifecycle,
+            "create_conversation_request",
+            session_lifecycle.resume_request,
+        ):
+            outcome = self._continue(send=stub)
+        # Green, against the composition that could not complete a rotation for
+        # real. Nothing about the stub is wrong; it simply cannot answer this
+        # question, and neither can any assertion built on one.
+        self.assertTrue(outcome.continued)
+        self.assertEqual([entry["mode"] for entry in sent], ["resume"])

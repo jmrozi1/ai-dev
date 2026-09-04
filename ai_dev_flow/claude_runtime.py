@@ -565,6 +565,44 @@ def launch_request(record: BindingRecord, **kwargs: Any) -> RuntimeRequest:
     return _build_request(record, mode=MODE_LAUNCH, **kwargs)
 
 
+def create_conversation_request(record: BindingRecord, **kwargs: Any) -> RuntimeRequest:
+    """Build the launch that brings a *bound* session's provider conversation into being.
+
+    `launch_request` above is authorized by a reservation, and for an ordinary
+    launch that is the whole story: the request is built while the record is still
+    reserved and sent as soon as the process attaches, so the conversation is
+    created by that first send and the record is bound by the time anyone could
+    ask again.
+
+    A replacement is not launched that way. It is minted, reserved, started and
+    bound with nothing sent -- deliberately, because coming into existence is not
+    the same act as being given work -- so its binding reaches `bound` while no
+    provider conversation under its id exists at all. That gap is invisible in the
+    record: `bound` describes the worker process, and a binding deliberately
+    carries no conversation evidence. `resume_request` cannot close it, because
+    `resume=<id>` names a conversation to reopen and the provider refuses an id it
+    has never seen -- `No conversation found with session ID: <id>`, observed for
+    real. Being bound is therefore necessary for a resume and not sufficient.
+
+    This builds the one invocation that can close it: the same launch the
+    reservation authorized, under the session's own minted id, from the bound
+    record. Whether a conversation already exists is stated by the caller rather
+    than read from the record, because only the controller that started the
+    session and has sent it nothing can say so; a caller that gets that wrong asks
+    the provider to create an id it already holds, which the provider refuses, and
+    nothing here quietly resumes instead.
+    """
+    if record.state != BINDING_STATE_BOUND:
+        raise ClaudeRuntimeError(
+            REASON_BINDING_NOT_BOUND,
+            "session {0} is {1}; only a bound binding whose provider conversation "
+            "does not yet exist authorizes a creating launch.".format(
+                record.session_id, record.state
+            ),
+        )
+    return _build_request(record, mode=MODE_LAUNCH, **kwargs)
+
+
 def resume_request(record: BindingRecord, **kwargs: Any) -> RuntimeRequest:
     """Build the one exact resume this binding authorizes.
 

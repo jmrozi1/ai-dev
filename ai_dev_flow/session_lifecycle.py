@@ -40,7 +40,12 @@ from .authorization import (
     AuthorizationDecision,
     authorize,
 )
-from .claude_runtime import RuntimeRequest, launch_request, resume_request
+from .claude_runtime import (
+    RuntimeRequest,
+    create_conversation_request,
+    launch_request,
+    resume_request,
+)
 from .claude_worker import (
     ClaudeWorkerError,
     WorkerHandle,
@@ -258,6 +263,19 @@ class SessionRegistry:
         # is created and dropped with the handle, which is also the only bound the
         # deduplication memory needs.
         self._context = ContextLifecycleLedger(threshold=rotation_threshold)
+        # Which held sessions this controller has actually established a provider
+        # conversation for. It starts empty and stays empty for a session nothing
+        # has been sent to, because `_reserve_and_bind` -- the only route that
+        # mints one -- sends nothing: a session can be minted, reserved, started
+        # and `bound` while no conversation under its id exists anywhere.
+        #
+        # It lives here, beside the handle, rather than in the durable binding, for
+        # the reason ownership does. It is a claim about what this controller
+        # itself did, the binding deliberately carries no conversation evidence at
+        # all, and nothing can act on it without the handle anyway -- a session
+        # whose handle is gone is refused by `require_owned` before this fact is
+        # ever consulted, so it is never missing at a moment it was needed.
+        self._conversation = set()
 
     @property
     def rotation_threshold(self) -> int:
@@ -273,6 +291,12 @@ class SessionRegistry:
         unavailable rather than as zero.
         """
         self._owned[owned.session_id] = owned
+        # Taking ownership is not having sent anything, so no session enters this
+        # registry already carrying a conversation. Reset rather than left alone:
+        # re-adding a session id is re-taking ownership, and a stale claim that its
+        # conversation exists would send a resume at a provider that has never seen
+        # the id.
+        self._conversation.discard(owned.session_id)
         self._context.begin(
             owned.session_id, role=owned.role, observed_from_start=observed_from_start
         )
@@ -286,6 +310,7 @@ class SessionRegistry:
         self._in_flight.discard(session_id)
         self._work_boundary.pop(session_id, None)
         self._terminal_finalization.pop(session_id, None)
+        self._conversation.discard(session_id)
         self._context.forget(session_id)
 
     def context(self, session_id: str) -> Optional[SessionContextLifecycle]:
@@ -307,6 +332,30 @@ class SessionRegistry:
 
     def rotation_marked_session_ids(self) -> Tuple[str, ...]:
         return self._context.rotation_marked_session_ids()
+
+    def conversation_established(self, session_id: str) -> bool:
+        """Whether a provider conversation exists under this session's own id.
+
+        False for a session that was minted, reserved, started and bound with
+        nothing sent -- exactly the state a replacement is left standing in, and
+        the state in which a resume has nothing to resume. The durable binding
+        cannot answer this: it turns `bound` when the worker process attaches,
+        which is strictly earlier than any provider conversation exists.
+        """
+        return session_id in self._conversation
+
+    def record_conversation_established(self, session_id: str) -> None:
+        """Record that a launch invocation under this session's id has returned.
+
+        Called from the two places that send one -- an ordinary launch and the
+        first invocation of a session nothing has been sent to -- and only after
+        the sender returned. A send that raised may have created nothing, so it
+        records nothing and the next invocation creates the conversation instead,
+        which is the fail-closed direction: asking for a conversation that already
+        exists is refused by the provider, while resuming one that does not exist
+        is the defect this exists to prevent.
+        """
+        self._conversation.add(session_id)
 
     def sessions(self) -> List[OwnedSession]:
         return [self._owned[key] for key in sorted(self._owned)]
@@ -871,6 +920,14 @@ def _reserve_and_bind(
     into existence. A caller that wants work done invokes it afterwards; a caller
     that must not -- checkpoint 66's replacement -- simply does not, and has no
     sender to forget to withhold.
+
+    What it therefore leaves standing is a session that is `bound` and has *no
+    provider conversation*: the binding turns bound when the worker process
+    attaches, and a conversation is created only by a launch invocation actually
+    being sent. The registry is told so -- a session enters it with its
+    conversation unestablished -- so the first invocation of a session nothing has
+    been sent to creates the conversation instead of trying to resume one that was
+    never created.
     """
     session_id = mint()
     reserved = reserve_binding(
@@ -1003,6 +1060,11 @@ def launch_session(
             ),
         ) from exc
 
+    # The launch returned, so a provider conversation now exists under this
+    # session's own id and every later invocation of it is an exact resume.
+    # Recorded after the send rather than before it, because a send that raised may
+    # have created nothing.
+    registry.record_conversation_established(owned.session_id)
     _observe_context(registry, owned.session_id, result)
     return LaunchOutcome(binding=bound, owned=owned, request=request, result=result)
 
@@ -1027,7 +1089,16 @@ def continue_session(
     command_timeout: Optional[float] = None,
     finalize_handoff: Optional[Callable] = None,
 ) -> Mapping:
-    """Resume exactly the bound session this controller still owns, once at a time."""
+    """Invoke exactly the bound session this controller still owns, once at a time.
+
+    Every invocation after the first is an exact resume, which is what this route
+    has always been. The first invocation of a session nothing has been sent to is
+    the launch that creates its provider conversation, under the session's own
+    minted id -- because a session can be bound with no conversation, and a resume
+    of an id the provider has never seen fails rather than creating one. Which of
+    the two this is comes from this controller's own record of what it has sent,
+    never from the caller: there is no parameter that selects a mode.
+    """
     _require_decision(decision, assignment, action=ACTION_CONTINUE)
     record = store.read(session_id)
     if record is None:
@@ -1064,7 +1135,25 @@ def continue_session(
         )
 
     owned = require_owned(registry, record, alive=alive)
-    request = resume_request(record, **dict(request_kwargs))
+    # Which invocation this is turns on a fact the binding cannot carry: whether a
+    # provider conversation exists under this session's id. A binding is `bound`
+    # from the moment its worker process attaches, which is strictly earlier, and a
+    # replacement is left standing in exactly that gap -- bound, owned, counted,
+    # and never sent anything. Resuming it names a conversation that was never
+    # created, which is the one thing a resume cannot recover from and is what a
+    # real rotation failed on.
+    #
+    # So the first invocation of a session this controller has sent nothing to is
+    # the launch that brings its conversation into being, under its own minted id
+    # and no other, and every invocation after it is the exact resume it always
+    # was. That places the creating act on the route that actually wants work done,
+    # which is what keeps `replace_old_context` free to bind and send nothing: the
+    # act it withholds is not missing, it is simply not its.
+    creating = not registry.conversation_established(session_id)
+    if creating:
+        request = create_conversation_request(record, **dict(request_kwargs))
+    else:
+        request = resume_request(record, **dict(request_kwargs))
     sender = send if send is not None else run_request
 
     send_arguments = {"prompt": prompt, "markers": list(markers)}
@@ -1085,6 +1174,14 @@ def continue_session(
         # Cleared regardless of outcome, and without swallowing it: a failed
         # invocation must not leave the session permanently un-continuable.
         registry.end_invocation(session_id)
+
+    if creating:
+        # The creating launch returned, so a conversation under this id exists now
+        # and every later invocation of it is a resume. Recorded after the send and
+        # only on the path where it returned: the failure path above raises before
+        # reaching here, leaving the conversation unestablished, so a retry creates
+        # it rather than resuming something that may never have been created.
+        registry.record_conversation_established(session_id)
 
     # Exact resume is the same session, so its observation is the same observation:
     # the count carries across the resume rather than restarting, and the identity
@@ -2816,6 +2913,26 @@ def replace_old_context(
 # what makes `category-unprovable` reachable in production for the first time. So
 # this slice also owes the route that handles that state, and owes D8 its delivery:
 # `release_continued_context` below.
+#
+# A fifth thing, learned the only way it could be: by running the composition
+# against the real provider. Both halves above were correct in their own terms and
+# their composition did not work. The replacement was bound with nothing sent, so
+# no provider conversation under the successor's id had ever been created; this
+# route then asked to *resume* that id, and the provider answered `No conversation
+# found with session ID: ...`. Every replacement the shipped composition could
+# produce was bound into a state from which the only continuation must fail, and
+# 276 green tests said nothing about it because every one of them stubbed the
+# sender -- a stub answers success to whatever it is handed, so no test could tell
+# a resume of a real conversation from a resume of one that never existed.
+#
+# The seam is `continue_session`, and the fact it was missing is not a durable one:
+# whether this controller has sent a session anything is a claim about what this
+# controller did, it lives beside the handle in the registry, and continuation
+# already refuses to act without that handle. So the first invocation of a session
+# nothing has been sent to creates its conversation, under its own minted id, and
+# everything above stays exactly as accepted: the brief still takes no registry and
+# carries only locators, this route still takes no `prompt`, and
+# `replace_old_context` still has no sender to forget to withhold.
 
 
 CONTINUATION_CONTINUED = "continuation-continued"
