@@ -9,6 +9,7 @@ import http.client
 import inspect
 import io
 import json
+import textwrap
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -29,6 +30,11 @@ from ai_dev_flow.attention_projection import (
     session_evidence,
 )
 from ai_dev_flow.authorization import CONCURRENCY_CEILING_DEFAULT
+from ai_dev_flow.authorization import (
+    ControlPlaneObservation,
+    RailObservation,
+    WorkspaceObservation,
+)
 from ai_dev_flow.claude_allowance_store import AllowanceStore
 from ai_dev_flow.context_lifecycle import (
     EVENT_COMPACTION_OBSERVED,
@@ -47,6 +53,7 @@ from ai_dev_flow.manager_controller import (
 from ai_dev_flow.queue_source import REASON_OWNERSHIP_CONTRADICTORY, QueueSourceError
 from ai_dev_flow.session_binding import BINDING_STATE_RESERVED, BindingStore
 from ai_dev_flow.session_lifecycle import (
+    ROTATION_READY,
     REASON_CATEGORY_IS_PROVABLE,
     REASON_ROTATION_REQUIRES_RETIREMENT,
     REASON_SUPERVISED_TEARDOWN,
@@ -70,7 +77,14 @@ from tests.test_decision_manager_launch import (
     a_queue,
 )
 from tests.test_session_lifecycle import LifecycleTestBase
+from tests.test_session_lifecycle import RotationHarness
+from tests.test_session_lifecycle import BLOB as LIFECYCLE_BLOB
+from tests.test_session_lifecycle import FakeHandle
+from tests.test_session_lifecycle import HEAD as LIFECYCLE_HEAD
+from tests.test_session_lifecycle import PUBLICATION as LIFECYCLE_PUBLICATION
+from tests.test_session_lifecycle import RAIL as LIFECYCLE_RAIL
 from tests.test_session_lifecycle import SESSION as LIFECYCLE_SESSION
+from tests.test_session_lifecycle import SUCCESSOR
 
 
 MODULE_SOURCE = Path(controller_module.__file__).read_text(encoding="utf-8")
@@ -1846,5 +1860,170 @@ class ActionableAttentionOverHttpTests(SourcedLaunchTestCase):
                 item for item, detail in payload["details"].items()
                 if detail["attentionOwner"] == OWNER_HUMAN
             ],
+            [],
+        )
+
+
+class ControllerReplacementTests(RotationHarness):
+    """A rotation swap through the controller that holds both halves of the count.
+
+    The lifecycle cases prove the ordering and the identities. These prove the one
+    thing only this altitude can: that the slot the predecessor released and the
+    slot the successor occupies are the same manager's slots, so the figure this
+    controller draws is right on both sides of the swap and never shows seven.
+    """
+
+    RETIREMENT_CLOCK = "2026-08-26T12:10:03Z"
+    SUCCESSOR_PGID = 5353
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.group_alive = {4242: True}
+
+    def _controller(self) -> ManagerController:
+        source = QueueSourceContext(
+            control_plane=self.tmp_path / "coordination",
+            project="ai-dev",
+            ticket="issue-55",
+            binding_root=self.store.root,
+        )
+        return ManagerController(source, registry=self.registry)
+
+    def _alive(self, pgid):
+        return bool(self.group_alive.get(pgid, False))
+
+    def _stopper(self):
+        def stop(handle):
+            self.group_alive[handle.pgid] = False
+            return {"graceful": True, "exit_code": 0, "process_group_gone": True}
+        return stop
+
+    def _successor_starter(self):
+        worker = FakeHandle(pid=self.SUCCESSOR_PGID, pgid=self.SUCCESSOR_PGID)
+        start, worker = self._starter(handle=worker)
+
+        def wrapped(store, reserved, **kwargs):
+            outcome = start(store, reserved, **kwargs)
+            self.group_alive[worker.pgid] = True
+            return outcome
+
+        return wrapped
+
+    def _observation(self):
+        return ControlPlaneObservation(
+            project="ai-dev",
+            ticket="issue-55",
+            head=LIFECYCLE_HEAD,
+            rails=(
+                RailObservation(
+                    identifier=LIFECYCLE_RAIL, status="running",
+                    rail_blob=LIFECYCLE_BLOB, role="executor",
+                ),
+            ),
+            workspace=WorkspaceObservation(
+                workspace_key="github:jmrozi1/ai-dev#55",
+                worktree_id=self.worktree_id,
+                workspace_path=str(self.workspace),
+            ),
+        )
+
+    def _ready(self):
+        outcome, worker, _sent = self._launch()
+        self._mark()
+        self._work(terminal=LIFECYCLE_PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        return outcome, worker
+
+    def _replace_through(self, controller, **overrides):
+        arguments = {
+            "read_rail": self._rail,
+            "read_handoff": self._handoff,
+            "read_worktree": self._worktree,
+            "read_observation": self._observation,
+            "reference": self.reference,
+            "request_kwargs": self._request_kwargs(),
+            "package_root": self.repo_root,
+            "now": self.RETIREMENT_CLOCK,
+            "clock": lambda: self.clock,
+            "new_session_id": lambda: SUCCESSOR,
+            "start": self._successor_starter(),
+            "stop": self._stopper(),
+            "alive": self._alive,
+        }
+        arguments.update(overrides)
+        return controller.replace_old_context(
+            LIFECYCLE_SESSION, self.assignment, **arguments
+        )
+
+    def test_the_controller_count_is_right_on_both_sides_of_a_swap(self) -> None:
+        controller = self._controller()
+        self._ready()
+        before = controller.agent_count(alive=self._alive)
+        self.assertEqual(before["current"], 1)
+        self.assertIsNone(before["reason"])
+        self.assertEqual(controller.owned_session_ids(), (LIFECYCLE_SESSION,))
+
+        replacement = self._replace_through(controller)
+
+        self.assertTrue(replacement.launched)
+        after = controller.agent_count(alive=self._alive)
+        # One agent before, one after -- and it is a different agent.
+        self.assertEqual(after["current"], 1)
+        self.assertIsNone(after["reason"])
+        self.assertEqual(after["permitted"], CONCURRENCY_CEILING_DEFAULT)
+        self.assertEqual(controller.owned_session_ids(), (SUCCESSOR,))
+        self.assertTrue(self.store.read(LIFECYCLE_SESSION).is_terminal)
+        self.assertFalse(self.store.read(SUCCESSOR).is_terminal)
+
+    def test_a_refused_swap_leaves_the_controller_counting_the_old_session(self) -> None:
+        controller = self._controller()
+        outcome, _worker, _sent = self._launch()
+        self._mark()  # marked, but no handoff was ever published
+
+        replacement = self._replace_through(controller)
+
+        self.assertFalse(replacement.launched)
+        self.assertIsNone(replacement.replacement)
+        count = controller.agent_count(alive=self._alive)
+        self.assertEqual(count["current"], 1)
+        self.assertEqual(controller.owned_session_ids(), (LIFECYCLE_SESSION,))
+        self.assertFalse(self.store.read(LIFECYCLE_SESSION).is_terminal)
+        self.assertIsNone(self.store.read(SUCCESSOR))
+
+    def test_the_swap_is_admitted_against_this_controllers_own_occupancy(self) -> None:
+        """One manager states one concurrency number, and a rotation is not an
+        occasion to run a different one -- so the ceiling this swap passes is the
+        one `agent_count` draws, through the same single-homed reduction."""
+        source = inspect.getsource(
+            controller_module.ManagerController.replace_old_context
+        )
+        self.assertIn("read_slots=lambda records: self.occupancy(", source)
+        parameters = list(
+            inspect.signature(
+                controller_module.ManagerController.replace_old_context
+            ).parameters
+        )
+        self.assertNotIn("ceiling", parameters)
+        self.assertNotIn("read_slots", parameters)
+
+    def test_the_controller_adds_no_route_of_its_own_to_a_replacement(self) -> None:
+        """A pass-through, like `launch` and `supervised_teardown`."""
+        source = inspect.getsource(
+            controller_module.ManagerController.replace_old_context
+        )
+        self.assertEqual(source.count("return replace_old_context("), 1)
+        # Read from the code, not the prose: a docstring naming what this route
+        # refuses to do must not read as it doing it.
+        code = _code_only(textwrap.dedent(source))
+        for absent in (
+            "reserve_binding", "start_worker", "run_request", "stop_session",
+            "retire_old_context", "shutdown_worker", "_retirement", "send",
+            "prompt", "**kwargs",
+        ):
+            self.assertNotIn(absent, code, absent)
+        self.assertEqual(
+            [name for name in inspect.signature(
+                controller_module.ManagerController.replace_old_context
+            ).parameters if name.startswith("_")],
             [],
         )

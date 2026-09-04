@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import dataclasses
 import inspect
 import json
@@ -14,7 +15,12 @@ from ai_dev_flow import claude_worker, session_lifecycle, workspaces
 from ai_dev_flow.authorization import (
     ACTION_CONTINUE,
     ACTION_LAUNCH,
+    REASON_CONCURRENCY_CEILING,
     AuthorizationDecision,
+    ControlPlaneObservation,
+    RailObservation,
+    WorkspaceObservation,
+    authorize,
     reconcile_agent_slots,
 )
 from ai_dev_flow.claude_runtime import ClaudeRuntimeError
@@ -73,6 +79,9 @@ OTHER_BLOB = "b" * 40
 HEAD = "c" * 40
 SESSION = "1a2b3c4d-0001-4000-8000-00000000000a"
 OTHER_SESSION = "1a2b3c4d-0002-4000-8000-00000000000b"
+# The successor a rotation binds. A distinct identity, because a replacement
+# that reused its predecessor's would read as a continuation of work it never did.
+SUCCESSOR = "1a2b3c4d-0003-4000-8000-00000000000c"
 SKILL = "executor"
 TOOLS = ("Read", "Glob")
 # Git object names of published handoff bytes. Two of them, because currency is a
@@ -4163,3 +4172,830 @@ class SupervisedTeardownTests(RotationHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplacementLaunchTests(RotationHarness):
+    """retired old context -> A REPLACEMENT LAUNCHED AND BOUND, and nothing past it.
+
+    Checkpoint 63 implemented the first half of D9's terminate-and-replace sentence
+    and stopped, launching nothing. This is the second half. It is deliberately not
+    the third: a successor is brought into existence and bound to the rail, and no
+    work is invoked through it, because resuming from the durable handoff is a
+    separate act that these cases prove is not reachable from here.
+
+    The fixtures are the accepted retirement ones, on purpose: the same launch, the
+    same real threshold mark, the same published handoff, the same injected handle
+    and the same process group modelled as a value these tests move. So a swap
+    permitted here is permitted on exactly the facts a retirement was permitted on
+    there, and a process proven gone is proven by an observation the code took
+    rather than by a report it was handed.
+
+    No case starts a real process.
+    """
+
+    RETIREMENT_CLOCK = "2026-08-26T12:10:03Z"
+    PREDECESSOR_PGID = 4242
+    SUCCESSOR_PGID = 5353
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.group_alive = {self.PREDECESSOR_PGID: True}
+        # Every liveness observation, stop, durable read and process start, in the
+        # order they happened. Ordering is the entire subject of this class: a
+        # reservation taken before a stop, or a fact read before the retirement it
+        # authorizes, would both be invisible in a boolean and are plain here.
+        self.observations = []
+        self._stopped = False
+        self._probes_since_stop = 0
+        # When set, the predecessor's process group comes back to life this many
+        # post-stop probes later -- which is how a retirement that honestly proved
+        # it gone can still be wrong by the time a launch would happen.
+        self.resurrect_after = None
+        self.successor = None
+
+    # -- the world these cases observe ----------------------------------------
+
+    def _alive(self, pgid):
+        if pgid == self.PREDECESSOR_PGID and self._stopped:
+            self._probes_since_stop += 1
+            if (
+                self.resurrect_after is not None
+                and self._probes_since_stop > self.resurrect_after
+            ):
+                self.group_alive[pgid] = True
+        answer = bool(self.group_alive.get(pgid, False))
+        self.observations.append(("alive", pgid, answer))
+        return answer
+
+    def _stopper(self, report=None, kills=True):
+        def stop(handle):
+            self.observations.append(("stop", handle.pgid))
+            self._stopped = True
+            if kills:
+                self.group_alive[handle.pgid] = False
+            if report is not None:
+                return report
+            return {"graceful": True, "exit_code": 0, "process_group_gone": True}
+        return stop
+
+    def _successor_starter(self, fail=None):
+        """Attach the successor exactly as the accepted starter attaches any launch."""
+        worker = FakeHandle(pid=self.SUCCESSOR_PGID, pgid=self.SUCCESSOR_PGID)
+        start, worker = self._starter(handle=worker, fail=fail)
+
+        def wrapped(store, reserved, **kwargs):
+            # Recorded before the attach, with the state the record is actually in:
+            # a successor started against anything but a reservation would show here.
+            self.observations.append(("start", reserved.session_id, reserved.state))
+            outcome = start(store, reserved, **kwargs)
+            self.group_alive[worker.pgid] = True
+            return outcome
+
+        self.successor = worker
+        return wrapped
+
+    # -- the facts the route reads for itself ---------------------------------
+
+    def _read_rail(self):
+        self.observations.append(("read", "rail"))
+        return self._rail()
+
+    def _read_handoff(self):
+        self.observations.append(("read", "handoff"))
+        return self._handoff()
+
+    def _read_worktree(self):
+        self.observations.append(("read", "worktree"))
+        return self._worktree()
+
+    def _observation(self, **overrides):
+        arguments = {
+            "project": "ai-dev",
+            "ticket": "issue-55",
+            "head": HEAD,
+            "rails": (
+                RailObservation(
+                    identifier=RAIL, status="running", rail_blob=BLOB, role="executor"
+                ),
+            ),
+            "workspace": WorkspaceObservation(
+                workspace_key="github:jmrozi1/ai-dev#55",
+                worktree_id=self.worktree_id,
+                workspace_path=str(self.workspace),
+            ),
+        }
+        arguments.update(overrides)
+        return ControlPlaneObservation(**arguments)
+
+    def _read_observation(self):
+        self.observations.append(("read", "observation"))
+        return self._observation()
+
+    def _read_slots(self, records):
+        """The occupancy reduction, as the controller hands it over: over exactly
+        the records the route read for itself, at the moment it asks."""
+        self.observations.append(
+            ("read", "slots", tuple(
+                sorted(r.session_id for r in records if not r.is_terminal)
+            ))
+        )
+        return self._reduce(records)
+
+    def _reduce(self, records, ceiling=6):
+        """What D6's reconciler makes of these records, by the production reduction.
+
+        A separate prober from `_alive`, so asking the question leaves no trace in
+        the observation sequence the ordering cases assert on.
+        """
+        return reconcile_agent_slots(
+            list(records),
+            ownership=session_lifecycle.ownership_evidence(
+                self.registry, list(records),
+                alive=lambda pgid: bool(self.group_alive.get(pgid, False)),
+            ),
+            ceiling=ceiling,
+        )
+
+    def _slots(self, ceiling=6):
+        """What this controller's occupancy is right now, over the durable store."""
+        return self._reduce(self.store.records(), ceiling=ceiling)
+
+    # -- the states these cases start from ------------------------------------
+
+    def _ready(self):
+        """A genuinely rotation-ready session, by the accepted route only."""
+        outcome, worker, _sent = self._launch()
+        self._mark()
+        self._work(terminal=PUBLICATION)
+        self.assertEqual(self._evaluate().state, ROTATION_READY)
+        return outcome, worker
+
+    def _unprovable(self):
+        """A live session whose compaction history cannot be called complete."""
+        outcome, worker, _sent = self._launch()
+        self.registry.observe_failed_invocation(
+            SESSION, "the invocation watching this session did not finish"
+        )
+        self.assertIsNone(self.registry.context(SESSION).reading().rotation_marked)
+        self.assertEqual(
+            session_lifecycle.stop_category(self.registry, SESSION),
+            session_lifecycle.STOP_CATEGORY_UNPROVEN,
+        )
+        return outcome, worker
+
+    def _fill(self, count, ceiling=6):
+        """Other managed agents this controller holds, so the ceiling is real."""
+        filled = []
+        for index in range(count):
+            rail = "issue-55-filler-rail-{0}".format(index)
+            blob = "{0}{1}".format(index, "f" * 39)
+            iteration = RailIteration(rail=rail, blob=blob)
+            session = "1a2b3c4d-01{0:02d}-4000-8000-00000000000f".format(index)
+            pid = 7000 + index
+            reserve_binding(
+                self.store, project="ai-dev", ticket="issue-55",
+                reference=self.reference, workspace_path=str(self.workspace),
+                worktree_id=self.worktree_id, rail=rail, role="executor",
+                iteration=iteration, session_id=session, launched_at_head=HEAD,
+                reserved_at=self.clock, ceiling=ceiling,
+            )
+            bound = attach_process(
+                self.store, session, pid=pid, pid_domain="test-host",
+                started_at="2026-08-26T12:00:02Z", bound_at="2026-08-26T12:00:03Z",
+                expected_iteration=iteration,
+            )
+            self.group_alive[pid] = True
+            self.registry.add(
+                OwnedSession(
+                    session_id=session, handle=FakeHandle(pid=pid, pgid=pid), pid=pid,
+                    pid_domain="test-host", pgid=pid, started_at=bound.started_at,
+                    iteration=iteration, workspace_path=bound.workspace_path,
+                    role=bound.role,
+                ),
+                observed_from_start=True,
+            )
+            filled.append(session)
+        return filled
+
+    def _replace(self, **overrides):
+        arguments = {
+            "session_id": SESSION,
+            "assignment": self.assignment,
+            "read_rail": self._read_rail,
+            "read_handoff": self._read_handoff,
+            "read_worktree": self._read_worktree,
+            "read_slots": self._read_slots,
+            "read_observation": self._read_observation,
+            "reference": self.reference,
+            "request_kwargs": self._request_kwargs(),
+            "package_root": self.repo_root,
+            "now": self.RETIREMENT_CLOCK,
+            "clock": lambda: self.clock,
+            "new_session_id": lambda: SUCCESSOR,
+            "start": self._successor_starter(),
+            "stop": self._stopper(),
+            "alive": self._alive,
+        }
+        arguments.update(overrides)
+        return session_lifecycle.replace_old_context(
+            self.store, self.registry, **arguments
+        )
+
+    # -- shared assertions -----------------------------------------------------
+
+    def _assert_nothing_launched(self):
+        """No successor exists: no reservation, no process, no second binding."""
+        self.assertEqual(
+            [entry for entry in self.observations if entry[0] == "start"], []
+        )
+        self.assertIsNone(self.store.read(SUCCESSOR))
+        self.assertIsNone(self.registry.get(SUCCESSOR))
+        self.assertEqual(
+            sorted(record.session_id for record in self.store.records()), [SESSION]
+        )
+
+    def _assert_predecessor_survives(self):
+        """The old session is exactly as it was: owned, bound, nonterminal, live."""
+        self.assertEqual(
+            [entry for entry in self.observations if entry[0] == "stop"], []
+        )
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertTrue(self.group_alive[self.PREDECESSOR_PGID])
+        self.assertEqual(self._slots().occupants, (SESSION,))
+
+    # -- A. retired -> replacement launched and bound --------------------------
+
+    def test_case_a_a_retired_context_is_replaced_by_a_distinct_bound_successor(self) -> None:
+        _outcome, worker = self._ready()
+        before = self._slots()
+        self.assertEqual(before.occupants, (SESSION,))
+
+        replacement = self._replace()
+
+        self.assertTrue(replacement.launched)
+        self.assertEqual(replacement.state, session_lifecycle.REPLACEMENT_LAUNCHED)
+        self.assertEqual(
+            replacement.reason, session_lifecycle.REASON_REPLACEMENT_LAUNCHED
+        )
+        self.assertEqual(replacement.predecessor_session_id, SESSION)
+
+        # The predecessor was retired by this call, on the readiness this call
+        # projected, and its group is gone as a matter of observation.
+        self.assertTrue(replacement.retirement.retired)
+        self.assertTrue(replacement.retirement.readiness.ready)
+        self.assertEqual(
+            replacement.retirement.readiness.handoff.handoff_publication, PUBLICATION
+        )
+        self.assertTrue(replacement.retirement.stopped.process_group_gone)
+        self.assertEqual(replacement.retirement.stopped.pgid, worker.pgid)
+        self.assertFalse(self.group_alive[worker.pgid])
+
+        # The successor is a different session, and says so in every record of it.
+        self.assertEqual(replacement.replacement.session_id, SUCCESSOR)
+        self.assertNotEqual(replacement.replacement.session_id, SESSION)
+        self.assertEqual(replacement.replacement.binding.state, BINDING_STATE_BOUND)
+        self.assertEqual(replacement.replacement.binding.rail, RAIL)
+        self.assertEqual(replacement.replacement.owned.pgid, self.SUCCESSOR_PGID)
+        self.assertIsNotNone(self.registry.get(SUCCESSOR))
+
+        # The predecessor's binding is terminal, and this controller holds nothing
+        # for it: no handle, no context, no work boundary.
+        predecessor = self.store.read(SESSION)
+        self.assertTrue(predecessor.is_terminal)
+        self.assertEqual(predecessor.state, BINDING_STATE_UNBOUND)
+        self.assertIsNone(self.registry.get(SESSION))
+        self.assertIsNone(self.registry.context(SESSION))
+
+        # D6 across the swap: one occupant before, one after, and it is the
+        # successor rather than the predecessor. Nothing became unprovable.
+        after = self._slots()
+        self.assertEqual(after.occupants, (SUCCESSOR,))
+        self.assertEqual(after.occupied, 1)
+        self.assertEqual(after.unprovable, ())
+        self.assertTrue(after.provable)
+        self.assertEqual(after.ceiling, before.ceiling)
+
+    def test_case_a_the_successor_is_reserved_only_after_the_predecessor_is_gone(self) -> None:
+        self._ready()
+        self._replace()
+
+        kinds = [entry[0] for entry in self.observations]
+        stopped_at = kinds.index("stop")
+        started_at = kinds.index("start")
+        self.assertLess(stopped_at, started_at)
+        # And the successor's process was started against a *reservation*, which is
+        # the accepted launch ordering: the durable record existed before anything
+        # was spawned.
+        self.assertEqual(
+            self.observations[started_at], ("start", SUCCESSOR, BINDING_STATE_RESERVED)
+        )
+        # The proof that the group is gone is an observation taken after the stop,
+        # and this route takes one of its own after the retirement returned.
+        post_stop_probes = [
+            entry for entry in self.observations[stopped_at:started_at]
+            if entry[0] == "alive" and entry[1] == self.PREDECESSOR_PGID
+        ]
+        self.assertGreaterEqual(len(post_stop_probes), 2)
+        self.assertTrue(all(entry[2] is False for entry in post_stop_probes))
+        # The occupancy this launch was admitted against was reduced from a store
+        # read taken after the terminalization, so the slot being counted is the
+        # released one -- not the predecessor's, carried from before the stop.
+        reductions = [
+            entry for entry in self.observations
+            if entry[0] == "read" and entry[1] == "slots"
+        ]
+        self.assertEqual(len(reductions), 1)
+        self.assertGreater(self.observations.index(reductions[0]), stopped_at)
+        self.assertEqual(reductions[0][2], ())
+        # Every fact the retirement decided on was read before the stop, and the
+        # facts the launch decided on only after it.
+        rail_read = self.observations.index(("read", "rail"))
+        observation_read = self.observations.index(("read", "observation"))
+        self.assertLess(rail_read, stopped_at)
+        self.assertLess(self.observations.index(("read", "handoff")), stopped_at)
+        self.assertLess(self.observations.index(("read", "worktree")), stopped_at)
+        self.assertGreater(observation_read, stopped_at)
+        self.assertLess(observation_read, started_at)
+
+    def test_case_a_a_successor_may_not_be_minted_with_its_predecessors_identity(self) -> None:
+        self._ready()
+        with self.assertRaises(LifecycleError) as raised:
+            self._replace(new_session_id=lambda: SESSION)
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_SUCCESSOR_IDENTITY_REUSED
+        )
+        # The retirement really did happen -- this refusal is about the successor --
+        # and no second record was written for the reused id.
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertEqual(
+            sorted(record.session_id for record in self.store.records()), [SESSION]
+        )
+        self.assertEqual([entry for entry in self.observations if entry[0] == "start"], [])
+
+    def test_case_a_the_store_refuses_a_reused_session_id_beneath_the_route(self) -> None:
+        """The identity guard is not the only thing holding this."""
+        self._ready()
+        self._replace()
+        with self.assertRaises(SessionBindingError) as raised:
+            reserve_binding(
+                self.store, project="ai-dev", ticket="issue-55",
+                reference=self.reference, workspace_path=str(self.workspace),
+                worktree_id=self.worktree_id, rail=RAIL, role="executor",
+                iteration=RailIteration(rail=RAIL, blob=OTHER_BLOB),
+                session_id=SESSION, launched_at_head=HEAD,
+                reserved_at=self.clock, ceiling=6,
+            )
+        self.assertIn("already", str(raised.exception))
+
+    # -- B. a live predecessor is never replaced -------------------------------
+
+    def test_case_b_a_predecessor_that_was_not_retired_gets_no_replacement(self) -> None:
+        """LOAD-BEARING: no replacement is bound beside a live predecessor."""
+        outcome, _worker, _sent = self._launch()
+        self._mark()
+        # No handoff was ever published, so this session is live and not ready.
+        self.assertEqual(self._evaluate().state, ROTATION_NOT_READY)
+
+        replacement = self._replace()
+
+        self.assertFalse(replacement.launched)
+        self.assertEqual(replacement.state, session_lifecycle.REPLACEMENT_REFUSED)
+        self.assertEqual(
+            replacement.reason, session_lifecycle.REASON_PREDECESSOR_NOT_RETIRED
+        )
+        self.assertIsNone(replacement.replacement)
+        self.assertFalse(replacement.retirement.retired)
+        self.assertIn("nothing was launched", replacement.detail)
+        self._assert_nothing_launched()
+        self._assert_predecessor_survives()
+
+    def test_case_b_the_authorizer_cannot_produce_a_launch_beside_a_live_binding(self) -> None:
+        """The refusal above is not the only thing standing between the two.
+
+        Even if a route reached the launch with a live predecessor, the accepted
+        authorizer answers a rail that already holds a live binding with a
+        *continuation* -- never a launch -- and the launch gate demands a launch.
+        """
+        self._ready()
+        records = list(self.store.records())
+        decision = authorize(
+            self._observation(),
+            project="ai-dev", ticket="issue-55", rail=RAIL, role="executor",
+            expected_head=HEAD, rail_blob=BLOB, slots=self._slots(),
+            bindings=records, in_flight_session_ids=(),
+        )
+        self.assertTrue(decision.authorized)
+        self.assertEqual(decision.action, ACTION_CONTINUE)
+        self.assertNotEqual(decision.action, ACTION_LAUNCH)
+
+    def test_case_b_the_store_refuses_a_second_binding_for_a_live_rail_iteration(self) -> None:
+        """And beneath the authorizer, the durable record refuses it too."""
+        self._ready()
+        with self.assertRaises(SessionBindingError) as raised:
+            reserve_binding(
+                self.store, project="ai-dev", ticket="issue-55",
+                reference=self.reference, workspace_path=str(self.workspace),
+                worktree_id=self.worktree_id, rail=RAIL, role="executor",
+                iteration=self.iteration, session_id=SUCCESSOR,
+                launched_at_head=HEAD, reserved_at=self.clock, ceiling=6,
+            )
+        self.assertIn("already held by session {0}".format(SESSION), str(raised.exception))
+
+    def test_case_b_a_predecessor_alive_again_at_the_launch_instant_gets_no_replacement(self) -> None:
+        """The retirement proved it gone; this route proves it again, and disagrees.
+
+        The strongest form of "actually retired": the retirement's own post-shutdown
+        probe honestly returned false, and by the instant a reservation would be
+        written the group answers again. A launch here would bind a successor beside
+        a live predecessor on the strength of a claim that was true a moment ago.
+        """
+        self._ready()
+        self.resurrect_after = 1
+        with self.assertRaises(LifecycleError) as raised:
+            self._replace()
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_RETIREMENT_UNPROVEN
+        )
+        self.assertIn("fresh liveness probe", str(raised.exception))
+        self.assertIn("Nothing was launched", str(raised.exception))
+        self._assert_nothing_launched()
+
+    # -- C. retirement failed -> no launch, and the truth survives -------------
+
+    def test_case_c_a_shutdown_that_cannot_be_proven_launches_nothing(self) -> None:
+        self._ready()
+        with self.assertRaises(LifecycleError) as raised:
+            self._replace(stop=self._stopper(kills=False))
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_SHUTDOWN_INCOMPLETE
+        )
+        # The old session survives truthfully: still bound, still owned, still
+        # counted, and its process group is still there.
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+        self.assertFalse(self.store.read(SESSION).is_terminal)
+        self.assertIsNotNone(self.registry.get(SESSION))
+        self.assertTrue(self.group_alive[self.PREDECESSOR_PGID])
+        self.assertEqual(self._slots().occupants, (SESSION,))
+        self._assert_nothing_launched()
+
+    def test_case_c_a_stopper_that_reports_no_shutdown_launches_nothing(self) -> None:
+        self._ready()
+        with self.assertRaises(LifecycleError) as raised:
+            self._replace(
+                stop=self._stopper(
+                    report={"graceful": False, "exit_code": None,
+                            "process_group_gone": False},
+                    kills=False,
+                )
+            )
+        self.assertEqual(
+            raised.exception.reason, session_lifecycle.REASON_SHUTDOWN_INCOMPLETE
+        )
+        self._assert_nothing_launched()
+        self.assertEqual(self.store.read(SESSION).state, BINDING_STATE_BOUND)
+
+    def test_case_c_a_disconnected_predecessor_is_recovered_not_replaced(self) -> None:
+        """Retirement routes it to a human; a successor would claim it was rotated."""
+        self._ready()
+        self.registry.remove(SESSION)
+        replacement = self._replace()
+        self.assertFalse(replacement.launched)
+        self.assertEqual(
+            replacement.reason, session_lifecycle.REASON_PREDECESSOR_NOT_RETIRED
+        )
+        self.assertIsNotNone(replacement.retirement.recovery)
+        self.assertIsNone(replacement.replacement)
+        self._assert_nothing_launched()
+
+    def test_case_c_a_missing_binding_is_refused_rather_than_replaced(self) -> None:
+        replacement = self._replace()
+        self.assertFalse(replacement.launched)
+        self.assertEqual(
+            replacement.reason, session_lifecycle.REASON_PREDECESSOR_MISSING
+        )
+        self.assertIsNone(replacement.retirement)
+        self.assertIsNone(replacement.replacement)
+        self.assertEqual(list(self.store.records()), [])
+
+    # -- D. supervised teardown is not rotation and produces no successor ------
+
+    def test_case_d_a_supervised_teardown_launches_no_replacement(self) -> None:
+        """It stops a session whose category nobody established. There is no
+        continuity for a successor to claim, so none is created."""
+        _outcome, worker = self._unprovable()
+        teardown = session_lifecycle.supervised_teardown(
+            self.store, self.registry, self.store.read(SESSION),
+            now=self.RETIREMENT_CLOCK, stop=self._stopper(), alive=self._alive,
+        )
+        self.assertTrue(teardown.torn_down)
+        self.assertFalse(self.group_alive[worker.pgid])
+        # Stopped, and nothing put in its place.
+        self.assertFalse(hasattr(teardown, "replacement"))
+        self._assert_nothing_launched()
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertEqual(self._slots().occupants, ())
+        self.assertEqual(self._slots().unprovable, ())
+
+    def test_case_d_the_supervised_route_cannot_reach_a_launch_at_all(self) -> None:
+        source = inspect.getsource(session_lifecycle.supervised_teardown)
+        for token in (
+            "replace_old_context", "_reserve_and_bind", "reserve_binding",
+            "launch_session", "start_worker", "_NewBinding", "BoundReplacement",
+        ):
+            self.assertEqual(source.count(token), 0, token)
+        self.assertEqual(
+            list(inspect.signature(session_lifecycle.supervised_teardown).parameters),
+            ["store", "registry", "record", "now", "stop", "alive"],
+        )
+
+    def test_case_d_an_unprovable_category_gets_no_replacement_by_the_rotation_route(self) -> None:
+        """And the rotation route will not quietly do the supervised route's job."""
+        self._unprovable()
+        replacement = self._replace()
+        self.assertFalse(replacement.launched)
+        self.assertEqual(
+            replacement.reason, session_lifecycle.REASON_PREDECESSOR_NOT_RETIRED
+        )
+        self.assertEqual(
+            replacement.retirement.reason,
+            session_lifecycle.REASON_NOT_MARKED_FOR_ROTATION,
+        )
+        self._assert_nothing_launched()
+        self._assert_predecessor_survives()
+
+    # -- E. the ceiling holds across the swap ---------------------------------
+
+    def test_case_e_a_swap_at_the_ceiling_neither_exceeds_it_nor_consumes_two_slots(self) -> None:
+        self._ready()
+        fillers = self._fill(5)
+        before = self._slots()
+        self.assertEqual(before.occupied, 6)
+        self.assertEqual(before.ceiling, 6)
+        self.assertTrue(before.provable)
+        self.assertIn(SESSION, before.occupants)
+
+        replacement = self._replace()
+        self.assertTrue(replacement.launched)
+
+        after = self._slots()
+        self.assertEqual(after.occupied, 6)
+        self.assertEqual(after.ceiling, 6)
+        self.assertTrue(after.provable)
+        self.assertEqual(after.unprovable, ())
+        # The successor took the slot the predecessor released, and nothing else
+        # moved: exactly one identity changed.
+        self.assertEqual(
+            sorted(after.occupants), sorted(list(fillers) + [SUCCESSOR])
+        )
+        self.assertNotIn(SESSION, after.occupants)
+        # Two slots were never consumed: the predecessor's binding is terminal, and
+        # the nonterminal set is the same size it was.
+        self.assertTrue(self.store.read(SESSION).is_terminal)
+        self.assertEqual(
+            len([r for r in self.store.records() if not r.is_terminal]), 6
+        )
+
+    def test_case_e_the_ceiling_is_real_at_the_limit_this_swap_passed(self) -> None:
+        """Non-vacuity: the swap fitted because a slot was released, not because
+        the ceiling was not being enforced."""
+        self._ready()
+        self._fill(5)
+        self.assertEqual(self._slots().occupied, 6)
+        with self.assertRaises(SessionBindingError) as raised:
+            reserve_binding(
+                self.store, project="ai-dev", ticket="issue-55",
+                reference=self.reference, workspace_path=str(self.workspace),
+                worktree_id=self.worktree_id, rail="issue-55-one-too-many",
+                role="executor",
+                iteration=RailIteration(rail="issue-55-one-too-many", blob="9" * 40),
+                session_id=OTHER_SESSION, launched_at_head=HEAD,
+                reserved_at=self.clock, ceiling=6,
+            )
+        self.assertIn("past the ceiling", str(raised.exception))
+
+    def test_case_e_a_launch_before_the_retirement_would_have_been_refused(self) -> None:
+        """Which is why the ordering is the mechanism and not a preference."""
+        self._ready()
+        self._fill(5)
+        records = list(self.store.records())
+        decision = authorize(
+            self._observation(
+                rails=(
+                    RailObservation(
+                        identifier="issue-55-fresh-rail", status="running",
+                        rail_blob=BLOB, role="executor",
+                    ),
+                ),
+            ),
+            project="ai-dev", ticket="issue-55", rail="issue-55-fresh-rail",
+            role="executor", expected_head=HEAD, rail_blob=BLOB,
+            slots=self._slots(), bindings=records, in_flight_session_ids=(),
+        )
+        self.assertFalse(decision.authorized)
+        self.assertEqual(decision.reason, REASON_CONCURRENCY_CEILING)
+
+    def test_case_e_an_unauthorized_replacement_leaves_the_rail_one_agent_lighter(self) -> None:
+        """A refusal after the retirement is truthful, not a second launch attempt."""
+        self._ready()
+        replacement = self._replace(
+            read_observation=lambda: self._observation(head="0" * 40)
+        )
+        self.assertFalse(replacement.launched)
+        self.assertEqual(
+            replacement.reason, session_lifecycle.REASON_REPLACEMENT_NOT_AUTHORIZED
+        )
+        self.assertTrue(replacement.retirement.retired)
+        self.assertIsNone(replacement.replacement)
+        self.assertIn("one fewer agent", replacement.detail)
+        # The slot was released and nothing took it. Never two, never seven.
+        self.assertEqual(self._slots().occupants, ())
+        self.assertIsNone(self.store.read(SUCCESSOR))
+
+    # -- F. nothing is continued through the replacement ----------------------
+
+    def test_case_f_no_work_invocation_reaches_the_replacement(self) -> None:
+        self._ready()
+
+        def forbidden(*args, **kwargs):
+            raise AssertionError("work was invoked on the replacement")
+
+        with patch.object(session_lifecycle, "run_request", forbidden):
+            replacement = self._replace()
+
+        self.assertTrue(replacement.launched)
+        # Nothing was sent, so nothing is in flight and no boundary was opened.
+        self.assertEqual(self.registry.in_flight(), ())
+        self.assertEqual(self.registry.work_boundary(SUCCESSOR), 0)
+        self.assertIsNone(self.registry.terminal_finalization(SUCCESSOR))
+        # And no result exists to be mistaken for one: the type has no such field.
+        self.assertNotIn(
+            "result",
+            [field.name for field in dataclasses.fields(session_lifecycle.BoundReplacement)],
+        )
+        self.assertNotIn(
+            "result",
+            [field.name for field in dataclasses.fields(session_lifecycle.ContextReplacement)],
+        )
+
+    def test_case_f_the_route_has_nothing_to_invoke_work_with(self) -> None:
+        parameters = list(
+            inspect.signature(session_lifecycle.replace_old_context).parameters
+        )
+        for absent in ("send", "prompt", "markers", "command_timeout", "finalize_handoff"):
+            self.assertNotIn(absent, parameters)
+        source = inspect.getsource(session_lifecycle.replace_old_context)
+        for token in ("run_request", "resume_request", "continue_session", "_observe_context"):
+            self.assertEqual(source.count(token), 0, token)
+
+    def test_case_f_a_caller_cannot_smuggle_a_sender_in(self) -> None:
+        self._ready()
+        with self.assertRaises(TypeError):
+            self._replace(send=lambda *a, **k: None)
+        with self.assertRaises(TypeError):
+            self._replace(prompt="carry on")
+
+    # -- G. the continue_session wiring obligation ----------------------------
+
+    def _production_callers(self, name):
+        """Every call to `name` inside the shipped package, by parsing it.
+
+        Counted from the syntax tree rather than from a grep, so prose that names a
+        function in a docstring or a comment is not mistaken for a call to it.
+        """
+        callers = {}
+        for path in sorted(Path(session_lifecycle.__file__).parent.glob("*.py")):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            found = 0
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                target = node.func
+                identifier = getattr(target, "id", None) or getattr(target, "attr", None)
+                if identifier == name:
+                    found += 1
+            if found:
+                callers[path.name] = found
+        return callers
+
+    def test_case_g_no_production_continue_session_caller_is_created_here(self) -> None:
+        """Checkpoint 66 does not create the first one, so the D8 delivery
+        obligation is not triggered and carries to the slice that does.
+
+        `category-unprovable` is reachable only through degraded observation, and
+        the sole degrader is `continue_session`'s failure path. While no production
+        code calls it, no production supervised teardown can occur.
+        """
+        self.assertEqual(self._production_callers("continue_session"), {})
+
+    def test_case_g_wiring_continue_session_obliges_wiring_the_supervised_route(self) -> None:
+        """The obligation, stated as something the code must keep true.
+
+        This passes today because neither caller exists. It will still pass when a
+        later slice wires both. It fails only if a slice makes a real supervised
+        teardown possible -- by giving `continue_session` a production caller --
+        without giving the route that reports it one, which is the shape the
+        checkpoint-65 review named as a genuine D8 failure.
+
+        It constrains the *caller*, not the delivery: that `human_action` reaches a
+        durable human-attention record is a property of the surface that slice
+        builds, and this cannot see it.
+        """
+        continues = self._production_callers("continue_session")
+        supervised = self._production_callers("supervised_teardown")
+        if continues:
+            self.assertTrue(
+                supervised,
+                "a production `continue_session` caller exists in {0}, so a real "
+                "supervised teardown is now possible and `supervised_teardown` must "
+                "have a production caller whose `human_action` reaches a durable D8 "
+                "human-attention record.".format(sorted(continues)),
+            )
+
+    # -- H. checkpoints 59 to 65 intact ---------------------------------------
+
+    def test_case_h_readiness_is_projected_in_call_and_never_handed_in(self) -> None:
+        self._ready()
+        for carried in ("readiness", "decision", "slots", "rail", "handoff",
+                        "worktree", "record", "retirement", "ceiling", "observation"):
+            with self.assertRaises(TypeError):
+                self._replace(**{carried: object()})
+
+    def test_case_h_the_retirement_authorization_still_has_one_producer(self) -> None:
+        module = Path(session_lifecycle.__file__).read_text(encoding="utf-8")
+        self.assertEqual(module.count("_RetirementAuthorization("), 1)
+        source = inspect.getsource(session_lifecycle.replace_old_context)
+        self.assertEqual(source.count("_RetirementAuthorization"), 0)
+        self.assertEqual(source.count("_retirement"), 0)
+        self.assertEqual(
+            [
+                name
+                for name in inspect.signature(session_lifecycle.stop_session).parameters
+                if name.startswith("_")
+            ],
+            ["_retirement"],
+        )
+        self.assertEqual(
+            [
+                name
+                for name in inspect.signature(
+                    session_lifecycle.replace_old_context
+                ).parameters
+                if name.startswith("_")
+            ],
+            [],
+        )
+
+    def test_case_h_the_chokepoint_refusal_still_stands_beneath_this_route(self) -> None:
+        """A marked session still cannot be stopped except through the gate."""
+        self._ready()
+        with self.assertRaises(LifecycleError) as raised:
+            stop_session(
+                self.store, self.registry, self.store.read(SESSION),
+                stop=self._stopper(), alive=self._alive,
+            )
+        self.assertEqual(
+            raised.exception.reason,
+            session_lifecycle.REASON_ROTATION_REQUIRES_RETIREMENT,
+        )
+        self._assert_predecessor_survives()
+
+    def test_case_h_new_bindings_still_come_into_existence_in_exactly_one_place(self) -> None:
+        """The extraction moved the launch ordering; it did not duplicate it."""
+        tree = ast.parse(
+            Path(session_lifecycle.__file__).read_text(encoding="utf-8")
+        )
+        reservers = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "id", None) == "reserve_binding"
+        ]
+        self.assertEqual(len(reservers), 1)
+        starters = inspect.getsource(session_lifecycle._reserve_and_bind)
+        self.assertIn("observed_from_start=True", starters)
+        self.assertEqual(
+            inspect.getsource(session_lifecycle.launch_session).count(
+                "observed_from_start"
+            ),
+            0,
+        )
+
+    def test_case_h_the_post_turn_terminal_finalization_still_credits_the_handoff(self) -> None:
+        self._ready()
+        self.assertEqual(self.published.value, PUBLICATION)
+        finalization = self.registry.terminal_finalization(SESSION)
+        self.assertIsNotNone(finalization)
+        replacement = self._replace()
+        self.assertEqual(
+            replacement.retirement.readiness.handoff.handoff_publication, PUBLICATION
+        )
+
+    def test_case_h_an_ordinary_launch_is_unchanged_by_the_extraction(self) -> None:
+        outcome, worker, sent = self._launch()
+        self.assertEqual(outcome.binding.state, BINDING_STATE_BOUND)
+        self.assertEqual(outcome.owned.session_id, SESSION)
+        self.assertEqual(outcome.owned.pgid, worker.pgid)
+        self.assertEqual([entry["session_id"] for entry in sent], [SESSION])
+        self.assertEqual(outcome.result["session_id"], SESSION)

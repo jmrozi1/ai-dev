@@ -34,7 +34,12 @@ from typing import (
 )
 import uuid
 
-from .authorization import ACTION_CONTINUE, ACTION_LAUNCH, AuthorizationDecision
+from .authorization import (
+    ACTION_CONTINUE,
+    ACTION_LAUNCH,
+    AuthorizationDecision,
+    authorize,
+)
 from .claude_runtime import RuntimeRequest, launch_request, resume_request
 from .claude_worker import (
     ClaudeWorkerError,
@@ -821,40 +826,52 @@ class LaunchOutcome:
     result: Mapping
 
 
-def launch_session(
-    decision: AuthorizationDecision,
+@dataclass(frozen=True)
+class _NewBinding:
+    """One session freshly minted, reserved, started and owned -- and sent nothing.
+
+    There is no `result` field, and the absence is the point: coming into existence
+    is not the same act as being given work, so the type that records the first
+    cannot accidentally carry evidence of the second.
+    """
+
+    binding: BindingRecord
+    owned: OwnedSession
+    request: RuntimeRequest
+    handle: Any
+
+
+def _reserve_and_bind(
     assignment: Assignment,
     *,
     store: BindingStore,
     registry: SessionRegistry,
     reference: Any,
     request_kwargs: Mapping,
-    prompt: str,
     package_root: Any,
-    markers: Sequence = (),
-    now: Optional[Callable] = None,
-    new_session_id: Optional[Callable] = None,
-    start: Optional[Callable] = None,
-    send: Optional[Callable] = None,
-    stop: Optional[Callable] = None,
+    ceiling: Optional[int],
+    clock: Callable,
+    mint: Callable,
+    starter: Callable,
     environment_source: Optional[Mapping] = None,
     ready_timeout: Optional[float] = None,
-    command_timeout: Optional[float] = None,
-) -> LaunchOutcome:
-    """authorize -> reserve -> build request while reserved -> start/attach -> send.
+) -> _NewBinding:
+    """mint -> reserve -> build the request while reserved -> start -> take ownership.
 
-    The request is built at step three on purpose. Attaching a process turns the
-    record `bound`, and `launch_request` is authorized by a reservation, so any
-    other ordering cannot construct the request at all -- the failure is
-    structural, not incidental.
+    Module-private, and the only place in this module that brings a managed session
+    into existence. Both routes that produce one -- an ordinary `launch_session` and
+    the replacement `replace_old_context` binds after a retirement -- reach a live
+    binding through here, so the ordering that makes a launch honest is stated once
+    rather than restated per route: the session id is minted before anything durable
+    exists, the reservation is written before any process is spawned, the request is
+    built while that record is still `reserved`, and the record becomes `bound` only
+    on the readiness handshake the starter performs.
+
+    It sends nothing and returns no result, because sending is not part of coming
+    into existence. A caller that wants work done invokes it afterwards; a caller
+    that must not -- checkpoint 66's replacement -- simply does not, and has no
+    sender to forget to withhold.
     """
-    _require_decision(decision, assignment, action=ACTION_LAUNCH)
-    clock = now if now is not None else _utc_now
-    mint = new_session_id if new_session_id is not None else (lambda: str(uuid.uuid4()))
-    starter = start if start is not None else start_worker
-    sender = send if send is not None else run_request
-    stopper = stop if stop is not None else shutdown_worker
-
     session_id = mint()
     reserved = reserve_binding(
         store,
@@ -869,9 +886,11 @@ def launch_session(
         session_id=session_id,
         launched_at_head=assignment.head,
         reserved_at=clock(),
-        # The ceiling the authorization was decided against, carried rather than
-        # re-read, so the commit-point guard cannot enforce a different policy.
-        ceiling=decision.ceiling,
+        # Stated by the caller, which took it from the decision that authorized this
+        # launch. It is carried rather than re-read here so the commit-point guard
+        # inside `reserve_binding` cannot enforce a different policy than the one
+        # admission was decided against.
+        ceiling=ceiling,
     )
 
     # Built here, while the record is still reserved. Nothing has been spawned yet,
@@ -907,6 +926,60 @@ def launch_session(
         ),
         observed_from_start=True,
     )
+    return _NewBinding(binding=bound, owned=owned, request=request, handle=handle)
+
+
+def launch_session(
+    decision: AuthorizationDecision,
+    assignment: Assignment,
+    *,
+    store: BindingStore,
+    registry: SessionRegistry,
+    reference: Any,
+    request_kwargs: Mapping,
+    prompt: str,
+    package_root: Any,
+    markers: Sequence = (),
+    now: Optional[Callable] = None,
+    new_session_id: Optional[Callable] = None,
+    start: Optional[Callable] = None,
+    send: Optional[Callable] = None,
+    stop: Optional[Callable] = None,
+    environment_source: Optional[Mapping] = None,
+    ready_timeout: Optional[float] = None,
+    command_timeout: Optional[float] = None,
+) -> LaunchOutcome:
+    """authorize -> reserve -> build request while reserved -> start/attach -> send.
+
+    The request is built at step three on purpose. Attaching a process turns the
+    record `bound`, and `launch_request` is authorized by a reservation, so any
+    other ordering cannot construct the request at all -- the failure is
+    structural, not incidental.
+    """
+    _require_decision(decision, assignment, action=ACTION_LAUNCH)
+    sender = send if send is not None else run_request
+    stopper = stop if stop is not None else shutdown_worker
+
+    new = _reserve_and_bind(
+        assignment,
+        store=store,
+        registry=registry,
+        reference=reference,
+        request_kwargs=request_kwargs,
+        package_root=package_root,
+        # The ceiling the authorization was decided against, carried rather than
+        # re-read, so the commit-point guard cannot enforce a different policy.
+        ceiling=decision.ceiling,
+        clock=now if now is not None else _utc_now,
+        mint=new_session_id if new_session_id is not None else (lambda: str(uuid.uuid4())),
+        starter=start if start is not None else start_worker,
+        environment_source=environment_source,
+        ready_timeout=ready_timeout,
+    )
+    bound = new.binding
+    handle = new.handle
+    owned = new.owned
+    request = new.request
 
     send_arguments = {"prompt": prompt, "markers": list(markers)}
     if command_timeout is not None:
@@ -2356,4 +2429,337 @@ def retire_old_context(
         ),
         readiness=readiness,
         stopped=stopped,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Replacement: retired old context -> a successor launched and bound
+# ---------------------------------------------------------------------------
+#
+# D9's sentence has two halves. Checkpoint 63 implemented the first -- "only after
+# that safe handoff may the manager terminate the old context" -- and deliberately
+# stopped there, launching nothing. This is the second half, "and launch a fresh
+# agent against durable state", and it too stops deliberately short: it launches
+# and binds a successor, and it does not continue anything through it. The third
+# half of the rotation, resuming work from the durable handoff alone, is a
+# separate act that this route has no way to perform: it takes no prompt and no
+# sender, so there is nothing here to invoke work with.
+#
+# The ordering is the whole substance. A replacement bound beside a live
+# predecessor is two agents claiming one rail's work, both able to move the same
+# worktree, and it is exactly what the ceiling and the binding store exist to make
+# impossible. So retirement is not merely requested here and its answer is not
+# merely read: this route re-proves, for itself and at the instant it is about to
+# reserve, that the predecessor's process group is gone, its binding is terminal in
+# the store, and this controller no longer holds a handle for it. Only then does it
+# ask whether a launch is authorized at all.
+#
+# That ordering also settles D6 without arithmetic. The predecessor's slot is
+# released by the terminalization the retirement performed, before the successor's
+# reservation is written, so the swap passes through N-1 rather than N+1 -- and
+# never leaves N+1 behind, because a rotation that stopped here would leave the
+# rail with one fewer agent, not two.
+
+REPLACEMENT_LAUNCHED = "replacement-launched"
+REPLACEMENT_REFUSED = "replacement-refused"
+REPLACEMENT_STATES = (REPLACEMENT_LAUNCHED, REPLACEMENT_REFUSED)
+
+REASON_REPLACEMENT_LAUNCHED = "replacement-launched"
+REASON_PREDECESSOR_MISSING = "predecessor-binding-missing"
+REASON_PREDECESSOR_NOT_RETIRED = "predecessor-not-retired"
+REASON_RETIREMENT_UNPROVEN = "retirement-not-proven-at-launch"
+REASON_SUCCESSOR_IDENTITY_REUSED = "successor-identity-reused"
+REASON_REPLACEMENT_NOT_AUTHORIZED = "replacement-not-authorized"
+
+
+@dataclass(frozen=True)
+class BoundReplacement:
+    """The successor: a distinct session, reserved before it existed, now bound.
+
+    It carries no result and no prompt, because nothing was sent to it. What it
+    proves is identity and state -- that a new session id was minted, that its
+    binding passed through `reserved` before any process existed, and that it is
+    `bound` now -- and nothing about work, because none was done.
+    """
+
+    session_id: str
+    binding: BindingRecord
+    owned: OwnedSession
+    request: RuntimeRequest
+
+
+@dataclass(frozen=True)
+class ContextReplacement:
+    """One rotation swap: what was retired, and what -- if anything -- replaced it.
+
+    `retirement` is the retirement this call performed itself, never one it was
+    handed. `replacement` is present only when a successor was actually reserved
+    and bound, and is absent on every refusal, so a caller cannot read a launch out
+    of a run that did not perform one.
+    """
+
+    predecessor_session_id: str
+    rail: str
+    state: str
+    reason: str
+    detail: str
+    retirement: Optional[ContextRetirement] = None
+    replacement: Optional[BoundReplacement] = None
+
+    @property
+    def launched(self) -> bool:
+        return self.state == REPLACEMENT_LAUNCHED
+
+
+def replace_old_context(
+    store: BindingStore,
+    registry: SessionRegistry,
+    *,
+    session_id: str,
+    assignment: Assignment,
+    read_rail: Callable,
+    read_handoff: Callable,
+    read_worktree: Callable,
+    read_slots: Callable,
+    read_observation: Callable,
+    reference: Any,
+    request_kwargs: Mapping,
+    package_root: Any,
+    now: str,
+    clock: Optional[Callable] = None,
+    new_session_id: Optional[Callable] = None,
+    start: Optional[Callable] = None,
+    stop: Optional[Callable] = None,
+    alive: Optional[Callable] = None,
+    environment_source: Optional[Mapping] = None,
+    ready_timeout: Optional[float] = None,
+) -> ContextReplacement:
+    """Retire one rotation-ready context, prove it gone, and bind a successor to it.
+
+    This is the first production call site of the retirement gate, and it owns its
+    own facts. Every input the gate decides on -- the durable binding, the rail, the
+    published handoff, the worktree, manager-wide occupancy, and the control-plane
+    observation a launch is authorized against -- is obtained *here*, inside this
+    call,
+    immediately before the decision that consumes it. That is why the readers are
+    parameters and the facts are not: there is no `rail=`, `handoff=`,
+    `worktree=`, `slots=` or `decision=` argument to hand a value that was true
+    earlier in some flow, so a stale input is not something a caller has to
+    remember not to pass -- it is something this signature cannot accept.
+
+    Nothing is launched unless the predecessor is *retired*: not projected ready,
+    not asked to stop, but stopped, with its process group proven gone by a probe
+    this function takes for itself after the retirement returned, its binding
+    terminal in a re-read of the store, and its handle no longer held. A retirement
+    that refuses, or that fails closed, launches nothing and leaves the old session
+    exactly as it was.
+
+    Nothing is continued through the successor either. There is no `send`, no
+    `prompt` and no `markers` parameter, so no work invocation is reachable from
+    here; resuming from the durable handoff is a separate act by a separate caller.
+    """
+    prober = alive if alive is not None else process_group_alive
+
+    # Fact one, read here: which durable binding this session actually has, now.
+    record = store.read(session_id)
+    if record is None:
+        return ContextReplacement(
+            predecessor_session_id=session_id,
+            rail=assignment.rail,
+            state=REPLACEMENT_REFUSED,
+            reason=REASON_PREDECESSOR_MISSING,
+            detail=(
+                "no binding for session {0}, so there is no old context to retire and "
+                "nothing whose work a replacement could claim to carry forward. "
+                "Nothing was launched.".format(session_id)
+            ),
+        )
+
+    # Facts two, three and four, read here, in the order the gate consumes them and
+    # at the instant it consumes them. A caller that read these a step earlier and
+    # passed the values would be handing the gate a description of a moment that has
+    # already gone; this call takes them itself so it cannot be handed one.
+    rail = read_rail()
+    handoff = read_handoff()
+    worktree = read_worktree()
+
+    # The retirement this call performs, and the only one it will act on. A
+    # `LifecycleError` from here -- a contradiction in the records, or a shutdown
+    # that could not be proven -- propagates untouched: it is a retirement that
+    # failed, so nothing is launched and the old session survives exactly as the
+    # accepted gate left it.
+    retirement = retire_old_context(
+        store,
+        registry,
+        rail,
+        record,
+        handoff=handoff,
+        worktree=worktree,
+        now=now,
+        stop=stop,
+        alive=alive,
+    )
+    if not retirement.retired:
+        return ContextReplacement(
+            predecessor_session_id=session_id,
+            rail=retirement.rail,
+            state=REPLACEMENT_REFUSED,
+            reason=REASON_PREDECESSOR_NOT_RETIRED,
+            detail=(
+                "the old context was not retired ({0}: {1}), so nothing was launched "
+                "and session {2} survives exactly as it was. A replacement is bound "
+                "only beside a predecessor that is gone.".format(
+                    retirement.reason, retirement.detail, session_id
+                )
+            ),
+            retirement=retirement,
+        )
+
+    # "Retired" is a claim, and this is where it stops being one. The retirement's
+    # own report is checked against the world it describes, immediately before the
+    # reservation that would make a successor real: the group is probed again, by
+    # this function, after the stop; the binding is re-read from the store rather
+    # than taken from the outcome object; and the registry is asked whether this
+    # controller still holds a handle. Each of these is the retirement's claim
+    # restated as an independent observation, and any one of them failing means the
+    # predecessor may still be alive -- which is the one state a launch must never
+    # be reached from.
+    stopped = retirement.stopped
+    unproven = None
+    if stopped is None or not stopped.process_group_gone:
+        unproven = "the retirement reported no proven process-group shutdown"
+    elif not stopped.binding.is_terminal:
+        unproven = "the retirement left binding {0} in state {1}".format(
+            session_id, stopped.binding.state
+        )
+    else:
+        after = store.read(session_id)
+        if after is None or not after.is_terminal:
+            unproven = (
+                "a fresh read of the store does not show binding {0} terminal".format(
+                    session_id
+                )
+            )
+        elif registry.get(session_id) is not None:
+            unproven = (
+                "this controller still holds a worker handle for session {0}".format(
+                    session_id
+                )
+            )
+        elif prober(stopped.pgid):
+            unproven = "process group {0} answers a fresh liveness probe".format(
+                stopped.pgid
+            )
+    if unproven is not None:
+        raise LifecycleError(
+            REASON_RETIREMENT_UNPROVEN,
+            "session {0} was reported retired but {1}; a replacement is refused "
+            "rather than bound beside a predecessor that may still be running. "
+            "Nothing was launched or reserved.".format(session_id, unproven),
+        )
+
+    # Fact five, read here and not before: manager-wide occupancy, over the store
+    # as it stands *after* the terminalization. The reduction itself is not
+    # performed here -- `reconcile_agent_slots` keeps exactly one production home,
+    # in the controller that draws the figure -- so this asks that home for it, at
+    # the instant it needs the answer, over records it read itself a line ago. That
+    # instant is what makes the ceiling hold across a swap at the limit: the slot
+    # the predecessor held was released a moment ago, so a rotation at six
+    # occupants authorizes against five rather than refusing itself, and it can
+    # never authorize against seven.
+    records = store.records()
+    slots = read_slots(records)
+    # Fact six: the control-plane observation, read now, and turned into a decision
+    # here rather than accepted as one. A caller cannot hand this route an
+    # authorization at all, which is what keeps a decision taken before the
+    # retirement -- when the rail still had a live binding -- from reaching the
+    # launch. The accepted authorizer is also the second guard on requirement A: a
+    # rail holding a live binding yields a continuation decision or a refusal, never
+    # a launch, so `_require_decision` below could not pass one.
+    decision = authorize(
+        read_observation(),
+        project=assignment.project,
+        ticket=assignment.ticket,
+        rail=assignment.rail,
+        role=assignment.role,
+        expected_head=assignment.head,
+        rail_blob=assignment.iteration.blob,
+        slots=slots,
+        bindings=records,
+        in_flight_session_ids=registry.in_flight(),
+    )
+    if not decision.authorized or decision.action != ACTION_LAUNCH:
+        return ContextReplacement(
+            predecessor_session_id=session_id,
+            rail=assignment.rail,
+            state=REPLACEMENT_REFUSED,
+            reason=REASON_REPLACEMENT_NOT_AUTHORIZED,
+            detail=(
+                "the old context was retired and its slot released, but no "
+                "replacement is authorized ({0}: {1}). Nothing was launched or "
+                "reserved; the rail holds one fewer agent than before and its "
+                "durable handoff is what a later launch resumes from.".format(
+                    decision.reason, decision.detail
+                )
+            ),
+            retirement=retirement,
+        )
+    _require_decision(decision, assignment, action=ACTION_LAUNCH)
+
+    minter = new_session_id if new_session_id is not None else (lambda: str(uuid.uuid4()))
+
+    def successor_id() -> str:
+        candidate = minter()
+        if candidate == session_id:
+            raise LifecycleError(
+                REASON_SUCCESSOR_IDENTITY_REUSED,
+                "a replacement may not be minted with its predecessor's session id "
+                "{0}: the successor is a different agent that never held the "
+                "predecessor's context, and reusing the identity would make its "
+                "record read as a continuation of work it did not do. Nothing was "
+                "reserved.".format(session_id),
+            )
+        return candidate
+
+    bound = _reserve_and_bind(
+        assignment,
+        store=store,
+        registry=registry,
+        reference=reference,
+        request_kwargs=request_kwargs,
+        package_root=package_root,
+        ceiling=decision.ceiling,
+        clock=clock if clock is not None else _utc_now,
+        mint=successor_id,
+        starter=start if start is not None else start_worker,
+        environment_source=environment_source,
+        ready_timeout=ready_timeout,
+    )
+    return ContextReplacement(
+        predecessor_session_id=session_id,
+        rail=assignment.rail,
+        state=REPLACEMENT_LAUNCHED,
+        reason=REASON_REPLACEMENT_LAUNCHED,
+        detail=(
+            "session {0} was retired -- process group {1} proven gone and its binding "
+            "{2} -- and only then was replacement session {3} reserved and bound to "
+            "pid {4} on rail {5}. The successor is a distinct session that holds none "
+            "of the predecessor's context, one slot was released before one was "
+            "occupied, and nothing has been sent to it: continuing from the durable "
+            "handoff is a separate act.".format(
+                session_id,
+                stopped.pgid,
+                stopped.binding.state,
+                bound.binding.session_id,
+                bound.binding.pid,
+                assignment.rail,
+            )
+        ),
+        retirement=retirement,
+        replacement=BoundReplacement(
+            session_id=bound.binding.session_id,
+            binding=bound.binding,
+            owned=bound.owned,
+            request=bound.request,
+        ),
     )

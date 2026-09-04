@@ -99,6 +99,7 @@ from .queue_source import QueueScope, QueueSourceError
 from .session_binding import BindingRecord, BindingStore
 from .session_lifecycle import (
     REASON_ROTATION_REQUIRES_RETIREMENT,
+    ContextReplacement,
     LaunchOutcome,
     LifecycleError,
     SessionRegistry,
@@ -106,6 +107,7 @@ from .session_lifecycle import (
     SupervisedTeardown,
     launch_session,
     ownership_evidence,
+    replace_old_context,
     single_liveness_snapshot,
     stop_session,
     supervised_teardown,
@@ -251,6 +253,71 @@ class ManagerController:
         """
         return supervised_teardown(
             self.store, self.registry, record, now=now, stop=stop, alive=alive
+        )
+
+    def replace_old_context(
+        self,
+        session_id: str,
+        assignment,
+        *,
+        read_rail: Callable,
+        read_handoff: Callable,
+        read_worktree: Callable,
+        read_observation: Callable,
+        reference,
+        request_kwargs,
+        package_root,
+        now: str,
+        clock: Optional[Callable] = None,
+        new_session_id: Optional[Callable] = None,
+        start: Optional[Callable] = None,
+        stop: Optional[Callable] = None,
+        alive: Optional[Callable] = None,
+        ready_timeout: Optional[float] = None,
+    ) -> ContextReplacement:
+        """Rotate one context: retire the old one, then bind a successor to the rail.
+
+        A pass-through, like `launch` and `supervised_teardown`. The ordering, the
+        proof that the predecessor is actually gone, the authorization of the
+        replacement, and the refusal to send it anything all stay in the accepted
+        lifecycle. What this adds is that both halves of the swap happen against the
+        registry and the store this controller counts, so the slot the predecessor
+        released and the slot the successor occupies are the same manager's slots
+        and the figure this controller draws is right across the swap.
+
+        Occupancy is this controller's own reduction, handed over as the reader the
+        lifecycle calls once it has terminalized the predecessor and re-read the
+        store. That keeps the ceiling this swap is admitted against the same number
+        the manager page draws -- one manager states one concurrency policy, and a
+        rotation is not an occasion to run a different one -- while leaving the
+        reduction with the single production home it already had.
+
+        It states its parameters rather than taking `**kwargs`, and every fact the
+        rotation decides on arrives as a reader that the lifecycle calls at the
+        moment it needs the fact -- there is no way through here to hand it a rail,
+        a handoff, a worktree reading, an occupancy or an authorization that was
+        true earlier.
+        """
+        return replace_old_context(
+            self.store,
+            self.registry,
+            session_id=session_id,
+            assignment=assignment,
+            read_rail=read_rail,
+            read_handoff=read_handoff,
+            read_worktree=read_worktree,
+            read_slots=lambda records: self.occupancy(records, alive=alive),
+            read_observation=read_observation,
+            reference=reference,
+            request_kwargs=request_kwargs,
+            package_root=package_root,
+            now=now,
+            clock=clock,
+            new_session_id=new_session_id,
+            start=start,
+            stop=stop,
+            alive=alive,
+            ready_timeout=ready_timeout,
         )
 
     def dispatch(
