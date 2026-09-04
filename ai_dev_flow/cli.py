@@ -24,6 +24,7 @@ from .repository import (
     branch_exists,
     create_or_reset_branch_from_source,
     create_commit,
+    read_commit_boundary,
     compare_main_and_scratch,
     commit_count_between,
     create_managed_ref,
@@ -2473,8 +2474,27 @@ def handle_commit(command_name: str, arguments: list[str]) -> int:
         ) from exc
     _clear_diff_baseline_after_success(repo_root, operation="commit")
 
+    try:
+        boundary = read_commit_boundary(repo_root, commit=commit_hash)
+    except RepositoryError as exc:
+        if "-" in command_name:
+            prefix, _, _ = command_name.rpartition("-")
+            status_command = f"{prefix}-status"
+        else:
+            status_command = "flow-status"
+        raise FlowError(
+            f"Checkpoint {next_checkpoint} commit was created but its committed "
+            f"changed-path boundary could not be derived. Commit: {commit_hash}. "
+            "No changed-path boundary is claimed. History was not changed. "
+            f"Run {status_command} to inspect the created checkpoint. {exc}"
+        ) from exc
+
     print(f"Created checkpoint {next_checkpoint}")
     print(f"commit: {commit_hash}")
+    print(f"parent: {boundary.parent}")
+    print(f"changed-paths: {len(boundary.changed_paths)}")
+    for changed_path in boundary.changed_paths:
+        print(f"  {changed_path}")
     if workflow_type == "patch":
         assert state.patch_description is not None
         print(f"patch: {state.patch_description}")

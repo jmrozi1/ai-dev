@@ -107,6 +107,24 @@ run_flow_capture() {
 	fi
 }
 
+run_flow_capture_split() {
+	local cwd="$1"
+	local stdout_file="$2"
+	local stderr_file="$3"
+	shift 3
+
+	if run_flow "$cwd" "$@" >"$stdout_file" 2>"$stderr_file"; then
+		return 0
+	else
+		local status=$?
+		return "$status"
+	fi
+}
+
+boundary_block() {
+	awk '/^changed-paths: /{found=1;next} found&&/^  /{sub(/^  /,"");print;next} found{exit}'
+}
+
 state_get() {
 	local cwd="$1"
 	(
@@ -528,6 +546,8 @@ assert_contains "$commit_fail_text" 'Git commit failed'
 assert_equals "$(current_head "$repo_commit_fail")" "$commit_fail_head_before"
 assert_equals "$(state_get "$repo_commit_fail/subdir")" "$commit_fail_state_before"
 assert_not_contains "$commit_fail_text" 'Created checkpoint'
+assert_not_contains "$commit_fail_text" 'changed-paths:'
+assert_not_contains "$commit_fail_text" 'commit was created'
 
 if [[ "$(id -u)" != '0' ]]; then
 	repo_state_fail="$TMP_DIR/repo-state-fail"
@@ -549,6 +569,7 @@ if [[ "$(id -u)" != '0' ]]; then
 	state_fail_text="$(cat "$state_fail_output")"
 	assert_equals "$state_fail_status" '1'
 	assert_contains "$state_fail_text" 'Cannot write workflow state to'
+	assert_not_contains "$state_fail_text" 'changed-paths:'
 	assert_not_contains "$state_fail_text" 'Traceback'
 	assert_equals "$(current_parent "$repo_state_fail")" "$state_fail_head_before"
 	assert_equals "$(current_message "$repo_state_fail")" '3'
@@ -564,6 +585,124 @@ if [[ "$(id -u)" != '0' ]]; then
 	assert_equals "$(cached_diff "$repo_state_fail")" ''
 	assert_equals "$(head_diff "$repo_state_fail")" ''
 	assert_equals "$(current_branch "$repo_state_fail")" 'scratch'
+fi
+
+repo_boundary="$TMP_DIR/repo-boundary"
+init_repo "$repo_boundary"
+git -C "$repo_boundary" checkout -q -b scratch
+state_set "$repo_boundary/subdir" '{"activeIssueNumber":30,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+printf 'edited\n' >> "$repo_boundary/tracked.txt"
+printf 'new\n' > "$repo_boundary/added.txt"
+boundary_head_before="$(current_head "$repo_boundary")"
+boundary_stdout="$TMP_DIR/boundary-stdout"
+boundary_stderr="$TMP_DIR/boundary-stderr"
+if run_flow_capture_split "$repo_boundary/subdir" "$boundary_stdout" "$boundary_stderr" commit; then
+	boundary_status=0
+else
+	boundary_status=$?
+fi
+boundary_text="$(cat "$boundary_stdout")"
+assert_equals "$boundary_status" '0'
+assert_equals "$(cat "$boundary_stderr")" ''
+boundary_head_after="$(current_head "$repo_boundary")"
+assert_contains "$boundary_text" "commit: $boundary_head_after"
+assert_contains "$boundary_text" "parent: $boundary_head_before"
+assert_contains "$boundary_text" 'changed-paths: 2'
+assert_equals "$(printf '%s\n' "$boundary_text" | boundary_block)" \
+	"$(git -C "$repo_boundary" diff-tree --no-commit-id -r --no-renames --name-only "$boundary_head_after" | sort)"
+assert_equals "$(printf '%s\n' "$boundary_text" | boundary_block)" $'added.txt\ntracked.txt'
+assert_repo_clean "$repo_boundary"
+
+repo_boundary_rename="$TMP_DIR/repo-boundary-rename"
+init_repo "$repo_boundary_rename"
+git -C "$repo_boundary_rename" checkout -q -b scratch
+state_set "$repo_boundary_rename/subdir" '{"activeIssueNumber":31,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+for line_number in $(seq 60); do
+	printf 'distinct payload line %s\n' "$line_number" >> "$repo_boundary_rename/old-name.txt"
+done
+git -C "$repo_boundary_rename" add old-name.txt
+git -C "$repo_boundary_rename" commit -q -m 'seed rename source'
+mv "$repo_boundary_rename/old-name.txt" "$repo_boundary_rename/new-name.txt"
+rename_output="$TMP_DIR/boundary-rename-output"
+if run_flow_capture "$repo_boundary_rename/subdir" "$rename_output" commit; then
+	rename_status=0
+else
+	rename_status=$?
+fi
+rename_text="$(cat "$rename_output")"
+assert_equals "$rename_status" '0'
+# Rename detection really does fire here, so a collapsing derivation would hide
+# the old path and this case would stop discriminating.
+assert_equals "$(git -C "$repo_boundary_rename" show --name-only --pretty=format: HEAD)" 'new-name.txt'
+assert_contains "$rename_text" 'changed-paths: 2'
+assert_equals "$(printf '%s\n' "$rename_text" | boundary_block)" $'new-name.txt\nold-name.txt'
+assert_repo_clean "$repo_boundary_rename"
+
+repo_boundary_late="$TMP_DIR/repo-boundary-late"
+init_repo "$repo_boundary_late"
+git -C "$repo_boundary_late" checkout -q -b scratch
+state_set "$repo_boundary_late/subdir" '{"activeIssueNumber":32,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+mkdir -p "$repo_boundary_late/.git/hooks"
+cat >"$repo_boundary_late/.git/hooks/pre-commit" <<'EOF'
+#!/usr/bin/env bash
+printf 'generated at commit time\n' > late-generated.txt
+git add late-generated.txt
+exit 0
+EOF
+chmod +x "$repo_boundary_late/.git/hooks/pre-commit"
+printf 'edited\n' >> "$repo_boundary_late/tracked.txt"
+printf 'new\n' > "$repo_boundary_late/added.txt"
+late_precheck="$(repo_status_porcelain "$repo_boundary_late")"
+assert_not_contains "$late_precheck" 'late-generated.txt'
+late_output="$TMP_DIR/boundary-late-output"
+if run_flow_capture "$repo_boundary_late/subdir" "$late_output" commit; then
+	late_status=0
+else
+	late_status=$?
+fi
+late_text="$(cat "$late_output")"
+assert_equals "$late_status" '0'
+assert_contains "$late_text" 'changed-paths: 3'
+assert_equals "$(printf '%s\n' "$late_text" | boundary_block)" $'added.txt\nlate-generated.txt\ntracked.txt'
+assert_repo_clean "$repo_boundary_late"
+
+if [[ "$(id -u)" != '0' ]]; then
+	repo_boundary_unreadable="$TMP_DIR/repo-boundary-unreadable"
+	init_repo "$repo_boundary_unreadable"
+	git -C "$repo_boundary_unreadable" checkout -q -b scratch
+	state_set "$repo_boundary_unreadable/subdir" '{"activeIssueNumber":33,"mainBranch":"main","scratchBranch":"scratch","checkpoint":0}' >/dev/null
+	mkdir -p "$repo_boundary_unreadable/.git/hooks"
+	cat >"$repo_boundary_unreadable/.git/hooks/post-commit" <<'EOF'
+#!/usr/bin/env bash
+sha="$(git rev-parse HEAD)"
+chmod 000 ".git/objects/${sha:0:2}" 2>/dev/null || true
+exit 0
+EOF
+	chmod +x "$repo_boundary_unreadable/.git/hooks/post-commit"
+	printf 'edited\n' >> "$repo_boundary_unreadable/tracked.txt"
+	unreadable_head_before="$(current_head "$repo_boundary_unreadable")"
+	unreadable_stdout="$TMP_DIR/boundary-unreadable-stdout"
+	unreadable_stderr="$TMP_DIR/boundary-unreadable-stderr"
+	if run_flow_capture_split "$repo_boundary_unreadable/subdir" "$unreadable_stdout" "$unreadable_stderr" commit; then
+		unreadable_status=0
+	else
+		unreadable_status=$?
+	fi
+	for object_shard in "$repo_boundary_unreadable"/.git/objects/??; do
+		chmod 755 "$object_shard" 2>/dev/null || true
+	done
+	unreadable_out="$(cat "$unreadable_stdout")"
+	unreadable_err="$(cat "$unreadable_stderr")"
+	assert_equals "$unreadable_status" '1'
+	assert_equals "$unreadable_out" ''
+	assert_contains "$unreadable_err" 'commit was created'
+	assert_contains "$unreadable_err" 'No changed-path boundary is claimed'
+	assert_contains "$unreadable_err" 'History was not changed'
+	assert_contains "$unreadable_err" 'flow-status'
+	assert_not_contains "$unreadable_err" 'changed-paths:'
+	assert_not_contains "$unreadable_err" 'Traceback'
+	assert_equals "$(current_parent "$repo_boundary_unreadable")" "$unreadable_head_before"
+	assert_equals "$(current_message "$repo_boundary_unreadable")" '1'
 fi
 
 printf 'flow commit tests passed\n'

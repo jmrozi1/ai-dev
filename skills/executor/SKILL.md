@@ -125,6 +125,14 @@ useful current state:
 Do not dump the executor transcript or claim work was completed without
 supporting evidence.
 
+State a changed-path boundary only from evidence read back from the created
+commit after checkpointing: the numeric checkpoint, the commit, its sole parent,
+and that commit's changed paths. Working-tree or index observations captured
+before the checkpoint are not a boundary claim, however carefully they were
+taken, because work between that observation and the commit still lands in it.
+When the checkpoint runtime reports that a checkpoint was created but its
+boundary could not be derived, report exactly that and claim no boundary.
+
 When useful and observable, keep the concise handoff evidence specific by
 reporting materially used skills, notable skill or process friction, repeated
 user corrections or interventions, rediscovered knowledge, unexpected

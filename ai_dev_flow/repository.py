@@ -518,6 +518,103 @@ def create_commit(repo_root: Path, *, message: str) -> str:
     return resolve_commit_hash(repo_root, "HEAD")
 
 
+@dataclass(frozen=True)
+class CommitBoundary:
+    """Changed-path evidence read back from a created commit object."""
+
+    commit: str
+    parent: str
+    changed_paths: tuple[str, ...]
+
+
+def read_commit_boundary(repo_root: Path, *, commit: str) -> CommitBoundary:
+    """Derive a single-parent commit's changed-path boundary from the commit object.
+
+    The read happens against the commit object itself, so it reflects what was
+    actually recorded rather than what the working tree or index looked like
+    before the commit existed.
+
+    Fails closed rather than reporting a boundary that cannot be trusted. Git
+    reports several distinct hazards as exit 0 with empty output -- a merge
+    commit without ``-m``, a root commit without ``--root``, and an object that
+    is not a commit at all -- so empty output is never read as "nothing
+    changed".
+
+    Pathnames are read NUL-separated so ``core.quotePath`` cannot mangle them,
+    and rename detection stays off so a rename's old path is never collapsed
+    away. Pathnames that are not valid UTF-8 are decoded with replacement
+    characters by the shared git helper; the path is still reported, but its
+    exact bytes are not recoverable from this evidence.
+    """
+
+    parents_output = _run_git(
+        repo_root,
+        ["rev-list", "--parents", "-n", "1", commit],
+        check=True,
+    ).stdout
+
+    tokens = parents_output.split()
+    if not tokens:
+        raise RepositoryError(
+            f"Cannot read commit {commit}: it does not resolve to a commit object."
+        )
+
+    if tokens[0] != commit:
+        raise RepositoryError(
+            f"Cannot read commit {commit}: git reported commit {tokens[0]} instead."
+        )
+
+    parents = tokens[1:]
+    if len(parents) != 1:
+        raise RepositoryError(
+            f"Commit {commit} has {len(parents)} parents; "
+            "a single-parent changed-path boundary is not derivable."
+        )
+
+    paths_output = _run_git(
+        repo_root,
+        [
+            "diff-tree",
+            "--no-commit-id",
+            "-r",
+            "--no-renames",
+            "--name-only",
+            "-z",
+            commit,
+        ],
+        check=True,
+    ).stdout
+
+    records = paths_output.split("\0")
+    if records and records[-1] == "":
+        records.pop()
+
+    if not records:
+        raise RepositoryError(
+            f"Commit {commit} reported no changed paths; "
+            "its changed-path boundary is not derivable."
+        )
+
+    if any(record == "" for record in records):
+        raise RepositoryError(
+            f"Cannot read the changed-path boundary of commit {commit}: "
+            "git returned a malformed path record."
+        )
+
+    for record in records:
+        if "\n" in record or "\r" in record:
+            raise RepositoryError(
+                f"Cannot report the changed-path boundary of commit {commit}: "
+                "a changed path contains a line break."
+            )
+
+    return CommitBoundary(
+        commit=commit,
+        parent=parents[0],
+        changed_paths=tuple(sorted(records)),
+    )
+
+
 def resolve_commit_hash(repo_root: Path, revision: str = "HEAD") -> str:
     completed = _run_git(
         repo_root,
