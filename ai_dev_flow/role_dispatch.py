@@ -64,6 +64,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
 
+from .claude_runtime import REASON_PLUGIN_ROLE_MISMATCH
 from .control_plane import ControlPlaneError, resolve_read_source
 from .decision_manager_launch import LaunchError, stated_run_inputs
 from .manager_controller import ManagerController
@@ -194,6 +195,34 @@ def _stated_role(arguments: argparse.Namespace) -> str:
     return arguments.role
 
 
+def _require_role_package(role: str, expected_skill: Optional[str]) -> None:
+    """The stated role and the stated package must be the same role's, said early.
+
+    `--role`, `--prompt-file`, `--plugin-root` and `--expected-skill` are four
+    independent operator inputs. Until checkpoint 75 nothing compared them, so
+    `--role executor` on an executor-assigned rail could be handed the reviewer
+    package and every role-fidelity check in the product would agree: the packet,
+    the snapshot, the observation, the `Assignment` and the durable binding would
+    all say `executor`, and the provider would load the reviewer's skill.
+
+    The gate that actually closes that is in `claude_runtime.validate_plugin_surface`,
+    reached from `_build_request` with the role read off the durable binding record,
+    where no caller can answer it. This is not that gate and does not replace it --
+    it is the same refusal said at the command line, before a control plane is read
+    or a binding reserved, in the reason the gate itself would raise. Same shape as
+    `_stated_role`: the door refuses again, and a person gets told no in the door's
+    own words rather than after a launch has been paid for.
+    """
+    if expected_skill != role:
+        raise DispatchError(
+            REASON_PLUGIN_ROLE_MISMATCH,
+            "{0} is '{1}' but {2} is '{3}'; a session runs the package of the role "
+            "it is launched in. State the package whose skill is '{1}'.".format(
+                ROLE_FLAG, role, EXPECTED_SKILL_FLAG, expected_skill
+            ),
+        )
+
+
 def stated_role_inputs(argv: Sequence[str]) -> Tuple[RoleRunInputs, List[str]]:
     """This run's stated role inputs, and the argv the accepted scope parser owns.
 
@@ -227,6 +256,7 @@ def stated_role_inputs(argv: Sequence[str]) -> Tuple[RoleRunInputs, List[str]]:
         )
 
     role = _stated_role(arguments)
+    _require_role_package(role, arguments.expected_skill)
     turns, budget = _stated_bounds(arguments)
     try:
         package_root = resolve_repo_root()

@@ -121,8 +121,25 @@ class RoleLaunch:
     The runtime policy is per launch and not per run, because the prompt file and the
     plugin a session runs under are per role. A driver that shared one runtime policy
     across an executor and a reviewer would be running one of them under the other's
-    role package, which is the exact failure `validate_plugin_surface` exists to
-    catch.
+    role package.
+
+    Checkpoint 74 said that mismatch was "the exact failure `validate_plugin_surface`
+    exists to catch". That was false when it was written: `validate_plugin_surface`
+    was handed only `expected_skill`, never the role, so it proved the package was a
+    well-formed package containing the skill its caller named -- and said nothing
+    about whether that was the role's skill. A launch stating `--role executor` with
+    the reviewer plugin and `--expected-skill reviewer` passed every check in this
+    package and ran the reviewer's skill under an `executor` binding.
+
+    What catches it now, added at checkpoint 75: `claude_runtime._build_request`
+    passes `role=record.role` -- the role off the durable binding record, not a
+    caller argument -- into `validate_plugin_surface`, which refuses
+    `plugin-role-mismatch` when the single skill the package exposes is not that
+    role's. It is reached by every launch, resume and creating-launch request this
+    package builds, so it is not a rule this driver keeps by convention.
+    `role_dispatch._require_role_package` says the same no at the command line, in
+    the same reason, before a control plane is read; that one is an early report,
+    not the gate.
     """
 
     rail: str

@@ -371,3 +371,41 @@ no overlap of provider turns; no rotation dogfood; no change to `manager_dispatc
 `orchestrator_invocation`, `authorization`, `session_lifecycle`, `session_binding`,
 `claude_runtime` or `claude_worker`; no change to `skills/**`; no checkpoint-72 residual
 closed; no checkpoint accepted; product `main` unmoved.
+
+---
+
+## CORRECTION NOTE — appended at checkpoint 75, 2026-09-04
+
+**Nothing above this line has been edited.**
+
+**1. The gate-integrity test could not fail.** This document offers, twice (the established-
+facts table and the Validation list), the fact that `manager_dispatch.py` and
+`orchestrator_invocation.py` are "verified byte-identical to their committed blobs by a test
+in the suite, not only by inspection", as the reason a reviewer need not take gate integrity
+on trust. The test
+(`tests.test_role_driver.StructuralTests.test_the_orchestrator_entry_points_are_byte_unchanged`)
+compared the working tree against `git show HEAD:<file>`. **HEAD is the commit under
+review**, so the comparison passed for any *committed* change to those files and could detect
+only an uncommitted edit in the reviewer's own checkout. It could not have detected
+checkpoint 73 or checkpoint 74 moving either file.
+
+At checkpoint 75 the test is pinned to the **accepted baseline commit `c0b6a3a`**
+(checkpoint 71) and to the literal blob names it carries, and it no longer skips when an
+object fails to resolve. It still passes — the substance was always true — and it can now
+fail. Both directions were demonstrated in a disposable clone: a *committed* change to
+`manager_dispatch.py` leaves the old comparison passing and fails the new one at
+`assertEqual(observed, blob, name)`; a *move* of the file leaves the old comparison
+skipping and fails the new one at `assertTrue(path.is_file(), …)`.
+
+**2. `RoleLaunch`'s docstring was wrong.** It said a shared runtime policy across an executor
+and a reviewer "is the exact failure `validate_plugin_surface` exists to catch". It was not:
+that function was never given the role. Corrected in `ai_dev_flow/role_driver.py`, and the
+gate that does catch it now exists.
+
+**3. "No checkpoint-72 residual closed"** was carried here against a statement that existed
+nowhere durable — checkpoint 72's commit message is the single token `72` and it has no
+document. A reconstruction from durable evidence is now at
+`docs/issue-55-continuation-brief-checkpoint72.md`. The residuals there are marked
+reconstructed; the original was lost with the crashed session that wrote it.
+
+See `docs/issue-55-role-package-fidelity-checkpoint75.md`.

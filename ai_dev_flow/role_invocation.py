@@ -66,18 +66,33 @@ from __future__ import annotations
 # its own -- the launchable-role refusal -- that the orchestrator door has neither
 # need of nor equivalent to.
 #
-# Role fidelity is structural in four places and conventional in none. The role a
+# Role fidelity is structural in five places and conventional in none. The role a
 # session is launched in is:
 #
 #   1. stated by the caller and carried on the packet, which refuses any role but
 #      `executor` or `reviewer` at construction;
 #   2. checked against the rail's durable `Role:` from the snapshot, here;
 #   3. re-checked from the observation by `authorize`, which refuses
-#      `rail-role-mismatch` before it authorizes anything; and
+#      `rail-role-mismatch` before it authorizes anything;
 #   4. carried into the `Assignment`, which `session_lifecycle._require_decision`
 #      refuses unless it equals the role the decision was granted for, and which
 #      `reserve_binding` writes into the durable record and `launch_request` reads
-#      back onto the runtime request.
+#      back onto the runtime request; and
+#   5. compared against the runtime package the session will actually run:
+#      `claude_runtime._build_request` hands `record.role` -- read off the durable
+#      binding, not off any argument it was given -- to `validate_plugin_surface`,
+#      which refuses `plugin-role-mismatch` unless the one skill that package
+#      exposes is that role's.
+#
+# The fifth was added at checkpoint 75 and the first four were published without
+# it. Checkpoints 73 and 74 stated that role fidelity was "structural in four
+# places", which was true of the four and false about what they covered: every one
+# of them compares a role to another statement of the *same* role, and none of them
+# looked at the prompt file, the plugin root or the expected skill. A run stating
+# `--role executor` on an executor-assigned rail, with the reviewer plugin and
+# `--expected-skill reviewer`, passed all four, wrote `executor` into the durable
+# binding, and ran the reviewer's package. That is corrected in the product rather
+# than only in prose, and item 5 is what corrects it.
 #
 # So a session launched in a role its authorization was not granted for cannot be
 # constructed: the two would have to disagree at a point where the product compares
@@ -85,6 +100,13 @@ from __future__ import annotations
 # orchestrator authorization would be worse than no path at all, and this ticket's
 # accepted contracts already refuse it -- what this module had to do was use them
 # rather than route around them.
+#
+# What item 5 does NOT cover, stated because it is the honest edge: the *system
+# prompt file* is still an operator input with no structural declaration of the role
+# it was written for, so an executor launch can still be handed a prompt file
+# written for a reviewer. What is bound is the plugin package -- the skill the
+# provider actually loads -- and the directive, which is `DIRECTIVES[role]` and
+# cannot be stated on the command line at all.
 #
 # Reuse, not respelling. The refusal type, the workspace rule, the head-currency
 # rule and the outcome shape are the accepted ones, imported. A second spelling of

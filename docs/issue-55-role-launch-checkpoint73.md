@@ -246,3 +246,55 @@ manager surface on this entry point; no change to `manager_dispatch`,
 `orchestrator_invocation`, `authorization`, `session_lifecycle`, `session_binding`,
 `claude_runtime` or `claude_worker`; no change to `skills/**`; neither checkpoint-72
 residual closed; no checkpoint accepted; product `main` unmoved.
+
+---
+
+## CORRECTION NOTE — appended at checkpoint 75, 2026-09-04
+
+**Nothing above this line has been edited.** The text stands as it was published, and this
+note says which part of it was wrong when it was written.
+
+**The claim: "Role fidelity is structural in four places" (the section above at lines
+53–72).** That heading and its four numbered items were **wrong as a statement about what
+they covered**, and they were wrong when published, not made wrong by later work.
+
+The four checks are real and each does what it says. What they do not do — and what the
+heading implied — is bind the role to the **runtime package** the session actually runs.
+Every one of the four compares a role to another statement of the *same* role: the packet's
+role, the rail's `Role:` in the snapshot, the rail's role in the observation, and the role
+on the `Assignment`, the binding and the `RuntimeRequest`. None of them looked at
+`--prompt-file`, `--plugin-root` or `--expected-skill`, which are three further independent
+operator inputs, and `claude_runtime.validate_plugin_surface` was never told which role was
+being launched.
+
+The consequence, demonstrated by an independent review of 72→73→74: a run stating
+`--role executor` on a rail durably assigned `executor`, handed the **reviewer** plugin and
+`--expected-skill reviewer`, **passed all four checks**, wrote `executor` into the durable
+binding, and ran the reviewer's package. Nothing failed closed.
+
+That is also why the run-E / run-R evidence above is weaker than it reads. The `SKILLS=`
+half of each transcript reply is described there as "the session reporting which role
+package it is actually running", and it is — but at the time it agreed with the role only
+because the operator (me) stated a matching package on the command line. It was a
+convention, not a structural fact.
+
+**What makes it true now.** Checkpoint 75 adds a fifth check, in the product:
+`claude_runtime._build_request` passes `role=record.role` — the role off the durable binding
+record, not any argument it was given — into `validate_plugin_surface`, which refuses
+`plugin-role-mismatch` unless the single skill that package exposes is that role's. It is on
+the one path every launch, resume and creating-launch request in the package is built
+through, and it has no injection point. `role_dispatch._require_role_package` says the same
+no at the command line, in the same reason, before a control plane is read.
+
+The rest of this document is unaffected: the two real runs happened, the three refusals were
+driven, and `manager_dispatch.py` and `orchestrator_invocation.py` are still byte-identical
+to their accepted blobs.
+
+**Also corrected at checkpoint 75:** the mutation table above ("Discriminating fixture")
+reports bare failure counts with no named oracle per row, which the accepted
+`feedback-loop-design` skill forbids — a suite that merely turns red can do so through an
+unrelated structural or setup failure. Checkpoint 74's table names an oracle per row;
+checkpoint 75's does too. The checkpoint-73 rows are **not** re-derived here and should be
+read as unproven per-partition kill power rather than as proven.
+
+See `docs/issue-55-role-package-fidelity-checkpoint75.md`.

@@ -16,6 +16,11 @@ from ai_dev_flow.authorization import (
     RailObservation,
     WorkspaceObservation,
 )
+from ai_dev_flow.claude_runtime import (
+    REASON_PLUGIN_ROLE_MISMATCH,
+    ClaudeRuntimeError,
+    validate_plugin_surface,
+)
 from ai_dev_flow.manager_controller import ManagerController
 from ai_dev_flow.orchestrator_invocation import InvocationRefused
 from ai_dev_flow.orchestrator_trigger import RailSnapshot, ScopeSnapshot
@@ -488,6 +493,169 @@ class RoleFidelityRefusalTests(RoleInvocationTestBase):
             self._invoke(role=EXECUTOR, snapshot=self._snapshot(executor_role=None))
         self.assertEqual(caught.exception.reason, REASON_RAIL_ROLE)
         self.assertIn("no role", str(caught.exception))
+
+
+class RolePackageFidelityTests(RoleInvocationTestBase):
+    """The role a session is launched in and the package it runs cannot disagree.
+
+    Checkpoints 73 and 74 published four structural role-fidelity checks, and every
+    one of them compared a role to another statement of the same role. None of them
+    looked at `--prompt-file`, `--plugin-root` or `--expected-skill`, so a launch
+    stating `--role executor` on an executor-assigned rail, handed the reviewer
+    package, passed all four, wrote `executor` into the durable binding, and ran the
+    reviewer's skill. These are the fifth check, and it is the one that closes it.
+    """
+
+    def _package_of(self, role):
+        """Exactly the request kwargs one role's package is stated with."""
+        return self._request_kwargs(role)
+
+    def test_an_executor_launch_handed_the_reviewer_package_is_refused(self):
+        """The reviewer's demonstration, driven, on the executor's own rail.
+
+        Everything else is the launch that succeeds: the same rail, the same
+        snapshot, the same observation, the same predicate, the same store. Only the
+        runtime package differs.
+        """
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            self._invoke(role=EXECUTOR, request_kwargs=self._package_of(REVIEWER))
+        self.assertEqual(caught.exception.reason, REASON_PLUGIN_ROLE_MISMATCH)
+        self.assertIn(REVIEWER, caught.exception.detail)
+        self.assertIn(EXECUTOR, caught.exception.detail)
+        # The refusal lands where the accepted ordering puts a construction failure:
+        # after the reservation, before anything is spawned or sent. No process, no
+        # bound record, and the session id stays consumed rather than reissued.
+        records = self.store.records()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0].state, BINDING_STATE_RESERVED)
+        self.assertEqual(self.registry.sessions(), [])
+
+    def test_a_reviewer_launch_handed_the_executor_package_is_refused(self):
+        """The other direction, so the gate is not an assertion about one role."""
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            self._invoke(role=REVIEWER, request_kwargs=self._package_of(EXECUTOR))
+        self.assertEqual(caught.exception.reason, REASON_PLUGIN_ROLE_MISMATCH)
+        self.assertEqual(self.registry.sessions(), [])
+
+    def test_the_same_launch_with_its_own_package_is_admitted(self):
+        """The admitting control, so the gate cannot be a route that refuses both.
+
+        One construction, two packages, and the verdict moves with the package and
+        with nothing else.
+        """
+        for role, rail in ((EXECUTOR, EXECUTOR_RAIL), (REVIEWER, REVIEWER_RAIL)):
+            with self.subTest(role=role):
+                store = BindingStore(self.tmp_path / "own-{0}".format(role))
+                outcome, sent = self._invoke(
+                    role=role,
+                    store=store,
+                    registry=SessionRegistry(),
+                    request_kwargs=self._package_of(role),
+                )
+                self.assertEqual(outcome.role, role)
+                self.assertEqual(outcome.rail, rail)
+                self.assertEqual(sent[0]["expected_skill"], role)
+
+    def test_the_gate_reads_the_role_off_the_durable_binding_not_an_argument(self):
+        """It is a gate, so it has no injection point and no caller answers it.
+
+        `validate_plugin_surface` takes `role` with no default -- a defaulted one
+        would be skippable by anything that forgot it, which is the same hole -- and
+        `_build_request` supplies it from `record.role`, the role `reserve_binding`
+        wrote from the `Assignment` the accepted decision was granted for.
+        """
+        import inspect
+
+        from ai_dev_flow import claude_runtime
+
+        parameter = inspect.signature(validate_plugin_surface).parameters["role"]
+        self.assertIs(parameter.default, inspect.Parameter.empty)
+        self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+
+        source = inspect.getsource(claude_runtime._build_request)
+        # The whole call: `role=record.role` on its own is also how the
+        # `RuntimeRequest` is constructed, so the substring alone does not say the
+        # validator was given it.
+        self.assertIn("expected_skill=expected_skill, role=record.role", source)
+        # And there is no `role` an operator could hand `_build_request` instead.
+        self.assertNotIn(
+            "role", inspect.signature(claude_runtime._build_request).parameters
+        )
+
+    def test_the_command_line_says_the_same_no_in_the_same_reason(self):
+        """The early report, before a control plane is read or a binding reserved.
+
+        This is not the gate and does not replace it; it is `role_dispatch` telling
+        a person no in the door's own words rather than after a launch is paid for.
+        """
+        from ai_dev_flow.manager_dispatch import DispatchError
+
+        argv = [
+            "--rail", EXECUTOR_RAIL,
+            "--role", EXECUTOR,
+            "--controller-root", str(self.controller_root),
+            "--prompt-file", str(self.prompts[REVIEWER]),
+            "--plugin-root", str(self.plugins[REVIEWER]),
+            "--expected-skill", REVIEWER,
+            "--allowed-tool", "Read",
+            "--max-turns", "2",
+            "--max-budget-usd", "0.25",
+            "--ticket-provider", "github",
+            "--ticket-id", "55",
+            "--ticket-repository", "jmrozi1/ai-dev",
+        ]
+        with self.assertRaises(DispatchError) as caught:
+            role_dispatch.stated_role_inputs(argv)
+        self.assertEqual(caught.exception.reason, REASON_PLUGIN_ROLE_MISMATCH)
+
+        # The admitting control on the identical construction: only the package
+        # moves, and the same parse succeeds.
+        matched = list(argv)
+        matched[matched.index("--prompt-file") + 1] = str(self.prompts[EXECUTOR])
+        matched[matched.index("--plugin-root") + 1] = str(self.plugins[EXECUTOR])
+        matched[matched.index("--expected-skill") + 1] = EXECUTOR
+        inputs, _remaining = role_dispatch.stated_role_inputs(matched)
+        self.assertEqual(inputs.role, EXECUTOR)
+        self.assertEqual(inputs.request_kwargs["expected_skill"], EXECUTOR)
+
+    def test_the_whole_entry_point_exits_non_zero_on_the_mismatch(self):
+        """Driven through `main()`, which is how an operator would meet it.
+
+        The reason is asserted, not merely the exit code: `main` reports several
+        different refusals as exit 1, so "non-zero" on its own is satisfied by a
+        run that refused for some entirely other reason. The M4 mutation -- the
+        command-line check removed -- exposed exactly that, and this is the
+        assertion that survives it.
+        """
+        import contextlib
+        import io as _io
+
+        stderr = _io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            code = role_dispatch.main(
+                [
+                    "--rail", EXECUTOR_RAIL,
+                    "--role", EXECUTOR,
+                    "--controller-root", str(self.controller_root),
+                    "--prompt-file", str(self.prompts[REVIEWER]),
+                    "--plugin-root", str(self.plugins[REVIEWER]),
+                    "--expected-skill", REVIEWER,
+                    "--allowed-tool", "Read",
+                    "--max-turns", "2",
+                    "--max-budget-usd", "0.25",
+                    "--ticket-provider", "github",
+                    "--ticket-id", "55",
+                    "--ticket-repository", "jmrozi1/ai-dev",
+                    "--control-plane", str(self.repo_root),
+                    "--project", PROJECT,
+                    "--ticket", TICKET,
+                    "--binding-root", str(self.tmp_path / "mismatch-bindings"),
+                ]
+            )
+        self.assertEqual(code, 1)
+        self.assertIn(REASON_PLUGIN_ROLE_MISMATCH, stderr.getvalue())
+        # Refused before anything durable: the binding root was never created.
+        self.assertFalse((self.tmp_path / "mismatch-bindings").exists())
 
 
 class OrchestratorIsRefusedTests(RoleInvocationTestBase):

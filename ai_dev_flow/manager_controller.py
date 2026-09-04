@@ -475,10 +475,15 @@ class ManagerController:
 
         It is a second method rather than a `role` argument on `dispatch` because the
         two doors are not the same door. `dispatch` requires a material wake and
-        starts an orchestrator; this one has no wake, cannot start an orchestrator,
-        and refuses to start anything while this controller already holds a session.
-        Collapsing them into one signature would put the wake gate behind a
-        parameter, which is how a gate stops being one.
+        starts an orchestrator; this one has no wake and cannot start an
+        orchestrator. Collapsing them into one signature would put the wake gate
+        behind a parameter, which is how a gate stops being one.
+
+        This method used also to say it "refuses to start anything while this
+        controller already holds a session". That was true of
+        `role_invocation._require_sequential`, which checkpoint 74 deleted
+        deliberately so a concurrent driver could exist; the sentence outlived it
+        and is removed here rather than left to describe a refusal that is gone.
         """
         records = self.store.records()
         return invoke_role(

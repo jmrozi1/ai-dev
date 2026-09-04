@@ -107,6 +107,7 @@ REASON_PLUGIN_MANIFEST_UNEXPECTED = "plugin-manifest-unexpected"
 REASON_PLUGIN_MANIFEST_MISSING = "plugin-manifest-missing"
 REASON_PLUGIN_NESTED_ESCAPE = "plugin-nested-escape"
 REASON_PLUGIN_SKILL_MISSING = "plugin-skill-missing"
+REASON_PLUGIN_ROLE_MISMATCH = "plugin-role-mismatch"
 REASON_RESULT_SESSION_MISMATCH = "result-session-mismatch"
 
 
@@ -267,8 +268,8 @@ def validate_controller_asset(
     return require_asset_kind(resolved, kind=kind, label=label)
 
 
-def validate_plugin_surface(plugin_root: Any, *, expected_skill: str) -> str:
-    """Prove the plugin is exactly the manifest plus one skill, all of it in place.
+def validate_plugin_surface(plugin_root: Any, *, expected_skill: str, role: str) -> str:
+    """Prove the plugin is exactly the manifest plus one skill *for this role*.
 
     Every component is resolved before it is accepted and every resolved component
     must still be inside the plugin root. Checking only the entry *names* would let
@@ -276,6 +277,17 @@ def validate_plugin_surface(plugin_root: Any, *, expected_skill: str) -> str:
     directory, outside the controller root -- and the scan would then walk happily
     into whatever it found. Links that stay inside the root are fine; the rule is
     about where a component lands, not about how it is referenced.
+
+    `role` is required and has no default, deliberately. Until checkpoint 75 this
+    function was handed only the skill name its caller claimed to expect, and the
+    role the session was actually being launched in never reached it -- so a launch
+    could state `--role executor` on an executor-assigned rail and hand this the
+    reviewer package, and every role-fidelity check in the product would pass while
+    the provider ran the other role's skill. A parameter with a default would leave
+    that hole open to anything that forgot to pass it, which is the same hole.
+    Making it required means the comparison cannot be skipped, and `_build_request`
+    supplies it from `record.role` -- the durable binding -- rather than from a
+    caller argument, so it is not answerable by whoever asked for the launch.
     """
     root = _real(plugin_root)
     require_asset_kind(root, kind=ASSET_DIRECTORY, label="plugin root")
@@ -320,6 +332,25 @@ def validate_plugin_surface(plugin_root: Any, *, expected_skill: str) -> str:
             REASON_PLUGIN_SKILL_MISSING,
             "plugin {0} exposes skill(s) {1}; exactly [{2}] was expected.".format(
                 root, ", ".join(skills) or "none", expected_skill
+            ),
+        )
+    # The one skill this package actually exposes -- established above from the
+    # directory itself, not from what the caller said -- must be the skill of the
+    # role the binding records. A session's role and the package it runs are two
+    # separate operator inputs everywhere upstream of here, and this is the point
+    # at which they are compared and made unable to disagree silently.
+    #
+    # The comparison is with `skills[0]` rather than with `expected_skill` so that
+    # what is checked is the package's own content: the line above has already
+    # proved the two are equal, and reading it off the filesystem is what makes
+    # this a statement about the plugin rather than about the command line.
+    if skills[0] != role:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_ROLE_MISMATCH,
+            "plugin {0} is the '{1}' package and this session's role is '{2}'. A "
+            "session runs the package of the role it is bound to; nothing here "
+            "will run one role's skill under another role's authorization.".format(
+                root, skills[0], role
             ),
         )
 
@@ -526,7 +557,14 @@ def _build_request(
         plugin_root, controller_root=controller_root, workspace_path=workspace,
         label="plugin root", kind=ASSET_DIRECTORY,
     )
-    validate_plugin_surface(resolved_plugin, expected_skill=expected_skill)
+    # `role` is read off the binding record, never taken as an argument of this
+    # function: the record's role is what `reserve_binding` wrote from the
+    # `Assignment` the accepted decision was granted for, so the role side of this
+    # comparison traces back to the authorization and cannot be supplied by the
+    # caller that chose the package.
+    validate_plugin_surface(
+        resolved_plugin, expected_skill=expected_skill, role=record.role
+    )
 
     turns, budget = _require_bounds(max_turns, max_budget_usd)
     return RuntimeRequest(

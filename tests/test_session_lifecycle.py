@@ -1161,6 +1161,31 @@ class ContextLifecycleTests(LifecycleTestBase):
 
     # -- role policy -----------------------------------------------------------
 
+    def _package_for(self, role):
+        """The runtime package of one role, built on demand.
+
+        Since checkpoint 75 a launch runs the package of the role its binding
+        records: `claude_runtime._build_request` hands `record.role` to
+        `validate_plugin_surface`, which refuses `plugin-role-mismatch` when the
+        one skill the package exposes is another role's. A fixture that launched a
+        reviewer under the executor's plugin was refused by exactly that gate,
+        which is the gate working -- so the fixture states each role's own package
+        rather than the gate being relaxed for it.
+        """
+        if role == SKILL:
+            return {}
+        plugin = self.controller_root / "plugins" / "ai-dev-{0}".format(role)
+        if not plugin.exists():
+            (plugin / "skills" / role).mkdir(parents=True)
+            (plugin / "skills" / role / "SKILL.md").write_text(
+                "---\nname: {0}\n---\n".format(role), encoding="utf-8"
+            )
+            (plugin / ".claude-plugin").mkdir(parents=True)
+            (plugin / ".claude-plugin" / "plugin.json").write_text(
+                json.dumps({"name": "ai-dev-{0}".format(role)}) + "\n", encoding="utf-8"
+            )
+        return {"plugin_root": plugin, "expected_skill": role}
+
     def _launch_as(self, role):
         """One launch under a role other than executor. Nothing is made persistent."""
         assignment = session_lifecycle.Assignment(
@@ -1170,7 +1195,8 @@ class ContextLifecycleTests(LifecycleTestBase):
         return launch_session(
             self._decision(role=role), assignment, store=self.store,
             registry=self.registry, reference=self.reference,
-            request_kwargs=self._request_kwargs(), prompt="x",
+            request_kwargs=self._request_kwargs(**self._package_for(role)),
+            prompt="x",
             package_root=self.repo_root, now=lambda: self.clock,
             new_session_id=lambda: SESSION, start=start, send=self._sender()[0],
         )

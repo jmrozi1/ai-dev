@@ -43,6 +43,17 @@ from tests.test_role_invocation import (
 )
 
 
+# The last ACCEPTED checkpoint on this ticket, and the blobs it carries for the two
+# files the orchestrator wake gate lives in. Checkpoint 71. Deliberately not `HEAD`:
+# an integrity oracle anchored to the commit under review passes for any change that
+# commit made, which is no oracle at all.
+ACCEPTED_BASELINE_COMMIT = "c0b6a3a"
+ACCEPTED_ENTRY_POINT_BLOBS = {
+    "manager_dispatch.py": "1501bf2dbd0a8e680e56f452fb5239e09d9ec75a",
+    "orchestrator_invocation.py": "e63a79586eb56a6610adc8657810a2a34c775750",
+}
+
+
 class DriverTestBase(RoleInvocationTestBase):
     """Real store, real registry, real controller, real predicate. Injected worker.
 
@@ -576,22 +587,64 @@ class StructuralTests(DriverTestBase):
         self.assertEqual(self._source("role_driver.py").count("controller.agent_count("), 3)
 
     def test_the_orchestrator_entry_points_are_byte_unchanged(self):
-        """`manager_dispatch` and `orchestrator_invocation` were not touched at all."""
+        """`manager_dispatch` and `orchestrator_invocation` are the accepted bytes.
+
+        Pinned to the ACCEPTED BASELINE, not to `HEAD`.
+
+        Until checkpoint 75 this compared the working tree against
+        `git show HEAD:<file>`. HEAD is the commit under review, so that comparison
+        passed for any committed change to those files and could only ever detect an
+        uncommitted edit in the reviewer's own checkout. It was offered in checkpoint
+        74's document as the reason a reviewer need not take gate integrity on trust,
+        and it could not have caught checkpoint 73 or checkpoint 74 moving either
+        file. It was an oracle that could not fail.
+
+        Three things are asserted instead, and each can fail on its own:
+
+          * the file still exists at its path in the working tree -- a move or a
+            rename fails here rather than passing silently;
+          * its bytes hash to the literal blob name recorded below, which is the
+            blob the accepted baseline carries. A literal, so the assertion does not
+            ask git what it should have been;
+          * the accepted baseline commit really does carry that blob at that path,
+            so the literal above is anchored to accepted state rather than to a
+            number typed into a test.
+        """
         import ai_dev_flow
 
         package = Path(ai_dev_flow.__file__).parent
-        for name in ("manager_dispatch.py", "orchestrator_invocation.py"):
+        for name, blob in ACCEPTED_ENTRY_POINT_BLOBS.items():
+            path = package / name
+            self.assertTrue(path.is_file(), "{0} is not at its accepted path".format(name))
             try:
-                committed = subprocess.run(
-                    ["git", "-C", str(package.parent), "show",
-                     "HEAD:ai_dev_flow/{0}".format(name)],
-                    check=True,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                ).stdout
+                subprocess.run(
+                    ["git", "-C", str(package.parent), "rev-parse", "--git-dir"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                )
             except (OSError, subprocess.CalledProcessError):
                 self.skipTest("no git checkout to compare against")
-            self.assertEqual(committed, (package / name).read_bytes(), name)
+            # Past this point nothing skips. A failure to resolve either object is
+            # the answer, not a reason to stand down: "the accepted baseline no
+            # longer carries this file at this path" is exactly the finding an
+            # integrity oracle owes a reviewer.
+            observed = self._git_object(package.parent, "hash-object", str(path))
+            baseline = self._git_object(
+                package.parent, "rev-parse",
+                "{0}:ai_dev_flow/{1}".format(ACCEPTED_BASELINE_COMMIT, name),
+            )
+            self.assertEqual(observed, blob, name)
+            self.assertEqual(baseline, blob, "{0} at {1}".format(name, ACCEPTED_BASELINE_COMMIT))
+
+    def _git_object(self, repo_root, *arguments):
+        result = subprocess.run(
+            ["git", "-C", str(repo_root)] + list(arguments),
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        self.assertEqual(
+            result.returncode, 0,
+            "git {0} failed: {1}".format(" ".join(arguments), result.stderr.strip()),
+        )
+        return result.stdout.strip()
 
     def test_the_module_has_a_main_and_it_is_the_driver_path(self):
         self.assertTrue(callable(role_driver_dispatch.main))

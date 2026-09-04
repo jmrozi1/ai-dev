@@ -376,7 +376,7 @@ class PluginSurfaceTests(RuntimeTestBase):
             with self.subTest(entry=relative):
                 self._extra(relative, directory=directory)
                 with self.assertRaises(ClaudeRuntimeError) as caught:
-                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
                 self.assertEqual(
                     caught.exception.reason,
                     claude_runtime.REASON_PLUGIN_SURFACE_UNEXPECTED,
@@ -389,18 +389,18 @@ class PluginSurfaceTests(RuntimeTestBase):
         (self.plugin_root / "skills" / "extra").mkdir()
         (self.plugin_root / "skills" / "extra" / "SKILL.md").write_text("x\n", encoding="utf-8")
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(caught.exception.reason, claude_runtime.REASON_PLUGIN_SKILL_MISSING)
 
     def test_the_expected_skill_must_actually_be_present(self) -> None:
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill="reviewer")
+            validate_plugin_surface(self.plugin_root, expected_skill="reviewer", role="reviewer")
         self.assertEqual(caught.exception.reason, claude_runtime.REASON_PLUGIN_SKILL_MISSING)
 
     def test_a_skill_directory_without_a_skill_file_fails_closed(self) -> None:
         (self.plugin_root / "skills" / SKILL / "SKILL.md").unlink()
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(caught.exception.reason, claude_runtime.REASON_PLUGIN_SKILL_MISSING)
 
     def test_a_manifest_redirecting_component_discovery_fails_closed(self) -> None:
@@ -414,7 +414,7 @@ class PluginSurfaceTests(RuntimeTestBase):
                     manifest={"name": "ai-dev-executor", key: "./elsewhere"},
                 )
                 with self.assertRaises(ClaudeRuntimeError) as caught:
-                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
                 self.assertEqual(
                     caught.exception.reason,
                     claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED,
@@ -430,7 +430,7 @@ class PluginSurfaceTests(RuntimeTestBase):
             },
         )
         self.assertEqual(
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL),
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL),
             str(self.plugin_root),
         )
         self.assertEqual(
@@ -443,7 +443,7 @@ class PluginSurfaceTests(RuntimeTestBase):
             "{}\n", encoding="utf-8"
         )
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED
         )
@@ -455,7 +455,7 @@ class PluginSurfaceTests(RuntimeTestBase):
         manifest.unlink()
         manifest.parent.rmdir()
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_MANIFEST_MISSING
         )
@@ -466,7 +466,7 @@ class PluginSurfaceTests(RuntimeTestBase):
                 payload = {} if name is None else {"name": name}
                 self._write_plugin(self.plugin_root, skill=SKILL, manifest=payload)
                 with self.assertRaises(ClaudeRuntimeError) as caught:
-                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
                 self.assertEqual(
                     caught.exception.reason,
                     claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED,
@@ -482,7 +482,7 @@ class PluginSurfaceTests(RuntimeTestBase):
                     manifest={"name": "ai-dev-executor", key: value},
                 )
                 with self.assertRaises(ClaudeRuntimeError) as caught:
-                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
                 self.assertEqual(
                     caught.exception.reason,
                     claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED,
@@ -498,7 +498,7 @@ class PluginSurfaceTests(RuntimeTestBase):
                 else:
                     target.write_text("extra\n", encoding="utf-8")
                 with self.assertRaises(ClaudeRuntimeError) as caught:
-                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
                 self.assertEqual(
                     caught.exception.reason,
                     claude_runtime.REASON_PLUGIN_SURFACE_UNEXPECTED,
@@ -511,7 +511,7 @@ class PluginSurfaceTests(RuntimeTestBase):
         skill_file.unlink()
         skill_file.mkdir()
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(caught.exception.reason, claude_runtime.REASON_ASSET_NOT_A_FILE)
 
     def test_a_malformed_manifest_fails_closed(self) -> None:
@@ -519,10 +519,106 @@ class PluginSurfaceTests(RuntimeTestBase):
             "{ not json", encoding="utf-8"
         )
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_MANIFEST_UNEXPECTED
         )
+
+
+class RolePackageBindingTests(RuntimeTestBase):
+    """A session's role and the package it runs are compared, and must agree.
+
+    Before checkpoint 75 `validate_plugin_surface` was never told which role was
+    being launched. It proved the plugin was a well-formed package containing the
+    skill its caller named, and said nothing about whether that was the role's
+    skill -- so a binding recording `executor` could be launched with the reviewer
+    package and nothing anywhere failed closed.
+    """
+
+    def _reviewer_plugin(self):
+        root = self.controller_root / "plugins" / "ai-dev-reviewer"
+        return self._write_plugin(
+            root, skill="reviewer", manifest={"name": "ai-dev-reviewer"}
+        )
+
+    def test_the_package_of_another_role_is_refused_for_this_binding(self) -> None:
+        reviewer = self._reviewer_plugin()
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            launch_request(
+                self._record(role="executor"),
+                **self._kwargs(plugin_root=reviewer, expected_skill="reviewer")
+            )
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_ROLE_MISMATCH
+        )
+        self.assertIn("reviewer", caught.exception.detail)
+        self.assertIn("executor", caught.exception.detail)
+
+    def test_the_same_package_is_admitted_for_the_role_it_belongs_to(self) -> None:
+        """The admitting control: only the record's role moves, on one package."""
+        reviewer = self._reviewer_plugin()
+        request = launch_request(
+            self._record(role="reviewer"),
+            **self._kwargs(plugin_root=reviewer, expected_skill="reviewer")
+        )
+        self.assertEqual(request.role, "reviewer")
+        self.assertEqual(request.expected_skill, "reviewer")
+
+    def test_the_executor_package_is_refused_for_a_reviewer_binding(self) -> None:
+        """The other direction on the shipped fixture, so neither role is special."""
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            launch_request(self._record(role="reviewer"), **self._kwargs())
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_ROLE_MISMATCH
+        )
+
+    def test_the_role_is_required_and_has_no_default(self) -> None:
+        """A defaulted role would be skippable by anything that forgot it."""
+        import inspect
+
+        parameter = inspect.signature(validate_plugin_surface).parameters["role"]
+        self.assertIs(parameter.default, inspect.Parameter.empty)
+        with self.assertRaises(TypeError):
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+
+    def test_the_role_comes_off_the_record_and_not_off_an_argument(self) -> None:
+        """`_build_request` reads `record.role`; it takes no role of its own."""
+        import inspect
+
+        source = inspect.getsource(claude_runtime._build_request)
+        # The whole call, not the substring: `role=record.role` also appears in the
+        # `RuntimeRequest` construction below, so asserting it alone passed even
+        # when the validator was handed the caller's `expected_skill` instead. The
+        # M3 mutation found that, and this is the assertion that survives it.
+        self.assertIn("expected_skill=expected_skill, role=record.role", source)
+        self.assertNotIn(
+            "role", inspect.signature(claude_runtime._build_request).parameters
+        )
+
+    def test_the_gate_reaches_every_request_this_boundary_builds(self) -> None:
+        """Launch, resume and creating-launch all pass through the one comparison."""
+        import inspect
+
+        reviewer = self._reviewer_plugin()
+        kwargs = self._kwargs(plugin_root=reviewer, expected_skill="reviewer")
+        for builder, record in (
+            (claude_runtime.launch_request, self._record(role="executor")),
+            (
+                claude_runtime.create_conversation_request,
+                self._bound(role="executor"),
+            ),
+        ):
+            with self.subTest(builder=builder.__name__):
+                with self.assertRaises(ClaudeRuntimeError) as caught:
+                    builder(record, **kwargs)
+                self.assertEqual(
+                    caught.exception.reason,
+                    claude_runtime.REASON_PLUGIN_ROLE_MISMATCH,
+                )
+        # And structurally: there is exactly one call to the plugin validator in
+        # this module, so no builder can reach the SDK around it.
+        module = inspect.getsource(claude_runtime)
+        self.assertEqual(module.count("validate_plugin_surface(\n"), 1)
 
 
 class NestedProvenanceTests(RuntimeTestBase):
@@ -563,7 +659,7 @@ class NestedProvenanceTests(RuntimeTestBase):
                 (target / "skills").mkdir(parents=True, exist_ok=True)
                 self._relink("skills", target / "skills")
                 with self.assertRaises(ClaudeRuntimeError) as caught:
-                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+                    validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
                 self.assertEqual(
                     caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
                 )
@@ -573,7 +669,7 @@ class NestedProvenanceTests(RuntimeTestBase):
         self._write_plugin(sibling, skill=SKILL)
         self._relink(".claude-plugin", sibling / ".claude-plugin")
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
         )
@@ -583,7 +679,7 @@ class NestedProvenanceTests(RuntimeTestBase):
         stray.write_text('{"name": "stray"}\n', encoding="utf-8")
         self._relink(".claude-plugin/plugin.json", stray)
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
         )
@@ -593,7 +689,7 @@ class NestedProvenanceTests(RuntimeTestBase):
         self._write_plugin(sibling, skill=SKILL)
         self._relink("skills/{0}".format(SKILL), sibling / "skills" / SKILL)
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
         )
@@ -603,7 +699,7 @@ class NestedProvenanceTests(RuntimeTestBase):
         target.write_text("executor-authored instructions\n", encoding="utf-8")
         self._relink("skills/{0}/SKILL.md".format(SKILL), target)
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(self.plugin_root, expected_skill=SKILL)
+            validate_plugin_surface(self.plugin_root, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_NESTED_ESCAPE
         )
@@ -618,11 +714,11 @@ class NestedProvenanceTests(RuntimeTestBase):
         except (OSError, NotImplementedError):
             self.skipTest("symlinks are unavailable on this platform")
         self.assertEqual(
-            validate_plugin_surface(link, expected_skill=SKILL), str(self.plugin_root)
+            validate_plugin_surface(link, expected_skill=SKILL, role=SKILL), str(self.plugin_root)
         )
         (self.plugin_root / "hooks").mkdir()
         with self.assertRaises(ClaudeRuntimeError) as caught:
-            validate_plugin_surface(link, expected_skill=SKILL)
+            validate_plugin_surface(link, expected_skill=SKILL, role=SKILL)
         self.assertEqual(
             caught.exception.reason, claude_runtime.REASON_PLUGIN_SURFACE_UNEXPECTED
         )
