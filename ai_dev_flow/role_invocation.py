@@ -1,4 +1,4 @@
-"""One gate between a stated role assignment and one managed executor or reviewer session."""
+"""One gate between a stated role assignment and a managed executor or reviewer session."""
 
 from __future__ import annotations
 
@@ -23,13 +23,29 @@ from __future__ import annotations
 #     the role is what makes "I left the wake gate exactly alone" a structural fact
 #     instead of a promise.
 #
-#   * It is not a driver, a pool, a scheduler, or a loop. `invoke_role` starts one
-#     session, hands the caller the one instant at which it is live, stops it, and
-#     returns. It additionally refuses outright when the registry it is launching
-#     into already holds a session, so "one managed session at a time" is enforced
-#     by the door rather than by the caller's good behaviour. Holding two live at
-#     once is the next slice's capability and it must move this refusal explicitly
-#     to get it -- which is the point of putting it here.
+#   * It is not a driver, a pool, a scheduler, or a loop, and it still is not one.
+#     `open_role_session` admits one session and hands it back live; `invoke_role`
+#     admits one, offers the caller the instant at which it is live, and stops it.
+#     Neither decides that a session should exist: a human's durable authorization
+#     on a named rail does.
+#
+#     Until checkpoint 74 this module additionally refused outright whenever the
+#     registry it was launching into already held a session (`_require_sequential`,
+#     `session-already-live`), so that "one managed session at a time" was enforced
+#     by the door rather than by the caller's good behaviour. Checkpoint 73 placed
+#     that refusal to be removed by the slice that earned it and said so in as many
+#     words. **This checkpoint removes it deliberately**, because holding more than
+#     one managed session live at once is exactly the capability the accepted middle
+#     cut authorizes next, and a door that refuses it cannot be that capability.
+#
+#     Nothing else moved with it, and the deletion is narrower than it sounds. What
+#     bounds concurrency now is what always bounded it on the accepted path: the D6
+#     ceiling inside `authorize`, evaluated per admission against occupancy the
+#     caller reconciled from durable records and proved ownership, and evaluated a
+#     second time inside the store lock by `reserve_binding` from the ceiling this
+#     decision carried. That ceiling is a limit, not a target -- nothing here starts
+#     a session because a slot happens to be free -- and every launch still needs
+#     its own standing durable authorization on its own rail.
 #
 #   * It is not a second authorization system. There is no parameter for a decision
 #     and no way to hand this module a fabricated `authorized=True`; it always calls
@@ -46,8 +62,9 @@ from __future__ import annotations
 # "an executor rail is ready", no producer of one, and inventing one would be the
 # autonomous continuation loop this ticket has explicitly deferred. So the standing
 # durable authorization -- a human's decision, written in the rail -- is the whole
-# authority, exactly as it is for the orchestrator, and this door adds two refusals
-# of its own that the orchestrator door has neither need of nor equivalent to.
+# authority, exactly as it is for the orchestrator, and this door adds a refusal of
+# its own -- the launchable-role refusal -- that the orchestrator door has neither
+# need of nor equivalent to.
 #
 # Role fidelity is structural in four places and conventional in none. The role a
 # session is launched in is:
@@ -103,10 +120,11 @@ __all__ = [
     "REASON_RAIL_ROLE",
     "REASON_RAIL_UNRECONCILED",
     "REASON_ROLE_NOT_LAUNCHABLE",
-    "REASON_SESSION_ALREADY_LIVE",
+    "OpenSession",
     "RolePacket",
     "build_role_packet",
     "invoke_role",
+    "open_role_session",
 ]
 
 # Exactly the two roles the human middle-cut decision authorized. `orchestrator` is
@@ -131,7 +149,10 @@ DIRECTIVES = {
 }
 
 REASON_ROLE_NOT_LAUNCHABLE = "role-not-launchable"
-REASON_SESSION_ALREADY_LIVE = "session-already-live"
+# `REASON_SESSION_ALREADY_LIVE` ("session-already-live") stood here until checkpoint
+# 74 and is gone with the refusal that raised it. It is named here, once, so a reader
+# of a checkpoint-73 transcript can find out what happened to it rather than assume
+# the reason merely stopped being reachable.
 REASON_RAIL_MISSING = "role-rail-missing"
 REASON_RAIL_NOT_RUNNING = "role-rail-not-running"
 REASON_RAIL_UNRECONCILED = "role-rail-unreconciled"
@@ -198,7 +219,7 @@ def build_role_packet(snapshot: ScopeSnapshot, *, rail: str, role: str) -> RoleP
 
 
 # --------------------------------------------------------------------------
-# The door's own two refusals
+# The door's own refusal
 # --------------------------------------------------------------------------
 
 
@@ -224,27 +245,6 @@ def _require_launchable_role(role: str) -> str:
             "role '{0}' is not one of {1}".format(role, ", ".join(LAUNCHABLE_ROLES)),
         )
     return role
-
-
-def _require_sequential(registry: Any) -> None:
-    """One managed session at a time, refused at the door rather than trusted.
-
-    Read from the registry this call is about to launch into, never from a
-    parameter, so a caller cannot answer this question on the door's behalf. A
-    controller that already holds a handle is a controller that would hold two, and
-    concurrency is a separate authorized capability with its own slice: whatever
-    builds it must delete this refusal deliberately and say so.
-    """
-    held = [owned.session_id for owned in registry.sessions()]
-    if held:
-        raise InvocationRefused(
-            REASON_SESSION_ALREADY_LIVE,
-            "this controller already holds {0} ({1}); this door starts one managed "
-            "session at a time and stops it before returning".format(
-                "a session" if len(held) == 1 else "{0} sessions".format(len(held)),
-                ", ".join(sorted(held)),
-            ),
-        )
 
 
 # --------------------------------------------------------------------------
@@ -333,7 +333,24 @@ def _require_standing_authorization(
 # --------------------------------------------------------------------------
 
 
-def invoke_role(
+@dataclass(frozen=True)
+class OpenSession:
+    """One managed session that is live right now, and what it was granted.
+
+    Returned rather than an `InvocationOutcome` because an outcome describes a
+    session that is over, and this one is not: the process is running, the binding
+    is nonterminal, and the handle is in the caller's registry. The caller that
+    opened it owns stopping it, and there is deliberately no finaliser, timer, or
+    context manager here that would stop it on the caller's behalf -- a session
+    torn down by something other than the code that asked for it is exactly how a
+    process group outlives its record.
+    """
+
+    assignment: Assignment
+    launched: Any
+
+
+def open_role_session(
     snapshot: ScopeSnapshot,
     packet: RolePacket,
     observation: ControlPlaneObservation,
@@ -350,31 +367,22 @@ def invoke_role(
     launch_kwargs: Optional[Mapping] = None,
     stop_kwargs: Optional[Mapping] = None,
     ledger: Optional[AllowanceLedger] = None,
-    while_running: Optional[Callable] = None,
-) -> InvocationOutcome:
-    """One gated launch of exactly one executor- or reviewer-role session, then stopped.
+) -> OpenSession:
+    """Every gate, then one launch, and the session is handed back still running.
 
-    Raises `InvocationRefused` before anything is enacted when any gate fails, and
-    lets a lifecycle failure propagate unchanged: a failed invocation is not
-    retried, resumed, or terminalized without proof. Every accepted rule below this
-    call -- reservation order, the commit-point ceiling, the readiness handshake,
-    the ownership record, the stop that proves the process group gone -- is reached
-    exactly as the accepted path reaches it, because this calls the same functions
-    with the same arguments and adds none of its own.
+    This is the whole of `invoke_role` except the stop, factored out rather than
+    copied, so that a caller which needs to hold a session open reaches exactly the
+    gates a caller which stops it immediately reaches. A second admission path with
+    its own copy of these checks is two policies free to drift, and the one that
+    drifts is always the one that admits more.
 
-    `while_running` is the one instant at which this session is live and provable,
-    offered to the caller and nothing else, on exactly the accepted terms: it is
-    given the `LaunchOutcome`, asked for nothing back, and if it raises, the session
-    is stopped and the failure propagates rather than being swallowed.
-
-    Accounting mirrors the accepted invocation exactly. A door that spent real
-    provider budget without the accounting the other door has would be a worse door,
-    not a smaller one.
+    It stops nothing and returns the session live. The caller must stop what it
+    opened; `invoke_role` does so immediately, and `role_driver` does so after
+    holding several at once.
     """
-    # Checked again at the enactment boundary, from the value that will actually be
+    # Checked at the enactment boundary, from the value that will actually be
     # carried into the binding, rather than trusted from construction alone.
     _require_launchable_role(packet.role)
-    _require_sequential(registry)
 
     decision, rail = _require_standing_authorization(
         snapshot,
@@ -433,8 +441,79 @@ def invoke_role(
         try:
             ledger.record_completed(identity, launched.result)
         except Exception:
+            # The session exists and the accounting for it failed, so it is stopped
+            # here rather than handed back: an unaccounted live session is the one
+            # thing worse than a failed launch.
             stop_session(store, registry, launched.binding, **dict(stop_kwargs or {}))
             raise
+
+    return OpenSession(assignment=assignment, launched=launched)
+
+
+def invoke_role(
+    snapshot: ScopeSnapshot,
+    packet: RolePacket,
+    observation: ControlPlaneObservation,
+    *,
+    store: Any,
+    registry: Any,
+    reference: Any,
+    request_kwargs: Mapping,
+    package_root: Any,
+    slots,
+    bindings: Iterable = (),
+    in_flight_session_ids: Sequence = (),
+    markers: Sequence = (),
+    launch_kwargs: Optional[Mapping] = None,
+    stop_kwargs: Optional[Mapping] = None,
+    ledger: Optional[AllowanceLedger] = None,
+    while_running: Optional[Callable] = None,
+) -> InvocationOutcome:
+    """One gated launch of exactly one executor- or reviewer-role session, then stopped.
+
+    Raises `InvocationRefused` before anything is enacted when any gate fails, and
+    lets a lifecycle failure propagate unchanged: a failed invocation is not
+    retried, resumed, or terminalized without proof. Every accepted rule below this
+    call -- reservation order, the commit-point ceiling, the readiness handshake,
+    the ownership record, the stop that proves the process group gone -- is reached
+    exactly as the accepted path reaches it, because this calls the same functions
+    with the same arguments and adds none of its own.
+
+    `while_running` is the one instant at which this session is live and provable,
+    offered to the caller and nothing else, on exactly the accepted terms: it is
+    given the `LaunchOutcome`, asked for nothing back, and if it raises, the session
+    is stopped and the failure propagates rather than being swallowed.
+
+    Accounting mirrors the accepted invocation exactly. A door that spent real
+    provider budget without the accounting the other door has would be a worse door,
+    not a smaller one.
+
+    This function stops what it started before it returns, and that has not changed.
+    What changed at checkpoint 74 is that it no longer *refuses* when the registry
+    already holds someone else's session, because refusing that was the thing
+    standing between this package and a concurrent driver. The single-session shape
+    of this call is now a property of this function alone rather than a rule it
+    imposed on every caller of the module.
+    """
+    opened = open_role_session(
+        snapshot,
+        packet,
+        observation,
+        store=store,
+        registry=registry,
+        reference=reference,
+        request_kwargs=request_kwargs,
+        package_root=package_root,
+        slots=slots,
+        bindings=bindings,
+        in_flight_session_ids=in_flight_session_ids,
+        markers=markers,
+        launch_kwargs=launch_kwargs,
+        stop_kwargs=stop_kwargs,
+        ledger=ledger,
+    )
+    assignment = opened.assignment
+    launched = opened.launched
 
     if while_running is not None:
         try:

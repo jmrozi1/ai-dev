@@ -1,4 +1,4 @@
-"""`role_invocation` starts executor- and reviewer-role sessions, one at a time, or refuses."""
+"""`role_invocation` starts executor- and reviewer-role sessions, or refuses."""
 
 from __future__ import annotations
 
@@ -25,10 +25,10 @@ from ai_dev_flow.role_invocation import (
     REASON_RAIL_ROLE,
     REASON_RAIL_UNRECONCILED,
     REASON_ROLE_NOT_LAUNCHABLE,
-    REASON_SESSION_ALREADY_LIVE,
     RolePacket,
     build_role_packet,
     invoke_role,
+    open_role_session,
 )
 from ai_dev_flow.session_binding import (
     BINDING_STATE_RESERVED,
@@ -347,6 +347,39 @@ class RoleInvocationTestBase(unittest.TestCase):
         outcome = invoke_role(snapshot, packet, observation, **arguments)
         return outcome, recorded
 
+    def _open(self, *, role=EXECUTOR, rail=None, snapshot=None, observation=None,
+              slots=None, registry=None, store=None, sent=None, seen=None,
+              stopped=None, **overrides):
+        """The same call as `_invoke`, admitted through the door that does not stop.
+
+        Deliberately identical in every argument, so a difference between what
+        `invoke_role` admits and what `open_role_session` admits would show up as a
+        test disagreeing with itself rather than as two suites agreeing separately.
+        """
+        rail = rail if rail is not None else (
+            EXECUTOR_RAIL if role == EXECUTOR else REVIEWER_RAIL
+        )
+        snapshot = snapshot if snapshot is not None else self._snapshot()
+        observation = observation if observation is not None else self._observation()
+        start, _worker = self._starter(seen=seen)
+        send, _recorded = self._sender(sent=sent)
+        registry = registry if registry is not None else self.registry
+        store = store if store is not None else self.store
+        arguments = dict(
+            store=store,
+            registry=registry,
+            reference=self.reference,
+            request_kwargs=self._request_kwargs(role),
+            package_root=self.repo_root,
+            slots=slots if slots is not None else self._slots(),
+            bindings=store.records(),
+            launch_kwargs={"start": start, "send": send},
+            stop_kwargs=dict(zip(("stop", "alive"), self._stopper(seen=stopped))),
+        )
+        arguments.update(overrides)
+        packet = build_role_packet(snapshot, rail=rail, role=role)
+        return open_role_session(snapshot, packet, observation, **arguments)
+
 
 class RoleLaunchTests(RoleInvocationTestBase):
     """The capability: a session really is started, in the role it was authorized for."""
@@ -496,8 +529,14 @@ class OrchestratorIsRefusedTests(RoleInvocationTestBase):
         self.assertEqual(set(role_invocation.DIRECTIVES), set(LAUNCHABLE_ROLES))
 
 
-class SequentialOnlyTests(RoleInvocationTestBase):
-    """One managed session at a time, refused by the door rather than trusted."""
+class ConcurrencyIsNoLongerRefusedTests(RoleInvocationTestBase):
+    """Checkpoint 74 deleted `_require_sequential`, and this is what that means.
+
+    The deletion is asserted in both directions: the refusal is really gone, so a
+    second session can be opened into a registry that already holds one; and nothing
+    else that stood beside it moved, so `invoke_role` still stops the session it
+    started before it returns.
+    """
 
     def _owned_stub(self, session_id):
         from ai_dev_flow.session_lifecycle import OwnedSession
@@ -514,60 +553,108 @@ class SequentialOnlyTests(RoleInvocationTestBase):
             role=EXECUTOR,
         )
 
-    def test_a_controller_already_holding_a_session_is_refused(self):
-        """The second launch never happens, and nothing of it is written down.
+    def test_the_sequential_refusal_and_its_reason_are_gone(self):
+        """A deliberate deletion, asserted by name so it cannot come back by accident.
 
-        The registry is put into the state a concurrent driver would put it in --
-        one live handle still held -- and the door refuses before the predicate,
-        before any reservation, and before any process could exist.
+        Checkpoint 73 put `_require_sequential` at the door and wrote that whatever
+        built concurrency had to remove it deliberately. This is that removal, pinned:
+        neither the gate nor its reason exists, and the module text no longer contains
+        the refusal string a caller might still be catching.
+        """
+        self.assertFalse(hasattr(role_invocation, "_require_sequential"))
+        self.assertFalse(hasattr(role_invocation, "REASON_SESSION_ALREADY_LIVE"))
+        self.assertNotIn("REASON_SESSION_ALREADY_LIVE", role_invocation.__all__)
+
+    def test_a_second_session_opens_into_a_registry_that_already_holds_one(self):
+        """The capability, at the door: two live handles in one controller's registry.
+
+        This is precisely the call checkpoint 73 refused. Nothing else about it
+        changed -- same registry, same store, same predicate, same rails -- so the
+        difference between then and now is exactly the deleted refusal.
         """
         registry = SessionRegistry()
         registry.add(self._owned_stub("11111111-0000-4000-8000-00000000aaaa"))
-        with self.assertRaises(InvocationRefused) as caught:
-            self._invoke(role=REVIEWER, registry=registry)
-        self.assertEqual(caught.exception.reason, REASON_SESSION_ALREADY_LIVE)
+        opened = self._open(role=REVIEWER, registry=registry)
+
+        self.assertEqual(opened.assignment.role, REVIEWER)
+        self.assertEqual(len(registry.sessions()), 2)
+        self.assertIn(
+            opened.launched.binding.session_id,
+            [owned.session_id for owned in registry.sessions()],
+        )
+
+    def test_an_opened_session_is_handed_back_still_running(self):
+        """`open_role_session` stops nothing: the binding is bound and still owned."""
+        stopped = []
+        registry = SessionRegistry()
+        opened = self._open(role=EXECUTOR, registry=registry, stopped=stopped)
+
+        self.assertEqual(opened.launched.binding.state, "bound")
+        self.assertEqual(stopped, [])
+        self.assertEqual(len(registry.sessions()), 1)
+        record = self.store.read(opened.launched.binding.session_id)
+        self.assertEqual(record.state, "bound")
+
+    def test_invoke_role_still_stops_the_session_it_started(self):
+        """The single-session shape of `invoke_role` is now local, and it still holds."""
+        registry = SessionRegistry()
+        outcome, _sent = self._invoke(role=EXECUTOR, registry=registry)
+        self.assertEqual(registry.sessions(), [])
+        self.assertEqual(outcome.binding_state, "unbound")
+        self.assertTrue(outcome.process_group_gone)
+
+    def test_the_gates_that_did_not_move_still_refuse_on_the_open_path(self):
+        """Every other gate is reached by the factored-out admission, not just by `invoke_role`.
+
+        A second admission path with its own copy of these checks would be two
+        policies free to drift, and the one that drifts is the one that admits more.
+        `open_role_session` is the admission and `invoke_role` calls it, so there is
+        one.
+        """
+        with self.assertRaises(InvocationRefused) as role_mismatch:
+            self._open(role=REVIEWER, rail=EXECUTOR_RAIL)
+        self.assertEqual(role_mismatch.exception.reason, REASON_RAIL_ROLE)
+
+        with self.assertRaises(InvocationRefused) as not_running:
+            self._open(role=EXECUTOR, snapshot=self._snapshot(executor_status="paused"))
+        self.assertEqual(not_running.exception.reason, REASON_RAIL_NOT_RUNNING)
+
+        with self.assertRaises(InvocationRefused) as ceiling:
+            self._open(
+                role=EXECUTOR,
+                slots=self._slots(
+                    occupants=tuple("0000000{0}".format(index) for index in range(6))
+                ),
+            )
+        self.assertEqual(ceiling.exception.reason, "not-authorized")
+        self.assertIn("concurrency-ceiling-reached", str(ceiling.exception))
         self.assertEqual(self.store.records(), [])
 
-    def test_the_same_call_with_an_empty_registry_is_admitted(self):
-        """The discriminating half: the refusal is the registry's doing, nothing else.
-
-        Every other argument is identical to the refused call above. Only the
-        registry differs, so the fixture cannot pass by refusing everything.
-        """
-        outcome, _sent = self._invoke(role=REVIEWER, registry=SessionRegistry())
-        self.assertEqual(outcome.role, REVIEWER)
-
-    def test_the_refusal_reads_the_registry_it_would_launch_into(self):
-        """Not a parameter: a caller cannot answer this question for the door.
-
-        `in_flight_session_ids` and `bindings` are caller-stated and say nothing
-        here; the held handle is read from the registry `launch_session` would
-        actually add to.
-        """
-        registry = SessionRegistry()
-        registry.add(self._owned_stub("22222222-0000-4000-8000-00000000bbbb"))
+    def test_the_orchestrator_role_is_still_refused_by_name_on_the_open_path(self):
+        packet = build_role_packet(self._snapshot(), rail=EXECUTOR_RAIL, role=EXECUTOR)
+        object.__setattr__(packet, "role", ORCHESTRATOR)
         with self.assertRaises(InvocationRefused) as caught:
-            self._invoke(
-                role=EXECUTOR,
-                registry=registry,
-                bindings=(),
-                in_flight_session_ids=(),
+            open_role_session(
+                self._snapshot(),
+                packet,
+                self._observation(),
+                store=self.store,
+                registry=self.registry,
+                reference=self.reference,
+                request_kwargs=self._request_kwargs(EXECUTOR),
+                package_root=self.repo_root,
+                slots=self._slots(),
             )
-        self.assertEqual(caught.exception.reason, REASON_SESSION_ALREADY_LIVE)
-        self.assertIn("22222222", str(caught.exception))
+        self.assertEqual(caught.exception.reason, REASON_ROLE_NOT_LAUNCHABLE)
+        self.assertEqual(self.store.records(), [])
 
-    def test_a_launch_leaves_the_registry_empty_so_the_next_one_is_possible(self):
-        """Sequential means the door closes behind itself, not that it opens once."""
-        registry = SessionRegistry()
-        first, _a = self._invoke(role=EXECUTOR, registry=registry)
-        self.assertEqual(registry.sessions(), [])
-        second, _b = self._invoke(role=REVIEWER, registry=registry)
-        self.assertEqual(registry.sessions(), [])
-        self.assertNotEqual(first.session_id, second.session_id)
-        self.assertEqual((first.role, second.role), (EXECUTOR, REVIEWER))
+    def test_the_sequential_entry_point_is_still_sequential(self):
+        """`role_dispatch` did not become a driver when the door stopped refusing.
 
-    def test_nothing_in_the_new_modules_can_hold_two_sessions_at_once(self):
-        """Structural: no thread, no pool, no scheduler, no loop over launches."""
+        Its single-session property is now local to it -- one enactment, no loop, no
+        thread -- rather than a rule the module below it imposed on every caller, and
+        it is pinned here because nothing else enforces it any more.
+        """
         import ai_dev_flow
 
         package = Path(ai_dev_flow.__file__).parent
@@ -579,13 +666,14 @@ class SequentialOnlyTests(RoleInvocationTestBase):
             "Thread(",
             "Pool(",
         )
-        for name in ("role_invocation.py", "role_dispatch.py"):
+        for name in ("role_invocation.py", "role_dispatch.py", "role_driver.py",
+                     "role_driver_dispatch.py"):
             text = (package / name).read_text(encoding="utf-8")
             for token in forbidden:
                 self.assertNotIn(token, text, "{0} mentions {1}".format(name, token))
-        # Exactly one enactment per process, and exactly one door behind it.
         entry = (package / "role_dispatch.py").read_text(encoding="utf-8")
         self.assertEqual(entry.count("dispatch_role("), 1)
+        self.assertNotIn("open_role", entry)
         body = entry.split("def main(", 1)[1]
         code = [
             line for line in body.splitlines()

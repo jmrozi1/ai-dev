@@ -29,11 +29,18 @@ from __future__ import annotations
 # not a limitation this module works around -- it is why one process runs one role.
 # Running an executor and then a reviewer is two runs of this program, one after the
 # other, and there is deliberately no way to ask it for both: a process that could
-# hold a second role's session would be the concurrent driver, which is the next
-# slice and is not authorized here. There is no loop, no pool, no thread, no
-# scheduler, and no queue in this file; `invoke_role` additionally refuses to start
-# anything while the controller already holds a session, so the property is enforced
-# a second time by the door itself rather than only by this file's shape.
+# hold a second role's session is the concurrent driver, and that is a different
+# entry point -- `role_driver_dispatch` -- rather than a mode of this one. There is
+# no loop, no pool, no thread, no scheduler, and no queue in this file, and
+# `invoke_role` still stops the session it started before it returns.
+#
+# Checkpoint 74 removed the door-level refusal that used to enforce this a second
+# time (`role_invocation._require_sequential`, `session-already-live`). This file's
+# single-session shape is therefore now its own -- one `dispatch_role` call, no loop
+# -- and no longer a rule the module below it imposed on every caller. Nothing about
+# what this program does changed with that removal; what changed is that the
+# guarantee is local rather than global, which is stated here so a reader is not
+# looking for a refusal that no longer exists.
 #
 # No page is served, and that is a deliberate trade rather than an oversight.
 # `manager_dispatch` serves one because its whole point was that a live occupancy be

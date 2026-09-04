@@ -96,7 +96,7 @@ from .decision_manager_web import serve_forever
 from .decision_queue import QueueView, SelectedDetail
 from .orchestrator_invocation import InvocationOutcome, invoke_orchestrator
 from .queue_source import QueueScope, QueueSourceError
-from .role_invocation import invoke_role
+from .role_invocation import OpenSession, invoke_role, open_role_session
 from .session_binding import BindingRecord, BindingStore
 from .session_lifecycle import (
     REASON_ROTATION_REQUIRES_RETIREMENT,
@@ -482,6 +482,44 @@ class ManagerController:
         """
         records = self.store.records()
         return invoke_role(
+            snapshot,
+            packet,
+            observation,
+            store=self.store,
+            registry=self.registry,
+            slots=self.occupancy(records, alive=alive),
+            bindings=records,
+            in_flight_session_ids=self.registry.in_flight(),
+            **kwargs
+        )
+
+    def open_role(
+        self,
+        snapshot,
+        packet,
+        observation,
+        *,
+        alive: Optional[Callable] = None,
+        **kwargs: Any
+    ) -> OpenSession:
+        """One gated role launch that is handed back still running, not stopped.
+
+        The same pass-through as `dispatch_role`, onto the same door, differing in
+        exactly one respect: the session is returned live, so the caller can hold it
+        while it admits the next one. That is what makes occupancy grow between
+        admissions instead of returning to zero, and it is why a driver built on this
+        cannot admit a seventh agent: the sixth is still in this controller's store
+        and this controller's registry when the seventh is reconciled.
+
+        The store is read once here and the same records reach both the reduction and
+        the predicate, so a launch cannot be admitted against one reading of the store
+        while the ceiling was checked against another.
+
+        This method adds no gate, no count and no policy of its own, and it does not
+        stop anything. Teardown of what it opened is `stop`, and it is the caller's.
+        """
+        records = self.store.records()
+        return open_role_session(
             snapshot,
             packet,
             observation,
