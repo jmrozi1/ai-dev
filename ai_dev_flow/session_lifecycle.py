@@ -2938,10 +2938,14 @@ def replace_old_context(
 CONTINUATION_CONTINUED = "continuation-continued"
 CONTINUATION_REFUSED = "continuation-refused"
 CONTINUATION_FAILED = "continuation-failed"
+CONTINUATION_BRIEF_UNREACHABLE = "continuation-brief-unreachable"
+CONTINUATION_UNENFORCEABLE = "continuation-unenforceable"
 CONTINUATION_STATES = (
     CONTINUATION_CONTINUED,
     CONTINUATION_REFUSED,
     CONTINUATION_FAILED,
+    CONTINUATION_BRIEF_UNREACHABLE,
+    CONTINUATION_UNENFORCEABLE,
 )
 
 REASON_CONTINUATION_CONTINUED = "continuation-continued"
@@ -2949,6 +2953,60 @@ REASON_CONTINUATION_BINDING_MISSING = "continuation-binding-missing"
 REASON_CONTINUATION_CLAIMS_TERMINAL = "continuation-claims-a-terminal-binding"
 REASON_CONTINUATION_NOT_AUTHORIZED = "continuation-not-authorized"
 REASON_CONTINUATION_INVOCATION_FAILED = "continuation-invocation-failed"
+REASON_CONTINUATION_BRIEF_UNREACHABLE = "continuation-brief-reported-unreachable"
+REASON_CONTINUATION_REPORT_UNSCORED = "continuation-reachability-report-unscored"
+
+# The one string the replacement is asked to emit, and the whole of the accepted
+# checkpoint-71 deployment condition 4 expressed in code.
+#
+# THE POLARITY IS THE DESIGN, and it is chosen against the obvious alternative.
+# The marker literal must appear in the brief the replacement is handed -- it
+# cannot emit a word it was never given -- and the worker scans the *reply*, so
+# any replacement can put this string in its answer by quoting its own
+# instructions back. A marker whose presence meant SUCCESS would therefore be
+# manufacturable by a replacement that read nothing, which is exactly the false
+# green this ticket exists to refuse. A marker whose presence means FAILURE
+# inherits the same echo, and the echo lands on the safe side: the worst a quoting
+# replacement can do is have its own turn refused as a continuation. So this route
+# asks for a report of failure and never for a proof of success.
+#
+# What that buys, exactly, and no more: condition 4 is a rule about a replacement
+# that *reports* it cannot reach its brief, and D9 -- read verbatim at checkpoint
+# 71 -- places its obligations on the manager and does not require proving the
+# replacement comprehended anything. This enforces the reported case. A
+# replacement that silently ignores its brief is not caught here, and no state
+# below claims it is.
+CONTINUATION_UNREACHABLE_MARKER = "AI-DEV-BRIEF-UNREACHABLE"
+
+
+def _reachability_report(result: Optional[Mapping]) -> Optional[bool]:
+    """Did the replacement report it could not reach its brief -- or is that unknown?
+
+    Three answers, because there are three different facts and collapsing any two
+    of them would produce a report that overstates what is known.
+
+    `True`  -- the scored channel says the replacement emitted the marker.
+    `False` -- the scored channel says it did not.
+    `None`  -- the channel returned no score for the marker at all, so nothing
+               about reachability was established on this invocation.
+
+    `None` is deliberately not folded into `False`. This route puts the marker on
+    *every* invocation it makes, so a result carrying no entry for it did not come
+    back from a send route that honoured the channel, and the check this route
+    exists to perform did not run. Reporting a continuation there would be
+    reporting a green whose one check was silently skipped and left no trace --
+    precisely the failure mode recorded against the checkpoint-71 harness. It is
+    also cleanly distinguishable from the unrelated-failure case it must not be
+    confused with: an invocation that failed *raises*, and is reported as
+    `continuation-failed` before this is ever consulted. This only sees a turn
+    that returned.
+    """
+    if not isinstance(result, Mapping):
+        return None
+    scores = result.get("markers")
+    if not isinstance(scores, Mapping) or CONTINUATION_UNREACHABLE_MARKER not in scores:
+        return None
+    return bool(scores[CONTINUATION_UNREACHABLE_MARKER])
 
 
 @dataclass(frozen=True)
@@ -3008,6 +3066,13 @@ class ContinuationBrief:
         workspace, and it deliberately carries no summary, no next action and no
         outcome -- those live in the published handoff, which is the single carrier
         of what the work says, and the replacement reads them there.
+
+        One further sentence, and it is the only one that is not a locator: what to
+        say if the handoff named here cannot be read at all. That is not a summary,
+        a next action or an outcome -- it is the protocol for reporting that this
+        brief did not arrive, which is the accepted checkpoint-71 deployment
+        condition 4 and is scored by `_reachability_report`. It is stated in the
+        brief because a replacement cannot emit a word it was never given.
         """
         return (
             "You are the replacement {role} on rail {rail} in {project}/{ticket}, "
@@ -3017,7 +3082,11 @@ class ContinuationBrief:
             "{handoff}, which is publication {publication}. Your workspace is "
             "{workspace} (worktree {worktree}) and it stands at {head}. Continue "
             "the unresolved work and the exact next action those artifacts state, "
-            "and nothing else.".format(
+            "and nothing else. If you cannot read the handoff at {handoff} -- it is "
+            "outside your workspace, no granted tool reaches it, or it is not there "
+            "-- then do not continue anything: reply with the exact text {marker}, "
+            "say what you tried, and stop.".format(
+                marker=CONTINUATION_UNREACHABLE_MARKER,
                 role=self.role,
                 rail=self.rail,
                 project=self.project,
@@ -3234,6 +3303,16 @@ def continue_from_durable_state(
     owned and continuable and degraded the observation its stop category is read
     from, so the session survives truthfully and this says what the manager does
     next. Nothing is launched, bound, reserved or stopped on any path here.
+
+    A turn that *returned* is not thereby a continuation. The accepted
+    checkpoint-71 deployment condition 4 -- a replacement reporting it cannot reach
+    its brief is not to be treated as having continued, notwithstanding the
+    reported state -- is applied here rather than left as an operational rule, and
+    it is the only thing that separates the three post-invocation states below:
+    `continuation-brief-unreachable` when the replacement said so on the channel it
+    was asked to say it on, `continuation-unenforceable` when that channel returned
+    no answer at all, and `continuation-continued` when it answered that no such
+    report was made. The last of those is now no stronger than that, and says so.
     """
     # Fact one, read here: which durable binding this session actually has, now.
     record = store.read(session_id)
@@ -3326,6 +3405,10 @@ def continue_from_durable_state(
         )
     _require_decision(decision, assignment, action=ACTION_CONTINUE)
 
+    scored_markers = (CONTINUATION_UNREACHABLE_MARKER,) + tuple(
+        marker for marker in markers if marker != CONTINUATION_UNREACHABLE_MARKER
+    )
+
     try:
         result = continue_session(
             decision,
@@ -3335,7 +3418,12 @@ def continue_from_durable_state(
             session_id=session_id,
             request_kwargs=request_kwargs,
             prompt=brief.prompt,
-            markers=markers,
+            # The enforcement marker is added by this route and cannot be taken
+            # away by a caller: it is prepended to whatever was asked for, and a
+            # caller naming it again does not get to score it twice. Same
+            # discipline as the six facts above -- what this route decides on is
+            # obtained here, not handed in.
+            markers=scored_markers,
             send=send,
             alive=alive,
             command_timeout=command_timeout,
@@ -3377,16 +3465,82 @@ def continue_from_durable_state(
                 "stop owes a person.".format(session_id, brief.handoff_location)
             ),
         )
+    # The invocation returned. That alone is what `continuation-continued` used to
+    # mean, and it is strictly less than the sentence it printed. The accepted
+    # checkpoint-71 deployment condition 4 is applied here, on the one turn it can
+    # be applied to, before any of the three states below is chosen.
+    reported_unreachable = _reachability_report(result)
+    if reported_unreachable is None:
+        return Continuation(
+            session_id=session_id,
+            rail=record.rail,
+            state=CONTINUATION_UNENFORCEABLE,
+            reason=REASON_CONTINUATION_REPORT_UNSCORED,
+            detail=(
+                "the continuation of session {0} on rail {1} returned a result that "
+                "carries no score for {2}, which this route asks for on every "
+                "invocation it makes. So whether the replacement could reach the "
+                "handoff publication {3} at {4} was never established, and this "
+                "route does not report a continuation whose one check did not run. "
+                "The session is left bound, owned and continuable; nothing was "
+                "launched, bound, reserved or stopped.".format(
+                    session_id, record.rail, CONTINUATION_UNREACHABLE_MARKER,
+                    brief.handoff_publication, brief.handoff_location,
+                )
+            ),
+            brief=brief,
+            result=result,
+            next_action=(
+                "continue session {0} through a send route that scores the markers "
+                "it is given -- the shipped worker returns a score for every one -- "
+                "so the deployment condition can be evaluated at all. Do not credit "
+                "this turn as continued work.".format(session_id)
+            ),
+        )
+    if reported_unreachable:
+        return Continuation(
+            session_id=session_id,
+            rail=record.rail,
+            state=CONTINUATION_BRIEF_UNREACHABLE,
+            reason=REASON_CONTINUATION_BRIEF_UNREACHABLE,
+            detail=(
+                "session {0} on rail {1} reported that it could not reach its "
+                "brief: the invocation returned, and the reply carried {2}, which "
+                "the brief instructs it to emit only when the handoff publication "
+                "{3} at {4} cannot be read. Under the accepted checkpoint-71 "
+                "deployment condition this is NOT a continuation, notwithstanding "
+                "the invocation having completed. The session is left bound, owned "
+                "and continuable; nothing was launched, bound, reserved or "
+                "stopped.".format(
+                    session_id, record.rail, CONTINUATION_UNREACHABLE_MARKER,
+                    brief.handoff_publication, brief.handoff_location,
+                )
+            ),
+            brief=brief,
+            result=result,
+            next_action=(
+                "put {0} inside the replacement's tool root, at or ahead of "
+                "publication {1}, with a granted read route to it, then continue "
+                "session {2} again from that same durable handoff. Do not credit "
+                "this turn as continued work.".format(
+                    brief.handoff_location, brief.handoff_publication, session_id
+                )
+            ),
+        )
     return Continuation(
         session_id=session_id,
         rail=record.rail,
         state=CONTINUATION_CONTINUED,
         reason=REASON_CONTINUATION_CONTINUED,
         detail=(
-            "session {0} continued the work of rail {1} from durable state alone: "
+            "session {0} was continued on rail {1} against durable state alone: "
             "the rail authorization at iteration {2} and handoff publication {3} at "
             "{4}, in workspace {5} standing at {6}. No transcript of the predecessor "
-            "was read, held, or required.".format(
+            "was read, held, or required, and the replacement did not report the "
+            "brief unreachable on the channel it was asked to report it on. That is "
+            "the whole of what is established: this route does not establish that "
+            "the replacement read or understood the handoff, only that it did not "
+            "say it could not reach it.".format(
                 session_id, record.rail, brief.iteration_blob,
                 brief.handoff_publication, brief.handoff_location,
                 brief.workspace_path, brief.worktree_head,

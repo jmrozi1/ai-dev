@@ -100,6 +100,40 @@ NEXT_PRODUCT_HEAD = "2" * 40
 _UNSET = object()
 
 
+# What a replacement that read its brief and got on with the work actually says.
+# Ordinary prose on purpose: it contains no marker, and it did not have to be
+# written to avoid one.
+REPLACEMENT_WORK_REPLY = (
+    "Read the rail authorization and the published handoff, resumed the "
+    "unresolved work, and did the exact next action they state."
+)
+# What the checkpoint-71 run B replacement said, in substance -- it could not
+# reach the handoff, and it said so loudly and diagnosably -- plus the one word
+# the brief now asks it for, which is the whole difference this slice makes.
+REPLACEMENT_UNREACHABLE_REPLY = (
+    "I cannot read that handoff. It is outside my workspace and none of my tools "
+    "reach it; every read I tried was rooted at my working directory. "
+    "{0}".format(session_lifecycle.CONTINUATION_UNREACHABLE_MARKER)
+)
+
+
+def _score_markers(markers, *texts):
+    """Score markers exactly the way the shipped worker scores them.
+
+    Deliberately not a re-implementation. `claude_worker._scan_markers` is the
+    function the real worker runs over each reply text block and over the terminal
+    result text, and it is the function called here -- so a fixture built on this
+    cannot agree with the product about scanning while the product's real scanner
+    does something else.
+    """
+    seen = {}
+    wanted = list(markers)
+    for text in texts:
+        if isinstance(text, str):
+            claude_worker._scan_markers(text, wanted, seen)
+    return {marker: bool(seen.get(marker)) for marker in wanted}
+
+
 class _PublishedHandoff(object):
     """The caller's control-plane read of which handoff publication currently stands.
 
@@ -265,7 +299,13 @@ class LifecycleTestBase(unittest.TestCase):
             if fail is not None:
                 raise fail
             payload = {"type": "result", "session_id": request.session_id,
-                       "mode": request.mode, "subtype": "success", "is_error": False}
+                       "mode": request.mode, "subtype": "success", "is_error": False,
+                       # The shipped worker returns a score for every marker it was
+                       # handed. This is a stub about *provider behaviour*; it is
+                       # not licensed to also drop a protocol field, because a
+                       # sender that answers less than the worker does is a sender
+                       # no marker-based check could ever fail.
+                       "markers": _score_markers(markers, REPLACEMENT_WORK_REPLY)}
             if results:
                 payload.update(results)
             return payload
@@ -5283,19 +5323,32 @@ class ContinuationFromDurableStateTests(ReplacementHarness):
 
     # -- the world these cases observe ----------------------------------------
 
-    def _continuation_sender(self, fail=None):
-        """One resumed invocation of the successor. Records exactly what it was told."""
+    def _continuation_sender(self, fail=None, reply=REPLACEMENT_WORK_REPLY,
+                             score_markers=True):
+        """One resumed invocation of the successor. Records exactly what it was told.
+
+        It also *answers as the worker answers*: the markers it was handed are
+        scored against what the replacement said, through the shipped scanner. A
+        sender that skipped that would be a sender no marker-based check could
+        ever fail, which is the shape of fixture this ticket has been bitten by.
+        `score_markers=False` is the old shape, kept only so the case that a
+        channel returning nothing is not a green can be written at all.
+        """
         def send(handle, request, *, prompt, markers=(), timeout=None):
             self.sent.append(
-                {"session_id": request.session_id, "mode": request.mode, "prompt": prompt}
+                {"session_id": request.session_id, "mode": request.mode,
+                 "prompt": prompt, "markers": tuple(markers)}
             )
             if fail is not None:
                 raise fail
-            return {
+            result = {
                 "type": "result", "session_id": request.session_id,
                 "mode": request.mode, "subtype": "success", "is_error": False,
                 "terminal_payload": None,
             }
+            if score_markers:
+                result["markers"] = _score_markers(markers, reply)
+            return result
         return send
 
     def _swap(self):
@@ -5922,12 +5975,15 @@ class ContinuationFromDurableStateTests(ReplacementHarness):
         self._swap()
         published = _PublishedHandoff()
 
+        payload = self._envelope(NEXT_PUBLICATION)
+
         def send(handle, request, *, prompt, markers=(), timeout=None):
             self.sent.append({"session_id": request.session_id, "prompt": prompt})
             return {
                 "type": "result", "session_id": request.session_id,
                 "mode": request.mode, "subtype": "success", "is_error": False,
-                "terminal_payload": self._envelope(NEXT_PUBLICATION),
+                "markers": _score_markers(markers, REPLACEMENT_WORK_REPLY, payload),
+                "terminal_payload": payload,
             }
 
         outcome = self._continue(
@@ -5943,6 +5999,236 @@ class ContinuationFromDurableStateTests(ReplacementHarness):
         self.assertEqual(published.value, NEXT_PUBLICATION)
         source = inspect.getsource(session_lifecycle.continue_from_durable_state)
         self.assertEqual(source.count("finalize_terminal_handoff"), 0)
+
+    # -- H. the checkpoint-71 deployment condition 4, in code -----------------
+    #
+    # The accepted limit: `ContinuationBrief` names a control-plane location the
+    # replacement is not guaranteed to be able to READ, and at checkpoint 71 a
+    # successor that genuinely could not reach its handoff said so plainly and the
+    # route still reported `continuation-continued`. Condition 4 says such a
+    # replacement is NOT to be treated as having continued, notwithstanding the
+    # reported state. These cases are that rule, and its limits.
+
+    def test_case_h_a_replacement_that_reports_it_cannot_reach_its_brief_did_not_continue(
+        self,
+    ) -> None:
+        """The one this slice exists for: checkpoint 71's run B, caught.
+
+        The sender scores what the replacement said through the shipped scanner,
+        so the outcome below turns on the reply text and on nothing this fixture
+        decided for itself.
+        """
+        self._swap()
+        outcome = self._continue(
+            send=self._continuation_sender(reply=REPLACEMENT_UNREACHABLE_REPLY)
+        )
+
+        self.assertFalse(outcome.continued)
+        self.assertEqual(
+            outcome.state, session_lifecycle.CONTINUATION_BRIEF_UNREACHABLE
+        )
+        self.assertEqual(
+            outcome.reason, session_lifecycle.REASON_CONTINUATION_BRIEF_UNREACHABLE
+        )
+        # The invocation itself returned. That is exactly the thing condition 4
+        # says must not be read as a continuation.
+        self.assertEqual([entry["session_id"] for entry in self.sent], [SUCCESSOR])
+        self.assertIsNotNone(outcome.result)
+        self.assertTrue(
+            outcome.result["markers"][session_lifecycle.CONTINUATION_UNREACHABLE_MARKER]
+        )
+        # And the report says where to look and what to do, not merely that
+        # something went wrong.
+        self.assertIn(self.HANDOFF, outcome.detail)
+        self.assertIn(PUBLICATION, outcome.next_action)
+        # Nothing was launched or stopped, and the session survives continuable.
+        self.assertEqual(self.store.read(SUCCESSOR).state, BINDING_STATE_BOUND)
+        self.assertFalse(self.store.read(SUCCESSOR).is_terminal)
+
+    def test_case_h_a_replacement_that_did_read_its_brief_still_continues(self) -> None:
+        """The negative control, on the same fixture and the same route.
+
+        Ordinary work prose, no marker, and the outcome is a continuation. Without
+        this the case above would be satisfied by a route that refused everything.
+        """
+        self._swap()
+        outcome = self._continue(
+            send=self._continuation_sender(reply=REPLACEMENT_WORK_REPLY)
+        )
+
+        self.assertTrue(outcome.continued)
+        self.assertEqual(outcome.state, session_lifecycle.CONTINUATION_CONTINUED)
+        self.assertFalse(
+            outcome.result["markers"][session_lifecycle.CONTINUATION_UNREACHABLE_MARKER]
+        )
+
+    def test_case_h_the_fixture_itself_discriminates_and_here_is_the_proof(self) -> None:
+        """The fixture, not the product, put under test.
+
+        This ticket has recorded three cases of a name outliving what its code
+        checks, and a fixture that scored the same either way would make the two
+        cases above agree with any product at all. So: ONE sender construction,
+        TWO replies, and the marker score, the state and the `continued` verdict
+        all move together. The scoring is the shipped `_scan_markers`, reached
+        through `_score_markers`, so this cannot pass while the real worker's scan
+        does something else.
+        """
+        markers = (session_lifecycle.CONTINUATION_UNREACHABLE_MARKER,)
+        self.assertEqual(
+            _score_markers(markers, REPLACEMENT_WORK_REPLY),
+            {session_lifecycle.CONTINUATION_UNREACHABLE_MARKER: False},
+        )
+        self.assertEqual(
+            _score_markers(markers, REPLACEMENT_UNREACHABLE_REPLY),
+            {session_lifecycle.CONTINUATION_UNREACHABLE_MARKER: True},
+        )
+        # The scorer really is the worker's, not a copy of it.
+        self.assertIs(
+            inspect.unwrap(claude_worker._scan_markers), claude_worker._scan_markers
+        )
+        self.assertIn("_scan_markers", inspect.getsource(_score_markers))
+        # And the same construction, driven end to end over one bound successor,
+        # lands on opposite states for the two replies.
+        self._swap()
+        states = [
+            self._continue(send=self._continuation_sender(reply=reply)).state
+            for reply in (REPLACEMENT_WORK_REPLY, REPLACEMENT_UNREACHABLE_REPLY)
+        ]
+        self.assertEqual(
+            states,
+            [session_lifecycle.CONTINUATION_CONTINUED,
+             session_lifecycle.CONTINUATION_BRIEF_UNREACHABLE],
+        )
+
+    def test_case_h_a_channel_that_scores_nothing_is_not_a_continuation(self) -> None:
+        """The judgement about the failure mode, made explicit rather than defaulted.
+
+        A result carrying no score for the marker is not a replacement that stayed
+        silent; it is a send route that did not honour a channel this route puts on
+        every invocation. The check did not run, so no continuation is reported --
+        and this is a THIRD state, because saying the replacement reported
+        something it may not have reported would be its own overstatement.
+
+        It is cleanly distinguishable from an unrelated failure: that path raises
+        and is reported `continuation-failed`, asserted here beside it.
+        """
+        self._swap()
+        outcome = self._continue(send=self._continuation_sender(score_markers=False))
+
+        self.assertFalse(outcome.continued)
+        self.assertEqual(outcome.state, session_lifecycle.CONTINUATION_UNENFORCEABLE)
+        self.assertEqual(
+            outcome.reason, session_lifecycle.REASON_CONTINUATION_REPORT_UNSCORED
+        )
+        self.assertNotEqual(
+            outcome.state, session_lifecycle.CONTINUATION_BRIEF_UNREACHABLE
+        )
+        # The unrelated-failure case, on the same bound successor, is a different
+        # state entirely -- which is what "distinguishable" has to mean.
+        failed = self._continue(
+            send=self._continuation_sender(
+                fail=ClaudeRuntimeError("provider-transport-failed", "channel closed")
+            )
+        )
+        self.assertEqual(failed.state, session_lifecycle.CONTINUATION_FAILED)
+        self.assertNotEqual(failed.state, outcome.state)
+
+    def test_case_h_the_route_asks_for_the_marker_and_a_caller_cannot_take_it_away(
+        self,
+    ) -> None:
+        """The enforcement is the route's, not the caller's.
+
+        A caller that passes no markers still gets it asked for; a caller that
+        passes its own gets those too; and a caller that names it again does not
+        get it scored twice.
+        """
+        marker = session_lifecycle.CONTINUATION_UNREACHABLE_MARKER
+        self._swap()
+        cases = (
+            ((), (marker,)),
+            (("OTHER-MARKER",), (marker, "OTHER-MARKER")),
+            ((marker,), (marker,)),
+            ((marker, "OTHER-MARKER"), (marker, "OTHER-MARKER")),
+        )
+        for index, (passed, expected) in enumerate(cases):
+            self._continue(markers=passed)
+            self.assertEqual(self.sent[index]["markers"], expected, passed)
+
+    def test_case_h_the_marker_is_a_failure_report_and_cannot_manufacture_a_green(
+        self,
+    ) -> None:
+        """The polarity, argued executably, and the echo hazard stated either way.
+
+        The marker literal IS in the brief -- a replacement cannot emit a word it
+        was never given -- so it CAN be echoed. Both halves are asserted:
+
+          * a replacement that quotes its own instructions back trips the marker,
+            and is refused. That is a false NEGATIVE, and it is the direction that
+            costs a turn rather than manufacturing a continuation;
+          * there is no string a replacement can emit to make the green stronger,
+            because the route scores exactly one marker and its presence only ever
+            subtracts. A replacement that says nothing at all is green.
+
+        That second bullet is the honest limit of this slice, not a gap in it:
+        this route does not establish that the replacement read anything.
+        """
+        self._swap()
+        brief_prompt = session_lifecycle.continuation_brief(
+            self._read_rail(), self.store.read(SUCCESSOR),
+            self._read_handoff(), self._read_worktree(),
+        ).prompt
+        marker = session_lifecycle.CONTINUATION_UNREACHABLE_MARKER
+        self.assertIn(marker, brief_prompt)
+
+        # The echo, and where it lands.
+        echoed = self._continue(send=self._continuation_sender(reply=brief_prompt))
+        self.assertEqual(
+            echoed.state, session_lifecycle.CONTINUATION_BRIEF_UNREACHABLE
+        )
+        self.assertFalse(echoed.continued)
+
+        # A replacement that read nothing and said nothing is still green, and the
+        # detail sentence does not pretend otherwise.
+        silent = self._continue(send=self._continuation_sender(reply=""))
+        self.assertTrue(silent.continued)
+        self.assertIn("does not establish", silent.detail)
+        self.assertIn("did not report the brief unreachable", silent.detail)
+
+    def test_case_h_the_brief_still_carries_only_locators_and_this_one_protocol_line(
+        self,
+    ) -> None:
+        """The added sentence is a report protocol, not work content.
+
+        Checkpoint 68's property is that the brief carries no summary, no next
+        action and no outcome. The reachability line names the same handoff the
+        brief already names and one constant, and the brief is still resolvable by
+        a fresh reader holding only the three durable reads.
+        """
+        self._swap()
+        outcome = self._continue()
+        prompt = outcome.brief.prompt
+        self.assertIn(session_lifecycle.CONTINUATION_UNREACHABLE_MARKER, prompt)
+        self.assertIn(self.HANDOFF, prompt)
+        for leaked in ("Done. Handoff below.", "Stopping here.",
+                       session_lifecycle.HANDOFF_ENVELOPE_BEGIN):
+            self.assertNotIn(leaked, prompt)
+        # Rendered from the brief's own fields only: a fresh reader with the same
+        # three durable reads and no registry resolves the identical prompt.
+        store = BindingStore(self.tmp_path / "controller-state")
+        fresh = session_lifecycle.continuation_brief(
+            RailFacts(identifier=RAIL, status="running", rail_blob=BLOB),
+            store.read(SUCCESSOR),
+            RotationHandoffFacts(
+                rail=RAIL, published=True, location=self.HANDOFF,
+                publication=PUBLICATION, work_state=PRODUCT_HEAD,
+            ),
+            WorktreeFacts(
+                worktree_id=self.worktree_id, path=str(self.workspace),
+                clean=True, active_operation=None, head=PRODUCT_HEAD,
+            ),
+        )
+        self.assertEqual(fresh.prompt, prompt)
+        self.assertEqual(self.sent[0]["prompt"], prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -5994,7 +6280,8 @@ class _ProviderConversations:
     process. It is a faithful model of one rule, not the provider.
     """
 
-    def __init__(self, refuse_creation=None, terminal_payload=None) -> None:
+    def __init__(self, refuse_creation=None, terminal_payload=None,
+                 reply=REPLACEMENT_WORK_REPLY) -> None:
         from ai_dev_flow.claude_runtime import build_option_fields
 
         self._options = build_option_fields
@@ -6004,6 +6291,11 @@ class _ProviderConversations:
         self.calls = []
         self._refuse_creation = refuse_creation
         self._terminal_payload = terminal_payload
+        # What the replacement says back. The second rule this models: the worker
+        # scores the markers it was handed against this text, through the shipped
+        # scanner, so what comes back is a function of what the replacement said
+        # rather than of what the fixture felt like answering.
+        self.reply = reply
 
     def __call__(self, handle, request, *, prompt, markers=(), timeout=None):
         options = self._options(request)
@@ -6015,6 +6307,7 @@ class _ProviderConversations:
                 "session_id": options["session_id"],
                 "resume": options["resume"],
                 "prompt": prompt,
+                "markers": tuple(markers),
             }
         )
         if creating:
@@ -6038,6 +6331,9 @@ class _ProviderConversations:
         return {
             "type": "result", "session_id": identity, "mode": request.mode,
             "subtype": "success", "is_error": False,
+            "markers": _score_markers(
+                markers, self.reply, self._terminal_payload
+            ),
             "terminal_payload": self._terminal_payload,
         }
 
