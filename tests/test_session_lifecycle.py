@@ -4858,26 +4858,144 @@ class ReplacementLaunchTests(RotationHarness):
 
     # -- G. the continue_session wiring obligation ----------------------------
 
-    def _production_callers(self, name):
-        """Every call to `name` inside the shipped package, by parsing it.
+    # The rotation surface the accepted checkpoint-65 finding named as unwired:
+    # `continue_session`, `supervised_teardown`, `retire_old_context`, and the
+    # replacement route checkpoint 66 added beside them. These names are the
+    # surface itself. A definition that carries one of them -- the lifecycle
+    # route, or the controller method that re-exports it under the same name --
+    # is part of the thing being wired, not code that drives it. A call between
+    # two of them cannot make the route run while the outer one is itself
+    # undriven, which is exactly the state checkpoint 65 recorded.
+    ROTATION_SURFACE = frozenset(
+        {
+            "continue_session",
+            "supervised_teardown",
+            "retire_old_context",
+            "replace_old_context",
+        }
+    )
 
-        Counted from the syntax tree rather than from a grep, so prose that names a
-        function in a docstring or a comment is not mistaken for a call to it.
+    def _call_sites(self, root=None):
+        """Every call in the shipped package as (file, called name, container).
+
+        Parsed rather than grepped, so prose that names a function in a docstring
+        or a comment is not mistaken for a call to it. `container` is the name of
+        the nearest enclosing `def`, or `None` for a call at module scope; it is
+        what lets a caller be judged rather than merely counted.
         """
-        callers = {}
-        for path in sorted(Path(session_lifecycle.__file__).parent.glob("*.py")):
+        sites = []
+        root = Path(session_lifecycle.__file__).parent if root is None else Path(root)
+        for path in sorted(root.glob("*.py")):
             tree = ast.parse(path.read_text(encoding="utf-8"))
-            found = 0
-            for node in ast.walk(tree):
-                if not isinstance(node, ast.Call):
+
+            def visit(node, container):
+                for child in ast.iter_child_nodes(node):
+                    if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        visit(child, child.name)
+                        continue
+                    if isinstance(child, ast.Call):
+                        target = child.func
+                        identifier = (
+                            getattr(target, "id", None) or getattr(target, "attr", None)
+                        )
+                        if identifier:
+                            sites.append((path.name, identifier, container))
+                    visit(child, container)
+
+            visit(tree, None)
+        return sites
+
+    def _driven_surface(self, sites):
+        """Which rotation routes anything can actually reach, smallest set first.
+
+        A route is driven once something outside the surface calls it -- ordinary
+        production code, or module scope, which runs on import. A route called
+        only from another rotation route is driven only once that outer route is
+        itself driven. Grown from nothing rather than assumed and pared down, so a
+        route that only calls itself, or a pair that only call each other, never
+        holds itself up.
+        """
+        driven = set()
+        while True:
+            grew = False
+            for _path, called, container in sites:
+                if called not in self.ROTATION_SURFACE or called in driven:
                     continue
-                target = node.func
-                identifier = getattr(target, "id", None) or getattr(target, "attr", None)
-                if identifier == name:
-                    found += 1
-            if found:
-                callers[path.name] = found
+                if (
+                    container is None
+                    or container not in self.ROTATION_SURFACE
+                    or container in driven
+                ):
+                    driven.add(called)
+                    grew = True
+            if not grew:
+                return driven
+
+    def _production_callers(self, name, root=None):
+        """Callers that can actually cause `name` to run, by file.
+
+        The distinction this draws, and the reason it is not a plain count: a thin
+        pass-through that re-exports a route under its own name adds no way to
+        reach it. `ManagerController.supervised_teardown` forwards to the
+        lifecycle's `supervised_teardown` and nothing calls the method, so the
+        route is exactly as unreachable as it was before the method existed. A
+        plain count reports that forwarding call as a caller, which is how the
+        obligation below came to have a consequent that was true no matter what
+        any slice did.
+
+        So a call is counted unless it sits inside a rotation route that nothing
+        has driven. Ordinary production code always counts -- including code that
+        nothing calls yet, which fails closed: a slice that adds a caller is
+        reported as having wired the route, and the obligation is asserted rather
+        than skipped.
+        """
+        sites = self._call_sites(root)
+        driven = self._driven_surface(sites)
+        callers = {}
+        for path, called, container in sites:
+            if called != name:
+                continue
+            if (
+                container is not None
+                and container in self.ROTATION_SURFACE
+                and container not in driven
+            ):
+                continue
+            callers[path] = callers.get(path, 0) + 1
         return callers
+
+    def _every_call_site(self, name, root=None):
+        """The plain count, kept only to show what the reconciliation changed."""
+        callers = {}
+        for path, called, _container in self._call_sites(root):
+            if called == name:
+                callers[path] = callers.get(path, 0) + 1
+        return callers
+
+    def _assert_wiring_obligation(self, root=None) -> None:
+        """The obligation itself, so the cases below exercise the real guard.
+
+        Stated as something the code must keep true: if a production caller can
+        cause `continue_session` to run, a production caller must equally be able
+        to cause the route that reports the resulting ambiguity to run.
+        """
+        continues = self._production_callers("continue_session", root)
+        supervised = self._production_callers("supervised_teardown", root)
+        if continues:
+            self.assertTrue(
+                supervised,
+                "a production `continue_session` caller exists in {0}, so a real "
+                "supervised teardown is now possible and `supervised_teardown` must "
+                "have a production caller whose `human_action` reaches a durable D8 "
+                "human-attention record.".format(sorted(continues)),
+            )
+
+    def _synthetic_package(self, source):
+        """A throwaway one-module package to point the counter at."""
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        Path(holder.name, "wired.py").write_text(source, encoding="utf-8")
+        return holder.name
 
     def test_case_g_no_production_continue_session_caller_is_created_here(self) -> None:
         """Checkpoint 66 does not create the first one, so the D8 delivery
@@ -4889,29 +5007,114 @@ class ReplacementLaunchTests(RotationHarness):
         """
         self.assertEqual(self._production_callers("continue_session"), {})
 
+    def test_case_g_the_counter_agrees_with_the_accepted_finding(self) -> None:
+        """What "production caller" means here is what checkpoint 65 accepted.
+
+        The accepted checkpoint-65 finding records that `supervised_teardown`,
+        `retire_old_context` and `continue_session` all have no production caller
+        and that the rotation surface is unwired. A plain count contradicts that on
+        two of the three: it reports the controller's own re-export as a caller of
+        `supervised_teardown`, and `replace_old_context`'s internal use as a caller
+        of `retire_old_context` -- while `replace_old_context` is itself reachable
+        from nothing. Both are calls inside the surface, not ways into it.
+        """
+        for route in ("continue_session", "supervised_teardown",
+                      "retire_old_context", "replace_old_context"):
+            self.assertEqual(self._production_callers(route), {}, route)
+        # And the plain count is what it was, so the reconciliation is visible
+        # rather than asserted: these are the two answers that disagreed.
+        self.assertEqual(
+            self._every_call_site("supervised_teardown"), {"manager_controller.py": 1}
+        )
+        self.assertEqual(
+            self._every_call_site("retire_old_context"), {"session_lifecycle.py": 1}
+        )
+        self.assertEqual(self._every_call_site("continue_session"), {})
+
+    def test_case_g_a_thin_re_export_is_not_a_production_caller(self) -> None:
+        """The distinction, on the smallest source that shows it.
+
+        A method that forwards to the route under the route's own name is counted
+        by a plain count and not by this one, because nothing calls the method.
+        """
+        package = self._synthetic_package(
+            "from .lifecycle import supervised_teardown\n"
+            "\n"
+            "\n"
+            "class Controller:\n"
+            "    def supervised_teardown(self, record):\n"
+            "        return supervised_teardown(self.store, record)\n"
+        )
+        self.assertEqual(
+            self._every_call_site("supervised_teardown", package), {"wired.py": 1}
+        )
+        self.assertEqual(self._production_callers("supervised_teardown", package), {})
+
     def test_case_g_wiring_continue_session_obliges_wiring_the_supervised_route(self) -> None:
         """The obligation, stated as something the code must keep true.
 
-        This passes today because neither caller exists. It will still pass when a
-        later slice wires both. It fails only if a slice makes a real supervised
-        teardown possible -- by giving `continue_session` a production caller --
-        without giving the route that reports it one, which is the shape the
-        checkpoint-65 review named as a genuine D8 failure.
+        This passes today because `continue_session` has no production caller: the
+        antecedent is false, and the case above proves that rather than assuming
+        it. It will still pass when a later slice wires both. It fails if a slice
+        makes a real supervised teardown possible -- by giving `continue_session` a
+        production caller -- without giving the route that reports it one, which is
+        the shape the checkpoint-65 review named as a genuine D8 failure. The two
+        cases below hold it to both halves of that.
 
         It constrains the *caller*, not the delivery: that `human_action` reaches a
         durable human-attention record is a property of the surface that slice
         builds, and this cannot see it.
         """
-        continues = self._production_callers("continue_session")
-        supervised = self._production_callers("supervised_teardown")
-        if continues:
-            self.assertTrue(
-                supervised,
-                "a production `continue_session` caller exists in {0}, so a real "
-                "supervised teardown is now possible and `supervised_teardown` must "
-                "have a production caller whose `human_action` reaches a durable D8 "
-                "human-attention record.".format(sorted(continues)),
-            )
+        self._assert_wiring_obligation()
+
+    def test_case_g_the_obligation_fails_on_the_forbidden_shape(self) -> None:
+        """The guard fires when `continue_session` is wired and the route is not.
+
+        The forbidden shape exactly: production code that can cause
+        `continue_session` to run, beside a `supervised_teardown` whose only call
+        is the controller's own re-export. This is the shape a plain count could
+        not fail on, because the re-export kept its consequent true.
+        """
+        package = self._synthetic_package(
+            "from .lifecycle import continue_session, supervised_teardown\n"
+            "\n"
+            "\n"
+            "class Controller:\n"
+            "    def supervised_teardown(self, record):\n"
+            "        return supervised_teardown(self.store, record)\n"
+            "\n"
+            "    def rotate(self, record):\n"
+            "        return continue_session(self.store, record)\n"
+        )
+        self.assertEqual(
+            self._production_callers("continue_session", package), {"wired.py": 1}
+        )
+        self.assertEqual(self._production_callers("supervised_teardown", package), {})
+        with self.assertRaises(AssertionError) as raised:
+            self._assert_wiring_obligation(package)
+        self.assertIn("must", str(raised.exception))
+        self.assertIn("human-attention record", str(raised.exception))
+
+    def test_case_g_wiring_both_satisfies_the_obligation(self) -> None:
+        """And it passes for the slice that wires both, so it is not a ban."""
+        package = self._synthetic_package(
+            "from .lifecycle import continue_session, supervised_teardown\n"
+            "\n"
+            "\n"
+            "class Controller:\n"
+            "    def rotate(self, record):\n"
+            "        outcome = continue_session(self.store, record)\n"
+            "        if outcome.category is None:\n"
+            "            return supervised_teardown(self.store, record)\n"
+            "        return outcome\n"
+        )
+        self.assertEqual(
+            self._production_callers("continue_session", package), {"wired.py": 1}
+        )
+        self.assertEqual(
+            self._production_callers("supervised_teardown", package), {"wired.py": 1}
+        )
+        self._assert_wiring_obligation(package)
 
     # -- H. checkpoints 59 to 65 intact ---------------------------------------
 
