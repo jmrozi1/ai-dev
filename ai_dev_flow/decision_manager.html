@@ -1,0 +1,705 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--CONTENT-SECURITY-POLICY-->
+<title>Decision queue</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #ffffff;
+  --ink: #16181d;
+  --muted: #5c6270;
+  --line: #e2e5ea;
+  --rule: #cfd4dc;
+  --sel-bg: #eef3ff;
+  --sel-edge: #2f5fd0;
+  --fail: #a4232b;
+  --focus: #2f5fd0;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14161a;
+    --ink: #e9ebef;
+    --muted: #a0a6b3;
+    --line: #262a31;
+    --rule: #333842;
+    --sel-bg: #1b2438;
+    --sel-edge: #6d94ee;
+    --fail: #ff8e93;
+    --focus: #6d94ee;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+.app {
+  display: grid;
+  grid-template-columns: minmax(320px, 4fr) minmax(360px, 5fr);
+  height: 100vh;
+}
+.queue {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--rule);
+}
+.filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: center;
+  margin: 0;
+  padding: 14px 20px;
+  border: 0;
+  border-bottom: 1px solid var(--line);
+}
+.filters legend { padding: 0; font-weight: 600; }
+.filters label { display: inline-flex; gap: 6px; align-items: center; cursor: pointer; }
+.allowance {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  align-items: baseline;
+  margin: 0;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 13px;
+}
+.allowance-window { display: inline-flex; gap: 6px; align-items: baseline; }
+.allowance-label { font-weight: 600; color: var(--ink); }
+.allowance-used { font-variant-numeric: tabular-nums; }
+.allowance-unavailable { font-style: italic; }
+.allowance-reset { font-size: 12px; opacity: 0.8; white-space: nowrap; }
+.allowance-note { font-size: 12px; opacity: 0.8; }
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow-y: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 2px 16px;
+  padding: 10px 20px;
+  border-bottom: 1px solid var(--line);
+  cursor: pointer;
+}
+.row:focus-visible { outline: 2px solid var(--focus); outline-offset: -2px; }
+.row[aria-selected="true"] {
+  background: var(--sel-bg);
+  box-shadow: inset 3px 0 0 var(--sel-edge);
+}
+.row-title { font-weight: 600; }
+.row-elapsed { color: var(--muted); font-variant-numeric: tabular-nums; }
+.row-context { grid-column: 1 / -1; color: var(--muted); font-size: 13px; }
+.detail {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+  padding: 22px 26px;
+  overflow-y: auto;
+  min-height: 0;
+}
+.explanation { margin: 0; max-width: 68ch; }
+.response { display: flex; flex-direction: column; gap: 8px; max-width: 68ch; }
+.response label { font-weight: 600; }
+textarea {
+  width: 100%;
+  min-height: 132px;
+  padding: 10px 12px;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--bg);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+textarea:focus-visible, summary:focus-visible, button:focus-visible, input:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+.response-actions { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.hint { margin: 0; color: var(--muted); font-size: 13px; }
+button {
+  padding: 8px 18px;
+  border: 1px solid var(--sel-edge);
+  border-radius: 6px;
+  background: var(--sel-edge);
+  color: #ffffff;
+  font: inherit;
+  cursor: pointer;
+}
+button[disabled] { background: transparent; color: var(--muted); border-color: var(--rule); cursor: default; }
+.failure { margin: 0; color: var(--fail); font-weight: 600; }
+.quiet { margin: 0; color: var(--muted); }
+details summary { cursor: pointer; font-weight: 600; }
+.evidence { margin: 10px 0 0; padding-left: 20px; }
+.evidence li { margin-bottom: 4px; }
+.facts { display: grid; grid-template-columns: max-content 1fr; gap: 4px 12px; margin: 10px 0 0; }
+.facts dt { color: var(--muted); }
+.facts dd { margin: 0; }
+.routing { margin: 0; }
+.routing dd { font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+/* The actionable block is bordered rather than tinted, and carries no colour of
+   its own beyond the rule and the heading. A blocker is not an alarm: colouring
+   it would make five kinds of ordinary obstacle read as five severities nobody
+   published, and severity is not one of the nine things D8 asks for. */
+.actionable {
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 14px 16px;
+  max-width: 68ch;
+}
+.actionable h2 { margin: 0; font-size: 14px; letter-spacing: 0.02em; text-transform: uppercase; color: var(--muted); }
+.actionable .facts { margin-top: 12px; }
+.actionable dd { overflow-wrap: anywhere; }
+.withheld {
+  margin: 0;
+  padding: 12px 14px;
+  max-width: 68ch;
+  border: 1px dashed var(--rule);
+  border-radius: 8px;
+  color: var(--muted);
+}
+[hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="queue">
+    <fieldset class="filters">
+      <legend>Agents</legend>
+      <label for="filter-waiting"><input type="checkbox" id="filter-waiting" data-state="waiting" checked> Waiting</label>
+      <label for="filter-running"><input type="checkbox" id="filter-running" data-state="running"> Running</label>
+      <label for="filter-disconnected"><input type="checkbox" id="filter-disconnected" data-state="disconnected"> Disconnected</label>
+    </fieldset>
+    <p class="allowance" id="allowance" aria-label="Manager aggregate"></p>
+    <ul class="rows" id="rows" role="listbox" aria-label="Decision queue" tabindex="0"></ul>
+    <p class="quiet" id="queue-empty" hidden>Nothing is waiting.</p>
+  </aside>
+
+  <section class="detail" id="detail" aria-label="Selected decision">
+    <dl class="facts routing" id="routing" aria-label="Affected work"></dl>
+
+    <p class="explanation" id="explanation"></p>
+
+    <section class="actionable" id="actionable" hidden aria-labelledby="actionable-kind">
+      <h2 id="actionable-kind"></h2>
+      <dl class="facts" id="actionable-facts"></dl>
+    </section>
+
+    <p class="withheld" id="blocker-withheld" hidden></p>
+
+    <form class="response" id="response">
+      <label for="response-input">Response</label>
+      <textarea id="response-input" aria-describedby="response-hint"></textarea>
+      <p class="failure" id="response-failure" role="alert" hidden></p>
+      <div class="response-actions">
+        <p class="hint" id="response-hint">Enter sends. Shift+Enter adds a newline.</p>
+        <button type="submit" id="send">Send</button>
+      </div>
+    </form>
+
+    <details id="details">
+      <summary>Details</summary>
+      <dl class="facts" id="facts"></dl>
+      <ul class="evidence" id="evidence"></ul>
+    </details>
+  </section>
+</div>
+
+<script type="application/json" id="queue-payload"><!--QUEUE-PAYLOAD--></script>
+<script>
+(function () {
+  "use strict";
+
+  var payload = JSON.parse(document.getElementById("queue-payload").textContent);
+
+  // The rows arrive oldest first from the accepted projection. Nothing here
+  // sorts, so "the oldest visible row" is simply the first one that passes the
+  // filter -- there is no second ordering rule to disagree with the first.
+  var items = payload.rows.slice();
+  var filters = {};
+  payload.states.forEach(function (state) {
+    filters[state] = payload.defaultFilters.indexOf(state) !== -1;
+  });
+  var selectedId = null;
+
+  var rowsEl = document.getElementById("rows");
+  var emptyEl = document.getElementById("queue-empty");
+  var detailEl = document.getElementById("detail");
+  var explanationEl = document.getElementById("explanation");
+  var formEl = document.getElementById("response");
+  var inputEl = document.getElementById("response-input");
+  var failureEl = document.getElementById("response-failure");
+  var sendEl = document.getElementById("send");
+  var detailsEl = document.getElementById("details");
+  var factsEl = document.getElementById("facts");
+  var evidenceEl = document.getElementById("evidence");
+  var routingEl = document.getElementById("routing");
+  var actionableEl = document.getElementById("actionable");
+  var actionableKindEl = document.getElementById("actionable-kind");
+  var actionableFactsEl = document.getElementById("actionable-facts");
+  var withheldEl = document.getElementById("blocker-withheld");
+  var allowanceEl = document.getElementById("allowance");
+
+  function visible() {
+    return items.filter(function (item) { return filters[item.state]; });
+  }
+
+  // One way to draw a labelled list of facts, used by all three of them. Every
+  // value arrives as a text node: published prose is written by people and is
+  // never markup here, whatever it contains.
+  function fillFacts(target, pairs) {
+    while (target.firstChild) { target.removeChild(target.firstChild); }
+    pairs.forEach(function (pair) {
+      var name = document.createElement("dt");
+      name.textContent = pair[0];
+      var value = document.createElement("dd");
+      value.textContent = pair[1];
+      target.appendChild(name);
+      target.appendChild(value);
+    });
+  }
+
+  // The one place the durable boolean becomes words. "May have changed" is the
+  // single answer a person cannot act on, so there is no third branch and no
+  // path that reaches this function without a boolean: the payload carries
+  // `stateChanged` as a JSON boolean, and an item with no blocker never gets
+  // here at all.
+  function stateChangedLabel(changed) {
+    return changed
+      ? "Yes - product or worktree state changed."
+      : "No - no product or worktree state changed.";
+  }
+
+  function elapsedLabel(seconds) {
+    if (seconds < 60) { return seconds + "s"; }
+    if (seconds < 3600) { return Math.floor(seconds / 60) + "m"; }
+    if (seconds < 86400) { return Math.floor(seconds / 3600) + "h"; }
+    return Math.floor(seconds / 86400) + "d";
+  }
+
+  function clearFailure() {
+    failureEl.hidden = true;
+    failureEl.textContent = "";
+  }
+
+  // One small secondary fact beside the progress figure. A span rather than a
+  // sentence, so each fact stays separately readable and an absent one simply
+  // does not appear instead of leaving a gap in prose.
+  function progressNote(text, className) {
+    var note = document.createElement("span");
+    note.className = className || "allowance-reset";
+    note.textContent = text;
+    return note;
+  }
+
+  // The D11 ticket figure, drawn once at the head of the same strip the usage
+  // figures use. It is deliberately one more name/value pair in the treatment
+  // this strip already repeats: the queue is the screen, and progress is a
+  // figure beside it.
+  //
+  // Nothing here computes anything. The percentage arrived already rounded, the
+  // counts already counted and the instants already derived from the
+  // control-plane mechanism; a surface that could not establish the measure
+  // arrives with its reason and the reason is what gets drawn, exactly as an
+  // unavailable usage window does. There is no control on it, nothing is
+  // clickable, and no value it shows is read back by anything on this page.
+  function renderProgress() {
+    if (payload.progress === null || payload.progress === undefined) { return; }
+    var progress = payload.progress;
+
+    var group = document.createElement("span");
+    group.className = "allowance-window";
+    group.setAttribute("data-window", "progress");
+    group.setAttribute("data-available", progress.available ? "true" : "false");
+    group.setAttribute("data-source-healthy", progress.sourceHealthy ? "true" : "false");
+
+    var name = document.createElement("span");
+    name.className = "allowance-label";
+    name.textContent = "Progress";
+    group.appendChild(name);
+
+    var value = document.createElement("span");
+    if (progress.available) {
+      value.className = "allowance-used";
+      // "of ~" and not "of": the denominator is an estimate, and a figure that
+      // reads as a commitment is the one thing D11 says it is not.
+      value.textContent = progress.percentage + " · checkpoint "
+        + progress.acceptedCheckpoint + " of ~" + progress.projectedFinal;
+    } else {
+      value.className = "allowance-unavailable";
+      value.textContent = progress.reason;
+      // An unavailable measure still shows the last accepted checkpoint when one
+      // is recorded: the estimate is what went missing, not the progress.
+      if (progress.acceptedCheckpoint !== null
+        && progress.acceptedCheckpoint !== undefined) {
+        value.textContent = progress.reason + " (last accepted checkpoint "
+          + progress.acceptedCheckpoint + ")";
+      }
+    }
+    group.appendChild(value);
+
+    if (progress.namedCheckpoint !== null && progress.namedCheckpoint !== undefined
+      && progress.namedTotal !== null && progress.namedTotal !== undefined) {
+      group.appendChild(progressNote(
+        "named " + progress.namedCheckpoint + " of " + progress.namedTotal));
+    }
+
+    if (progress.confidence !== null && progress.confidence !== undefined) {
+      group.appendChild(progressNote(progress.confidence + " confidence"));
+    }
+
+    // The exact instant, machine-readable, derived only from what the
+    // control-plane mechanism recorded. No countdown and no relative phrase:
+    // this page is static, so "2 hours ago" would silently rot on screen.
+    if (progress.acceptedAt !== null && progress.acceptedAt !== undefined) {
+      group.appendChild(instantNote("accepted ", progress.acceptedAt));
+    }
+    if (progress.namedCompletedAt !== null && progress.namedCompletedAt !== undefined) {
+      group.appendChild(instantNote("last named checkpoint ", progress.namedCompletedAt));
+    }
+
+    // Absent rather than zero when the recorded history does not reach back far
+    // enough: "none accepted in 48 hours" and "this history is four hours old"
+    // are different facts and must not print the same.
+    var deltas = [];
+    if (progress.delta24h !== null && progress.delta24h !== undefined) {
+      deltas.push("+" + progress.delta24h + " / 24h");
+    }
+    if (progress.delta48h !== null && progress.delta48h !== undefined) {
+      deltas.push("+" + progress.delta48h + " / 48h");
+    }
+    if (progress.deltaReason !== null && progress.deltaReason !== undefined) {
+      deltas.push("delta " + progress.deltaReason);
+    }
+    if (deltas.length) { group.appendChild(progressNote(deltas.join(" · "))); }
+
+    // Why the denominator moved. Drawn whenever there has been a revision, so a
+    // percentage that dropped because the estimate grew can never be read as
+    // work that was lost.
+    if (progress.revision !== null && progress.revision !== undefined) {
+      var revision = document.createElement("span");
+      revision.className = "allowance-note";
+      var when = new Date(progress.revision.at);
+      var text = "estimate revised " + when.toLocaleString(undefined, {
+        month: "short", day: "numeric", hour: "numeric", minute: "2-digit"
+      }) + ": " + progress.revision.from + " → " + progress.revision.to;
+      if (progress.revision.note) { text = text + " — " + progress.revision.note; }
+      if (progress.preservedCount) {
+        text = text + " (preserved unchanged " + progress.preservedCount
+          + (progress.preservedCount === 1 ? " time" : " times") + " since)";
+      }
+      revision.textContent = text;
+      group.appendChild(revision);
+    }
+
+    allowanceEl.appendChild(group);
+  }
+
+  // One recorded instant, drawn as the calendar time it is.
+  function instantNote(prefix, instant) {
+    var at = new Date(instant);
+    var element = document.createElement("time");
+    element.className = "allowance-reset";
+    element.setAttribute("datetime", at.toISOString());
+    element.textContent = prefix + at.toLocaleString(undefined, {
+      month: "short", day: "numeric", hour: "numeric", minute: "2-digit"
+    });
+    return element;
+  }
+
+  // Static context, drawn once. Every field was decided by the accepted
+  // allowance view: nothing here rounds, compares, totals, or falls back to a
+  // zero, and a window with no number prints the reason it has none.
+  function renderAllowance() {
+    // The manager-wide agent count sits first in the same strip, drawn as one
+    // more name/value pair in the treatment this strip already repeats. Absent
+    // when no reading was supplied, and printing its reason rather than a number
+    // when the controller could not prove how many agents it owns.
+    if (payload.agents !== null && payload.agents !== undefined) {
+      var agents = document.createElement("span");
+      agents.className = "allowance-window";
+      agents.setAttribute("data-window", "agents");
+
+      var agentsName = document.createElement("span");
+      agentsName.className = "allowance-label";
+      agentsName.textContent = "Agents";
+
+      var agentsValue = document.createElement("span");
+      var counted = payload.agents.current !== null
+        && payload.agents.current !== undefined;
+      agentsValue.className = counted ? "allowance-used" : "allowance-unavailable";
+      agentsValue.textContent = counted
+        ? payload.agents.current + " / " + payload.agents.permitted
+        : payload.agents.reason;
+
+      agents.appendChild(agentsName);
+      agents.appendChild(agentsValue);
+      allowanceEl.appendChild(agents);
+    }
+
+    payload.allowance.forEach(function (entry) {
+      var group = document.createElement("span");
+      group.className = "allowance-window";
+      group.setAttribute("data-window", entry.window);
+      group.setAttribute("data-health", entry.health);
+      group.setAttribute("data-source-healthy", entry.sourceHealthy ? "true" : "false");
+
+      var name = document.createElement("span");
+      name.className = "allowance-label";
+      name.textContent = entry.label;
+
+      var value = document.createElement("span");
+      var known = entry.used !== null && entry.used !== undefined;
+      value.className = known ? "allowance-used" : "allowance-unavailable";
+      value.textContent = known ? entry.used : entry.reason;
+
+      group.appendChild(name);
+      group.appendChild(value);
+
+      // Secondary context, drawn from the epoch the accepted view already
+      // supplied. No clock is read here and no countdown is drawn: this page is
+      // static, so a relative "in 2h" would silently rot on screen. A missing
+      // resetsAt means the accepted view stated no reset, and none is invented.
+      if (entry.resetsAt !== null && entry.resetsAt !== undefined) {
+        var resetAt = new Date(entry.resetsAt * 1000);
+        var reset = document.createElement("time");
+        reset.className = "allowance-reset";
+        // The exact instant, machine-readable, derived only from resetsAt.
+        reset.setAttribute("datetime", resetAt.toISOString());
+        // Weekday and calendar date on purpose: a seven-day reset must not be
+        // readable as a time later today.
+        reset.textContent = "resets " + resetAt.toLocaleString(undefined, {
+          weekday: "short",
+          month: "short",
+          day: "numeric",
+          hour: "numeric",
+          minute: "2-digit"
+        });
+        group.appendChild(reset);
+      }
+
+      allowanceEl.appendChild(group);
+    });
+  }
+
+  function renderRows(list) {
+    while (rowsEl.firstChild) { rowsEl.removeChild(rowsEl.firstChild); }
+    list.forEach(function (item) {
+      var row = document.createElement("li");
+      row.className = "row";
+      row.id = "row-" + list.indexOf(item);
+      row.setAttribute("role", "option");
+      row.setAttribute("tabindex", "-1");
+      row.setAttribute("data-item-id", item.itemId);
+      row.setAttribute("aria-selected", item.itemId === selectedId ? "true" : "false");
+
+      var title = document.createElement("span");
+      title.className = "row-title";
+      title.textContent = item.title;
+
+      var elapsed = document.createElement("span");
+      elapsed.className = "row-elapsed";
+      elapsed.textContent = elapsedLabel(item.elapsedSeconds);
+
+      var context = document.createElement("span");
+      context.className = "row-context";
+      context.textContent = item.project + " · " + item.ticket;
+
+      row.appendChild(title);
+      row.appendChild(elapsed);
+      row.appendChild(context);
+      row.addEventListener("click", function () { select(item.itemId); });
+      rowsEl.appendChild(row);
+    });
+  }
+
+  function renderDetail(list) {
+    var item = null;
+    list.forEach(function (candidate) {
+      if (candidate.itemId === selectedId) { item = candidate; }
+    });
+
+    if (item === null) {
+      detailEl.hidden = true;
+      emptyEl.hidden = list.length !== 0;
+      return;
+    }
+    detailEl.hidden = false;
+    emptyEl.hidden = true;
+
+    var detail = payload.details[item.itemId];
+    var waiting = detail.explanation !== null && detail.explanation !== undefined;
+
+    // Which work this is, on every item and above everything else. It used to be
+    // reachable only by decoding the item identity, which is a routing key rather
+    // than something a person reads -- so an item genuinely did not say which
+    // durable rail it was about. The rail is shown as the rail, never as a
+    // session, a worker name or a process: those stay inside Details, as evidence.
+    fillFacts(routingEl, [
+      ["Project", detail.project],
+      ["Ticket", detail.ticket],
+      ["Rail", detail.rail]
+    ]);
+
+    explanationEl.textContent = waiting ? detail.explanation : "";
+    explanationEl.hidden = !waiting;
+
+    // D8's actionable half. Present exactly when the accepted projection supplied
+    // a blocker, and never assembled here from parts: this branch prints the
+    // published facts or prints none of them. Nothing on this page fills a missing
+    // one in, and nothing shortens one -- the bound that keeps a blocker readable
+    // was applied where it was published.
+    //
+    // The Agent row is the one place a published name and a stated absence share a
+    // row, and the choice between them is the projection's, not this page's. The
+    // projection sets exactly one of `agent` and `agentUnavailable`, so this reads
+    // whichever it set rather than testing for a blank and inventing wording for
+    // it. The row is never dropped: "who is affected" is a question a person asks
+    // whether or not it has an answer, and a missing row reads as an oversight
+    // while a row saying the rail publishes no assignment reads as the fact it is.
+    var blocker = detail.blocker;
+    actionableEl.hidden = blocker === null || blocker === undefined;
+    if (!actionableEl.hidden) {
+      actionableKindEl.textContent = blocker.kind + " blocker";
+      var affected = blocker.agent === null || blocker.agent === undefined
+        ? blocker.agentUnavailable
+        : blocker.agent;
+      fillFacts(actionableFactsEl, [
+        ["What failed", blocker.whatFailed],
+        ["Agent", affected],
+        ["Missing", blocker.missingCapability],
+        ["You must change", blocker.humanChange],
+        ["State", stateChangedLabel(blocker.stateChanged)],
+        ["Next action", blocker.nextAction]
+      ]);
+    } else {
+      fillFacts(actionableFactsEl, []);
+    }
+
+    // A published blocker that could not be completed says so, in this module's
+    // own words, where the blocker would have been. An item that simply never had
+    // one shows nothing here -- "no blocker" and "the blocker was unreadable" are
+    // different facts and a person acts differently on each.
+    var withheld = detail.blockerUnavailable;
+    withheldEl.hidden = withheld === null || withheld === undefined;
+    withheldEl.textContent = withheldEl.hidden ? "" : withheld;
+
+    // Responding belongs to a decision a person was asked to make. An operational
+    // row is inspectable, and that is all it is -- so the whole composer goes
+    // away rather than sitting there greyed out. A disabled control still
+    // advertises an action that does not exist for this row.
+    //
+    // One hidden parent, never five hidden children: the label, textarea,
+    // failure line, hint, and Send all live inside this form, so they cannot
+    // drift out of agreement about whether responding is possible.
+    formEl.hidden = !waiting;
+
+    // Kept as a backstop. If the form were ever revealed by other means, the
+    // controls still refuse, and `submit` still returns early on a disabled Send.
+    sendEl.disabled = !waiting;
+    inputEl.disabled = !waiting;
+
+    // What the work is doing and who owes it attention, both decided by the
+    // accepted projection. They are drawn here rather than on a row on purpose:
+    // the row contract is title, age and context, and a per-row marker for either
+    // of these is exactly the density this list refuses to spend. Nothing here
+    // combines them, colours one by the other, or hides one when the other has a
+    // particular value -- they are two independent facts and they are printed as
+    // two independent facts.
+    fillFacts(factsEl, [
+      ["Activity", detail.activity],
+      ["Attention", detail.attentionOwner]
+    ]);
+
+    while (evidenceEl.firstChild) { evidenceEl.removeChild(evidenceEl.firstChild); }
+    detail.evidence.forEach(function (reference) {
+      var entry = document.createElement("li");
+      entry.textContent = reference.label + ": " + reference.locator;
+      evidenceEl.appendChild(entry);
+    });
+    detailsEl.open = false;
+  }
+
+  function render() {
+    var list = visible();
+    var stillVisible = list.some(function (item) { return item.itemId === selectedId; });
+    if (!stillVisible) {
+      selectedId = list.length ? list[0].itemId : null;
+    }
+    renderRows(list);
+    renderDetail(list);
+  }
+
+  function select(itemId) {
+    if (itemId === selectedId) { return; }
+    selectedId = itemId;
+    clearFailure();
+    inputEl.value = "";
+    render();
+  }
+
+  function submit() {
+    if (sendEl.disabled) { return; }
+    var response = inputEl.value;
+    if (response.trim() === "") {
+      failureEl.textContent = "Type a response before sending.";
+      failureEl.hidden = false;
+      inputEl.focus();
+      return;
+    }
+
+    // Fixture behavior only. The response is not stored, not transmitted, and
+    // there is no endpoint that could receive it; the item simply leaves this
+    // page's memory. Nothing here may claim the decision was delivered.
+    var index = -1;
+    items.forEach(function (item, position) {
+      if (item.itemId === selectedId) { index = position; }
+    });
+    if (index !== -1) { items.splice(index, 1); }
+
+    selectedId = null;
+    inputEl.value = "";
+    clearFailure();
+    render();
+  }
+
+  payload.states.forEach(function (state) {
+    var box = document.getElementById("filter-" + state);
+    box.addEventListener("change", function () {
+      filters[state] = box.checked;
+      render();
+    });
+  });
+
+  inputEl.addEventListener("keydown", function (event) {
+    if (event.key !== "Enter" || event.shiftKey) { return; }
+    event.preventDefault();
+    submit();
+  });
+
+  formEl.addEventListener("submit", function (event) {
+    event.preventDefault();
+    submit();
+  });
+
+  renderProgress();
+  renderAllowance();
+  render();
+})();
+</script>
+</body>
+</html>

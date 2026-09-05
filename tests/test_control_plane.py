@@ -11,21 +11,30 @@ from unittest.mock import patch
 
 from ai_dev_flow import control_plane
 from ai_dev_flow.control_plane import (
+    ARTIFACT_FILENAMES,
+    ARTIFACT_OWNERS,
     ControlPlaneError,
+    accept_progress,
     allocate_proceed_number,
+    artifact_relative,
     collect_rail_states,
     materialize_tracked_upstream,
     parse_proceed_sequence,
     publish,
     resolve_control_plane_config,
     resolve_read_source,
+    rail_blob_sha,
+    rail_handoff_publication,
     render_rail,
     render_status,
     resolve_coordination_repo,
     resolve_current_head,
+    validate_decision_record,
     validate_evidence_projection,
     validate_identifier,
 )
+from ai_dev_flow.progress_record import progress_relative
+from ai_dev_flow.progress_store import ProgressStore
 
 
 SAFE_EVIDENCE = {
@@ -33,6 +42,27 @@ SAFE_EVIDENCE = {
     "provenance": {"source": "provider-adapter", "collectedAt": "2026-08-24T15:00:00Z", "turnId": "turn-7"},
     "sourceHealth": {"status": "partial", "detail": "one source unavailable"},
     "observations": [{"kind": "terminal-action", "count": 17, "status": "completed"}],
+}
+
+
+SAFE_DECISION = {
+    "schemaVersion": 1,
+    "decisionId": "runtime-boundary-choice",
+    "project": "ai-dev",
+    "ticket": "issue-51",
+    "rail": "control-plane-surface",
+    "raisedAt": "2026-08-24T15:00:00Z",
+    "title": "Choose the runtime launch boundary",
+    "explanation": "Two compositions are viable and only a person can pick between them.",
+    "evidence": [{"label": "focused suite", "locator": "tests.test_control_plane"}],
+    "blocker": {
+        "kind": "permission",
+        "whatFailed": "publishing the recovery ref",
+        "missingCapability": "push access to the coordination remote",
+        "humanChange": "grant push access, or publish the ref by hand",
+        "stateChanged": False,
+        "nextAction": "re-dispatch the rail once the ref exists",
+    },
 }
 
 
@@ -73,6 +103,9 @@ class ControlPlaneTests(unittest.TestCase):
         }
         arguments.update(overrides)
         return publish(self.coordination, **arguments)  # type: ignore[arg-type]
+
+    def _rail_dir(self) -> Path:
+        return self.coordination / "ai-dev" / "issue-51" / "rails" / "control-plane-surface"
 
     # Ownership
 
@@ -478,6 +511,145 @@ class ControlPlaneTests(unittest.TestCase):
             self._publish(artifact="evidence", role="evidence", content="{not json")
         self.assertFalse((self.coordination / "ai-dev" / "issue-51" / "rails" / "control-plane-surface" / "evidence.json").exists())
 
+    # The durable human-attention record
+
+    def test_a_valid_record_is_stored_as_its_own_rail_scoped_artifact(self) -> None:
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nexecutor claim\n")
+        self._publish(artifact="decision", role="orchestrator", content=json.dumps(SAFE_DECISION))
+        rail_dir = self.coordination / "ai-dev" / "issue-51" / "rails" / "control-plane-surface"
+        stored = json.loads((rail_dir / "decision.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored["decisionId"], "runtime-boundary-choice")
+        self.assertEqual(stored["blocker"]["kind"], "permission")
+        self.assertNotIn("executor claim", (rail_dir / "decision.json").read_text(encoding="utf-8"))
+        self.assertEqual(self._git(self.coordination, "status", "--porcelain"), "")
+
+    def test_only_the_orchestrator_may_raise_a_human_decision(self) -> None:
+        for role in ("executor", "evidence"):
+            with self.subTest(role=role), self.assertRaises(ControlPlaneError) as caught:
+                self._publish(artifact="decision", role=role, content=json.dumps(SAFE_DECISION))
+            self.assertIn("owned by 'orchestrator'", str(caught.exception))
+        self.assertFalse((self._rail_dir() / "decision.json").exists())
+
+    def test_a_record_is_rail_scoped_and_never_scope_level(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(
+                artifact="decision", role="orchestrator", rail=None,
+                content=json.dumps(SAFE_DECISION),
+            )
+        self.assertIn("requires a rail identifier", str(caught.exception))
+
+    def test_raw_content_keys_are_refused_in_a_decision(self) -> None:
+        for denied in ("prompt", "response", "output", "transcript", "logs", "telemetry"):
+            payload = dict(SAFE_DECISION)
+            payload[denied] = "anything"
+            with self.subTest(denied=denied), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(payload)
+            self.assertIn("excluded raw content key", str(caught.exception))
+
+    def test_a_non_allowlisted_decision_key_is_refused(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(dict(SAFE_DECISION, severity="high"))
+        self.assertIn("non-allowlisted", str(caught.exception))
+
+    def test_every_required_decision_field_is_required(self) -> None:
+        for field in ("decisionId", "project", "ticket", "rail", "raisedAt", "title", "explanation"):
+            payload = {key: value for key, value in SAFE_DECISION.items() if key != field}
+            with self.subTest(field=field), self.assertRaises(ControlPlaneError):
+                validate_decision_record(payload)
+
+    def test_the_schema_version_is_exact(self) -> None:
+        for version in (2, "1", True, None):
+            with self.subTest(version=version), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(dict(SAFE_DECISION, schemaVersion=version))
+            self.assertIn("schemaVersion must be exactly 1", str(caught.exception))
+
+    def test_decision_identity_and_routing_refuse_session_shaped_values(self) -> None:
+        for field in ("decisionId", "project", "ticket", "rail"):
+            payload = dict(SAFE_DECISION)
+            payload[field] = "1a2b3c4d0001400080000000000000ab"
+            with self.subTest(field=field), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(payload)
+            self.assertIn("session, agent, or process", str(caught.exception))
+
+    def test_the_raised_time_must_be_the_shape_the_lifecycle_parses(self) -> None:
+        for raised in ("yesterday", "2026-08-24", "2026-08-24T15:00:00+00:00"):
+            with self.subTest(raised=raised), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(dict(SAFE_DECISION, raisedAt=raised))
+            self.assertIn("UTC timestamp", str(caught.exception))
+
+    def test_unbounded_decision_text_is_refused(self) -> None:
+        for field, limit in (("title", 120), ("explanation", 2000)):
+            with self.subTest(field=field), self.assertRaises(ControlPlaneError) as caught:
+                validate_decision_record(dict(SAFE_DECISION, **{field: "x" * (limit + 1)}))
+            self.assertIn("bounded projection", str(caught.exception))
+
+    def test_evidence_stays_bounded_pointers(self) -> None:
+        too_many = dict(
+            SAFE_DECISION,
+            evidence=[{"label": f"e{index}", "locator": "l"} for index in range(9)],
+        )
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(too_many)
+        self.assertIn("at most 8", str(caught.exception))
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(
+                dict(SAFE_DECISION, evidence=[{"label": "e", "locator": "l", "output": "a log"}])
+            )
+        self.assertIn("excluded raw content key", str(caught.exception))
+
+    def test_a_blocker_is_complete_or_absent(self) -> None:
+        without = {key: value for key, value in SAFE_DECISION.items() if key != "blocker"}
+        self.assertEqual(validate_decision_record(without), without)
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(dict(SAFE_DECISION, blocker={"kind": "permission"}))
+        self.assertIn("missing required key(s)", str(caught.exception))
+
+    def test_a_blocker_names_a_known_kind_and_an_explicit_state_answer(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(
+                dict(SAFE_DECISION, blocker=dict(SAFE_DECISION["blocker"], kind="vibes"))
+            )
+        self.assertIn("blocker kind must be one of", str(caught.exception))
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_decision_record(
+                dict(SAFE_DECISION, blocker=dict(SAFE_DECISION["blocker"], stateChanged="maybe"))
+            )
+        self.assertIn("must be true or false", str(caught.exception))
+
+    def test_malformed_decision_json_is_refused_without_writing(self) -> None:
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="decision", role="orchestrator", content="{not json")
+        self.assertIn("Human-decision record is not valid JSON", str(caught.exception))
+        self.assertFalse((self._rail_dir() / "decision.json").exists())
+
+    def test_a_rail_lists_its_decision_only_once_one_exists(self) -> None:
+        self._publish(artifact="state", role="orchestrator", rail=None, content="# Accepted\n")
+        self._publish()
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n")
+        self.assertIn(
+            "- control-plane-surface: ready; artifacts: rail, handoff",
+            render_status(self.coordination, project="ai-dev", ticket="issue-51"),
+        )
+        self._publish(artifact="decision", role="orchestrator", content=json.dumps(SAFE_DECISION))
+        self.assertIn(
+            "- control-plane-surface: ready; artifacts: rail, handoff, decision",
+            render_status(self.coordination, project="ai-dev", ticket="issue-51"),
+        )
+
+    def test_the_new_artifact_leaves_provider_evidence_intake_unchanged(self) -> None:
+        self._publish(artifact="evidence", role="evidence", content=json.dumps(SAFE_EVIDENCE))
+        self._publish(artifact="decision", role="orchestrator", content=json.dumps(SAFE_DECISION))
+        self.assertEqual(
+            json.loads((self._rail_dir() / "evidence.json").read_text(encoding="utf-8")),
+            SAFE_EVIDENCE,
+        )
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._publish(artifact="evidence", role="evidence", content="{not json")
+        self.assertIn("Provider evidence is not valid JSON", str(caught.exception))
+        with self.assertRaises(ControlPlaneError) as caught:
+            validate_evidence_projection(dict(SAFE_EVIDENCE, decisionId="borrowed"))
+        self.assertIn("non-allowlisted", str(caught.exception))
+
     # Isolation
 
     def test_operations_never_touch_the_product_repository(self) -> None:
@@ -491,8 +663,21 @@ class ControlPlaneTests(unittest.TestCase):
 
     # Multiple bounded rails
 
-    def _authorize(self, rail: str, status: str, *, depends_on: str = "", resource: str = "") -> None:
+    def _authorize(
+        self,
+        rail: str,
+        status: str,
+        *,
+        depends_on: str = "",
+        resource: str = "",
+        role: str | None = None,
+        extra_role: str | None = None,
+    ) -> None:
         header = [f"# Rail: {rail}", "", f"Status: {status}"]
+        if role is not None:
+            header.append(f"Role: {role}")
+        if extra_role is not None:
+            header.append(f"Role: {extra_role}")
         if depends_on:
             header.append(f"Depends on: {depends_on}")
         if resource:
@@ -520,6 +705,59 @@ class ControlPlaneTests(unittest.TestCase):
                              ("rail-blocked", "blocked"), ("rail-completed", "completed")):
             with self.subTest(rail=rail):
                 self.assertIn(f"- {rail}: {status}; artifacts: rail", rendered)
+
+    # Durable rail role
+
+    def test_a_rail_without_a_role_still_reads_and_surfaces_none(self) -> None:
+        """38 of 81 published rails predate this header; refusing them would retire
+        whole scopes for every reader, which is far worse than an unenforced field."""
+        self._authorize("rail-legacy", "running")
+        state = self._states()["rail-legacy"]
+        self.assertIsNone(state.role)  # type: ignore[attr-defined]
+        self.assertIn("rail-legacy: running", render_status(
+            self.coordination, project="ai-dev", ticket="issue-51"))
+
+    def test_an_empty_or_none_role_reads_as_absent(self) -> None:
+        for value in ("", "   ", "none", "None"):
+            with self.subTest(value=value):
+                rail = "rail-empty-{0}".format(abs(hash(value)) % 9973)
+                self._authorize(rail, "running", role=value)
+                self.assertIsNone(self._states()[rail].role)  # type: ignore[attr-defined]
+
+    def test_a_non_managed_role_stays_readable_and_normalized(self) -> None:
+        """`evidence-worker` is a real assignment in Issue #55's own history. It must
+        remain observable here; refusing it belongs to authorization, not the reader."""
+        self._authorize("rail-evidence", "running", role="Evidence-Worker")
+        self.assertEqual(self._states()["rail-evidence"].role, "evidence-worker")  # type: ignore[attr-defined]
+
+    def test_every_managed_role_parses(self) -> None:
+        for role in ("executor", "reviewer", "orchestrator"):
+            with self.subTest(role=role):
+                rail = "rail-{0}".format(role)
+                self._authorize(rail, "running", role=role)
+                self.assertEqual(self._states()[rail].role, role)  # type: ignore[attr-defined]
+
+    def test_a_backticked_role_is_normalized(self) -> None:
+        self._authorize("rail-quoted", "running", role="`orchestrator`")
+        self.assertEqual(self._states()["rail-quoted"].role, "orchestrator")  # type: ignore[attr-defined]
+
+    def test_two_role_headers_fail_the_scope_read(self) -> None:
+        """Role is authorization-sensitive now, so 'last one wins' is not a safe read."""
+        self._authorize("rail-ambiguous", "running", role="executor", extra_role="orchestrator")
+        with self.assertRaises(ControlPlaneError) as caught:
+            self._states()
+        self.assertIn("Role:", str(caught.exception))
+        self.assertIn("unambiguous", str(caught.exception))
+
+    def test_two_identical_role_headers_are_still_ambiguous(self) -> None:
+        self._authorize("rail-twice", "running", role="executor", extra_role="executor")
+        with self.assertRaises(ControlPlaneError):
+            self._states()
+
+    def test_the_reader_never_checks_the_role_against_a_managed_vocabulary(self) -> None:
+        """Three namespaces stay distinct; the reader owns none of them."""
+        self._authorize("rail-odd", "running", role="release-captain")
+        self.assertEqual(self._states()["rail-odd"].role, "release-captain")  # type: ignore[attr-defined]
 
     def test_target_rail_read_stays_bounded_with_many_rails(self) -> None:
         self._authorize("rail-alpha", "running")
@@ -601,6 +839,262 @@ class ControlPlaneTests(unittest.TestCase):
         with self.assertRaises(ControlPlaneError) as caught:
             render_status(self.coordination, project="ai-dev", ticket="issue-51")
         self.assertIn("contradictory", str(caught.exception))
+
+    # Rail iteration identity
+
+    def test_rail_blob_sha_is_the_object_name_of_that_rails_authorization(self) -> None:
+        self._authorize("rail-iterated", "running")
+        source = resolve_read_source(self.coordination)
+        blob = rail_blob_sha(source, project="ai-dev", ticket="issue-51", rail="rail-iterated")
+        expected = self._git(
+            self.coordination, "rev-parse", "HEAD:ai-dev/issue-51/rails/rail-iterated/rail.md"
+        )
+        self.assertEqual(blob, expected)
+
+    def test_rail_blob_sha_changes_only_when_the_authorization_text_changes(self) -> None:
+        self._authorize("rail-iterated", "running")
+        first = rail_blob_sha(
+            resolve_read_source(self.coordination), project="ai-dev", ticket="issue-51",
+            rail="rail-iterated",
+        )
+        # Publishing an unrelated artifact moves the head but not the iteration.
+        self._handoff("rail-iterated", "running")
+        unchanged = rail_blob_sha(
+            resolve_read_source(self.coordination), project="ai-dev", ticket="issue-51",
+            rail="rail-iterated",
+        )
+        self.assertEqual(unchanged, first)
+
+        self._authorize("rail-iterated", "blocked")
+        changed = rail_blob_sha(
+            resolve_read_source(self.coordination), project="ai-dev", ticket="issue-51",
+            rail="rail-iterated",
+        )
+        self.assertNotEqual(changed, first)
+
+    def test_a_rails_handoff_publication_is_reported_by_location_presence_and_identity(self) -> None:
+        # What a rotation boundary needs to know about durable handoff evidence:
+        # exactly where a fresh agent reads it, whether it is there yet, and which
+        # publication is there -- all from one read, so a caller can never pair a
+        # presence seen at one instant with an identity seen at another.
+        self._publish()
+        source = resolve_read_source(self.coordination)
+        location, published, publication, work_state = rail_handoff_publication(
+            source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
+        )
+        self.assertEqual(
+            location, "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
+        )
+        self.assertFalse(published)
+        self.assertIsNone(publication)
+        self.assertIsNone(work_state)
+
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nnext action\n")
+        location, published, publication, work_state = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )
+        self.assertEqual(
+            location, "ai-dev/issue-51/rails/control-plane-surface/handoff.md"
+        )
+        self.assertTrue(published)
+        self.assertRegex(publication, r"^[0-9a-f]{40}$")
+        # Published without naming a product repository, so it claims nothing about
+        # one. Absence, never "unchanged".
+        self.assertIsNone(work_state)
+
+    def test_the_handoff_publication_name_moves_only_when_the_published_bytes_do(self) -> None:
+        # The identity of a publication, not a judgement about it: republishing the
+        # same bytes is the same publication, and different bytes are a different
+        # one. Nothing here reads a word of what the handoff says.
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nfirst\n")
+        first = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )[2]
+
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nfirst\n")
+        unchanged = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )[2]
+        self.assertEqual(unchanged, first)
+
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nsecond\n")
+        changed = rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )[2]
+        self.assertNotEqual(changed, first)
+
+        # And an unrelated publication still does not move the rail iteration, which
+        # is why iteration freshness could never have answered handoff currency.
+        self._authorize("control-plane-surface", "running")
+        iteration = rail_blob_sha(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )
+        self._publish(artifact="handoff", role="executor", content="# Handoff\n\nthird\n")
+        source = resolve_read_source(self.coordination)
+        self.assertEqual(
+            rail_blob_sha(
+                source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
+            ),
+            iteration,
+        )
+        self.assertNotEqual(
+            rail_handoff_publication(
+                source, project="ai-dev", ticket="issue-51", rail="control-plane-surface"
+            )[2],
+            changed,
+        )
+
+    # -- what a publication was written against ---------------------------------
+    #
+    # The ordering fact, at the only instant it exists. Everything below runs
+    # against a real product repository and the real `publish`, because the claim
+    # being tested is exactly that the helper reads that state *when it publishes*
+    # rather than whenever someone later asks.
+
+    def _work_repo(self) -> Path:
+        return self._init_repo("product")
+
+    def _product_commit(self, product: Path, text: str) -> str:
+        (product / "work.py").write_text(text, encoding="utf-8")
+        self._git(product, "add", "work.py")
+        self._git(product, "commit", "-q", "-m", "work")
+        return self._git(product, "rev-parse", "HEAD")
+
+    def _handoff_facts(self):
+        return rail_handoff_publication(
+            resolve_read_source(self.coordination),
+            project="ai-dev", ticket="issue-51", rail="control-plane-surface",
+        )
+
+    def test_a_handoff_publication_records_the_product_state_it_was_written_against(self) -> None:
+        product = self._work_repo()
+        head = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nfirst\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], head)
+
+    def test_a_commit_landing_after_the_publication_leaves_it_naming_the_older_state(self) -> None:
+        # The whole invariant, at the seam that can actually hold it: the agent
+        # works, publishes its handoff, and then commits again. The publication
+        # names where the repository stood when those bytes were written, so the
+        # later commit is visible as a difference rather than being invisible as an
+        # ordering inside one opaque turn.
+        product = self._work_repo()
+        published_against = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nfirst\n", work_repo=product,
+        )
+        after = self._product_commit(product, "second\n")
+
+        self.assertNotEqual(after, published_against)
+        self.assertEqual(self._handoff_facts()[3], published_against)
+        self.assertNotEqual(self._handoff_facts()[3], after)
+
+        # And republishing against the state that now stands says so, which is the
+        # only way the claim becomes true again: by being made again.
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nsecond\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], after)
+
+    def test_republishing_identical_bytes_does_not_refresh_the_recorded_state(self) -> None:
+        # No commit is made for identical bytes, so no new claim is recorded. That
+        # is the conservative answer and the correct one: identical bytes are not a
+        # new statement about the work, and a republication that changed nothing
+        # must not be able to certify work it never described.
+        product = self._work_repo()
+        published_against = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nsame\n", work_repo=product,
+        )
+        after = self._product_commit(product, "second\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nsame\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], published_against)
+        self.assertNotEqual(self._handoff_facts()[3], after)
+
+    def test_a_publication_made_against_an_incoherent_checkout_records_no_state(self) -> None:
+        # A head does not identify a checkout carrying uncommitted change, so
+        # recording one would be a claim this helper cannot support. The publication
+        # is still made; it simply says nothing it cannot prove.
+        product = self._work_repo()
+        self._product_commit(product, "first\n")
+        (product / "work.py").write_text("uncommitted\n", encoding="utf-8")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\ndirty\n", work_repo=product,
+        )
+        self.assertTrue(self._handoff_facts()[1])
+        self.assertIsNone(self._handoff_facts()[3])
+
+        # Same refusal for a repository mid-operation, with a clean tree.
+        self._git(product, "checkout", "-q", "--", "work.py")
+        (Path(self._git(product, "rev-parse", "--absolute-git-dir")) / "MERGE_HEAD").write_text(
+            self._git(product, "rev-parse", "HEAD") + "\n", encoding="utf-8"
+        )
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nmid-merge\n", work_repo=product,
+        )
+        self.assertIsNone(self._handoff_facts()[3])
+
+    def test_coordination_activity_after_the_publication_changes_nothing_it_recorded(self) -> None:
+        # The boundary is the product repository, deliberately. The supported
+        # executor path publishes and pushes first and *then* allocates a receipt,
+        # which moves the coordination repository; a rule that read "nothing after
+        # publication" would break that documented path. Everything the coordination
+        # repository does here leaves the recorded product state exactly where it
+        # was, so an otherwise current handoff stays current.
+        product = self._work_repo()
+        head = self._product_commit(product, "first\n")
+        self._publish(
+            artifact="handoff", role="executor",
+            content="# Handoff\n\nfirst\n", work_repo=product,
+        )
+        self.assertEqual(self._handoff_facts()[3], head)
+
+        # Exactly the supported ordering: publish, push, *then* allocate the
+        # receipt. The allocation commits and pushes into the coordination
+        # repository, which is the act a naive "nothing after publication" rule
+        # would have to reject.
+        upstream = self._attach_shared_upstream("upstream")
+        self._git(self.coordination, "push", "-q", "origin", "main")
+        self._seed_counter(upstream)
+        allocate_proceed_number(self.coordination, project="ai-dev", ticket="issue-51")
+
+        self.assertEqual(self._handoff_facts()[3], head)
+        self.assertEqual(self._git(product, "rev-parse", "HEAD"), head)
+
+    def test_rail_blob_sha_is_absent_for_an_unauthorized_rail(self) -> None:
+        source = resolve_read_source(self.coordination)
+        self.assertIsNone(
+            rail_blob_sha(source, project="ai-dev", ticket="issue-51", rail="rail-absent")
+        )
+
+    def test_rail_blob_sha_reads_the_revision_the_source_serves(self) -> None:
+        upstream = self._attach_shared_upstream("upstream-iteration")
+        self._authorize("rail-iterated", "running")
+        self._git(self.coordination, "push", "-q", "origin", "main")
+        remote_blob = self._git(
+            upstream, "rev-parse", "HEAD:ai-dev/issue-51/rails/rail-iterated/rail.md"
+        )
+        source = resolve_read_source(self.coordination)
+        self.assertEqual(
+            rail_blob_sha(source, project="ai-dev", ticket="issue-51", rail="rail-iterated"),
+            remote_blob,
+        )
 
     # Rail authorization versus executor-proposed status
 
@@ -1172,6 +1666,224 @@ class ControlPlaneTests(unittest.TestCase):
             resolve_coordination_repo(plain)
         with self.assertRaises(ControlPlaneError):
             resolve_coordination_repo(self.tmp_path / "missing")
+
+
+# --------------------------------------------------------------------------
+# The supported progress action
+# --------------------------------------------------------------------------
+
+
+class ProgressActionTests(unittest.TestCase):
+    """Accepting a checkpoint is a durable control-plane transition, so it is tested here.
+
+    These are the boundary properties, not the measure: who may publish a
+    progress record, where it lands, that the reader looks exactly there, that a
+    concurrent record cannot be lost, and that none of it touches the product
+    worktree. What the published history comes to is `progress_view`'s question.
+    """
+
+    PROJECT = "ai-dev"
+    TICKET = "issue-55"
+
+    def setUp(self) -> None:
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmpdir.cleanup)
+        self.tmp_path = Path(self._tmpdir.name)
+        self.coordination = self._repo("coordination")
+        self.product = self._repo("product")
+        self.checkpoints = {}
+        for number in (52, 53, 54):
+            self._git(self.product, "commit", "-q", "--allow-empty", "-m", str(number))
+            self.checkpoints[number] = self._git(self.product, "rev-parse", "HEAD")
+
+    def _git(self, repo_root: Path, *args: str) -> str:
+        completed = subprocess.run(
+            ["git", "-C", str(repo_root), *args],
+            check=True, text=True, encoding="utf-8", errors="replace",
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        return completed.stdout.strip()
+
+    def _repo(self, name: str) -> Path:
+        repo_root = self.tmp_path / name
+        repo_root.mkdir(parents=True)
+        self._git(repo_root, "init", "-q")
+        self._git(repo_root, "config", "user.name", "Progress Action Tests")
+        self._git(repo_root, "config", "user.email", "progress-action@example.com")
+        (repo_root / "README.md").write_text("{0}\n".format(name), encoding="utf-8")
+        self._git(repo_root, "add", "README.md")
+        self._git(repo_root, "commit", "-q", "-m", "initial commit")
+        return repo_root
+
+    def accept(self, **overrides: object) -> tuple[Path, str, dict]:
+        arguments: dict = {
+            "project": self.PROJECT, "ticket": self.TICKET,
+            "remaining": 12, "confidence": "low", "note": "",
+            "state": "# Control Plane State\n\nProject: ai-dev\n",
+            "product_repo": self.product,
+        }
+        arguments.update(overrides)
+        return accept_progress(self.coordination, **arguments)  # type: ignore[arg-type]
+
+    # -- ownership and placement ------------------------------------------
+
+    def test_the_progress_record_is_an_orchestrator_owned_scope_artifact(self) -> None:
+        self.assertEqual(ARTIFACT_OWNERS["progress"], "orchestrator")
+        self.assertNotIn("progress", control_plane.RAIL_SCOPED_ARTIFACTS)
+        # Stronger than ownership: no role may publish it, because it is one half
+        # of an acceptance and `accept` writes both halves in a single commit.
+        for role in ("executor", "orchestrator"):
+            with self.assertRaises(ControlPlaneError) as caught:
+                publish(
+                    self.coordination, project=self.PROJECT, ticket=self.TICKET,
+                    artifact="progress", role=role, content="{}\n",
+                )
+            self.assertIn(
+                "written with the accepted state by `accept`", str(caught.exception)
+            )
+
+    def test_the_reader_looks_exactly_where_the_action_publishes(self) -> None:
+        """One path, composed twice, pinned together rather than kept in step by hand."""
+        target, _head, _document = self.accept(
+            checkpoint=52, commit=self.checkpoints[52], remaining=12
+        )
+        relative = target.relative_to(self.coordination).as_posix()
+        self.assertEqual(relative, progress_relative(self.PROJECT, self.TICKET))
+        self.assertEqual(
+            relative,
+            artifact_relative(
+                project=self.PROJECT, ticket=self.TICKET, artifact="progress", rail=None
+            ),
+        )
+        store = ProgressStore.for_scope(
+            self.coordination, project=self.PROJECT, ticket=self.TICKET
+        )
+        self.assertEqual(store.relative, relative)
+        self.assertEqual(store.facts().acceptances[-1].checkpoint, 52)
+
+    def test_the_action_commits_the_state_and_the_record_and_nothing_else(self) -> None:
+        """Both halves of the acceptance, in one commit, and no third path.
+
+        This asserted a single path while the record was separately publishable.
+        Pairing them is the fix, so the property is now "exactly these two".
+        """
+        _target, head, _document = self.accept(
+            checkpoint=52, commit=self.checkpoints[52], remaining=12
+        )
+        changed = sorted(self._git(
+            self.coordination, "show", "--name-only", "--format=", head
+        ).split())
+        self.assertEqual(changed, sorted([
+            progress_relative(self.PROJECT, self.TICKET),
+            artifact_relative(
+                project=self.PROJECT, ticket=self.TICKET, artifact="state", rail=None
+            ),
+        ]))
+        self.assertEqual(self._git(self.coordination, "status", "--porcelain"), "")
+
+    def test_a_record_this_action_would_refuse_cannot_be_published_by_hand(self) -> None:
+        """`publish` validates the record too, so the artifact has one gate, not two."""
+        for content in (
+            "{}\n",
+            json.dumps({"schemaVersion": 1, "accepted": None, "named": None, "projection": None}),
+            json.dumps({
+                "schemaVersion": 1, "accepted": None, "named": None,
+                "projection": {"confidence": "urgent", "note": "", "remaining": 1},
+            }),
+            json.dumps({
+                "schemaVersion": 1, "accepted": None, "named": None, "diary": "what happened",
+                "projection": {"confidence": "low", "note": "", "remaining": 1},
+            }),
+        ):
+            with self.subTest(content=content[:40]), self.assertRaises(ControlPlaneError):
+                publish(
+                    self.coordination, project=self.PROJECT, ticket=self.TICKET,
+                    artifact="progress", role="orchestrator", content=content,
+                )
+        self.assertFalse(
+            (self.coordination / progress_relative(self.PROJECT, self.TICKET)).exists()
+        )
+
+    # -- the writer model --------------------------------------------------
+
+    def test_a_record_that_landed_in_between_refuses_this_one_rather_than_losing_it(
+        self,
+    ) -> None:
+        """The writer model, proven rather than asserted.
+
+        Publication carries the head the action read its current state from, so
+        two writers cannot both compose from one state and have the second
+        silently overwrite the first. The racing record here is a projection
+        reconsideration, which passes every value check the losing writer makes --
+        so the only thing that can stop it is the head it read, and it is stopped.
+        Nothing is lost, the reconsideration survives, and no lock was involved:
+        the coordination repository's own history is what serializes the two.
+        """
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        real = control_plane.resolve_read_source
+        landed = []
+
+        def racing(repo_root):
+            source = real(repo_root)
+            if not landed:
+                # Marked before the nested call, so the other writer reads the
+                # unpatched source and this stays one race rather than a loop.
+                landed.append(True)
+                self.accept(remaining=9, note="reconsidered while the other composed")
+            return source
+
+        with patch.object(control_plane, "resolve_read_source", racing):
+            with self.assertRaises(ControlPlaneError) as caught:
+                self.accept(checkpoint=53, commit=self.checkpoints[53], remaining=11)
+        self.assertIn("expected head", str(caught.exception))
+
+        store = ProgressStore.for_scope(
+            self.coordination, project=self.PROJECT, ticket=self.TICKET
+        )
+        facts = store.facts()
+        self.assertEqual([entry.checkpoint for entry in facts.acceptances], [52])
+        self.assertEqual(facts.projections[-1].remaining, 9)
+        self.assertEqual(
+            facts.projections[-1].note, "reconsidered while the other composed"
+        )
+
+    def test_the_action_holds_no_lock_and_needs_none(self) -> None:
+        """No lock file, no lock directory, and nothing left behind to recover."""
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        source = Path(control_plane.__file__).read_text(encoding="utf-8")
+        for forbidden in ("lock", "flock", "O_EXCL"):
+            self.assertNotIn(forbidden, source.lower().split("accept_progress")[-1][:4000])
+
+    # -- the product worktree ----------------------------------------------
+
+    def test_accepting_a_checkpoint_writes_nothing_into_the_product_worktree(self) -> None:
+        """Cleanliness by construction: the action never opens the product for writing."""
+        before = self._tree(self.product)
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        self.accept(named=6, named_total=9, remaining=12)
+        self.accept(checkpoint=53, commit=self.checkpoints[53], remaining=11)
+        self.assertEqual(self._tree(self.product), before)
+        self.assertEqual(self._git(self.product, "status", "--porcelain"), "")
+        self.assertFalse((self.product / ".ai-dev").exists())
+
+    def test_reading_the_published_history_writes_nothing_anywhere(self) -> None:
+        self.accept(checkpoint=52, commit=self.checkpoints[52], remaining=12)
+        store = ProgressStore.for_scope(
+            self.coordination, project=self.PROJECT, ticket=self.TICKET
+        )
+        before = (self._tree(self.product), self._tree(self.coordination))
+        head = resolve_current_head(self.coordination)
+        store.facts()
+        store.facts()
+        self.assertEqual((self._tree(self.product), self._tree(self.coordination)), before)
+        self.assertEqual(resolve_current_head(self.coordination), head)
+
+    def _tree(self, root: Path) -> dict:
+        return {
+            str(item.relative_to(root)): item.read_bytes()
+            for item in sorted(root.rglob("*"))
+            if item.is_file() and ".git" not in item.relative_to(root).parts
+        }
 
 
 if __name__ == "__main__":
