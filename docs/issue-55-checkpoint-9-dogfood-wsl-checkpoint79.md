@@ -520,3 +520,88 @@ no product code was added to work around credentials. Nothing was ported to Wind
 `main` was not moved, no checkpoint was accepted, `state.md` and every rail were left
 alone, and nothing under `skills/**` was read into scope, modified or activated.
 **Named checkpoint 9 is not complete and is not claimed complete.**
+
+---
+
+# Appended correction — checkpoint 80
+
+Appended by checkpoint 80. **The published narrative above is unedited**; this note only
+records what a later run established about two of its statements. Both corrections were
+verified first-hand against the artifacts checkpoint 79 itself produced, on the same host.
+
+## 1. REFUTED — the cause of the failed compaction *is* established
+
+Checkpoint 79's **Limit 3** says *"`/compact` produced no compaction and I do not know
+why … its cause is not established"*, and item 6 says *"**What changed between the two is
+not established here** — the host, the CLI version and the workload all differ."*
+
+**Both are refuted.** The cause is stated in plain text inside the very transcript the
+checkpoint cites, `1d233750-d431-4be1-9435-5eadc59a55a3.jsonl` (the rotation predecessor),
+at record 21:
+
+```
+{"type":"system","subtype":"local_command",
+ "content":"<local-command-stdout>Not enough messages to compact.</local-command-stdout>",
+ "cwd":"/root/aidev/cp79/ws", "entrypoint":"sdk-py"}
+```
+
+The record order in that 33-record transcript makes the condition exact. `/compact` was
+enqueued at record 17 and delivered at record 20; the only conversation ahead of it was
+**one** user turn (record 3), **one** assistant reply (record 15) and the `/compact` user
+turn itself (record 19). **The session had two turns when `/compact` was issued**, and the
+CLI refused for that reason and no other.
+
+So the variable is **workload size**, not the host, not the CLI version and not the
+product. Checkpoint 71's sessions reached 68,387 and 68,257 pre-compaction tokens before
+their compactions succeeded; checkpoint 79's had barely begun. The failure was
+harness sequencing — issuing the compaction before the context was large enough to have
+one — and it is of the same family as the three provider sessions checkpoint 79 records
+losing to its own mis-set bounds.
+
+Nothing about the product changed between the two runs, and item 6's honest refusal to
+guess was the right call at the time. It is simply no longer the state of knowledge.
+
+## 2. CORRECTED — the tabled CLI version is not the one that ran
+
+The environment table above records Claude CLI **`2.1.261`** at `/root/.local/bin/claude`,
+and item 6 floats "the CLI version" as one of three candidate causes.
+
+**That binary never ran.** The Python Agent SDK invokes its own **bundled** CLI, and a
+`/proc` walk of a live managed session on this host shows exactly which executable the
+worker starts:
+
+```
+pid 582186  ppid 582183  cwd /root/aidev/cp80/ws
+  /root/aidev/host/venv/lib/python3.14/site-packages/claude_agent_sdk/_bundled/claude
+    --output-format stream-json --verbose --system-prompt-file …
+```
+
+That bundled binary reports **`2.1.259`**, and `/root/.local/bin/claude` reports `2.1.261`
+— two different executables present at the same time, only one of which a managed session
+ever executes:
+
+```
+/root/aidev/host/venv/.../claude_agent_sdk/_bundled/claude --version  ->  2.1.259
+/root/.local/bin/claude --version                                     ->  2.1.261
+```
+
+All eight of checkpoint 79's provider transcripts record `2.1.259`, and no other version
+appears in any of them:
+
+```
+130dc766-…  41 records  "version":"2.1.259"     325bc2bd-…  33 records  "version":"2.1.259"
+1d233750-…  33 records  "version":"2.1.259"     3cf157ed-…  27 records  "version":"2.1.259"
+31c3ea85-…  16 records  "version":"2.1.259"     5f07d2a4-…  32 records  "version":"2.1.259"
+84890f98-…  16 records  "version":"2.1.259"     97dff1e9-…  33 records  "version":"2.1.259"
+```
+
+So the tabled figure is a reading of the wrong binary, not a stale reading of the right
+one: the CLI did not update after the run. **`2.1.259` is what ran at checkpoint 79 and it
+is still what runs today**, which makes the CLI version a *controlled* variable across the
+two runs rather than a candidate cause of anything. Together with correction 1, the CLI
+version was never a candidate at all.
+
+**The residual this leaves.** Nothing in the product pins, records or reports which CLI
+binary a managed session actually executed. The version that governs a run is a property
+of the installed SDK wheel, and a person reading `claude --version` on this host is told
+about a binary the product does not use. That is recorded as a boundary, not closed here.
