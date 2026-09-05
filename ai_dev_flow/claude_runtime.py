@@ -1,0 +1,803 @@
+"""The Agent SDK request boundary: exactly what the controller asks for, and nothing ambient."""
+
+from __future__ import annotations
+
+# Issue #55's controller launches executors through the Python Claude Agent SDK.
+# The danger is not what the request says -- it is what the SDK would otherwise
+# pick up on its own. Loaded without constraint, a session inherits user, project,
+# and local settings files, whatever `.mcp.json` is reachable, plugin-declared
+# hooks and MCP servers, and permission arrays nobody in this system authorized.
+# Any of those can widen the executor past its rail.
+#
+# So this module states every relevant option explicitly, including the ones whose
+# SDK default already happens to be empty. An option that is merely defaulted is
+# an option a future SDK release may default differently; an option written down
+# is a contract a test can hold.
+#
+# One thing this boundary does not do: it does not isolate the worker's
+# environment. `env={}` is an overlay the SDK merges with the inherited process
+# environment, so credential and provider selectors already in that environment
+# survive it. Sanitizing them requires owning the child process, which is the next
+# rail's work, not this module's.
+#
+# Two further things are deliberately not here. There is no live invocation path that
+# tests exercise -- the SDK is imported lazily or injected, so neither unit nor
+# integration tests need it installed. And no provider output is retained beyond
+# the identity and bounds needed to reconcile a run: transcripts are not
+# collaboration state and never become durable.
+
+from dataclasses import dataclass
+import json
+import os
+from pathlib import Path
+import re
+from typing import Any, Iterable, Mapping, Optional, Tuple
+
+from .session_binding import (
+    BINDING_STATE_BOUND,
+    BINDING_STATE_RESERVED,
+    BindingRecord,
+    RailIteration,
+    validate_session_id,
+)
+
+
+DISTRIBUTION_NAME = "claude-agent-sdk"
+
+# Python Agent SDK 0.1.59 and earlier ignore `setting_sources=[]`, so on those
+# versions the single option this whole boundary rests on silently does nothing.
+# There is no way to detect that at runtime from inside a session, which is why
+# the version is a hard precondition rather than a warning.
+MINIMUM_SDK_VERSION = (0, 1, 60)
+
+MODE_LAUNCH = "launch"
+MODE_RESUME = "resume"
+RUNTIME_MODES = (MODE_LAUNCH, MODE_RESUME)
+
+PERMISSION_MODE = "dontAsk"
+
+PLUGIN_MANIFEST_DIRECTORY = ".claude-plugin"
+PLUGIN_MANIFEST_FILENAME = "plugin.json"
+PLUGIN_SKILLS_DIRECTORY = "skills"
+SKILL_FILENAME = "SKILL.md"
+
+# A plugin root may hold only its manifest directory and its skills directory.
+# Everything else Claude Code auto-discovers from a plugin root -- `hooks/`,
+# `agents/`, `commands/`, `.mcp.json`, `.lsp.json`, `bin/`, and the rest -- would
+# activate capability this rail never authorized, so their presence is fatal
+# rather than ignored.
+ALLOWED_PLUGIN_ENTRIES = frozenset({PLUGIN_MANIFEST_DIRECTORY, PLUGIN_SKILLS_DIRECTORY})
+
+# The manifest may describe the plugin and nothing more. `skills`, `commands`,
+# `agents`, `hooks`, `mcpServers`, and `lspServers` all redirect component
+# discovery to arbitrary paths, so a manifest carrying them can reintroduce
+# exactly what the directory scan above rejects.
+ALLOWED_MANIFEST_KEYS = frozenset({"name", "displayName", "version", "description"})
+
+_VERSION_PART = re.compile(r"^[0-9]+$")
+
+
+class ClaudeRuntimeError(Exception):
+    """A fail-closed runtime refusal carrying one stable machine-readable reason."""
+
+    def __init__(self, reason: str, detail: str) -> None:
+        super().__init__(detail)
+        self.reason = reason
+        self.detail = detail
+
+
+REASON_SDK_MISSING = "sdk-missing"
+REASON_SDK_VERSION_UNSUPPORTED = "sdk-version-unsupported"
+REASON_SDK_VERSION_UNREADABLE = "sdk-version-unreadable"
+REASON_INVALID_MODE = "invalid-mode"
+REASON_BINDING_NOT_RESERVED = "binding-not-reserved"
+REASON_BINDING_NOT_BOUND = "binding-not-bound"
+REASON_SESSION_MISMATCH = "session-mismatch"
+REASON_WORKSPACE_MISMATCH = "workspace-mismatch"
+REASON_INVALID_ALLOWED_TOOLS = "invalid-allowed-tools"
+REASON_INVALID_BOUNDS = "invalid-bounds"
+REASON_ASSET_MISSING = "asset-missing"
+REASON_ASSET_NOT_A_FILE = "asset-not-a-file"
+REASON_ASSET_NOT_A_DIRECTORY = "asset-not-a-directory"
+REASON_ASSET_UNREADABLE = "asset-unreadable"
+REASON_ASSET_OUTSIDE_CONTROLLER_ROOT = "asset-outside-controller-root"
+REASON_ASSET_INSIDE_WORKSPACE = "asset-inside-workspace"
+REASON_PLUGIN_SURFACE_UNEXPECTED = "plugin-surface-unexpected"
+REASON_PLUGIN_MANIFEST_UNEXPECTED = "plugin-manifest-unexpected"
+REASON_PLUGIN_MANIFEST_MISSING = "plugin-manifest-missing"
+REASON_PLUGIN_NESTED_ESCAPE = "plugin-nested-escape"
+REASON_PLUGIN_SKILL_MISSING = "plugin-skill-missing"
+REASON_PLUGIN_ROLE_MISMATCH = "plugin-role-mismatch"
+REASON_RESULT_SESSION_MISMATCH = "result-session-mismatch"
+
+
+# ---------------------------------------------------------------------------
+# SDK availability
+# ---------------------------------------------------------------------------
+
+
+def parse_version(text: Any) -> Tuple[int, ...]:
+    """Read the numeric release of a version string, refusing what it cannot read.
+
+    Only the leading numeric components are compared; a suffix such as `1.2.3rc1`
+    is not a release this boundary will accept on faith.
+    """
+    if not isinstance(text, str) or not text.strip():
+        raise ClaudeRuntimeError(
+            REASON_SDK_VERSION_UNREADABLE, "SDK version {0!r} is not a string.".format(text)
+        )
+    parts = text.strip().split(".")
+    numbers = []
+    for part in parts:
+        if not _VERSION_PART.match(part):
+            raise ClaudeRuntimeError(
+                REASON_SDK_VERSION_UNREADABLE,
+                "SDK version {0!r} has a non-numeric component {1!r}; its ordering "
+                "against {2} cannot be established.".format(
+                    text, part, ".".join(str(number) for number in MINIMUM_SDK_VERSION)
+                ),
+            )
+        numbers.append(int(part))
+    return tuple(numbers)
+
+
+def require_supported_sdk(version_reader=None, *, distribution: str = DISTRIBUTION_NAME) -> str:
+    """Prove an adequate SDK is installed without importing it.
+
+    Reading distribution metadata rather than importing keeps this check cheap and
+    keeps an unusable SDK from executing any of its own import-time code.
+    """
+    reader = version_reader if version_reader is not None else _installed_version
+    try:
+        raw = reader(distribution)
+    except ClaudeRuntimeError:
+        raise
+    except Exception as exc:
+        raise ClaudeRuntimeError(
+            REASON_SDK_MISSING,
+            "the {0} distribution is not installed for this interpreter ({1}). Install it "
+            "in the controller environment; this rail does not install packages.".format(
+                distribution, exc
+            ),
+        ) from exc
+
+    resolved = parse_version(raw)
+    if resolved < MINIMUM_SDK_VERSION:
+        raise ClaudeRuntimeError(
+            REASON_SDK_VERSION_UNSUPPORTED,
+            "{0} {1} ignores an empty setting_sources, so filesystem settings would load "
+            "anyway; {2} or newer is required.".format(
+                distribution, raw, ".".join(str(number) for number in MINIMUM_SDK_VERSION)
+            ),
+        )
+    return raw.strip()
+
+
+def _installed_version(distribution: str) -> str:
+    from importlib import metadata
+
+    return metadata.version(distribution)
+
+
+# ---------------------------------------------------------------------------
+# Provenance
+# ---------------------------------------------------------------------------
+
+
+def _real(path: Any) -> str:
+    """Resolve symlinks before any containment question is asked.
+
+    Comparing unresolved paths would let a link inside the controller root point
+    at the product worktree and pass every check below.
+    """
+    return os.path.realpath(os.path.abspath(str(path)))
+
+
+def _is_within(candidate: str, ancestor: str) -> bool:
+    if candidate == ancestor:
+        return True
+    return candidate.startswith(ancestor.rstrip(os.sep) + os.sep)
+
+
+ASSET_FILE = "file"
+ASSET_DIRECTORY = "directory"
+
+
+def require_asset_kind(resolved: str, *, kind: str, label: str) -> str:
+    """Prove an existing path is the kind of thing it is about to be used as.
+
+    Existence alone is not enough. A prompt path that is a directory, a manifest
+    that is a fifo, or a skill directory that is a file all reach the SDK as
+    something it will handle its own way -- skipping, erroring late, or blocking
+    on a read -- long after the point where refusing was still cheap.
+    """
+    if not os.path.exists(resolved):
+        raise ClaudeRuntimeError(
+            REASON_ASSET_MISSING,
+            "{0} {1} does not exist. The SDK skips a missing plugin path silently, so "
+            "this is checked before invocation.".format(label, resolved),
+        )
+    if kind == ASSET_DIRECTORY:
+        if not os.path.isdir(resolved):
+            raise ClaudeRuntimeError(
+                REASON_ASSET_NOT_A_DIRECTORY,
+                "{0} {1} is not a directory.".format(label, resolved),
+            )
+    elif not os.path.isfile(resolved):
+        # isfile() is false for directories and for every special file -- fifo,
+        # socket, device -- which is the point: a read from one of those does not
+        # behave like reading instructions.
+        raise ClaudeRuntimeError(
+            REASON_ASSET_NOT_A_FILE,
+            "{0} {1} is not a regular file.".format(label, resolved),
+        )
+    if not os.access(resolved, os.R_OK):
+        raise ClaudeRuntimeError(
+            REASON_ASSET_UNREADABLE, "{0} {1} is not readable.".format(label, resolved)
+        )
+    return resolved
+
+
+def validate_controller_asset(
+    path: Any, *, controller_root: Any, workspace_path: Any, label: str, kind: str = ASSET_FILE
+) -> str:
+    """Prove one input is controller-owned and not reachable from the product tree.
+
+    An executor that can edit its own prompt or its own skill has no bounded
+    authorization at all, so both must live under a root the controller owns and
+    the workspace cannot reach.
+    """
+    resolved = _real(path)
+    root = _real(controller_root)
+    workspace = _real(workspace_path)
+
+    # Workspace containment is checked first: when both rules are broken, the fact
+    # worth reporting is that the executor could edit this, not merely that it sits
+    # in the wrong directory. A symlink out of the controller root lands here too.
+    if _is_within(resolved, workspace):
+        raise ClaudeRuntimeError(
+            REASON_ASSET_INSIDE_WORKSPACE,
+            "{0} {1} is inside the product workspace {2}; an executor could rewrite "
+            "its own instructions.".format(label, resolved, workspace),
+        )
+    if not _is_within(resolved, root):
+        raise ClaudeRuntimeError(
+            REASON_ASSET_OUTSIDE_CONTROLLER_ROOT,
+            "{0} {1} is outside the controller-owned root {2}.".format(label, resolved, root),
+        )
+    return require_asset_kind(resolved, kind=kind, label=label)
+
+
+def validate_plugin_surface(plugin_root: Any, *, expected_skill: str, role: str) -> str:
+    """Prove the plugin is exactly the manifest plus one skill *for this role*.
+
+    Every component is resolved before it is accepted and every resolved component
+    must still be inside the plugin root. Checking only the entry *names* would let
+    a `skills` symlink point anywhere -- the workspace, a sibling controller
+    directory, outside the controller root -- and the scan would then walk happily
+    into whatever it found. Links that stay inside the root are fine; the rule is
+    about where a component lands, not about how it is referenced.
+
+    `role` is required and has no default, deliberately. Until checkpoint 75 this
+    function was handed only the skill name its caller claimed to expect, and the
+    role the session was actually being launched in never reached it -- so a launch
+    could state `--role executor` on an executor-assigned rail and hand this the
+    reviewer package, and every role-fidelity check in the product would pass while
+    the provider ran the other role's skill. A parameter with a default would leave
+    that hole open to anything that forgot to pass it, which is the same hole.
+    Making it required means the comparison cannot be skipped, and `_build_request`
+    supplies it from `record.role` -- the durable binding -- rather than from a
+    caller argument, so it is not answerable by whoever asked for the launch.
+    """
+    root = _real(plugin_root)
+    require_asset_kind(root, kind=ASSET_DIRECTORY, label="plugin root")
+
+    present = set(_entry_names(root, label="plugin root"))
+    unexpected = sorted(present - ALLOWED_PLUGIN_ENTRIES)
+    if unexpected:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_SURFACE_UNEXPECTED,
+            "plugin {0} carries unauthorized entr(ies): {1}. Only {2} are permitted.".format(
+                root, ", ".join(unexpected), " and ".join(sorted(ALLOWED_PLUGIN_ENTRIES))
+            ),
+        )
+    if PLUGIN_MANIFEST_DIRECTORY not in present:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_MISSING,
+            "plugin {0} has no {1}/{2}. This adapter requires the manifest rather than "
+            "relying on auto-discovery, so the plugin's identity and declared surface are "
+            "stated rather than inferred.".format(
+                root, PLUGIN_MANIFEST_DIRECTORY, PLUGIN_MANIFEST_FILENAME
+            ),
+        )
+    if PLUGIN_SKILLS_DIRECTORY not in present:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_SKILL_MISSING,
+            "plugin {0} has no {1}/ directory.".format(root, PLUGIN_SKILLS_DIRECTORY),
+        )
+
+    manifest_directory = _nested(
+        root, root, PLUGIN_MANIFEST_DIRECTORY,
+        kind=ASSET_DIRECTORY, label="plugin manifest directory",
+    )
+    _validate_manifest(root, manifest_directory)
+
+    skills_root = _nested(
+        root, root, PLUGIN_SKILLS_DIRECTORY,
+        kind=ASSET_DIRECTORY, label="plugin skills directory",
+    )
+    skills = sorted(_entry_names(skills_root, label="plugin skills directory"))
+    if skills != [expected_skill]:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_SKILL_MISSING,
+            "plugin {0} exposes skill(s) {1}; exactly [{2}] was expected.".format(
+                root, ", ".join(skills) or "none", expected_skill
+            ),
+        )
+    # The one skill this package actually exposes -- established above from the
+    # directory itself, not from what the caller said -- must be the skill of the
+    # role the binding records. A session's role and the package it runs are two
+    # separate operator inputs everywhere upstream of here, and this is the point
+    # at which they are compared and made unable to disagree silently.
+    #
+    # The comparison is written against `skills[0]` rather than `expected_skill`,
+    # but -- corrected at checkpoint 76 -- that is not what makes this a statement
+    # about the package. The check directly above raises unless
+    # `skills == [expected_skill]`, so by this line `skills[0] == expected_skill`
+    # always holds and the two spellings are provably the same predicate. Claiming
+    # otherwise overstated it.
+    #
+    # What actually makes this a statement about the binding rather than about the
+    # command line is the *other* operand: `role` reaches here from `record.role`,
+    # which `_build_request` supplies from the durable binding and never accepts as
+    # an argument. `skills[0]` is kept for the narrower and honest reason that it is
+    # the value this function read off the filesystem, so the comparison and the
+    # refusal message below quote one source, and the line stays correct if the
+    # equality check above is ever loosened.
+    if skills[0] != role:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_ROLE_MISMATCH,
+            "plugin {0} is the '{1}' package and this session's role is '{2}'. A "
+            "session runs the package of the role it is bound to; nothing here "
+            "will run one role's skill under another role's authorization.".format(
+                root, skills[0], role
+            ),
+        )
+
+    skill_directory = _nested(
+        root, skills_root, expected_skill,
+        kind=ASSET_DIRECTORY, label="plugin skill directory",
+    )
+    contents = sorted(_entry_names(skill_directory, label="plugin skill directory"))
+    if SKILL_FILENAME not in contents:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_SKILL_MISSING,
+            "plugin skill '{0}' has no {1}.".format(expected_skill, SKILL_FILENAME),
+        )
+    if contents != [SKILL_FILENAME]:
+        # The executor package contract is one file. Scripts, references, and
+        # nested plugin metadata are all provider-readable, so accepting them
+        # silently would widen the surface without anyone deciding to.
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_SURFACE_UNEXPECTED,
+            "plugin skill '{0}' holds {1}; exactly [{2}] is the current executor package "
+            "contract. Expanding it is a contract change, not a validation "
+            "relaxation.".format(expected_skill, ", ".join(contents) or "nothing", SKILL_FILENAME),
+        )
+    _nested(root, skill_directory, SKILL_FILENAME, kind=ASSET_FILE, label="plugin skill file")
+    return root
+
+
+def _entry_names(directory: str, *, label: str) -> list:
+    try:
+        return [entry.name for entry in Path(directory).iterdir()]
+    except OSError as exc:
+        raise ClaudeRuntimeError(
+            REASON_ASSET_UNREADABLE, "cannot list {0} {1}: {2}".format(label, directory, exc)
+        ) from exc
+
+
+def _nested(plugin_root: str, parent: str, name: str, *, kind: str, label: str) -> str:
+    """Resolve one component and require it to land inside the plugin root."""
+    resolved = _real(os.path.join(parent, name))
+    if not _is_within(resolved, plugin_root):
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_NESTED_ESCAPE,
+            "{0} {1}/{2} resolves to {3}, outside the validated plugin root {4}.".format(
+                label, parent, name, resolved, plugin_root
+            ),
+        )
+    return require_asset_kind(resolved, kind=kind, label=label)
+
+
+def _validate_manifest(plugin_root: str, manifest_directory: str) -> None:
+    entries = sorted(_entry_names(manifest_directory, label="plugin manifest directory"))
+    if entries != [PLUGIN_MANIFEST_FILENAME]:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_UNEXPECTED,
+            "{0} holds {1}; only {2} is permitted.".format(
+                manifest_directory, ", ".join(entries) or "nothing", PLUGIN_MANIFEST_FILENAME
+            ),
+        )
+    manifest_path = _nested(
+        plugin_root, manifest_directory, PLUGIN_MANIFEST_FILENAME,
+        kind=ASSET_FILE, label="plugin manifest",
+    )
+    try:
+        payload = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_UNEXPECTED,
+            "cannot read plugin manifest {0}: {1}".format(manifest_path, exc),
+        ) from exc
+    if not isinstance(payload, dict):
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_UNEXPECTED,
+            "plugin manifest {0} is not a JSON object.".format(manifest_path),
+        )
+    unknown = sorted(set(payload) - ALLOWED_MANIFEST_KEYS)
+    if unknown:
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_UNEXPECTED,
+            "plugin manifest {0} declares {1}, which redirect component discovery "
+            "outside the validated directory layout.".format(manifest_path, ", ".join(unknown)),
+        )
+    name = payload.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise ClaudeRuntimeError(
+            REASON_PLUGIN_MANIFEST_UNEXPECTED,
+            "plugin manifest {0} needs a non-empty string name; got {1!r}.".format(
+                manifest_path, name
+            ),
+        )
+    for key in sorted(ALLOWED_MANIFEST_KEYS - {"name"}):
+        if key in payload and not isinstance(payload[key], str):
+            raise ClaudeRuntimeError(
+                REASON_PLUGIN_MANIFEST_UNEXPECTED,
+                "plugin manifest {0} field '{1}' must be a string; got {2!r}.".format(
+                    manifest_path, key, payload[key]
+                ),
+            )
+
+
+# ---------------------------------------------------------------------------
+# The request
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeRequest:
+    """One immutable launch-or-resume invocation, fully validated before it exists."""
+
+    mode: str
+    workspace_path: str
+    workspace_key: str
+    worktree_id: str
+    session_id: str
+    role: str
+    iteration: RailIteration
+    controller_root: str
+    prompt_file: str
+    plugin_root: str
+    expected_skill: str
+    allowed_tools: Tuple[str, ...]
+    max_turns: int
+    max_budget_usd: float
+    cli_path: Optional[str] = None
+
+    @property
+    def is_launch(self) -> bool:
+        return self.mode == MODE_LAUNCH
+
+
+def _require_allowed_tools(values: Any) -> Tuple[str, ...]:
+    if isinstance(values, str) or not isinstance(values, (list, tuple)):
+        raise ClaudeRuntimeError(
+            REASON_INVALID_ALLOWED_TOOLS, "allowed_tools must be a sequence of tool rules."
+        )
+    resolved = []
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            raise ClaudeRuntimeError(
+                REASON_INVALID_ALLOWED_TOOLS,
+                "allowed_tools entries must be non-empty strings; got {0!r}.".format(value),
+            )
+        resolved.append(value.strip())
+    if not resolved:
+        raise ClaudeRuntimeError(
+            REASON_INVALID_ALLOWED_TOOLS,
+            "allowed_tools is empty. Under {0} that denies every tool, which is a "
+            "misconfigured rail rather than a runnable one.".format(PERMISSION_MODE),
+        )
+    duplicates = sorted({name for name in resolved if resolved.count(name) > 1})
+    if duplicates:
+        raise ClaudeRuntimeError(
+            REASON_INVALID_ALLOWED_TOOLS,
+            "allowed_tools repeats {0}.".format(", ".join(duplicates)),
+        )
+    return tuple(resolved)
+
+
+def _require_bounds(max_turns: Any, max_budget_usd: Any) -> Tuple[int, float]:
+    if not isinstance(max_turns, int) or isinstance(max_turns, bool) or max_turns <= 0:
+        raise ClaudeRuntimeError(
+            REASON_INVALID_BOUNDS, "max_turns must be a positive integer; got {0!r}.".format(max_turns)
+        )
+    if isinstance(max_budget_usd, bool) or not isinstance(max_budget_usd, (int, float)):
+        raise ClaudeRuntimeError(
+            REASON_INVALID_BOUNDS,
+            "max_budget_usd must be a number; got {0!r}.".format(max_budget_usd),
+        )
+    if max_budget_usd <= 0:
+        raise ClaudeRuntimeError(
+            REASON_INVALID_BOUNDS,
+            "max_budget_usd must be positive; got {0!r}.".format(max_budget_usd),
+        )
+    return max_turns, float(max_budget_usd)
+
+
+def _build_request(
+    record: BindingRecord,
+    *,
+    mode: str,
+    controller_root: Any,
+    prompt_file: Any,
+    plugin_root: Any,
+    expected_skill: str,
+    allowed_tools: Iterable,
+    max_turns: int,
+    max_budget_usd: float,
+    workspace_path: Any = None,
+    cli_path: Any = None,
+) -> RuntimeRequest:
+    workspace = _real(workspace_path if workspace_path is not None else record.workspace_path)
+    if workspace != _real(record.workspace_path):
+        raise ClaudeRuntimeError(
+            REASON_WORKSPACE_MISMATCH,
+            "session {0} is bound to workspace {1}, not {2}.".format(
+                record.session_id, record.workspace_path, workspace
+            ),
+        )
+
+    resolved_prompt = validate_controller_asset(
+        prompt_file, controller_root=controller_root, workspace_path=workspace,
+        label="system prompt file", kind=ASSET_FILE,
+    )
+    resolved_plugin = validate_controller_asset(
+        plugin_root, controller_root=controller_root, workspace_path=workspace,
+        label="plugin root", kind=ASSET_DIRECTORY,
+    )
+    # `role` is read off the binding record, never taken as an argument of this
+    # function: the record's role is what `reserve_binding` wrote from the
+    # `Assignment` the accepted decision was granted for, so the role side of this
+    # comparison traces back to the authorization and cannot be supplied by the
+    # caller that chose the package.
+    validate_plugin_surface(
+        resolved_plugin, expected_skill=expected_skill, role=record.role
+    )
+
+    turns, budget = _require_bounds(max_turns, max_budget_usd)
+    return RuntimeRequest(
+        mode=mode,
+        workspace_path=workspace,
+        workspace_key=record.workspace_key,
+        worktree_id=record.worktree_id,
+        session_id=validate_session_id(record.session_id),
+        role=record.role,
+        iteration=record.iteration,
+        controller_root=_real(controller_root),
+        prompt_file=resolved_prompt,
+        plugin_root=resolved_plugin,
+        expected_skill=expected_skill,
+        allowed_tools=_require_allowed_tools(allowed_tools),
+        max_turns=turns,
+        max_budget_usd=budget,
+        cli_path=str(cli_path) if cli_path is not None else None,
+    )
+
+
+def launch_request(record: BindingRecord, **kwargs: Any) -> RuntimeRequest:
+    """Build the one launch this reservation authorizes.
+
+    Launch is built from a *reserved* record, never a bound one: a bound record
+    already has a process, so launching from it would start a second session
+    under one session id.
+    """
+    if record.state != BINDING_STATE_RESERVED:
+        raise ClaudeRuntimeError(
+            REASON_BINDING_NOT_RESERVED,
+            "session {0} is {1}; only a reserved binding authorizes a launch.".format(
+                record.session_id, record.state
+            ),
+        )
+    return _build_request(record, mode=MODE_LAUNCH, **kwargs)
+
+
+def create_conversation_request(record: BindingRecord, **kwargs: Any) -> RuntimeRequest:
+    """Build the launch that brings a *bound* session's provider conversation into being.
+
+    `launch_request` above is authorized by a reservation, and for an ordinary
+    launch that is the whole story: the request is built while the record is still
+    reserved and sent as soon as the process attaches, so the conversation is
+    created by that first send and the record is bound by the time anyone could
+    ask again.
+
+    A replacement is not launched that way. It is minted, reserved, started and
+    bound with nothing sent -- deliberately, because coming into existence is not
+    the same act as being given work -- so its binding reaches `bound` while no
+    provider conversation under its id exists at all. That gap is invisible in the
+    record: `bound` describes the worker process, and a binding deliberately
+    carries no conversation evidence. `resume_request` cannot close it, because
+    `resume=<id>` names a conversation to reopen and the provider refuses an id it
+    has never seen -- `No conversation found with session ID: <id>`, observed for
+    real. Being bound is therefore necessary for a resume and not sufficient.
+
+    This builds the one invocation that can close it: the same launch the
+    reservation authorized, under the session's own minted id, from the bound
+    record. Whether a conversation already exists is stated by the caller rather
+    than read from the record, because only the controller that started the
+    session and has sent it nothing can say so; a caller that gets that wrong asks
+    the provider to create an id it already holds, which the provider refuses, and
+    nothing here quietly resumes instead.
+    """
+    if record.state != BINDING_STATE_BOUND:
+        raise ClaudeRuntimeError(
+            REASON_BINDING_NOT_BOUND,
+            "session {0} is {1}; only a bound binding whose provider conversation "
+            "does not yet exist authorizes a creating launch.".format(
+                record.session_id, record.state
+            ),
+        )
+    return _build_request(record, mode=MODE_LAUNCH, **kwargs)
+
+
+def resume_request(record: BindingRecord, **kwargs: Any) -> RuntimeRequest:
+    """Build the one exact resume this binding authorizes.
+
+    Resume is built from a *bound* record, so the session being resumed is one
+    this controller observed starting. There is no most-recent fallback anywhere
+    in this module: `continue_conversation` would silently pick whatever session
+    last ran in the directory, which is precisely the routing-by-inference the
+    ticket forbids.
+    """
+    if record.state != BINDING_STATE_BOUND:
+        raise ClaudeRuntimeError(
+            REASON_BINDING_NOT_BOUND,
+            "session {0} is {1}; only a bound binding authorizes an exact resume.".format(
+                record.session_id, record.state
+            ),
+        )
+    return _build_request(record, mode=MODE_RESUME, **kwargs)
+
+
+# ---------------------------------------------------------------------------
+# Options
+# ---------------------------------------------------------------------------
+
+
+def build_option_fields(request: RuntimeRequest) -> dict:
+    """The exact `ClaudeAgentOptions` keyword arguments this request implies.
+
+    Returned as plain data so the contract is testable without the SDK installed.
+    Every ambient source is named and closed here rather than left to a default.
+    """
+    if request.mode not in RUNTIME_MODES:
+        raise ClaudeRuntimeError(
+            REASON_INVALID_MODE,
+            "mode must be one of {0}; got {1!r}.".format(", ".join(RUNTIME_MODES), request.mode),
+        )
+
+    fields = {
+        "cwd": request.workspace_path,
+        # The empty list is the whole isolation story: no user, project, or local
+        # settings file is read, so no permission array or hook can arrive from disk.
+        "setting_sources": [],
+        "system_prompt": {"type": "file", "path": request.prompt_file},
+        "plugins": [{"type": "local", "path": request.plugin_root}],
+        "mcp_servers": {},
+        "strict_mcp_config": True,
+        "permission_mode": PERMISSION_MODE,
+        "allowed_tools": list(request.allowed_tools),
+        "disallowed_tools": [],
+        "add_dirs": [],
+        # An overlay on the worker's environment, not a scrub of it: the SDK merges
+        # this with the inherited process environment, so an empty dict adds nothing
+        # and removes nothing. Validating what the worker inherits -- credential and
+        # provider selectors above all -- belongs to the process-integration rail
+        # that actually owns the child process. Nothing here should be read as
+        # environment isolation.
+        "env": {},
+        "extra_args": {},
+        "hooks": None,
+        "agents": None,
+        "fallback_model": None,
+        "max_turns": request.max_turns,
+        "max_budget_usd": request.max_budget_usd,
+        # Never a fallback route: continuing would resume whatever session last ran
+        # here, and forking would mint an id the binding does not name.
+        "continue_conversation": False,
+        "fork_session": False,
+    }
+
+    if request.is_launch:
+        fields["session_id"] = request.session_id
+        fields["resume"] = None
+    else:
+        fields["session_id"] = None
+        fields["resume"] = request.session_id
+
+    if request.cli_path is not None:
+        fields["cli_path"] = request.cli_path
+    return fields
+
+
+# ---------------------------------------------------------------------------
+# Result
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class RuntimeResult:
+    """What a run is allowed to leave behind: identity, outcome, spend, and its last word.
+
+    No transcript, no tool log, and no assistant message before the last one.
+    Provider output is not collaboration state, and the handoff the executor
+    publishes is.
+
+    `terminal_payload` is the exception, and it is exactly one field of exactly one
+    message: the text the provider's terminal result carried when this invocation
+    completed. It is here so that the controller can publish the handoff the agent
+    ended its turn by writing -- transported, not interpreted, and never stored.
+    Nothing reads it as history: it exists only for the duration of the
+    finalization that follows the turn, and it is `None` on a failed invocation,
+    because a turn that did not complete has no last word to carry.
+    """
+
+    session_id: str
+    mode: str
+    subtype: Optional[str]
+    is_error: bool
+    num_turns: Optional[int] = None
+    total_cost_usd: Optional[float] = None
+    terminal_payload: Optional[str] = None
+
+
+def interpret_result(request: RuntimeRequest, observed: Mapping) -> RuntimeResult:
+    """Reduce a provider result to the binding-relevant facts, refusing a stranger.
+
+    The observed session id must equal the one this controller assigned. A
+    different id means the SDK started or resumed some other session, and nothing
+    downstream -- liveness, continuation, unbinding -- would be about the session
+    the binding names.
+    """
+    observed_id = observed.get("session_id")
+    if observed_id != request.session_id:
+        raise ClaudeRuntimeError(
+            REASON_RESULT_SESSION_MISMATCH,
+            "requested session {0} but the provider reported {1!r}.".format(
+                request.session_id, observed_id
+            ),
+        )
+    subtype = observed.get("subtype")
+    is_error = bool(observed.get("is_error", False)) or subtype != "success"
+    terminal = observed.get("terminal_text")
+    return RuntimeResult(
+        session_id=request.session_id,
+        mode=request.mode,
+        subtype=subtype if isinstance(subtype, str) else None,
+        is_error=is_error,
+        # An errored invocation carries no payload forward. Checkpoint 58's
+        # fail-closed semantics are that a turn which did not complete leaves
+        # nothing that can be credited, and dropping the text here means the
+        # finalization path downstream has nothing to be tempted by.
+        terminal_payload=(
+            terminal if isinstance(terminal, str) and not is_error else None
+        ),
+        num_turns=observed.get("num_turns") if isinstance(observed.get("num_turns"), int) else None,
+        total_cost_usd=(
+            float(observed["total_cost_usd"])
+            if isinstance(observed.get("total_cost_usd"), (int, float))
+            and not isinstance(observed.get("total_cost_usd"), bool)
+            else None
+        ),
+    )

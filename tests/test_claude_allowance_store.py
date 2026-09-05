@@ -1,0 +1,1428 @@
+"""`claude_allowance_store` records evidence exactly once and never invents any."""
+
+from __future__ import annotations
+
+from decimal import Decimal
+from pathlib import Path
+import ast
+import json
+import os
+import tempfile
+import unittest
+
+from ai_dev_flow import claude_allowance_store as store_module
+from ai_dev_flow.claude_allowance import (
+    AllowanceError,
+    CalibrationPoint,
+    build_profile,
+    estimate_current,
+)
+from ai_dev_flow.claude_allowance_store import (
+    CURRENT_METER,
+    SCHEMA_VERSION,
+    AllowanceStore,
+    AllowanceStoreError,
+    ProjectionInputs,
+    allowance_store_path,
+    result_workload,
+)
+from ai_dev_flow.claude_runtime import RuntimeResult
+
+FIVE_HOUR = 5 * 60 * 60
+SEVEN_DAY = 7 * 24 * 60 * 60
+BASE = 1_700_000_000
+RESET = BASE + FIVE_HOUR
+SEVEN_RESET = BASE + SEVEN_DAY
+
+
+def result(cost, *, is_error: bool = False) -> RuntimeResult:
+    """A reduced runtime result; only its cost is ever read."""
+    return RuntimeResult(
+        session_id="11111111-2222-3333-4444-555555555555",
+        mode="launch",
+        subtype="error" if is_error else "success",
+        is_error=is_error,
+        num_turns=1,
+        total_cost_usd=cost,
+    )
+
+
+class StoreTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        self.root = Path(tempfile.mkdtemp(prefix="allowance-store-"))
+        self.addCleanup(self._remove_root)
+        self.path = self.root / "workload.json"
+        self.store = AllowanceStore(self.path)
+
+    def _remove_root(self) -> None:
+        for item in sorted(self.root.rglob("*"), reverse=True):
+            item.unlink() if item.is_file() else item.rmdir()
+        self.root.rmdir()
+
+    def payload(self) -> dict:
+        return json.loads(self.path.read_text(encoding="utf-8"))
+
+    def rewrite(self, payload) -> None:
+        text = payload if isinstance(payload, str) else json.dumps(payload, indent=2)
+        self.path.write_text(text, encoding="utf-8")
+
+    def observe(self, offset: int, percentage: str, *, since=BASE - 1, window="five_hour"):
+        return self.store.append_observation(
+            window=window,
+            observed_at=BASE + offset,
+            resets_at=RESET,
+            used_percentage=Decimal(percentage),
+            human_exclusive_since=since,
+        )
+
+
+# --------------------------------------------------------------------------
+# The one conversion boundary
+# --------------------------------------------------------------------------
+
+
+class ConversionTests(StoreTestCase):
+    def test_the_runtime_float_converts_through_its_decimal_string(self) -> None:
+        """`Decimal(value)` would bake in binary noise nobody reported."""
+        self.assertNotEqual(Decimal(0.1), Decimal("0.1"))
+        self.assertEqual(result_workload(0.1), Decimal("0.1"))
+        self.assertNotEqual(result_workload(0.1), Decimal(0.1))
+        for value, expected in ((0.3, "0.3"), (1.005, "1.005"), (2, "2"), (0.0, "0.0")):
+            with self.subTest(value=value):
+                self.assertEqual(result_workload(value), Decimal(expected))
+
+    def test_a_missing_cost_is_not_a_number_at_all(self) -> None:
+        self.assertIsNone(result_workload(None))
+
+    def test_costs_that_are_not_exact_non_negative_numbers_are_refused(self) -> None:
+        for value in (True, False, "0.1", float("nan"), float("inf"), -0.5, Decimal("1")):
+            with self.subTest(value=value):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    result_workload(value)
+                self.assertEqual(caught.exception.reason, store_module.REASON_INVALID_COST)
+
+    def test_only_a_reduced_runtime_result_is_a_workload_event(self) -> None:
+        for value in (object(), {"total_cost_usd": 0.1}, None, 0.1):
+            with self.subTest(value=type(value).__name__):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.record_result(value, idempotency_key="k1")
+                self.assertEqual(caught.exception.reason, store_module.REASON_INVALID_RESULT)
+
+
+# --------------------------------------------------------------------------
+# Accumulation
+# --------------------------------------------------------------------------
+
+
+class AccumulationTests(StoreTestCase):
+    def test_an_absent_store_has_recorded_nothing(self) -> None:
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.store.workload_units(), Decimal("0"))
+
+    def test_each_result_contributes_its_own_cost_once(self) -> None:
+        self.assertEqual(self.store.record_result(result(0.1), idempotency_key="a"),
+                         Decimal("0.1"))
+        self.assertEqual(self.store.record_result(result(0.2), idempotency_key="b"),
+                         Decimal("0.3"))
+        self.assertEqual(self.store.workload_units(), Decimal("0.3"))
+
+    def test_an_error_result_with_a_numeric_cost_still_counts(self) -> None:
+        """Unsuccessful work still consumed allowance."""
+        self.store.record_result(result(0.1), idempotency_key="ok")
+        failed = result(0.25, is_error=True)
+        self.assertTrue(failed.is_error)
+        self.assertEqual(self.store.record_result(failed, idempotency_key="bad"),
+                         Decimal("0.35"))
+
+    def test_a_missing_cost_adds_nothing_and_is_not_zero_work(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        self.assertEqual(self.store.record_result(result(None), idempotency_key="gap"),
+                         Decimal("0.1"))
+        recorded = self.payload()["results"]
+        self.assertEqual([entry["cost"] for entry in recorded], ["0.1", None])
+        # It is recorded as a hole, not dropped and not counted as free work.
+        self.assertEqual(len(recorded), 2)
+
+    def test_a_persisted_ledger_that_cannot_be_summed_fails_closed(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        self.store.record_result(result(0.2), idempotency_key="b")
+        payload = self.payload()
+        payload["results"][0]["cost"] = "9E+999999"
+        payload["results"][1]["cost"] = "9E+999999"
+        payload["workloadUnits"] = "0"
+        self.rewrite(payload)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.workload_units()
+        self.assertEqual(caught.exception.reason, store_module.REASON_WORKLOAD_OVERFLOW)
+
+
+# --------------------------------------------------------------------------
+# Exactly once
+# --------------------------------------------------------------------------
+
+
+class IdempotencyTests(StoreTestCase):
+    def test_an_identical_retry_is_a_no_op_across_a_restart(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        self.store.record_result(result(0.2), idempotency_key="b")
+        before = self.path.read_bytes()
+
+        # A brand-new store object reads only what is on disk.
+        restarted = AllowanceStore(self.path)
+        self.assertEqual(restarted.record_result(result(0.1), idempotency_key="a"),
+                         Decimal("0.3"))
+        self.assertEqual(restarted.workload_units(), Decimal("0.3"))
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_a_missing_cost_retry_is_also_a_no_op(self) -> None:
+        self.store.record_result(result(None), idempotency_key="gap")
+        before = self.path.read_bytes()
+        AllowanceStore(self.path).record_result(result(None), idempotency_key="gap")
+        self.assertEqual(self.path.read_bytes(), before)
+
+    def test_the_same_key_with_different_evidence_fails_closed(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        for conflicting in (result(0.2), result(None)):
+            with self.subTest(cost=conflicting.total_cost_usd):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.record_result(conflicting, idempotency_key="a")
+                self.assertEqual(caught.exception.reason, store_module.REASON_KEY_CONFLICT)
+        self.assertEqual(self.store.workload_units(), Decimal("0.1"))
+
+    def test_ordinals_are_assigned_by_the_store_in_append_order(self) -> None:
+        """A replay cannot obtain a second ordinal, in any arrival order."""
+        for index, key in enumerate(("a", "b", "c"), start=1):
+            self.store.record_result(result(0.1), idempotency_key=key)
+            self.assertEqual(self.payload()["results"][index - 1]["ordinal"], index)
+        # Re-presenting the first event does not append a fourth ordinal.
+        self.store.record_result(result(0.1), idempotency_key="a")
+        self.assertEqual([entry["ordinal"] for entry in self.payload()["results"]], [1, 2, 3])
+
+    def test_the_key_must_be_an_opaque_bounded_token(self) -> None:
+        for value in ("", "   ", None, 7, True, "/home/u/.claude/sessions/abc.jsonl",
+                      "has space", "x" * 129, "-leading-punctuation"):
+            with self.subTest(value=value):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.record_result(result(0.1), idempotency_key=value)
+                self.assertEqual(caught.exception.reason, store_module.REASON_INVALID_KEY)
+
+
+# --------------------------------------------------------------------------
+# Persistence
+# --------------------------------------------------------------------------
+
+
+class PersistenceTests(StoreTestCase):
+    def _populate(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        self.observe(0, "10", since=None)
+        self.store.record_result(result(0.2), idempotency_key="b")
+        self.observe(1_000, "30")
+
+    def test_the_serialized_form_is_deterministic(self) -> None:
+        self._populate()
+        first = self.path.read_bytes()
+        twin = AllowanceStore(self.root / "twin.json")
+        twin.record_result(result(0.1), idempotency_key="a")
+        twin.append_observation(window="five_hour", observed_at=BASE, resets_at=RESET,
+                                used_percentage=Decimal("10"), human_exclusive_since=None)
+        twin.record_result(result(0.2), idempotency_key="b")
+        twin.append_observation(window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
+                                used_percentage=Decimal("30"), human_exclusive_since=BASE - 1)
+        self.assertEqual(first, twin.path.read_bytes())
+
+    def test_the_schema_declares_its_version_and_meter(self) -> None:
+        self._populate()
+        payload = self.payload()
+        self.assertEqual(payload["version"], SCHEMA_VERSION)
+        self.assertEqual(payload["meter"], CURRENT_METER)
+        # The meter names its source, its accumulation semantics, and its version.
+        self.assertIn("total-cost-usd", CURRENT_METER)
+        self.assertTrue(CURRENT_METER.endswith("-v1"))
+
+    def test_a_store_written_for_another_meter_is_never_mixed_in(self) -> None:
+        self._populate()
+        payload = self.payload()
+        payload["meter"] = "claude-agent-sdk-result-total-cost-usd-v2"
+        self.rewrite(payload)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.workload_units()
+        self.assertEqual(caught.exception.reason, store_module.REASON_METER_MISMATCH)
+
+    def test_every_recorded_reading_carries_the_store_meter(self) -> None:
+        self._populate()
+        for point in self.store.observations("five_hour"):
+            self.assertEqual(point.meter, CURRENT_METER)
+
+    def test_unreadable_state_fails_closed_and_is_never_read_as_empty(self) -> None:
+        cases = {
+            "truncated": '{"version": 1, "met',
+            "empty": "",
+            "not an object": "[]",
+            "unknown version": None,
+            "unknown key": None,
+            "missing key": None,
+            "cumulative disagrees with the ledger": None,
+            "renumbered ordinal": None,
+            "removed ledger entry": None,
+            "repeated key": None,
+            "negative cost": None,
+            "cost that is not a string": None,
+            "tampered coverage flag": None,
+            "impossible observation epoch": None,
+            "observation out of order": None,
+        }
+        for label in cases:
+            with self.subTest(case=label):
+                # Each case owns its own store, so a failing assertion cannot
+                # leave durable state that decides the next case's outcome.
+                self.store = AllowanceStore(
+                    self.root / ("corrupt-%s.json" % label.replace(" ", "-")))
+                self.path = self.store.path
+                self._populate()
+                if cases[label] is not None:
+                    self.rewrite(cases[label])
+                else:
+                    payload = self.payload()
+                    if label == "unknown version":
+                        payload["version"] = 2
+                    elif label == "unknown key":
+                        payload["extra"] = 1
+                    elif label == "missing key":
+                        payload.pop("results")
+                    elif label == "cumulative disagrees with the ledger":
+                        payload["workloadUnits"] = "99"
+                    elif label == "renumbered ordinal":
+                        payload["results"][1]["ordinal"] = 7
+                    elif label == "removed ledger entry":
+                        payload["results"].pop(0)
+                    elif label == "repeated key":
+                        payload["results"][1]["key"] = payload["results"][0]["key"]
+                    elif label == "negative cost":
+                        payload["results"][0]["cost"] = "-1"
+                    elif label == "cost that is not a string":
+                        payload["results"][0]["cost"] = 0.1
+                    elif label == "tampered coverage flag":
+                        payload["observations"][1]["completeCoverage"] = False
+                    elif label == "impossible observation epoch":
+                        payload["observations"][0]["observedAt"] = 0
+                    elif label == "observation out of order":
+                        payload["observations"][1]["observedAt"] = BASE - 1
+                    self.rewrite(payload)
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.workload_units()
+                self.assertEqual(caught.exception.reason, store_module.REASON_MALFORMED_STORE)
+
+    def test_the_default_location_is_inside_the_workspace_state_directory(self) -> None:
+        self.assertEqual(allowance_store_path(Path("/repo")),
+                         Path("/repo/.ai-dev/allowance/workload.json"))
+
+
+# --------------------------------------------------------------------------
+# Privacy
+# --------------------------------------------------------------------------
+
+
+class PrivacyTests(StoreTestCase):
+    FORBIDDEN = ("account", "session", "prompt", "response", "transcript", "credential",
+                 "token", "api_key", "cookie", "email", "user", "log", "path")
+
+    def test_the_schema_has_nowhere_to_put_identity_or_content(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        self.observe(0, "10")
+        payload = self.payload()
+        names = set(payload)
+        for entry in payload["results"]:
+            names |= set(entry)
+        for entry in payload["observations"]:
+            names |= set(entry)
+        for name in names:
+            for banned in self.FORBIDDEN:
+                with self.subTest(field=name, banned=banned):
+                    self.assertNotIn(banned, name.lower())
+
+    def test_the_runtime_session_id_never_reaches_the_store(self) -> None:
+        recorded = result(0.1)
+        self.assertTrue(recorded.session_id)
+        self.store.record_result(recorded, idempotency_key="a")
+        self.assertNotIn(recorded.session_id, self.path.read_text(encoding="utf-8"))
+
+    def test_the_module_imports_only_the_standard_library_and_this_package(self) -> None:
+        source = Path(store_module.__file__).read_text(encoding="utf-8")
+        names = set()
+        for node in ast.walk(ast.parse(source)):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    names.add(alias.name)
+            elif isinstance(node, ast.ImportFrom):
+                names.add(("." * (node.level or 0)) + (node.module or ""))
+        self.assertEqual(
+            names,
+            {"__future__", "decimal", "errno", "json", "os", "pathlib", "re", "time",
+             "typing", ".claude_allowance", ".claude_runtime", ".json_files"},
+        )
+
+    def test_both_modules_parse_under_the_minimum_python(self) -> None:
+        for module in (store_module, __import__("ai_dev_flow.claude_allowance", fromlist=["x"])):
+            with self.subTest(module=module.__name__):
+                source = Path(module.__file__).read_text(encoding="utf-8")
+                ast.parse(source, feature_version=(3, 8))
+
+
+# --------------------------------------------------------------------------
+# Calibration observations
+# --------------------------------------------------------------------------
+
+
+class ObservationTests(StoreTestCase):
+    def test_the_store_supplies_workload_and_meter_not_the_caller(self) -> None:
+        self.store.record_result(result(0.4), idempotency_key="a")
+        point = self.observe(0, "10")
+        self.assertEqual(point.workload_units, Decimal("0.4"))
+        self.assertEqual(point.meter, CURRENT_METER)
+        for injected in ({"workload_units": Decimal("99")}, {"meter": "other"}):
+            with self.subTest(field=sorted(injected)[0]):
+                with self.assertRaises(TypeError):
+                    self.store.append_observation(
+                        window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
+                        used_percentage=Decimal("20"), human_exclusive_since=BASE - 1,
+                        **injected)
+
+    def test_coverage_is_the_conjunction_of_the_human_and_the_ledger(self) -> None:
+        """Every truth-table case, with the other input held fixed.
+
+        The human half is now derived: a claim starting at or before this
+        window's predecessor is the `True` row, and no claim at all is the
+        `False` row.
+        """
+        cases = (
+            (True, True, True),
+            (True, False, False),
+            (False, True, False),
+            (False, False, False),
+        )
+        for human, ledger_clean, expected in cases:
+            with self.subTest(human=human, ledger_clean=ledger_clean):
+                store = AllowanceStore(self.root / "case-{0}-{1}.json".format(human, ledger_clean))
+                store.record_result(result(0.1), idempotency_key="opening")
+                store.append_observation(
+                    window="five_hour", observed_at=BASE, resets_at=RESET,
+                    used_percentage=Decimal("10"), human_exclusive_since=BASE - 1)
+                store.record_result(result(0.2), idempotency_key="inside")
+                if not ledger_clean:
+                    store.record_result(result(None), idempotency_key="hole")
+                point = store.append_observation(
+                    window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
+                    used_percentage=Decimal("30"),
+                    human_exclusive_since=(BASE - 1 if human else None))
+                self.assertEqual(point.complete_coverage, expected)
+
+    def test_a_gap_only_affects_the_span_that_contains_it(self) -> None:
+        # The window is opened first so both readings below have a predecessor
+        # and a covering claim. The ledger half is then the only thing that can
+        # separate them -- without the opening reading, the holed one would be
+        # uncovered by the human half as well and prove nothing about the span.
+        self.observe(0, "5")
+        self.store.record_result(result(None), idempotency_key="hole")
+        first = self.observe(1_000, "10")
+        self.store.record_result(result(0.2), idempotency_key="clean")
+        second = self.observe(2_000, "30")
+        self.assertFalse(first.complete_coverage)
+        self.assertTrue(second.complete_coverage)
+
+    def test_coverage_is_never_inferred_from_a_neighbouring_reading(self) -> None:
+        # The window is opened first: a first reading has no predecessor and is
+        # uncovered by derivation alone, which would confound the claim varied here.
+        self.observe(0, "5")
+        self.store.record_result(result(0.1), idempotency_key="a")
+        covered = self.observe(1_000, "10", since=BASE - 1)
+        self.store.record_result(result(0.2), idempotency_key="b")
+        uncovered = self.observe(2_000, "30", since=None)
+        self.store.record_result(result(0.3), idempotency_key="c")
+        recovered = self.observe(3_000, "50", since=BASE - 1)
+        self.assertEqual([covered.complete_coverage, uncovered.complete_coverage,
+                          recovered.complete_coverage], [True, False, True])
+
+    def test_the_exclusivity_claim_has_no_default_and_admits_only_an_instant(self) -> None:
+        """`None` is a statement, not an omission, and only an exact epoch is one.
+
+        Omitting the keyword is a Python `TypeError` rather than a refusal with a
+        reason, because a caller that never decided must not be able to fall
+        through to a default in either direction.
+        """
+        with self.assertRaises(TypeError):
+            self.store.append_observation(window="five_hour", observed_at=BASE,
+                                          resets_at=RESET, used_percentage=Decimal("10"))
+        # `None` is accepted and means the human has affirmed nothing this run.
+        point = self.store.append_observation(
+            window="five_hour", observed_at=BASE, resets_at=RESET,
+            used_percentage=Decimal("10"), human_exclusive_since=None)
+        self.assertFalse(point.complete_coverage)
+        for value in (True, False, 0, -1, 1.0, float(BASE), "yes", Decimal("1"),
+                      (BASE,), [BASE], object()):
+            with self.subTest(value=value):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.append_observation(
+                        window="five_hour", observed_at=BASE + 1_000, resets_at=RESET,
+                        used_percentage=Decimal("10"), human_exclusive_since=value)
+                self.assertEqual(caught.exception.reason, "invalid-epoch")
+        # Nothing above reached the history.
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+
+    def test_a_malformed_claim_costs_neither_a_lock_nor_a_write(self) -> None:
+        fresh = AllowanceStore(self.root / "untouched.json")
+        with self.assertRaises(AllowanceStoreError) as caught:
+            fresh.append_observation(window="five_hour", observed_at=BASE,
+                                     resets_at=RESET, used_percentage=Decimal("10"),
+                                     human_exclusive_since=1.0)
+        self.assertEqual(caught.exception.reason, "invalid-epoch")
+        self.assertFalse(fresh.path.exists())
+        self.assertFalse(fresh.lock_path.exists())
+
+    def test_no_boolean_keyword_survives_on_the_store_surface(self) -> None:
+        with self.assertRaises(TypeError):
+            self.store.append_observation(
+                window="five_hour", observed_at=BASE, resets_at=RESET,
+                used_percentage=Decimal("10"), human_complete_coverage=True)
+
+    def test_the_claim_is_compared_against_this_window_own_predecessor(self) -> None:
+        """Equal covers; one second later does not; no predecessor never does."""
+        first = self.observe(1_000, "10", since=BASE - 1)
+        self.assertFalse(first.complete_coverage, "a first reading has no span")
+        equal = self.observe(2_000, "20", since=BASE + 1_000)
+        self.assertTrue(equal.complete_coverage)
+        later = self.observe(3_000, "30", since=BASE + 2_000 + 1)
+        self.assertFalse(later.complete_coverage)
+
+    def test_no_claim_instant_reaches_the_file(self) -> None:
+        self.observe(0, "10")
+        self.observe(1_000, "20", since=BASE - 1)
+        text = self.path.read_text(encoding="utf-8")
+        self.assertNotIn(str(BASE - 1), text)
+        entry = self.payload()["observations"][-1]
+        self.assertEqual(sorted(entry), sorted([
+            "window", "observedAt", "resetsAt", "usedPercentage",
+            "workloadUnits", "ledgerOrdinal", "humanCoverage", "completeCoverage"]))
+        self.assertIs(entry["humanCoverage"], True)
+
+    def test_readings_append_in_strict_chronological_order(self) -> None:
+        self.observe(1_000, "10")
+        # A backfilled reading whose own reset horizon is valid, so only the
+        # chronology rule can refuse it.
+        for offset, label in ((999, "earlier"), (1_000, "identical")):
+            with self.subTest(case=label):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.append_observation(
+                        window="five_hour", observed_at=BASE + offset,
+                        resets_at=RESET, used_percentage=Decimal("20"),
+                        human_exclusive_since=BASE - 1)
+                self.assertEqual(caught.exception.reason,
+                                 store_module.REASON_OBSERVATION_OUT_OF_ORDER)
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+
+    def test_a_reading_the_estimator_would_refuse_is_refused_here_too(self) -> None:
+        for overrides, reason in (
+            ({"window": "hourly"}, "invalid-window"),
+            ({"observed_at": 0}, "invalid-epoch"),
+            ({"resets_at": BASE + FIVE_HOUR + 1}, "reset-beyond-named-window"),
+            ({"used_percentage": Decimal("101")}, "invalid-percentage"),
+            ({"used_percentage": 10.0}, "invalid-percentage"),
+        ):
+            with self.subTest(overrides=sorted(overrides)):
+                call = dict(window="five_hour", observed_at=BASE, resets_at=RESET,
+                            used_percentage=Decimal("10"), human_exclusive_since=BASE - 1)
+                call.update(overrides)
+                with self.assertRaises(AllowanceError) as caught:
+                    self.store.append_observation(**call)
+                self.assertEqual(caught.exception.reason, reason)
+
+    def test_the_public_history_is_every_recorded_reading_of_that_window(self) -> None:
+        """Coverage is predecessor-relative, so a filtered history would lie.
+
+        Asserted as behaviour rather than as a parameter list: what matters is
+        that nothing a caller can do drops a recorded reading or lets another
+        window's readings change this one's answer.
+        """
+        appended = []
+        for offset, percentage in ((0, "10"), (1_000, "30"), (2_000, "50")):
+            appended.append(self.observe(offset, percentage, since=None))
+            self.store.record_result(
+                result(0.1), idempotency_key="k%d" % offset)
+        recorded = self.store.observations("five_hour")
+        self.assertEqual(recorded, tuple(appended))
+        self.assertEqual(self.store.profile("five_hour"), build_profile(recorded))
+
+        # Readings in the other window are invisible here and change nothing.
+        baseline = self.store.profile("five_hour")
+        self.store.append_observation(
+            window="seven_day", observed_at=BASE + 3_000, resets_at=SEVEN_RESET,
+            used_percentage=Decimal("15"), human_exclusive_since=BASE - 1)
+        self.assertEqual(self.store.observations("five_hour"), recorded)
+        self.assertEqual(self.store.profile("five_hour"), baseline)
+
+    def test_an_unsupported_window_is_refused(self) -> None:
+        for name in ("hourly", "", None, 5):
+            with self.subTest(window=name):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.observations(name)
+                self.assertEqual(caught.exception.reason, store_module.REASON_INVALID_WINDOW)
+
+
+# --------------------------------------------------------------------------
+# Round trip
+# --------------------------------------------------------------------------
+
+
+class RoundTripTests(StoreTestCase):
+    def _history(self):
+        self.store.record_result(result(0.1), idempotency_key="a")
+        opening = self.observe(0, "10", since=None)
+        self.store.record_result(result(0.3), idempotency_key="b")
+        middle = self.observe(1_000, "30")
+        self.store.record_result(result(0.6), idempotency_key="c")
+        closing = self.observe(2_000, "50")
+        return opening, middle, closing
+
+    def test_the_whole_history_survives_a_restart_exactly(self) -> None:
+        expected = self._history()
+        restarted = AllowanceStore(self.path)
+        self.assertEqual(restarted.observations("five_hour"), expected)
+        for original, reloaded in zip(expected, restarted.observations("five_hour")):
+            self.assertEqual(original.used_percentage, reloaded.used_percentage)
+            self.assertEqual(original.workload_units, reloaded.workload_units)
+            self.assertEqual(original.complete_coverage, reloaded.complete_coverage)
+            self.assertEqual(original.observed_at, reloaded.observed_at)
+
+    def test_the_same_profile_and_estimate_before_and_after_reload(self) -> None:
+        self._history()
+        restarted = AllowanceStore(self.path)
+        before = self.store.profile("five_hour")
+        after = restarted.profile("five_hour")
+        self.assertEqual(before, after)
+        self.assertEqual(len(before.intervals), 2)
+
+        anchor = restarted.latest_observation("five_hour")
+        self.assertEqual(anchor, self.store.latest_observation("five_hour"))
+        arguments = dict(now=BASE + 3_000, workload_units=restarted.workload_units(),
+                         complete_coverage_since_anchor=True)
+        self.assertEqual(estimate_current(before, anchor, **arguments),
+                         estimate_current(after, anchor, **arguments))
+        self.assertTrue(estimate_current(after, anchor, **arguments).available)
+
+    def test_the_profile_is_built_from_the_complete_recorded_history(self) -> None:
+        self._history()
+        recorded = self.store.observations("five_hour")
+        self.assertEqual(self.store.profile("five_hour"), build_profile(recorded))
+        self.assertEqual(len(recorded), 3)
+
+    def test_a_window_with_no_history_is_empty_rather_than_absent(self) -> None:
+        self._history()
+        self.assertEqual(self.store.observations("seven_day"), ())
+        self.assertIsNone(self.store.latest_observation("seven_day"))
+        self.assertEqual(self.store.profile("seven_day").intervals, ())
+
+    def test_a_restart_does_not_turn_absence_into_zero_or_coverage(self) -> None:
+        self.store.record_result(result(None), idempotency_key="hole")
+        point = self.observe(0, "10", since=BASE - 1)
+        self.assertFalse(point.complete_coverage)
+        restarted = AllowanceStore(self.path)
+        self.assertEqual(restarted.workload_units(), Decimal("0"))
+        self.assertFalse(restarted.observations("five_hour")[0].complete_coverage)
+        self.assertEqual(restarted.profile("five_hour").intervals, ())
+
+
+# --------------------------------------------------------------------------
+# Cross-process exclusion
+# --------------------------------------------------------------------------
+
+
+class ExclusionTests(StoreTestCase):
+    def test_two_processes_never_silently_lose_recorded_work(self) -> None:
+        """Released from one barrier, every attempt either persists or refuses.
+
+        The assertion is deterministic whatever the interleaving: recorded plus
+        explicitly refused must account for every attempt. Silent loss is the
+        defect, and it shows up as a shortfall no matter who wins the races.
+        """
+        attempts_each = 40
+        read_end, write_end = os.pipe()
+        children = []
+        for worker in range(2):
+            pid = os.fork()
+            if pid == 0:  # pragma: no cover - child process
+                os.close(write_end)
+                os.read(read_end, 1)
+                os.close(read_end)
+                store = AllowanceStore(self.path)
+                refused = 0
+                for index in range(attempts_each):
+                    try:
+                        store.record_result(
+                            result(0.01),
+                            idempotency_key="w%d-%03d" % (worker, index))
+                    except AllowanceStoreError as exc:
+                        if exc.reason != store_module.REASON_STORE_LOCKED:
+                            os._exit(255)
+                        refused += 1
+                os._exit(refused)
+            children.append(pid)
+        os.close(read_end)
+        os.write(write_end, b"gg")
+        os.close(write_end)
+        refusals = 0
+        for pid in children:
+            status = os.waitpid(pid, 0)[1]
+            code = status >> 8
+            self.assertNotEqual(code, 255, "a child saw an unexpected refusal reason")
+            refusals += code
+
+        recorded = self.payload()["results"]
+        self.assertEqual(len(recorded) + refusals, 2 * attempts_each)
+        self.assertGreater(len(recorded), 0)
+        # Whatever persisted is exactly consistent, and its total is its ledger.
+        self.assertEqual(self.store.workload_units(),
+                         Decimal("0.01") * len(recorded))
+        self.assertEqual([e["ordinal"] for e in recorded],
+                         list(range(1, len(recorded) + 1)))
+        self.assertEqual(len({e["key"] for e in recorded}), len(recorded))
+
+    def test_a_held_lock_refuses_and_leaves_the_store_byte_identical(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        before_bytes = self.path.read_bytes()
+        self.store.lock_path.write_text(json.dumps(
+            {"version": 1, "generation": "someone-else", "pid": 1,
+             "acquiredAt": "2026-01-01T00:00:00+0000", "operation": "record_result"}),
+            encoding="utf-8")
+        calls = (
+            ("record_result", lambda: self.store.record_result(
+                result(0.2), idempotency_key="b")),
+            ("append_observation", lambda: self.observe(0, "10")),
+        )
+        for label, call in calls:
+            with self.subTest(call=label):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    call()
+                self.assertEqual(caught.exception.reason, store_module.REASON_STORE_LOCKED)
+        self.assertEqual(self.path.read_bytes(), before_bytes)
+
+    def test_a_malformed_lock_is_held_not_stale(self) -> None:
+        """An owner that cannot be proven is exactly when guessing is expensive."""
+        self.store.lock_path.write_text("{ not json", encoding="utf-8")
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.record_result(result(0.1), idempotency_key="a")
+        self.assertEqual(caught.exception.reason, store_module.REASON_STORE_LOCKED)
+        self.assertTrue(self.store.lock_path.exists(), "the lock was broken")
+
+    def test_a_refused_call_is_safely_retryable_under_the_same_key(self) -> None:
+        self.store.lock_path.write_text(json.dumps(
+            {"version": 1, "generation": "someone-else", "pid": 1,
+             "acquiredAt": "2026-01-01T00:00:00+0000", "operation": "record_result"}),
+            encoding="utf-8")
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.record_result(result(0.25), idempotency_key="same")
+        self.assertEqual(caught.exception.reason, store_module.REASON_STORE_LOCKED)
+        self.store.lock_path.unlink()
+
+        self.assertEqual(self.store.record_result(result(0.25), idempotency_key="same"),
+                         Decimal("0.25"))
+        self.assertEqual(self.store.record_result(result(0.25), idempotency_key="same"),
+                         Decimal("0.25"))
+        self.assertEqual(len(self.payload()["results"]), 1)
+
+    def test_the_lock_is_released_on_success_and_on_refusal(self) -> None:
+        self.store.record_result(result(0.1), idempotency_key="a")
+        self.assertFalse(self.store.lock_path.exists())
+        with self.assertRaises(AllowanceStoreError):
+            self.store.record_result(result(0.2), idempotency_key="a")  # conflicting
+        self.assertFalse(self.store.lock_path.exists(),
+                         "the lock survived an error path")
+        self.assertEqual(self.store.record_result(result(0.3), idempotency_key="c"),
+                         Decimal("0.4"))
+
+    def test_only_the_acquired_generation_is_released(self) -> None:
+        generation = self.store._acquire("probe")
+        self.store.lock_path.write_text(json.dumps(
+            {"version": 1, "generation": "a-different-generation", "pid": 1,
+             "acquiredAt": "2026-01-01T00:00:00+0000", "operation": "probe"}),
+            encoding="utf-8")
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store._release(generation)
+        self.assertEqual(caught.exception.reason, store_module.REASON_LOCK_LOST)
+        self.assertTrue(self.store.lock_path.exists())
+        self.store.lock_path.unlink()
+
+    def test_lock_metadata_carries_no_identity_or_content(self) -> None:
+        generation = self.store._acquire("record_result")
+        try:
+            payload = json.loads(self.store.lock_path.read_text(encoding="utf-8"))
+            self.assertEqual(set(payload),
+                             {"version", "generation", "pid", "acquiredAt", "operation"})
+            serialized = json.dumps(payload).lower()
+            for banned in PrivacyTests.FORBIDDEN:
+                with self.subTest(banned=banned):
+                    self.assertNotIn(banned, serialized)
+        finally:
+            self.store._release(generation)
+
+
+# --------------------------------------------------------------------------
+# Two windows from one human reading
+# --------------------------------------------------------------------------
+
+
+class WindowRelativeTests(StoreTestCase):
+    def _reading(self, offset, percentage, *, order, since=BASE - 1):
+        """One human `/usage` view recorded into both windows at one instant."""
+        pair = [("five_hour", RESET), ("seven_day", SEVEN_RESET)]
+        if order == "seven_first":
+            pair.reverse()
+        return [
+            self.store.append_observation(
+                window=window, observed_at=BASE + offset, resets_at=reset,
+                used_percentage=Decimal(percentage), human_exclusive_since=since)
+            for window, reset in pair
+        ]
+
+    def test_both_windows_of_one_reading_may_share_an_instant(self) -> None:
+        for order in ("five_first", "seven_first"):
+            with self.subTest(order=order):
+                store = AllowanceStore(self.root / ("shared-%s.json" % order))
+                self.store, saved = store, self.store
+                try:
+                    points = self._reading(0, "10", order=order)
+                    self.assertEqual({p.observed_at for p in points}, {BASE})
+                    self.assertEqual({p.window for p in points},
+                                     {"five_hour", "seven_day"})
+                finally:
+                    self.store = saved
+
+    def test_a_dirty_span_is_seen_by_both_windows_in_either_order(self) -> None:
+        """The review's reproduction: same ledger hole, same answer both windows."""
+        for order in ("five_first", "seven_first"):
+            with self.subTest(order=order):
+                store = AllowanceStore(self.root / ("dirty-%s.json" % order))
+                self.store, saved = store, self.store
+                try:
+                    store.record_result(result(1.0), idempotency_key="open")
+                    self._reading(0, "10", order=order)
+                    store.record_result(result(None), idempotency_key="hole")
+                    store.record_result(result(4.0), idempotency_key="seen")
+                    second = self._reading(100, "25", order=order)
+                    self.assertEqual([p.complete_coverage for p in second], [False, False])
+                    for window in ("five_hour", "seven_day"):
+                        self.assertEqual(store.profile(window).intervals, ())
+                finally:
+                    self.store = saved
+
+    def test_a_clean_span_stays_clean_for_both_windows(self) -> None:
+        self.store.record_result(result(1.0), idempotency_key="open")
+        self._reading(0, "10", order="five_first")
+        self.store.record_result(result(4.0), idempotency_key="seen")
+        second = self._reading(100, "25", order="seven_first")
+        self.assertEqual([p.complete_coverage for p in second], [True, True])
+        for window in ("five_hour", "seven_day"):
+            with self.subTest(window=window):
+                self.assertEqual(len(self.store.profile(window).intervals), 1)
+
+    def test_each_window_keeps_its_own_workload_and_predecessor(self) -> None:
+        """A gap before one window's reading does not follow it into the other."""
+        self.store.record_result(result(1.0), idempotency_key="open")
+        self.observe(0, "10", since=BASE - 1)                   # five_hour only
+        self.store.record_result(result(None), idempotency_key="hole")
+        seven = self.store.append_observation(
+            window="seven_day", observed_at=BASE + 50, resets_at=SEVEN_RESET,
+            used_percentage=Decimal("12"), human_exclusive_since=BASE - 1)
+        # seven_day has no predecessor, so its span starts at ordinal 0 and
+        # traverses the missing cost.
+        self.assertFalse(seven.complete_coverage)
+        self.store.record_result(result(2.0), idempotency_key="after")
+        five = self.observe(100, "20", since=BASE - 1)
+        self.assertFalse(five.complete_coverage)
+
+    def test_same_window_equal_time_and_backfill_still_fail_closed(self) -> None:
+        self.observe(1_000, "10")
+        for offset, label in ((1_000, "identical"), (999, "earlier")):
+            with self.subTest(case=label):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.append_observation(
+                        window="five_hour", observed_at=BASE + offset, resets_at=RESET,
+                        used_percentage=Decimal("20"), human_exclusive_since=BASE - 1)
+                self.assertEqual(caught.exception.reason,
+                                 store_module.REASON_OBSERVATION_OUT_OF_ORDER)
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+
+    def test_interleaved_two_window_history_reloads_identically(self) -> None:
+        self.store.record_result(result(1.0), idempotency_key="a")
+        self._reading(0, "10", order="five_first")
+        self.store.record_result(result(3.0), idempotency_key="b")
+        self._reading(1_000, "25", order="seven_first")
+        before_bytes = self.path.read_bytes()
+
+        restarted = AllowanceStore(self.path)
+        for window in ("five_hour", "seven_day"):
+            with self.subTest(window=window):
+                self.assertEqual(restarted.observations(window),
+                                 self.store.observations(window))
+                self.assertEqual(restarted.profile(window), self.store.profile(window))
+        self.assertEqual(self.path.read_bytes(), before_bytes)
+
+
+# --------------------------------------------------------------------------
+# Reload re-derivation
+# --------------------------------------------------------------------------
+
+
+class ReDerivationTests(StoreTestCase):
+    def _seed(self):
+        """The hole falls between the two readings, so nothing legitimately trains."""
+        self.observe(0, "10")
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.store.record_result(result(4.0), idempotency_key="seen")
+        self.observe(100, "30")
+
+    def test_a_tampered_observation_workload_is_refused(self) -> None:
+        for label, value in (("inflated", "400"), ("deflated", "0.01")):
+            with self.subTest(case=label):
+                # Each case owns its own store, for the same reason.
+                self.store = AllowanceStore(self.root / ("tampered-%s.json" % label))
+                self.path = self.store.path
+                self._seed()
+                payload = self.payload()
+                payload["observations"][1]["workloadUnits"] = value
+                self.rewrite(payload)
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.profile("five_hour")
+                self.assertEqual(caught.exception.reason, store_module.REASON_MALFORMED_STORE)
+
+    def test_downshifted_ordinals_cannot_manufacture_a_clean_span(self) -> None:
+        """The sharp case: lowering ordinals used to invent training evidence."""
+        self._seed()
+        untouched = self.store.profile("five_hour")
+        self.assertEqual(untouched.intervals, ())
+        payload = self.payload()
+        for observation in payload["observations"]:
+            observation["ledgerOrdinal"] = 0
+            observation["completeCoverage"] = True
+        self.rewrite(payload)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.profile("five_hour")
+        self.assertEqual(caught.exception.reason, store_module.REASON_MALFORMED_STORE)
+
+    def test_a_valid_store_still_reloads(self) -> None:
+        self._seed()
+        self.assertEqual(AllowanceStore(self.path).observations("five_hour"),
+                         self.store.observations("five_hour"))
+
+
+# --------------------------------------------------------------------------
+# Reset ordering within a window
+# --------------------------------------------------------------------------
+
+# A window's second reset identity is one whole window later, and its readings
+# necessarily fall inside it -- a five-hour reading cannot sit five hours before
+# a reset two windows away, and the record refuses that outright.
+WINDOW_SPANS = {"five_hour": (FIVE_HOUR, RESET), "seven_day": (SEVEN_DAY, SEVEN_RESET)}
+
+
+def window_reading(window, identity, step):
+    """An `(observed_at, resets_at)` pair inside the given reset identity."""
+    span, first_reset = WINDOW_SPANS[window]
+    reset = first_reset + identity * span
+    return reset - span + 100 * (step + 1), reset
+
+
+def trained_spans_with_holes(store, window):
+    """Every trained interval, checked against the ledger it actually spans.
+
+    Deliberately ignores the stored `completeCoverage` flag and reads the durable
+    file instead. A flag computed against a shorter recorded span must not be able
+    to vouch for an interval that really covers more, so the oracle re-derives each
+    span from the two readings' own ledger ordinals.
+    """
+    payload = json.loads(store.path.read_text(encoding="utf-8"))
+    costs = {entry["ordinal"]: entry["cost"] for entry in payload["results"]}
+    ordinal_of = {
+        (entry["resetsAt"], entry["observedAt"]): entry["ledgerOrdinal"]
+        for entry in payload["observations"] if entry["window"] == window
+    }
+    offenders = []
+    for interval in store.profile(window).intervals:
+        start = ordinal_of[(interval.resets_at, interval.started_at)]
+        end = ordinal_of[(interval.resets_at, interval.ended_at)]
+        holes = [o for o in range(start + 1, end + 1) if costs.get(o) is None]
+        if holes:
+            offenders.append((interval.started_at, interval.ended_at, holes))
+    return offenders
+
+
+class ResetOrderTests(StoreTestCase):
+    def _reading(self, store, window, identity, step, percentage):
+        observed_at, reset = window_reading(window, identity, step)
+        return store.append_observation(
+            window=window, observed_at=observed_at, resets_at=reset,
+            used_percentage=Decimal(percentage), human_exclusive_since=BASE - 1)
+
+    def test_an_unchanged_reset_epoch_is_accepted(self) -> None:
+        """Successive readings inside one reset identity are the normal case."""
+        first = self._reading(self.store, "five_hour", 0, 0, "10")
+        second = self._reading(self.store, "five_hour", 0, 1, "20")
+        self.assertEqual(first.resets_at, second.resets_at)
+        self.assertGreater(second.observed_at, first.observed_at)
+        self.assertEqual(len(self.store.observations("five_hour")), 2)
+
+    def test_an_advancing_reset_epoch_is_accepted(self) -> None:
+        """The provider moving on to a later window is also normal."""
+        first = self._reading(self.store, "five_hour", 0, 0, "10")
+        later = self._reading(self.store, "five_hour", 1, 0, "5")
+        self.assertGreater(later.resets_at, first.resets_at)
+        self.assertNotEqual(later.reset_identity, first.reset_identity)
+        self.assertEqual(len(self.store.observations("five_hour")), 2)
+
+    def test_a_regressing_reset_epoch_is_refused(self) -> None:
+        first = self._reading(self.store, "five_hour", 1, 0, "10")
+        before_bytes = self.path.read_bytes()
+        # Later in time, but claiming a reset behind the one already recorded, with
+        # its own horizon valid so only the ordering rule can object.
+        observed_at = first.observed_at + 100
+        regressing = observed_at + 60
+        self.assertLess(regressing, first.resets_at)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.append_observation(
+                window="five_hour", observed_at=observed_at, resets_at=regressing,
+                used_percentage=Decimal("20"), human_exclusive_since=BASE - 1)
+        self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
+        self.assertEqual(self.path.read_bytes(), before_bytes)
+        self.assertFalse(self.store.lock_path.exists())
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+
+    def test_reset_order_is_independent_between_windows(self) -> None:
+        """Each window carries its own reset history; neither constrains the other."""
+        five = self._reading(self.store, "five_hour", 1, 0, "10")
+        # five_hour has already advanced to its second identity. That constrains
+        # nothing in seven_day, whose own first reading is accepted regardless.
+        seven = self._reading(self.store, "seven_day", 0, 0, "10")
+        self.assertNotEqual(seven.resets_at, five.resets_at)
+        self.assertEqual(len(self.store.observations("seven_day")), 1)
+        self.assertEqual(len(self.store.observations("five_hour")), 1)
+        # The identical shape inside five_hour is still refused.
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.append_observation(
+                window="five_hour", observed_at=five.observed_at + 100,
+                resets_at=five.observed_at + 160,
+                used_percentage=Decimal("20"), human_exclusive_since=BASE - 1)
+        self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
+
+    def test_interleaved_two_window_histories_survive_in_both_orders(self) -> None:
+        for order in ("five_first", "seven_first"):
+            with self.subTest(order=order):
+                store = AllowanceStore(self.root / ("interleaved-%s.json" % order))
+                windows = ["five_hour", "seven_day"]
+                if order == "seven_first":
+                    windows.reverse()
+                for step in (0, 1):
+                    store.record_result(result(1.0),
+                                        idempotency_key="k-%s-%d" % (order, step))
+                    for window in windows:
+                        self._reading(store, window, 0, step, str(10 + 10 * step))
+                for window in ("five_hour", "seven_day"):
+                    self.assertEqual(len(store.observations(window)), 2)
+                reloaded = AllowanceStore(store.path)
+                for window in ("five_hour", "seven_day"):
+                    self.assertEqual(reloaded.observations(window), store.observations(window))
+
+    def test_persisted_reset_order_tampering_is_refused_on_reload(self) -> None:
+        self._reading(self.store, "five_hour", 0, 0, "10")
+        self._reading(self.store, "five_hour", 0, 1, "20")
+        payload = self.payload()
+        # Raise the first reading's reset so the second now reads as a regression,
+        # keeping every horizon valid so only the ordering rule can object.
+        payload["observations"][0]["resetsAt"] += 50
+        self.assertLess(payload["observations"][1]["resetsAt"],
+                        payload["observations"][0]["resetsAt"])
+        self.assertLessEqual(
+            payload["observations"][0]["resetsAt"] - payload["observations"][0]["observedAt"],
+            FIVE_HOUR)
+        self.rewrite(payload)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.observations("five_hour")
+        self.assertEqual(caught.exception.reason, store_module.REASON_MALFORMED_STORE)
+
+    def test_equal_and_advancing_histories_reload_unchanged(self) -> None:
+        self.store.record_result(result(1.0), idempotency_key="a")
+        self._reading(self.store, "five_hour", 0, 0, "10")
+        self.store.record_result(result(2.0), idempotency_key="b")
+        self._reading(self.store, "five_hour", 0, 1, "20")
+        self.store.record_result(result(3.0), idempotency_key="c")
+        self._reading(self.store, "five_hour", 1, 0, "5")
+        identities = {p.resets_at for p in self.store.observations("five_hour")}
+        self.assertEqual(len(identities), 2)
+        reloaded = AllowanceStore(self.path)
+        self.assertEqual(reloaded.observations("five_hour"), self.store.observations("five_hour"))
+        self.assertEqual(reloaded.profile("five_hour"), self.store.profile("five_hour"))
+
+    def test_the_reviewer_reproduction_cannot_be_recorded(self) -> None:
+        """A/B/A: an earlier-reset reading recorded between two later-reset ones.
+
+        On checkpoint 24 this history was writable, and `build_profile` paired the
+        two later-reset readings across a span containing a missing cost. The guard
+        now refuses the middle reading, so that history cannot exist.
+        """
+        self.store.record_result(result(1.0), idempotency_key="k1")
+        first = self._reading(self.store, "five_hour", 1, 0, "10")
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.store.record_result(result(4.0), idempotency_key="k2")
+        observed_at, earlier = window_reading("five_hour", 0, 1)
+        self.assertLess(earlier, first.resets_at)
+        with self.assertRaises(AllowanceStoreError) as caught:
+            self.store.append_observation(
+                window="five_hour", observed_at=first.observed_at + 10,
+                resets_at=first.observed_at + 10 + 60,
+                used_percentage=Decimal("15"), human_exclusive_since=BASE - 1)
+        self.assertEqual(caught.exception.reason, store_module.REASON_RESET_EPOCH_REGRESSED)
+
+        # The premise really was adversarial: a hole sits in the ledger, and only
+        # the one surviving reset identity remains, so nothing can pair across it.
+        payload = self.payload()
+        self.assertIn(None, [entry["cost"] for entry in payload["results"]])
+        self.assertEqual({entry["resetsAt"] for entry in payload["observations"]},
+                         {first.resets_at})
+        self.assertEqual(trained_spans_with_holes(self.store, "five_hour"), [])
+
+    def test_no_trained_interval_ever_spans_a_missing_cost(self) -> None:
+        """A bounded public-API corpus, judged by the ledger rather than by flags.
+
+        Every one of the 64 cases records both windows from each reading, as one
+        `/usage` view does, and every case attempts a reset that regresses behind
+        the one already recorded for that window. All three reset epochs sit far
+        above every observation the case can append, so an accepted regression
+        stays readable and the oracle is reachable: with the reset rule removed the
+        prohibited history trains across a hole and this test fails on its own
+        `assertEqual(offenders, [])`, not on a horizon or premise error.
+
+        Window choice and the human coverage statement are driven by disjoint bits,
+        so neither window's coverage can be inferred from which window it is.
+        """
+        windows = ("five_hour", "seven_day")
+        spans = {"five_hour": FIVE_HOUR, "seven_day": SEVEN_DAY}
+        steps = 6
+        # Three identities per window, all beyond any observation this corpus makes,
+        # so only the ordering rule can ever object to the regressing one.
+        base = {w: BASE + spans[w] for w in windows}
+        advanced = {w: BASE + spans[w] + 100 for w in windows}
+        regressing = {w: BASE + spans[w] - 50 for w in windows}
+        reset_for = {0: base, 1: base, 2: regressing, 3: base, 4: advanced, 5: advanced}
+
+        trained = {w: 0 for w in windows}
+        attempted = {w: 0 for w in windows}
+        refused = {w: 0 for w in windows}
+        holes_in_span = {w: 0 for w in windows}
+        oracles_run = {w: 0 for w in windows}
+        coverage_values = {w: set() for w in windows}
+
+        for case in range(64):
+            store = AllowanceStore(self.root / ("corpus-%02d.json" % case))
+            last_clean_ordinal = {w: 0 for w in windows}
+            for step in range(steps):
+                missing = (case + step) % 4 == 1
+                store.record_result(result(None if missing else 1.0 + step),
+                                    idempotency_key="c%02d-%d" % (case, step))
+                for index, window in enumerate(windows):
+                    # Disjoint bits: window index picks the triple, step picks the bit.
+                    covered = bool((case >> (3 * index + step % 3)) & 1)
+                    reset = reset_for[step][window]
+                    if step == 2:
+                        attempted[window] += 1
+                    try:
+                        store.append_observation(
+                            window=window, observed_at=BASE + 100 * (step + 1),
+                            resets_at=reset,
+                            used_percentage=Decimal(str(10 + 5 * step)),
+                            human_exclusive_since=(BASE - 1 if covered else None))
+                        # The store's own derived flag, read back from the file:
+                        # a strictly stronger premise than the argument sent in.
+                        coverage_values[window].add(
+                            [e for e in json.loads(
+                                store.path.read_text(encoding="utf-8"))["observations"]
+                             if e["window"] == window][-1]["humanCoverage"])
+                        if missing:
+                            holes_in_span[window] += 1
+                        last_clean_ordinal[window] = step
+                    except AllowanceStoreError as exc:
+                        self.assertEqual(exc.reason,
+                                         store_module.REASON_RESET_EPOCH_REGRESSED)
+                        refused[window] += 1
+            for window in windows:
+                offenders = trained_spans_with_holes(store, window)
+                oracles_run[window] += 1
+                self.assertEqual(offenders, [], "case %d %s trained across a hole: %s"
+                                 % (case, window, offenders))
+                trained[window] += len(store.profile(window).intervals)
+
+        # Emitted so the fixture can be audited from the validation record rather
+        # than taken on trust.
+        for window in windows:
+            print("corpus[%s]: oracles=%d intervals=%d holes_in_span=%d "
+                  "regressions_attempted=%d refused=%d coverage=%s"
+                  % (window, oracles_run[window], trained[window], holes_in_span[window],
+                     attempted[window], refused[window], sorted(coverage_values[window])))
+
+        # Per-window premises, so neither window can be carried by the other.
+        for window in windows:
+            with self.subTest(window=window):
+                self.assertEqual(oracles_run[window], 64, "the oracle did not run every case")
+                self.assertGreater(trained[window], 0, "no interval was ever trained")
+                self.assertGreater(holes_in_span[window], 0, "no missing cost landed in a span")
+                self.assertEqual(attempted[window], 64, "not every case attempted a regression")
+                self.assertEqual(refused[window], 64, "not every regression was refused")
+                self.assertEqual(coverage_values[window], {True, False},
+                                 "the coverage statement never varied")
+
+
+# --------------------------------------------------------------------------
+# One generation's worth of projection evidence
+# --------------------------------------------------------------------------
+
+
+class ProjectionInputsTests(StoreTestCase):
+    """The composition an honest current projection reads, proved to be one read."""
+
+    def _count_reads(self):
+        """Count generations, not method calls: `_read_payload` is what a load reads."""
+        reads = []
+        original = self.store._read_payload
+
+        def counting():
+            reads.append(1)
+            return original()
+
+        self.store._read_payload = counting
+        return reads
+
+    def test_an_empty_store_still_names_the_window_and_the_current_meter(self) -> None:
+        """`build_profile(())` reports blank values; the caller must not inherit them."""
+        for window in ("five_hour", "seven_day"):
+            with self.subTest(window=window):
+                inputs = self.store.projection_inputs(window)
+                self.assertEqual(inputs.window, window)
+                self.assertEqual(inputs.meter, CURRENT_METER)
+                self.assertEqual(inputs.profile.window, "")
+                self.assertEqual(inputs.profile.meter, "")
+                self.assertIsNone(inputs.anchor)
+                self.assertEqual(inputs.workload_units, Decimal(0))
+                self.assertTrue(inputs.ledger_clean_since_anchor)
+
+    def test_it_reports_the_newest_reading_for_the_requested_window_only(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20", window="five_hour")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40", window="five_hour")
+        seven = self.store.append_observation(
+            window="seven_day", observed_at=BASE + 30, resets_at=SEVEN_RESET,
+            used_percentage=Decimal("9"), human_exclusive_since=BASE - 1,
+        )
+
+        five = self.store.projection_inputs("five_hour")
+        self.assertEqual(five.anchor.used_percentage, Decimal("40"))
+        self.assertEqual(five.anchor.window, "five_hour")
+        self.assertEqual(five.workload_units, Decimal("0.75"))
+        self.assertEqual(five.profile.window, "five_hour")
+        self.assertEqual(len(five.profile.intervals), 1)
+
+        seven_inputs = self.store.projection_inputs("seven_day")
+        self.assertEqual(seven_inputs.anchor, seven)
+        self.assertEqual(seven_inputs.workload_units, Decimal("0.75"))
+        self.assertEqual(seven_inputs.profile.window, "seven_day")
+
+    def test_the_anchor_and_the_profile_agree_with_the_public_surface(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40")
+        inputs = self.store.projection_inputs("five_hour")
+        self.assertEqual(inputs.anchor, self.store.latest_observation("five_hour"))
+        self.assertEqual(inputs.profile, self.store.profile("five_hour"))
+        self.assertEqual(inputs.workload_units, self.store.workload_units())
+
+    def test_a_hole_after_the_anchor_makes_the_ledger_span_dirty(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.assertFalse(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+        # A later reading re-anchors past the hole, so the span becomes clean again
+        # without anything being repaired or forgotten.
+        self.observe(20, "40")
+        self.store.record_result(result(0.25), idempotency_key="after")
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+    def test_a_hole_before_the_anchor_does_not_dirty_the_span_after_it(self) -> None:
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="after")
+        inputs = self.store.projection_inputs("five_hour")
+        self.assertTrue(inputs.ledger_clean_since_anchor)
+        self.assertFalse(inputs.anchor.complete_coverage)
+
+    def test_with_no_reading_the_span_is_the_whole_ledger(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.assertFalse(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+    def test_each_window_gets_its_own_predecessor_ordinal(self) -> None:
+        """One `/usage` view writes both windows; a hole must dirty the right span."""
+        self.observe(10, "20", window="five_hour")
+        self.store.append_observation(
+            window="seven_day", observed_at=BASE + 10, resets_at=SEVEN_RESET,
+            used_percentage=Decimal("5"), human_exclusive_since=BASE - 1,
+        )
+        self.store.record_result(result(None), idempotency_key="hole")
+        self.observe(20, "40", window="five_hour")
+
+        # `five_hour` re-anchored past the hole; `seven_day` did not.
+        self.assertTrue(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+        self.assertFalse(self.store.projection_inputs("seven_day").ledger_clean_since_anchor)
+
+    def test_it_reads_exactly_one_generation(self) -> None:
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        reads = self._count_reads()
+        self.store.projection_inputs("five_hour")
+        self.assertEqual(len(reads), 1)
+
+    def test_a_write_landing_mid_read_cannot_change_what_is_reported(self) -> None:
+        """One generation means the generation that was read, whatever lands after.
+
+        The store gains a costed result and a hole once the first read is done. A
+        reader that went back for a second generation would answer partly from
+        the newer one -- which is how a newer workload total ends up beside a
+        cleanliness flag derived from an older ledger, the pairing that overstates
+        coverage. Reporting the first generation unchanged is the only answer that
+        cannot be such a mixture.
+        """
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        before = self.store.workload_units()
+        self.assertEqual(before, Decimal("0.5"))
+
+        original = self.store._read_payload
+        reads = []
+
+        def mutating():
+            reads.append(1)
+            if len(reads) == 1:
+                return original()
+            # Stand down first: the writes below load the store themselves, and a
+            # hook that re-entered here would deadlock on its own lock instead of
+            # letting the reader reach its assertion.
+            self.store._read_payload = original
+            self.store.record_result(result(0.25), idempotency_key="late")
+            self.store.record_result(result(None), idempotency_key="late-hole")
+            return original()
+
+        self.store._read_payload = mutating
+        inputs = self.store.projection_inputs("five_hour")
+
+        self.assertEqual(inputs.workload_units, before,
+                         "the workload came from a generation the reader should not have read")
+        self.assertTrue(inputs.ledger_clean_since_anchor,
+                        "the cleanliness flag came from a later generation")
+        self.assertEqual(len(reads), 1)
+
+        # And the later generation really was different, so the assertions above
+        # are not passing because there was nothing to notice.
+        self.assertEqual(self.store.workload_units(), Decimal("0.75"))
+        self.assertFalse(self.store.projection_inputs("five_hour").ledger_clean_since_anchor)
+
+    def test_it_refuses_a_window_that_is_not_one_of_the_two(self) -> None:
+        for window in ("hourly", "", "FIVE_HOUR", None, 5):
+            with self.subTest(window=window):
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.projection_inputs(window)
+                self.assertEqual(caught.exception.reason, store_module.REASON_INVALID_WINDOW)
+
+    def test_it_exposes_no_ledger_ordinal_and_takes_no_subset(self) -> None:
+        """The ordinal is the store's numbering; a caller may neither read nor choose one."""
+        inputs = self.store.projection_inputs("five_hour")
+        self.assertEqual(
+            ProjectionInputs._fields,
+            ("window", "meter", "profile", "anchor", "workload_units",
+             "ledger_clean_since_anchor"),
+        )
+        self.assertNotIn("ordinal", " ".join(ProjectionInputs._fields))
+        with self.assertRaises(TypeError):
+            self.store.projection_inputs("five_hour", since_ordinal=1)
+        self.assertIsInstance(inputs, ProjectionInputs)
+
+    def test_the_value_is_immutable(self) -> None:
+        inputs = self.store.projection_inputs("five_hour")
+        with self.assertRaises(AttributeError):
+            inputs.workload_units = Decimal("99")
+
+    def test_every_load_refusal_still_applies(self) -> None:
+        """No refusal is caught and softened into a value on this path."""
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+
+        cases = (
+            ("meter", lambda p: p.update({"meter": "other-meter-v1"}),
+             store_module.REASON_METER_MISMATCH),
+            ("workload", lambda p: p.update({"workloadUnits": "9.99"}),
+             store_module.REASON_MALFORMED_STORE),
+            ("version", lambda p: p.update({"version": 2}),
+             store_module.REASON_MALFORMED_STORE),
+            # Flipped, not set to a literal: a first reading already carries
+            # `False`, and writing the value it already holds would mutate
+            # nothing and prove nothing.
+            ("coverage", lambda p: p["observations"][0].update(
+                {"completeCoverage": not p["observations"][0]["completeCoverage"]}),
+             store_module.REASON_MALFORMED_STORE),
+        )
+        good = self.payload()
+        for label, mutate, reason in cases:
+            with self.subTest(case=label):
+                payload = json.loads(json.dumps(good))
+                mutate(payload)
+                self.rewrite(payload)
+                with self.assertRaises(AllowanceStoreError) as caught:
+                    self.store.projection_inputs("five_hour")
+                self.assertEqual(caught.exception.reason, reason)
+        self.rewrite(good)
+
+    def test_a_contradicting_history_raises_rather_than_returning_a_value(self) -> None:
+        """A percentage that fell has no append-only repair; it must not be softened."""
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40")
+        payload = self.payload()
+        payload["observations"][1]["usedPercentage"] = "10"
+        self.rewrite(payload)
+        with self.assertRaises(AllowanceError) as caught:
+            self.store.projection_inputs("five_hour")
+        self.assertEqual(caught.exception.reason, "provider-percentage-decreased")
+
+    def test_it_feeds_the_estimator_without_a_second_read(self) -> None:
+        """The composition exists to be handed straight to `estimate_current`."""
+        self.store.record_result(result(0.5), idempotency_key="a")
+        self.observe(10, "20")
+        self.store.record_result(result(0.25), idempotency_key="b")
+        self.observe(20, "40")
+        self.store.record_result(result(0.25), idempotency_key="c")
+
+        inputs = self.store.projection_inputs("five_hour")
+        estimate = estimate_current(
+            inputs.profile,
+            inputs.anchor,
+            now=BASE + 30,
+            workload_units=inputs.workload_units,
+            complete_coverage_since_anchor=inputs.ledger_clean_since_anchor and True,
+        )
+        self.assertTrue(estimate.available)
+        self.assertFalse(estimate.confirmed_exhausted)
+
+
+if __name__ == "__main__":
+    unittest.main()

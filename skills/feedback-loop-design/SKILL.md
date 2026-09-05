@@ -64,6 +64,88 @@ An unexpected result is not a reason for an automatic retry. Diagnose what the
 result changed, revise the hypothesis or implementation, and perform another
 expensive pass only when it can establish newly useful evidence.
 
+## Prove The Apparatus Before Paying The Cost
+
+A prepared pass can fail without producing any evidence when the harness,
+driver, or command it depends on was never checked against the place it will
+actually run. Before the first materially expensive boundary — a download or
+install, a build or deployment, an authentication step, a provider call, a live
+environment, a rendered or relayed observation, or a human handoff — establish
+that the apparatus can reach that boundary at all:
+
+- prove the target runtime, interpreter, and tool versions the apparatus
+  requires, including the interface features it actually uses;
+- validate the exact options, arguments, and input shapes the target will
+  accept, from authoritative interface documentation or a bounded direct probe;
+- compile, parse, or otherwise construct the driver through the last
+  deterministic boundary before the expensive action, including the state and
+  ordering preconditions that action requires;
+- when host and target differ materially, run the cheapest faithful self-test on
+  the target itself rather than trusting local behavior.
+
+Non-exhaustive help output, a local host's version of a tool, and a neighboring
+interface's behavior are not capability evidence. Absence from an abbreviated
+listing does not establish that an option is unsupported, and working locally
+does not establish that it works on the target.
+
+Dry construction covers ordering as well as syntax. Build the request, command,
+or payload in the exact state the real call will see, so a precondition that can
+only hold earlier in the sequence fails deterministically and cheaply instead of
+after the cost is paid.
+
+Preflight iteration is cheap and repairable. Correct a failed compatibility
+check, an invalid option, or a broken dry construction and continue; that is
+what the preflight is for. Once the expensive attempt begins, that latitude ends
+and the no-automatic-retry rule above governs. Keep the boundary honest in both
+directions: an authoring defect corrected before a declared pass is not a
+failure of that pass, and a declared validation or expensive attempt does not
+become repeatable by describing its failure as a typo.
+
+The same discipline governs what a pass declares it will affect. When a negative
+control, mutation, or other deliberate-breakage pass states an exact set of tests
+it expects to fail, derive that set two ways and take both: from the prohibited
+behavioral invariant, and from searching the tests themselves for the exact text
+or construct the mutation will change, together with the assertions structurally
+coupled to it — those that index on, split around, or compare against that same
+text. Recalling which test names sound related to the behavior is not an
+enumeration method, because a test can assert the mutated construct without
+naming the idea at all.
+
+A failure caused directly by such a coupled assertion is inside the pass rather
+than outside it, but it still proves the declaration incomplete. Disclose the
+omission plainly instead of relabelling the extra failure unrelated or widening
+the original claim after seeing the result.
+
+A pass that claims a semantic invariant holds across several partitions -- corpus
+members, input classes, rendered viewports, locales, or any other set the claim
+enumerates -- owes that proof per partition rather than in aggregate. Enumerate the
+partitions the claim covers before paying the outer-loop cost, so the asserted set
+is fixed before any result is seen rather than described afterwards from whatever
+the pass happened to reach.
+
+Prove the oracle, not the redness. A deliberate-breakage control establishes kill
+power only when the failure it produces is the named semantic assertion for the
+partition in question. A suite that merely turns red can do so through an
+unrelated structural, parsing, or setup failure that would have fired whatever the
+invariant said, which leaves the claimed coverage unproven for every partition the
+control never actually reached. State which assertion is expected to fail, and
+confirm that it is the one that did.
+
+Layered defenses can hide a missing oracle. When an aggregate guard and a
+per-partition guard both stand over the same behavior, removing one leaves the
+other to fail the pass while the intended oracle is never exercised. Remove the
+coupled defenses together inside the isolated control, so the assertion whose
+load-bearing status is in question is the one left to catch the breakage.
+
+Controls are isolated, never canonical. Run deliberate breakage in a disposable
+copy, or restore byte-exact afterwards and show that it was restored. Proving kill
+power is never a reason to leave the canonical worktree mutated.
+
+Keep this proportional. A pass that claims no exact set owes no enumeration, and
+nothing here asks for a dependency analyzer, a mutation harness, a registry of
+controls, or any scoring of declarations. Routine fast validation that claims no
+partition or corpus coverage owes no per-partition control at all.
+
 ## Size The Execution Rail To The Next Branch Point
 
 Build a rail only across work whose route is currently knowable.
