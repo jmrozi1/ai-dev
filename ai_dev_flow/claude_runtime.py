@@ -340,10 +340,20 @@ def validate_plugin_surface(plugin_root: Any, *, expected_skill: str, role: str)
     # separate operator inputs everywhere upstream of here, and this is the point
     # at which they are compared and made unable to disagree silently.
     #
-    # The comparison is with `skills[0]` rather than with `expected_skill` so that
-    # what is checked is the package's own content: the line above has already
-    # proved the two are equal, and reading it off the filesystem is what makes
-    # this a statement about the plugin rather than about the command line.
+    # The comparison is written against `skills[0]` rather than `expected_skill`,
+    # but -- corrected at checkpoint 76 -- that is not what makes this a statement
+    # about the package. The check directly above raises unless
+    # `skills == [expected_skill]`, so by this line `skills[0] == expected_skill`
+    # always holds and the two spellings are provably the same predicate. Claiming
+    # otherwise overstated it.
+    #
+    # What actually makes this a statement about the binding rather than about the
+    # command line is the *other* operand: `role` reaches here from `record.role`,
+    # which `_build_request` supplies from the durable binding and never accepts as
+    # an argument. `skills[0]` is kept for the narrower and honest reason that it is
+    # the value this function read off the filesystem, so the comparison and the
+    # refusal message below quote one source, and the line stays correct if the
+    # equality check above is ever loosened.
     if skills[0] != role:
         raise ClaudeRuntimeError(
             REASON_PLUGIN_ROLE_MISMATCH,

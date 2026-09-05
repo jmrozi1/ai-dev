@@ -29,6 +29,7 @@ from ai_dev_flow.session_binding import (
 )
 from ai_dev_flow.session_lifecycle import SessionRegistry
 
+from tests.source_oracles import call_locations
 from tests.test_role_invocation import (
     EXECUTOR,
     EXECUTOR_RAIL,
@@ -583,8 +584,15 @@ class StructuralTests(DriverTestBase):
                           "occupied", "ceiling"):
             self.assertNotIn(forbidden, used)
             self.assertFalse(hasattr(role_driver, forbidden))
-        # The only occupancy readings it holds are ones the controller produced.
-        self.assertEqual(self._source("role_driver.py").count("controller.agent_count("), 3)
+        # The only occupancy readings it holds are ones the controller produced,
+        # and all three are inside `drive_roles` rather than scattered. Counted over
+        # the parsed module, not over its text: this file argues in comments about
+        # the second count it does not have, and a substring count was failed by any
+        # comment that spelled the call out.
+        self.assertEqual(
+            call_locations("agent_count", modules=("role_driver.py",)),
+            [("role_driver.py", "drive_roles")] * 3,
+        )
 
     def test_the_orchestrator_entry_points_are_byte_unchanged(self):
         """`manager_dispatch` and `orchestrator_invocation` are the accepted bytes.
@@ -650,7 +658,10 @@ class StructuralTests(DriverTestBase):
         self.assertTrue(callable(role_driver_dispatch.main))
         text = self._source("role_driver_dispatch.py")
         self.assertIn('if __name__ == "__main__":', text)
-        self.assertEqual(text.count("drive_roles("), 1)
+        self.assertEqual(
+            call_locations("drive_roles", modules=("role_driver_dispatch.py",)),
+            [("role_driver_dispatch.py", "main")],
+        )
 
 
 class EntryPointTests(DriverTestBase):

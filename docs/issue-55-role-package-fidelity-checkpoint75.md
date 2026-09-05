@@ -317,3 +317,65 @@ no provider budget spent; **neither checkpoint-72 residual closed** — both sta
 they stood at `381689d`, and are now written down; checkpoint 73's and checkpoint 74's
 published text not edited, only appended to; no follow-on ticket filed; no checkpoint
 accepted; product `main` unmoved.
+
+---
+
+## Correction, appended at checkpoint 76 — two claims above were overstated
+
+Checkpoint 75's narrative above is left as it was published. These two sentences in it
+were wrong when they were written, and are corrected here rather than edited there.
+
+**1. "Asserted structurally: the module contains exactly one call to the validator."**
+(under *It is a gate, so*, third bullet). **False as published.** The assertion was not
+structural. It was
+
+```python
+module = inspect.getsource(claude_runtime)
+self.assertEqual(module.count("validate_plugin_surface(
+"), 1)
+```
+
+— a count of the *substring* `validate_plugin_surface(` immediately followed by a line
+break. It therefore counted calls whose open paren happened to sit at the end of a line.
+A genuine second call to the validator, written on one line, satisfies it. Review
+demonstrated exactly that: a second call was added, the count stayed at 1, and **no
+shipped test failed**. The single-chokepoint property this boundary is built on was, in
+practice, guarded by a formatting convention.
+
+**What it is now.** `tests/test_claude_runtime.py` parses every module in `ai_dev_flow/`
+and counts `ast.Call` nodes by resolved callee name, via `tests/source_oracles.py`. It
+asserts both halves of the property, and the same site for each:
+
+- exactly one call to `validate_plugin_surface`, in `claude_runtime._build_request`;
+- exactly one construction of `RuntimeRequest`, in `claude_runtime._build_request`.
+
+The second half was never asserted at all before. One validator call says the gate is not
+bypassed by a laxer second call; one request construction says no builder can assemble a
+request *beside* the gate. Neither implies the other. The scan is over the whole package,
+not one module, because a second call anywhere in `ai_dev_flow` defeats the property.
+Comments, whitespace and line breaks are not in the parse tree, so the oracle cannot be
+satisfied or broken by formatting. Three sibling oracles that had the mirror-image defect
+— `controller.agent_count(`, `drive_roles(` and `dispatch_role(` substring counts, each
+breakable by a *comment* that merely mentioned the call — were converted with it.
+
+**2. "so it is a statement about the package's content rather than about the command
+line"** (under *Where it lives*), and the same claim in the `validate_plugin_surface`
+comment. **An overclaim.** The check immediately above raises unless
+`skills == [expected_skill]`, so at the role comparison `skills[0] == expected_skill`
+already holds and `skills[0] != role` and `expected_skill != role` are provably the same
+predicate. Choosing `skills[0]` cannot be what turns the comparison into a statement about
+the package, because the alternative would have said precisely the same thing.
+
+What actually makes it a statement about the binding rather than about the command line is
+the *other* operand: `role` comes from `record.role`, which `_build_request` supplies from
+the durable binding and refuses to take as a parameter. That part of checkpoint 75's
+argument stands unchanged and is what the gate rests on. `skills[0]` is kept for a
+narrower and honest reason, now written in the code: it is the value read off the
+filesystem, so the comparison and the refusal message quote one source, and the line stays
+correct if the equality check above is ever loosened.
+
+**Neither correction changes behaviour.** `ai_dev_flow/claude_runtime.py` was edited only
+inside a comment; its parse tree at checkpoint 76 is identical to its parse tree at
+`62e3d68`. The gate's behaviour, signature and reason semantics are untouched, and the
+refusal reason `plugin-role-mismatch` is now pinned as a literal by a test, which nothing
+did before.

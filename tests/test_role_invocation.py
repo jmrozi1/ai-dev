@@ -45,6 +45,8 @@ from ai_dev_flow.session_binding import (
 from ai_dev_flow.session_lifecycle import SessionRegistry
 from ai_dev_flow.tickets import TicketReference
 
+from tests.source_oracles import call_locations
+
 PROJECT = "ai-dev"
 TICKET = "issue-55"
 HEAD = "c" * 40
@@ -840,7 +842,13 @@ class ConcurrencyIsNoLongerRefusedTests(RoleInvocationTestBase):
             for token in forbidden:
                 self.assertNotIn(token, text, "{0} mentions {1}".format(name, token))
         entry = (package / "role_dispatch.py").read_text(encoding="utf-8")
-        self.assertEqual(entry.count("dispatch_role("), 1)
+        # One enactment, counted over the parsed module: a comment naming the call
+        # -- and the module carries one, explaining this very property -- broke the
+        # substring count this replaces without changing a line of code.
+        self.assertEqual(
+            call_locations("dispatch_role", modules=("role_dispatch.py",)),
+            [("role_dispatch.py", "main")],
+        )
         self.assertNotIn("open_role", entry)
         body = entry.split("def main(", 1)[1]
         code = [

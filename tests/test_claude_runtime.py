@@ -32,6 +32,7 @@ from ai_dev_flow.session_binding import (
     BindingRecord,
     RailIteration,
 )
+from tests.source_oracles import call_locations, call_sites
 
 
 RAIL = "issue-55-agent-sdk-isolation-contract"
@@ -597,8 +598,6 @@ class RolePackageBindingTests(RuntimeTestBase):
 
     def test_the_gate_reaches_every_request_this_boundary_builds(self) -> None:
         """Launch, resume and creating-launch all pass through the one comparison."""
-        import inspect
-
         reviewer = self._reviewer_plugin()
         kwargs = self._kwargs(plugin_root=reviewer, expected_skill="reviewer")
         for builder, record in (
@@ -615,10 +614,67 @@ class RolePackageBindingTests(RuntimeTestBase):
                     caught.exception.reason,
                     claude_runtime.REASON_PLUGIN_ROLE_MISMATCH,
                 )
-        # And structurally: there is exactly one call to the plugin validator in
-        # this module, so no builder can reach the SDK around it.
-        module = inspect.getsource(claude_runtime)
-        self.assertEqual(module.count("validate_plugin_surface(\n"), 1)
+
+    def test_the_gate_and_the_request_have_exactly_one_site_and_it_is_the_same_one(
+        self,
+    ) -> None:
+        """The chokepoint, asserted over the call graph rather than over formatting.
+
+        Both halves are needed and neither implies the other. One validator call
+        says the gate is not bypassed by a second, laxer call; one `RuntimeRequest`
+        construction says no builder can assemble a request *beside* the gate and
+        reach the SDK around it. A single site for each, and the same site for both,
+        is the property this boundary is built on.
+
+        Until checkpoint 76 this was `module.count("validate_plugin_surface(" +
+        newline) == 1` -- a count of calls whose open paren happened to be followed
+        by a line break. A real second call written on one line passed it, and no
+        shipped test died when one was added. The guard counted a formatting
+        artefact; this counts calls, over the whole package rather than one module,
+        because a second call anywhere in `ai_dev_flow` would defeat the property.
+        """
+        for name in ("validate_plugin_surface", "RuntimeRequest"):
+            with self.subTest(callee=name):
+                self.assertEqual(
+                    call_locations(name),
+                    [("claude_runtime.py", "_build_request")],
+                    "{0} call sites: {1}".format(name, call_sites(name)),
+                )
+
+    def test_the_refusal_reason_is_the_wire_value_operators_read(self) -> None:
+        """`plugin-role-mismatch` is pinned here, once, as a literal.
+
+        Every other assertion in this suite compares against the *constant*, so the
+        string itself could have been renamed in one edit with the whole suite still
+        green. It is what an operator greps for and what checkpoint 75's document
+        prints, so it is a wire value and it is pinned like one.
+        """
+        self.assertEqual(
+            claude_runtime.REASON_PLUGIN_ROLE_MISMATCH, "plugin-role-mismatch"
+        )
+
+    def test_the_role_and_package_comparison_is_case_sensitive(self) -> None:
+        """Pinning the decided behaviour, not changing it.
+
+        `skills[0] != role` is an exact string comparison, so an `Executor` package
+        is not the `executor` role's package. That is the safe direction -- it fails
+        closed, and role names are produced by the control plane rather than typed
+        freehand -- but it was undecided in the sense that nothing said so. This
+        asserts what the gate does today; a future slice that wants case folding
+        must come here and change this on purpose.
+        """
+        cased = self.controller_root / "plugins" / "ai-dev-Executor"
+        self._write_plugin(cased, skill="Executor", manifest={"name": "ai-dev-Executor"})
+        if sorted(entry.name for entry in (cased / "skills").iterdir()) != ["Executor"]:
+            self.skipTest("this filesystem does not preserve the case of entry names")
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            launch_request(
+                self._record(role="executor"),
+                **self._kwargs(plugin_root=cased, expected_skill="Executor")
+            )
+        self.assertEqual(
+            caught.exception.reason, claude_runtime.REASON_PLUGIN_ROLE_MISMATCH
+        )
 
 
 class NestedProvenanceTests(RuntimeTestBase):
