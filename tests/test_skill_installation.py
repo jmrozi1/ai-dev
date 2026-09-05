@@ -7,8 +7,10 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from ai_dev_flow.skill_installation import (
+    path_is_managed_link,
     discover_skill_packages,
     install_skill_packages,
     SkillInstallationError,
@@ -23,6 +25,19 @@ class SkillInstallationTests(unittest.TestCase):
         self.tmp_path = Path(self._tmpdir.name)
         self.repo_root = self.tmp_path / "repo"
         self.repo_root.mkdir(parents=True, exist_ok=True)
+        # The ownership manifest resolves from APPDATA/XDG_CONFIG_HOME rather
+        # than the home override, so an unisolated test shares the machine-global
+        # manifest and obsolete reconciliation would remove the user's real
+        # installed packages.
+        self._ownership_env = patch.dict(
+            os.environ,
+            {
+                "APPDATA": str(self.tmp_path / "appdata"),
+                "XDG_CONFIG_HOME": str(self.tmp_path / "xdg"),
+            },
+        )
+        self._ownership_env.start()
+        self.addCleanup(self._ownership_env.stop)
 
     def tearDown(self) -> None:
         self._tmpdir.cleanup()
@@ -50,7 +65,7 @@ class SkillInstallationTests(unittest.TestCase):
         chatgpt_skill = self.repo_root / "skills" / "chatgpt" / "orchestrator"
         chatgpt_skill.mkdir(parents=True, exist_ok=True)
         (chatgpt_skill / "SKILL.md").write_text("# ChatGPT orchestration\n", encoding="utf-8")
-        copilot_skill = self.repo_root / "skills" / "copilot" / "executor"
+        copilot_skill = self.repo_root / "skills" / "executor"
         copilot_skill.mkdir(parents=True, exist_ok=True)
         (copilot_skill / "SKILL.md").write_text("# Copilot execution\n", encoding="utf-8")
         chatgpt_flow = self.repo_root / "skills" / "chatgpt" / "flow"
@@ -200,9 +215,12 @@ class SkillInstallationTests(unittest.TestCase):
         source_repo = Path(__file__).resolve().parents[1]
         names = [package.name for package in discover_skill_packages(source_repo)]
 
-        self.assertEqual(names.count("auto-review"), 2)
-        self.assertEqual(names.count("flow"), 2)
-        self.assertEqual(len(names), 14)
+        # chatgpt, claude, and copilot each own an auto-review and a flow package.
+        self.assertEqual(names.count("auto-review"), 3)
+        self.assertEqual(names.count("flow"), 3)
+        # The provider-neutral executor role has exactly one shared source.
+        self.assertEqual(names.count("executor"), 1)
+        self.assertEqual(len(names), 16)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -222,11 +240,12 @@ class SkillInstallationTests(unittest.TestCase):
         self.assertEqual(result.updated_count, 0)
         self.assertEqual(result.unchanged_count, 0)
         for package in copilot_packages:
-            self.assertTrue((destination / package.name).is_symlink())
+            self.assertTrue(path_is_managed_link(destination / package.name))
 
     def test_each_audience_install_includes_shared_and_selected_skills(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
         shared_names = {
+            "executor",
             "feedback-loop-design",
             "frontend-design-review",
             "investigation-synthesis",
@@ -243,19 +262,24 @@ class SkillInstallationTests(unittest.TestCase):
                 "ticket-creation",
                 "work-skill-refinement",
             },
-            "copilot": {"auto-review", "executor", "flow"},
+            "claude": {"auto-review", "flow"},
+            "copilot": {"auto-review", "flow"},
         }
         for audience, audience_skills in expected_audience_skills.items():
             with self.subTest(audience=audience):
                 destination = self.tmp_path / f"dest-{audience}"
                 home = self.tmp_path / f"home-{audience}"
                 home.mkdir(parents=True, exist_ok=True)
-                result = install_skill_packages(
-                    repo_root=source_repo,
-                    destination_root=destination,
-                    home=home,
-                    audience=audience,
-                )
+                # The ownership manifest resolves from APPDATA on Windows rather
+                # than the home override, so isolate it or this shares the real
+                # machine-global manifest.
+                with patch.dict(os.environ, {"APPDATA": str(home / "appdata")}):
+                    result = install_skill_packages(
+                        repo_root=source_repo,
+                        destination_root=destination,
+                        home=home,
+                        audience=audience,
+                    )
 
                 self.assertEqual(
                     {status.name for status in result.statuses if status.state == "installed"},
@@ -282,8 +306,10 @@ class SkillInstallationTests(unittest.TestCase):
             [
                 "auto-review",
                 "auto-review",
+                "auto-review",
                 "executor",
                 "feedback-loop-design",
+                "flow",
                 "flow",
                 "flow",
                 "frontend-design-review",
@@ -319,8 +345,10 @@ class SkillInstallationTests(unittest.TestCase):
             [
                 "auto-review",
                 "auto-review",
+                "auto-review",
                 "executor",
                 "feedback-loop-design",
+                "flow",
                 "flow",
                 "flow",
                 "frontend-design-review",
@@ -356,7 +384,7 @@ class SkillInstallationTests(unittest.TestCase):
         self.assertEqual(result.unchanged_count, 0)
         self.assertEqual(result.statuses[0].state, "installed")
         installed = destination / "flow"
-        self.assertTrue(installed.is_symlink())
+        self.assertTrue(path_is_managed_link(installed))
         self.assertEqual(installed.resolve(), (self.repo_root / "skills" / "flow").resolve())
 
     def test_repeat_install_is_idempotent(self) -> None:
@@ -400,7 +428,7 @@ class SkillInstallationTests(unittest.TestCase):
         self.assertEqual(result.updated_count, 1)
         self.assertEqual(result.unchanged_count, 0)
         self.assertEqual(result.statuses[0].state, "updated")
-        self.assertTrue(installed.is_symlink())
+        self.assertTrue(path_is_managed_link(installed))
         self.assertEqual(installed.resolve(), (self.repo_root / "skills" / "flow").resolve())
 
     def test_retargeted_managed_symlink_fails_closed_and_is_preserved(self) -> None:
@@ -420,7 +448,7 @@ class SkillInstallationTests(unittest.TestCase):
         with self.assertRaisesRegex(SkillInstallationError, "conflicting unmanaged or divergent symlink"):
             self._install(destination, home=home)
 
-        self.assertTrue(installed.is_symlink())
+        self.assertTrue(path_is_managed_link(installed))
         self.assertEqual(installed.resolve(), unrelated_target.resolve())
 
     def test_unrelated_entries_are_preserved(self) -> None:
@@ -442,7 +470,7 @@ class SkillInstallationTests(unittest.TestCase):
         self.assertEqual(result.discovered_count, 1)
         self.assertTrue((unrelated_dir / "SKILL.md").exists())
         self.assertEqual(unrelated_file.read_text(encoding="utf-8"), "keep\n")
-        self.assertTrue(unrelated_link.is_symlink())
+        self.assertTrue(path_is_managed_link(unrelated_link))
 
     def test_existing_non_symlink_conflicts_fail_closed(self) -> None:
         self._write_skill("flow", content="# Flow\n")
@@ -460,7 +488,7 @@ class SkillInstallationTests(unittest.TestCase):
                 else:
                     conflict.write_text("user\n", encoding="utf-8")
 
-                with self.assertRaisesRegex(SkillInstallationError, "is not a symlink"):
+                with self.assertRaisesRegex(SkillInstallationError, "is not a managed symlink or junction"):
                     self._install(destination, home=home)
 
     def test_unmanaged_symlink_conflict_fails_closed(self) -> None:
@@ -487,7 +515,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self._install(destination, home=home)
         installed_legacy = destination / "legacy"
-        self.assertTrue(installed_legacy.is_symlink())
+        self.assertTrue(path_is_managed_link(installed_legacy))
 
         shutil.rmtree(removed_skill)
         result = self._install(destination, home=home)
@@ -507,7 +535,7 @@ class SkillInstallationTests(unittest.TestCase):
 
         self._install(destination, home=home)
         installed_legacy = destination / "legacy"
-        self.assertTrue(installed_legacy.is_symlink())
+        self.assertTrue(path_is_managed_link(installed_legacy))
 
         shutil.rmtree(removed_skill)
         installed_legacy.unlink()
@@ -538,7 +566,7 @@ class SkillInstallationTests(unittest.TestCase):
         with self.assertRaisesRegex(SkillInstallationError, "symlink target diverged"):
             self._install(destination, home=home)
 
-        self.assertTrue(installed_legacy.is_symlink())
+        self.assertTrue(path_is_managed_link(installed_legacy))
         self.assertEqual(installed_legacy.resolve(), divergent_target.resolve())
 
     def test_unrelated_unowned_skill_remains_untouched_during_obsolete_cleanup(self) -> None:

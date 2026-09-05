@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# AI_DEV_LAUNCHER_V1 (claude audience)
+# Resolves its own runtime from the launcher location and preserves the caller
+# working directory so repository identity comes from the product repository.
+set -euo pipefail
+
+script_path="${BASH_SOURCE[0]:-$0}"
+while [[ -L "$script_path" ]]; do
+  script_dir="$(cd "$(dirname "$script_path")" && pwd)"
+  script_path="$(readlink "$script_path")"
+  [[ "$script_path" != /* ]] && script_path="$script_dir/$script_path"
+done
+
+script_dir="$(cd "$(dirname "$script_path")" && pwd -P)"
+repo_root="$(cd "$script_dir/../../../.." && pwd)"
+
+source "$repo_root/tools/bootstrap/python_select.sh"
+python_executable="$(ai_dev_select_python "ai-dev")" || exit 1
+
+# Run the entry point by absolute path: sys.path[0] becomes the runtime's own
+# directory, never the caller's, so an older ai-dev CWD cannot shadow it.
+exec "$python_executable" "$repo_root/tools/claude/ai-dev-entry.py" "$@"
