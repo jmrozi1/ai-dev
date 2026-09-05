@@ -228,7 +228,15 @@ def main(argv: Optional[List[str]] = None) -> int:
             snapshot,
             [
                 RoleLaunch(
-                    rail=inputs.rail, role=inputs.role, request_kwargs=inputs.request_kwargs
+                    rail=inputs.rail,
+                    role=inputs.role,
+                    request_kwargs=inputs.request_kwargs,
+                    # Carried rather than dropped. This entry point parses its
+                    # groups with `role_dispatch.stated_role_inputs`, so
+                    # `--command-timeout` is accepted here whether or not anything
+                    # honours it; a flag that parses and is discarded is worse than
+                    # one that does not exist.
+                    command_timeout=inputs.command_timeout,
                 )
                 for inputs in launches
             ],
