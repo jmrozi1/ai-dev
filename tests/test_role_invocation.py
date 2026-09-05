@@ -11,7 +11,9 @@ import unittest
 
 from ai_dev_flow import role_dispatch, role_invocation, workspaces
 from ai_dev_flow.authorization import (
+    ACTION_CONTINUE,
     AgentSlots,
+    AuthorizationDecision,
     ControlPlaneObservation,
     RailObservation,
     WorkspaceObservation,
@@ -42,7 +44,7 @@ from ai_dev_flow.session_binding import (
     attach_process,
     reserve_binding,
 )
-from ai_dev_flow.session_lifecycle import SessionRegistry
+from ai_dev_flow.session_lifecycle import SessionRegistry, continue_session
 from ai_dev_flow.tickets import TicketReference
 
 from tests.source_oracles import call_locations, keyword_bindings
@@ -538,6 +540,66 @@ class RolePackageFidelityTests(RoleInvocationTestBase):
             self._invoke(role=REVIEWER, request_kwargs=self._package_of(EXECUTOR))
         self.assertEqual(caught.exception.reason, REASON_PLUGIN_ROLE_MISMATCH)
         self.assertEqual(self.registry.sessions(), [])
+
+    def _continued_with(self, package, *, established):
+        """Drive `continue_session` on a bound executor session, given a package.
+
+        The session is opened through the door that does not stop, so what is
+        continued is the bound, owned, `executor` binding a real launch wrote,
+        not a record this test assembled. `established` selects which of the two
+        routes out of `continue_session` runs: a session this controller has
+        already sent something to resumes, and one it has not is the creating
+        launch. Re-taking ownership reaches the second, because
+        `SessionRegistry.add` discards the conversation claim by design.
+        """
+        opened = self._open(role=EXECUTOR)
+        owned = opened.launched.owned
+        if not established:
+            self.registry.add(owned)
+        self.assertEqual(
+            self.registry.conversation_established(owned.session_id), established
+        )
+        assignment = opened.assignment
+        decision = AuthorizationDecision(
+            authorized=True, reason="ok", detail="",
+            project=assignment.project, ticket=assignment.ticket,
+            rail=assignment.rail, role=assignment.role, action=ACTION_CONTINUE,
+            iteration=assignment.iteration, head=assignment.head, ceiling=6,
+        )
+        send, sent = self._sender()
+        with self.assertRaises(ClaudeRuntimeError) as caught:
+            continue_session(
+                decision, assignment, store=self.store, registry=self.registry,
+                session_id=owned.session_id, request_kwargs=package,
+                prompt="carry on", send=send, alive=lambda pgid: True,
+            )
+        # Refused while the request was built, so nothing reached the worker.
+        self.assertEqual(sent, [])
+        return caught.exception
+
+    def test_an_executor_resume_handed_the_reviewer_package_is_refused(self):
+        """The steady-state route: every invocation after the first is this one.
+
+        The launch above is the first invocation only. If the gate held there and
+        nowhere else, one wrong package would be refused and every continuation
+        of the same session would run the other role's skill.
+        """
+        error = self._continued_with(self._package_of(REVIEWER), established=True)
+        self.assertEqual(error.reason, REASON_PLUGIN_ROLE_MISMATCH)
+        self.assertIn(REVIEWER, error.detail)
+        self.assertIn(EXECUTOR, error.detail)
+
+    def test_an_executor_creating_launch_handed_the_reviewer_package_is_refused(self):
+        """The other route out of the same call: bound, with nothing sent yet.
+
+        This is the replacement's first invocation, which is a launch rather than
+        a resume, and it is a separate request builder -- so the gate has to be
+        shown on it rather than inferred from the resume beside it.
+        """
+        error = self._continued_with(self._package_of(REVIEWER), established=False)
+        self.assertEqual(error.reason, REASON_PLUGIN_ROLE_MISMATCH)
+        self.assertIn(REVIEWER, error.detail)
+        self.assertIn(EXECUTOR, error.detail)
 
     def test_the_same_launch_with_its_own_package_is_admitted(self):
         """The admitting control, so the gate cannot be a route that refuses both.
