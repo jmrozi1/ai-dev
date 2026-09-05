@@ -32,7 +32,7 @@ from ai_dev_flow.session_binding import (
     BindingRecord,
     RailIteration,
 )
-from tests.source_oracles import call_locations, call_sites
+from tests.source_oracles import call_locations, call_sites, keyword_bindings
 
 
 RAIL = "issue-55-agent-sdk-isolation-contract"
@@ -586,12 +586,25 @@ class RolePackageBindingTests(RuntimeTestBase):
         """`_build_request` reads `record.role`; it takes no role of its own."""
         import inspect
 
-        source = inspect.getsource(claude_runtime._build_request)
-        # The whole call, not the substring: `role=record.role` also appears in the
-        # `RuntimeRequest` construction below, so asserting it alone passed even
-        # when the validator was handed the caller's `expected_skill` instead. The
-        # M3 mutation found that, and this is the assertion that survives it.
-        self.assertIn("expected_skill=expected_skill, role=record.role", source)
+        # The bindings at the call, read off the tree. `role=record.role` also
+        # appears in the `RuntimeRequest` construction below, so asserting that
+        # substring alone passed even when the validator was handed the caller's
+        # `expected_skill` instead -- the M3 mutation found that. Asserting the
+        # whole call as *text* survived M3 but not the two edits that matter: a
+        # comment quoting the asserted shape made it pass with the call weakened,
+        # and reformatting the real call across four lines made it fail with
+        # nothing changed. A comment is not a call and a line break is not in the
+        # tree, so neither reaches this.
+        self.assertEqual(
+            keyword_bindings("validate_plugin_surface"),
+            [
+                (
+                    "claude_runtime.py",
+                    "_build_request",
+                    {"expected_skill": "expected_skill", "role": "record.role"},
+                )
+            ],
+        )
         self.assertNotIn(
             "role", inspect.signature(claude_runtime._build_request).parameters
         )
@@ -606,6 +619,13 @@ class RolePackageBindingTests(RuntimeTestBase):
                 claude_runtime.create_conversation_request,
                 self._bound(role="executor"),
             ),
+            # Resume was named in the docstring above and driven by nothing until
+            # checkpoint 77. A resume that read the role off `expected_skill` --
+            # the caller's own argument -- instead of off the record passed the
+            # whole suite, because no shipped test ever handed a *resume* a
+            # package that disagreed with the binding. Every builder this module
+            # exports is driven here now, which is what the docstring claims.
+            (claude_runtime.resume_request, self._bound(role="executor")),
         ):
             with self.subTest(builder=builder.__name__):
                 with self.assertRaises(ClaudeRuntimeError) as caught:

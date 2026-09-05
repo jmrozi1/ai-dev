@@ -45,7 +45,7 @@ from ai_dev_flow.session_binding import (
 from ai_dev_flow.session_lifecycle import SessionRegistry
 from ai_dev_flow.tickets import TicketReference
 
-from tests.source_oracles import call_locations
+from tests.source_oracles import call_locations, keyword_bindings
 
 PROJECT = "ai-dev"
 TICKET = "issue-55"
@@ -574,11 +574,22 @@ class RolePackageFidelityTests(RoleInvocationTestBase):
         self.assertIs(parameter.default, inspect.Parameter.empty)
         self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
 
-        source = inspect.getsource(claude_runtime._build_request)
-        # The whole call: `role=record.role` on its own is also how the
-        # `RuntimeRequest` is constructed, so the substring alone does not say the
-        # validator was given it.
-        self.assertIn("expected_skill=expected_skill, role=record.role", source)
+        # The bindings at the one call, read off the tree rather than out of the
+        # file's text. `role=record.role` on its own is also how the
+        # `RuntimeRequest` is constructed, so the bare substring does not say the
+        # validator was given it; and asserting the whole call as text was in turn
+        # satisfiable by a comment quoting that shape while the call itself read
+        # `role=expected_skill`, and breakable by reformatting the real call.
+        self.assertEqual(
+            keyword_bindings("validate_plugin_surface"),
+            [
+                (
+                    "claude_runtime.py",
+                    "_build_request",
+                    {"expected_skill": "expected_skill", "role": "record.role"},
+                )
+            ],
+        )
         # And there is no `role` an operator could hand `_build_request` instead.
         self.assertNotIn(
             "role", inspect.signature(claude_runtime._build_request).parameters

@@ -16,6 +16,14 @@ different question than the one asked:
   without making one, and the modules they read argue at length in comments about
   exactly these calls. An oracle that a comment can break pushes the reasoning out
   of the code.
+- `tests/test_claude_runtime.py` and `tests/test_role_invocation.py` asserted
+  `"expected_skill=expected_skill, role=record.role" in source` to hold the *role*
+  side of the plugin gate -- where the gate reads its role operand from, which the
+  call merely existing does not answer. Both failure modes met in that one
+  assertion: weakening the call to `role=expected_skill` while adding a comment
+  quoting the asserted shape flipped both tests from failing to passing with the
+  code broken, and reformatting the real call across four lines failed both on an
+  edit that changes nothing. `keyword_bindings` answers it off the tree.
 
 Parsing removes both failure modes at once: comments, whitespace and line breaks
 are not in the tree, and a call is a call however it is spelled across lines.
@@ -49,6 +57,14 @@ def _resolve_callee(call):
     reached through an attribute, which is how `dispatch_role` and `agent_count`
     are actually reached. A call through a subscript or another expression resolves
     to nothing and is not counted; that is a real limit, stated rather than hidden.
+
+    The easiest evasion is neither of those, and is named here because omitting it
+    overstated what this resolution buys. Resolution is syntactic and follows no
+    binding, so a plain name rebinding -- `_gate = validate_plugin_surface` on one
+    line and `_gate(...)` on the next -- resolves to `_gate`. A scan for
+    `validate_plugin_surface` does not see that call at all, with no attribute and
+    no subscript anywhere in it, and nothing in this suite catches it today. It is
+    a disclosed residual of resolving names rather than resolving bindings.
     """
     callee = call.func
     if isinstance(callee, ast.Attribute):
@@ -62,9 +78,22 @@ def _collect(node, function, name, module, found):
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
         function = node.name
     if isinstance(node, ast.Call) and _resolve_callee(node) == name:
-        found.append((module, function, node.lineno))
+        found.append((module, function, node))
     for child in ast.iter_child_nodes(node):
         _collect(child, function, name, module, found)
+
+
+def _calls(name, modules):
+    """Every call to `name`, as (module, enclosing function, the `ast.Call` node).
+
+    The one traversal both public oracles below read: they differ only in what
+    they keep off each node, and a second traversal would be a second answer.
+    """
+    found = []
+    for path in _sources(modules):
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        _collect(tree, None, name, path.name, found)
+    return found
 
 
 def call_sites(name, *, modules=None):
@@ -77,11 +106,7 @@ def call_sites(name, *, modules=None):
     A `def`, an import, a type annotation and a mention in prose are not calls and
     are not counted. That is the entire point.
     """
-    found = []
-    for path in _sources(modules):
-        tree = ast.parse(path.read_text(encoding="utf-8"))
-        _collect(tree, None, name, path.name, found)
-    return found
+    return [(module, function, call.lineno) for module, function, call in _calls(name, modules)]
 
 
 def call_locations(name, *, modules=None):
@@ -92,3 +117,50 @@ def call_locations(name, *, modules=None):
     in the wrong function.
     """
     return [(module, function) for module, function, _ in call_sites(name, modules=modules)]
+
+
+def _binding_expression(value):
+    """One argument's value as canonical source regenerated from the tree.
+
+    `ast.unparse` re-renders the parsed node instead of quoting the file, so the
+    string compared against is one the file's own formatting cannot reach: it
+    carries no comment, no line break and no incidental spacing. A call spread
+    across four lines and the same call on one line produce the same string, and a
+    comment that merely quotes the call produces no string at all, because a
+    comment is not a call.
+    """
+    return ast.unparse(value)
+
+
+def _keyword_bindings(call):
+    bound = {}
+    for keyword in call.keywords:
+        if keyword.arg is None:
+            # `f(**mapping)` binds names this oracle cannot read. Recording it
+            # under a key no keyword argument can have keeps such a call visibly
+            # different from one that binds nothing, rather than silently empty.
+            bound["**"] = _binding_expression(keyword.value)
+            continue
+        bound[keyword.arg] = _binding_expression(keyword.value)
+    return bound
+
+
+def keyword_bindings(name, *, modules=None):
+    """Every call to `name`, as `(module, enclosing function, {keyword: expression})`.
+
+    `call_locations` says a call happens and where; this says what it was handed.
+    That is the separate question a gate raises -- a gate that reads its operand
+    from the caller's own argument instead of from durable state is still exactly
+    one call in exactly the right function -- and it is the question a substring
+    search over the source was being asked, and answering badly in both
+    directions at once.
+
+    Positional arguments are deliberately not reported. What is being pinned here
+    are the keywords, and a value moved out of one shows up as a keyword that is
+    no longer bound, which is a difference this oracle should report rather than
+    absorb.
+    """
+    return [
+        (module, function, _keyword_bindings(call))
+        for module, function, call in _calls(name, modules)
+    ]
