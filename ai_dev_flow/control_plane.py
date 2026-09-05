@@ -683,6 +683,23 @@ def tracked_content_is_clean(repo_root: Path) -> bool:
     return not completed.stdout.strip()
 
 
+def worktree_is_clean(repo_root: Path) -> bool:
+    """Report whether the checkout carries no staged, unstaged, or untracked change.
+
+    Distinct from `tracked_content_is_clean` above, and deliberately stricter. That
+    one answers about the *coordination* checkout, where an untracked artifact another
+    product has not published yet is none of this product's business. This one answers
+    about the *product* worktree a publication is recorded against, where an untracked
+    file is unpublished work and a head alone would not identify the tree. Restored at
+    promotion: the automatic merge of main into this lineage dropped the definition
+    while keeping its caller, and the two predicates must not be collapsed.
+    """
+    completed = _git_capture(repo_root, ["status", "--porcelain", "--untracked-files=all"])
+    if completed.returncode != 0:
+        raise ControlPlaneError(f"Cannot inspect the coordination checkout: {completed.stderr.strip()}")
+    return not completed.stdout.strip()
+
+
 # The name of the trailer one publication carries to say which product-repository
 # state it was written against. A trailer rather than artifact content because the
 # handoff's bytes are executor-authored prose whose contract belongs to the reviewer
