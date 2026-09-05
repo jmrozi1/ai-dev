@@ -68,6 +68,40 @@ from .session_binding import (
 
 
 WORKER_MODULE = "ai_dev_flow.claude_worker"
+
+# The worker must run *this* package, never whatever `ai_dev_flow` its workspace
+# happens to contain -- and `PYTHONPATH` alone cannot promise that. For `-m` and
+# for `-c` alike, CPython puts the working directory at `sys.path[0]`, ahead of
+# every `PYTHONPATH` entry, and the worker's working directory is the workspace.
+# A workspace carrying a different copy of this package would therefore shadow
+# the controller's silently: a managed session would run a different version of
+# the product's own worker and the controller would have no way to know.
+#
+# So the worker is started through this bootstrap instead. It removes exactly the
+# one path entry the interpreter injected for the working directory -- guarded, so
+# it can only ever delete an entry that *is* the working directory -- and only
+# then imports `runpy` and hands over to the module. `PYTHONPATH` is untouched and
+# still load-bearing; it is simply no longer outranked. Two entries can name the
+# working directory when the workspace and the controller are the same tree, and
+# the guard drops only the injected one, leaving the `PYTHONPATH` copy in place.
+#
+# Written as a bootstrap rather than as `-P` or `PYTHONSAFEPATH=1`, which do the
+# same job only from Python 3.11: below that floor the flag is a startup error
+# that would stop the worker from launching at all, and the variable is a silent
+# no-op that would leave this invariant quietly false. This text is plain 3.8
+# syntax and uses no interpreter option newer than the package's stated floor.
+WORKER_BOOTSTRAP = (
+    "import sys, os\n"
+    "_cwd = os.getcwd()\n"
+    "if sys.path and (\n"
+    "    sys.path[0] in ('', '.', _cwd)\n"
+    "    or os.path.realpath(sys.path[0]) == os.path.realpath(_cwd)\n"
+    "):\n"
+    "    del sys.path[0]\n"
+    "import runpy\n"
+    "runpy.run_module({0!r}, run_name='__main__', alter_sys=True)\n"
+).format(WORKER_MODULE)
+
 PROTOCOL_VERSION = 1
 
 MESSAGE_READY = "ready"
@@ -205,8 +239,11 @@ def build_worker_environment(
         value = source.get(name)
         if value is not None:
             environment[name] = value
-    # The worker is started with `-m`, so it must be able to import this package
-    # without depending on what its working directory happens to contain.
+    # Where the worker finds this package. This is necessary and not sufficient:
+    # it says the controller's package root is *a* place to look, and the launch
+    # bootstrap in `spawn_worker` is what makes it the *first* place, by dropping
+    # the working directory the interpreter would otherwise put ahead of it. On
+    # its own, this line would let a workspace's own `ai_dev_flow` win.
     environment["PYTHONPATH"] = str(package_root)
     if extra:
         for name, value in extra.items():
@@ -339,9 +376,13 @@ def spawn_worker(
     controller can signal the whole tree it owns and later prove that tree is gone.
     A shell would insert a process the controller does not hold and would
     reinterpret arguments it already validated.
+
+    The default command runs `WORKER_BOOTSTRAP`, not `-m WORKER_MODULE`, so that
+    the module the child imports is the controller's own and not one the workspace
+    supplies. See the constant for why that is not `-m` plus `PYTHONPATH`.
     """
     command = list(argv) if argv is not None else [
-        executable or sys.executable, "-m", WORKER_MODULE
+        executable or sys.executable, "-c", WORKER_BOOTSTRAP
     ]
     try:
         return subprocess.Popen(

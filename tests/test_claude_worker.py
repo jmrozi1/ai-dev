@@ -239,7 +239,11 @@ class OwnedProcessTests(WorkerTestBase):
         arguments, keywords = spied.call_args
         self.assertIs(keywords["shell"], False)
         self.assertIs(keywords["start_new_session"], True)
-        self.assertEqual(arguments[0][1:], ["-m", claude_worker.WORKER_MODULE])
+        # The child is this interpreter running the controller's own worker
+        # module directly. Which module actually answers is not settled here --
+        # that is behaviour, and `WorkerImportIsolationTests` settles it.
+        self.assertEqual(arguments[0][0], sys.executable)
+        self.assertIn(claude_worker.WORKER_MODULE, arguments[0][-1])
 
         self.assertEqual(handle.pgid, handle.pid)
         self.assertNotEqual(handle.pgid, os.getpgrp())
@@ -976,6 +980,102 @@ class FailedCommandEventRetentionTests(LifecycleEventTransportTests):
         message = self._run([self._boundary(), self._result()])
         self.assertEqual([event["uuid"] for event in message["events"]], [BOUNDARY_UUID])
         self.assertEqual(message["subtype"], "success")
+
+
+class WorkerImportIsolationTests(WorkerTestBase):
+    """The workspace does not get to choose which `ai_dev_flow` the worker runs.
+
+    Every assertion here is about *which module answered a real spawned process*,
+    never about which interpreter flag was passed. A decoy that pins a flag string
+    would pass on the defect; these do not, and the docstring of each says how it
+    fails without the fix.
+    """
+
+    DECOY = (
+        "import json, os, sys\n"
+        "open({0!r}, 'w').write('ran')\n"
+        # Deliberately indistinguishable from a real readiness message except for
+        # its own confession: same type, same protocol, same real pid. If the
+        # controller ever accepted this, it accepted the wrong package.
+        "sys.stdout.write(json.dumps({{\n"
+        "    'type': 'ready', 'protocol': 1, 'pid': os.getpid(),\n"
+        "    'pgid': os.getpgrp(), 'started_at': '2026-01-01T00:00:00Z',\n"
+        "    'sdk_version': None, 'sdk_detail': None, 'impostor': True,\n"
+        "}}) + '\\n')\n"
+        "sys.stdout.flush()\n"
+    )
+
+    def _plant(self, *, with_worker_module: bool) -> Path:
+        """Give the workspace its own `ai_dev_flow`, and say where it would confess."""
+        marker = self.workspace / "decoy-ran"
+        package = self.workspace / "ai_dev_flow"
+        package.mkdir()
+        (package / "__init__.py").write_text("", encoding="utf-8")
+        if with_worker_module:
+            (package / "claude_worker.py").write_text(
+                self.DECOY.format(str(marker)), encoding="utf-8"
+            )
+        return marker
+
+    def _spawn(self):
+        environment = build_worker_environment(self._clean_env(), package_root=REPO_ROOT)
+        process = spawn_worker(environment=environment, cwd=self.workspace)
+        self.addCleanup(self._reap, process)
+        return process
+
+    def _reap(self, process) -> None:
+        try:
+            claude_worker._terminate_group(os.getpgid(process.pid))
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except Exception:
+            pass
+        claude_worker._close_streams(process)
+
+    def _read(self, process) -> dict:
+        return claude_worker._read_message(
+            process.stdout, deadline=time.monotonic() + 20, process=process
+        )
+
+    def test_a_workspace_copy_of_this_package_cannot_shadow_the_controllers(self) -> None:
+        """Without the fix the decoy answers, its marker exists, and shutdown is unanswered."""
+        marker = self._plant(with_worker_module=True)
+        process = self._spawn()
+        message = self._read(process)
+
+        # Which module ran, established two ways that do not depend on each other.
+        self.assertNotIn("impostor", message)
+        self.assertFalse(
+            marker.exists(),
+            "the workspace's copy of ai_dev_flow.claude_worker executed",
+        )
+        self.assertEqual(message["type"], "ready")
+        self.assertEqual(message["pid"], process.pid)
+
+        # And it is still the controller's worker after readiness: the decoy has
+        # nothing left to say, so only the real module answers a real command.
+        process.stdin.write(json.dumps({"type": "shutdown"}) + "\n")
+        process.stdin.flush()
+        self.assertEqual(self._read(process)["type"], "stopped")
+
+    def test_a_workspace_package_without_the_worker_module_still_launches(self) -> None:
+        """Without the fix this workspace shadows the module away: `No module named ...`."""
+        self._plant(with_worker_module=False)
+        process = self._spawn()
+        message = self._read(process)
+        self.assertEqual(message["type"], "ready")
+        self.assertEqual(message["pid"], process.pid)
+
+    def test_the_controllers_own_tree_as_the_workspace_still_resolves(self) -> None:
+        """The guard drops the injected working directory, not the PYTHONPATH copy."""
+        environment = build_worker_environment(self._clean_env(), package_root=REPO_ROOT)
+        process = spawn_worker(environment=environment, cwd=REPO_ROOT)
+        self.addCleanup(self._reap, process)
+        message = self._read(process)
+        self.assertEqual(message["type"], "ready")
+        self.assertEqual(message["pid"], process.pid)
 
 
 class WorkerEntryPointTests(WorkerTestBase):
