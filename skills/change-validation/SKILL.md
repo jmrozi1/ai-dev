@@ -34,6 +34,11 @@ lower and higher tiers mechanically when the higher tier already subsumes the
 needed evidence, and do not run an old checkpoint's full suite merely to create
 a comparison unless the current failure surface cannot otherwise be interpreted.
 
+This section selects *which* evidence a change needs. When the integration or
+full tier runs asynchronously, `integration-signal` owns *when* it runs, which
+exact commit its result binds to, and what a failure blocks. Selecting the
+integration tier is not a reason to hold a submission open waiting for it.
+
 ## Treat Accepted Tests As Memory
 
 Once an accepted automated test protects an invariant at the right boundary,

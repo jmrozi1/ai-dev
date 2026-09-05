@@ -73,6 +73,11 @@ should be worked differently. Look for these failure modes:
   work, or proof prose that are broader than the changed boundary without a
   current risk justification. Apply `change-validation` when this judgment is
   material.
+- **Integration serialization:** development held behind an integration run,
+  a run queued per edit rather than per coherent slice, an acceptance resting on
+  a green that predates the accepted commit, or a red run stopping work it does
+  not actually depend on. Apply `integration-signal` when this judgment is
+  material.
 - **Skill opportunity:** a new or refined skill could materially reduce recurring
   friction, preserve reusable operational knowledge, or make observed behavior
   match the intended process.

@@ -74,6 +74,16 @@ boundary. Before publishing a rail, verify that named commands exist at its
 authorized base and that each required proof can be exhibited by the capability
 the rail authorizes.
 
+Size a development rail to one coherent requirement slice, and let
+`module-development` own how that slice is refined and constructed rather than
+prescribing module internals in the rail. Where integration validation is
+asynchronous, apply `integration-signal`: do not serialize rails behind it, keep
+at most the active run plus the newest pending candidate, and require a green on
+the exact commit being accepted — never an ancestor's green — before accepting a
+named checkpoint or promoting. When an integration run is red, state whether it
+blocks acceptance, blocks a dependent rail, or blocks nothing else, instead of
+pausing unrelated rails.
+
 A tasking file is current state, not history. Keep it as simple Markdown and
 include only what a fresh executor needs:
 

@@ -46,6 +46,12 @@ For development validation, use `change-validation` to name the selected tier
 and its changed-boundary justification. A prior checkpoint's evidence ladder is
 not a reason to repeat an expensive loop.
 
+When the expensive loop is integration validation, do not make it synchronous to
+make it cheap. Use `integration-signal`: run it asynchronously against an exact
+candidate commit while independent development continues, and keep the fast
+inner loop that `module-development` describes as the loop that actually gates
+submission.
+
 ## Increase Payload Before Paying The Outer-Loop Cost
 
 Before entering a materially expensive loop:

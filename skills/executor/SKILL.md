@@ -113,6 +113,17 @@ discovery, historical comparisons, or mutation campaigns merely because an
 earlier checkpoint used them. Record the selected tier and justification, and
 capture validation and total runtime when observable.
 
+When the assignment builds or changes a module, use `module-development` to
+refine the slice before implementing it, to keep clocks, filesystems,
+repositories, process control, and networks injected at the boundary, and to
+submit one coherent requirement slice rather than every intermediate edit.
+
+When integration validation is asynchronous, use `integration-signal`. Submit
+the slice once its module and affected-contract tests pass and continue
+independent work rather than waiting; report the exact SHA any integration
+result was produced against, and never report a checkpoint as green from a run
+that predates the commit being accepted.
+
 Verify work with appropriate commands, tests, or diagnostics. Return a concise
 handoff for the orchestrator to rewrite the same tasking file. Include only
 useful current state:

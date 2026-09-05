@@ -15,6 +15,9 @@ deterministic repository helpers and their execution.
   reviewer normally attacks the riskiest novel claim and consumes valid executor
   evidence; freshness does not require repeating the executor's full suite,
   old/new comparison, or mutation campaign.
+- Apply `integration-signal` when integration evidence is part of the review.
+  Check that the green being relied on names the exact commit under review, not
+  an ancestor; an unlabeled or stale pass is an evidence gap, not a pass.
 
 - Decide which configured candidate reviews apply from the evidence surface,
   issue scope, requirements, and current task state.
