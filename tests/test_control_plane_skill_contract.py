@@ -13,7 +13,7 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.repo_root = Path(__file__).resolve().parents[1]
         self.skills_root = self.repo_root / "skills"
         self.orchestrator = _normalized(self.skills_root / "chatgpt" / "orchestrator" / "SKILL.md")
-        self.executor = _normalized(self.skills_root / "copilot" / "executor" / "SKILL.md")
+        self.executor = _normalized(self.skills_root / "executor" / "SKILL.md")
 
     # Orchestrator: read fresh, reconcile, accept
 

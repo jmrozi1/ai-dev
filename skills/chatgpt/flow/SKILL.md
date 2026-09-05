@@ -7,7 +7,9 @@ description: Interpret AI Dev Flow lifecycle state and decide valid transitions 
 
 Use this skill for lifecycle meaning and decision-making around the shared Flow
 runtime. Flow commands and workflow state remain deterministic repository
-runtime owned by AI Dev; routine command mechanics belong to Copilot.
+runtime owned by AI Dev; routine command mechanics belong to the executor
+audience. New execution work routes to Claude; existing Copilot behavior stays
+supported for work already running on it.
 
 ## Contract
 
@@ -20,8 +22,9 @@ runtime owned by AI Dev; routine command mechanics belong to Copilot.
   Flow safety rules.
 - Preserve orchestrator authority over lifecycle intent, scope, promotion,
   completion, and reconciliation decisions.
-- Delegate routine command execution and repository inspection to Copilot when
-  appropriate, with explicit scope and expected evidence.
+- Delegate routine command execution and repository inspection to the Claude
+  executor when appropriate, with explicit scope and expected evidence.
+  Delegate to Copilot only for work already running on that path.
 - Escalate when state is blocked, contradictory, stale, unsafe, or requires a
   product, scope, permission, or reconciliation decision.
 
@@ -43,11 +46,12 @@ runtime owned by AI Dev; routine command mechanics belong to Copilot.
 ## Command and Report Use
 
 Understand `/status` semantics for orchestration, but delegate the interaction
-to Copilot Flow. Copilot's installed package renders the active ticket's named
-roadmap progress and may return Flow diagnostics only when they require a
-decision, recovery, or escalation. Flow's numeric `checkpoint` is never the
-`/status` roadmap index. Avoid carrying Copilot-level launcher and shell
-procedure unless reviewing such an execution failure.
+to the executor's installed package. Claude exposes `ai-dev status`, which does
+not collide with Claude's built-in `/status`; Copilot exposes `ticket-status`.
+Either renders the active ticket's named roadmap progress and may return Flow
+diagnostics only when they require a decision, recovery, or escalation. Flow's
+numeric `checkpoint` is never the roadmap index. Avoid carrying executor-level
+launcher and shell procedure unless reviewing such an execution failure.
 
 The shared runtime remains the source of truth for state transitions and
 command results. This skill supplies lifecycle judgment, not a second command

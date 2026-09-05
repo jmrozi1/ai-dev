@@ -57,6 +57,11 @@ unit, integration, or end-to-end tests; static checks; explicit manual
 validation; runtime observations; logs; metrics; or other objective results.
 Do not reduce validation to unit-test coverage alone.
 
+Before relying on a failure or other negative observation as evidence, confirm
+that it was caused by the requirement or proof obligation being evaluated.
+Compilation, setup, configuration, environment, harness, or unrelated failures
+do not establish the intended negative case merely because the check failed.
+
 Record only the evidence needed to establish the current result and remaining
 uncertainty. Do not turn requirements work into a process diary or append-only
 history.

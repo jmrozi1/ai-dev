@@ -135,6 +135,7 @@ Use the current audience model:
 ```text
 skills/<name>/                 # genuinely shared operational behavior
 skills/chatgpt/<name>/         # ChatGPT judgment or interaction behavior
+skills/claude/<name>/          # Claude repository execution behavior
 skills/copilot/<name>/         # Copilot repository execution behavior
 ```
 
