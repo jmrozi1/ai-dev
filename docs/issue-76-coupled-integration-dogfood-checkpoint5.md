@@ -35,8 +35,8 @@ synchronous gate is author-owned and cheap, and integration is not that gate.
 **Corrected after re-review (N1).** This originally read *"roughly three thousandfold between a
 slice's own gate and the integration suite"*, computed as 84.202 / 0.028. That is wrong: 84.202 s is
 `test_role_invocation`, which the same table labels S4's **affected contract** — another *local*
-gate, not the integration suite. Against the integration suite the spread is **~4,900x** in WSL
-(136 s) and **~98,000x** on Windows (2753 s). The error understated its own case, which is how it
+gate, not the integration suite. Against the integration suite the spread is **~4,750x** in WSL
+(133.1 s / 0.028 s) and **~98,000x** on Windows (2753 s / 0.028 s). The error understated its own case, which is how it
 survived.
 
 ## Coalescing — three superseded candidates dropped, none re-run
@@ -270,7 +270,7 @@ environment at `644a3c8`:
 | what | WSL | Windows |
 |---|---|---|
 | full integration suite | **~133 s** | 2753 s |
-| S4's affected-contract gate (`test_role_invocation`, 49 tests) | **1.729 s** | 53.7 s unloaded |
+| S4's affected-contract gate (`test_role_invocation`, 49 tests) | **1.677-1.729 s** | 53.7 s unloaded |
 
 A **133-second** synchronous integration gate is not obviously intolerable. `integration-signal`'s
 opening argument — that a synchronous gate *"serializes development behind the slowest suite in the
