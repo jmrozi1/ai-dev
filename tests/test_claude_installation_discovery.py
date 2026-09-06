@@ -325,6 +325,83 @@ class IdentityAndAuthorizationTests(_TempHome):
             activation.resolve_product_identity(repo)
         self.assertIn("No active Flow issue", str(caught.exception))
 
+    def test_named_ticket_resolves_without_any_flow_workflow(self) -> None:
+        # The claimless review workspace: no active workflow to derive a ticket
+        # from, and starting one to get past discovery would acquire a claim.
+        repo = self._product_repo(
+            remote="https://github.com/jmrozi1/ai-dev.git", active_issue=None
+        )
+
+        identity = activation.resolve_product_identity(repo, ticket="issue-79")
+
+        self.assertEqual(identity.ticket, "issue-79")
+        self.assertEqual(identity.issue_number, 79)
+        self.assertEqual(identity.project, "ai-dev")
+        self.assertEqual(identity.repository, "jmrozi1/ai-dev")
+
+    def test_named_ticket_overrides_a_different_active_workflow_ticket(self) -> None:
+        repo = self._product_repo(
+            remote="https://github.com/jmrozi1/ai-dev.git", active_issue=9
+        )
+
+        self.assertEqual(activation.resolve_product_identity(repo).ticket, "issue-9")
+        named = activation.resolve_product_identity(repo, ticket="issue-79")
+        self.assertEqual(named.ticket, "issue-79")
+        self.assertEqual(named.issue_number, 79)
+
+    def test_named_project_replaces_the_derived_namespace(self) -> None:
+        repo = self._product_repo(
+            remote="https://github.com/jmrozi1/ai-dev.git", active_issue=None
+        )
+
+        identity = activation.resolve_product_identity(
+            repo, project="other-project", ticket="issue-79"
+        )
+
+        self.assertEqual(identity.project, "other-project")
+        # Git identity is still proven from the workspace, never taken on trust.
+        self.assertEqual(identity.repository, "jmrozi1/ai-dev")
+
+    def test_unusable_named_ticket_fails_closed(self) -> None:
+        repo = self._product_repo(
+            remote="https://github.com/jmrozi1/ai-dev.git", active_issue=None
+        )
+
+        for candidate in ("not-a-ticket", "issue-0", "issue-007", "issue-abc", "79"):
+            with self.subTest(ticket=candidate):
+                with self.assertRaises(ClaudeActivationError):
+                    activation.resolve_product_identity(repo, ticket=candidate)
+
+    def test_unusable_named_project_fails_closed(self) -> None:
+        repo = self._product_repo(
+            remote="https://github.com/jmrozi1/ai-dev.git", active_issue=None
+        )
+
+        for candidate in ("", "a", "../escape", "Proj Ect"):
+            with self.subTest(project=candidate):
+                with self.assertRaises(ClaudeActivationError):
+                    activation.resolve_product_identity(
+                        repo, project=candidate, ticket="issue-79"
+                    )
+
+    def test_naming_a_project_alone_still_needs_the_active_workflow(self) -> None:
+        # Naming widens nothing it was not asked to widen: without a ticket the
+        # workflow read is still the source, and still fails closed.
+        repo = self._product_repo(
+            remote="https://github.com/jmrozi1/ai-dev.git", active_issue=None
+        )
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.resolve_product_identity(repo, project="ai-dev")
+        self.assertIn("No active Flow issue", str(caught.exception))
+
+    def test_named_identity_still_requires_provable_git_identity(self) -> None:
+        repo = self._product_repo(remote=None, active_issue=None)
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.resolve_product_identity(
+                repo, project="ai-dev", ticket="issue-79"
+            )
+        self.assertIn("repository identity", str(caught.exception))
+
     def test_missing_cache_fails_closed_without_creating_anything(self) -> None:
         repo = self._product_repo(
             remote="https://github.com/jmrozi1/ai-dev.git", active_issue=56
@@ -342,8 +419,8 @@ class IdentityAndAuthorizationTests(_TempHome):
 
 
 class AuthorizedRailSelectionTests(_TempHome):
-    def _coordination(self, rails: dict[str, str]) -> Path:
-        repo = self.tmp_path / "coordination"
+    def _coordination(self, rails: dict[str, str], *, name: str = "coordination") -> Path:
+        repo = self.tmp_path / name
         scope = repo / "proj" / "issue-1" / "rails"
         scope.mkdir(parents=True)
         (repo / "proj" / "issue-1" / "state.md").write_text("# State\n", encoding="utf-8")
@@ -384,6 +461,81 @@ class AuthorizedRailSelectionTests(_TempHome):
         repo = self._coordination({"rail-a": "ready"})
         with self.assertRaises(ClaudeActivationError):
             activation.resolve_authorized_rail(repo, project="proj", ticket="issue-404")
+
+    # Issue #79: an explicitly named rail resolves at ready or running only.
+
+    def _named(self, repo: Path, rail: str):
+        return activation.resolve_authorized_rail(
+            repo, project="proj", ticket="issue-1", rail=rail
+        )
+
+    def test_a_named_running_rail_resolves(self) -> None:
+        # The launched executor's own rail: launching it is what moved it off
+        # ready, so requiring ready made it undiscoverable.
+        repo = self._coordination({"rail-a": "running"})
+        rail = self._named(repo, "rail-a")
+        self.assertEqual(rail.identifier, "rail-a")
+        self.assertEqual(rail.status, "running")
+
+    def test_a_named_ready_rail_resolves(self) -> None:
+        repo = self._coordination({"rail-a": "ready"})
+        self.assertEqual(self._named(repo, "rail-a").status, "ready")
+
+    def test_naming_selects_that_rail_and_not_another_open_one(self) -> None:
+        # Naming resolves exactly one rail; it is not a widened search that can
+        # land on a different rail than the caller identified.
+        repo = self._coordination(
+            {"rail-a": "running", "rail-b": "ready", "rail-c": "completed"}
+        )
+        self.assertEqual(self._named(repo, "rail-a").identifier, "rail-a")
+        self.assertEqual(self._named(repo, "rail-b").identifier, "rail-b")
+
+    def test_naming_resolves_where_the_unnamed_path_is_ambiguous(self) -> None:
+        repo = self._coordination({"rail-a": "ready", "rail-b": "ready"})
+        with self.assertRaises(ClaudeActivationError):
+            activation.resolve_authorized_rail(repo, project="proj", ticket="issue-1")
+        self.assertEqual(self._named(repo, "rail-b").identifier, "rail-b")
+
+    def test_unknown_named_rail_fails_closed_and_reports_what_exists(self) -> None:
+        repo = self._coordination({"rail-a": "running"})
+        with self.assertRaises(ClaudeActivationError) as caught:
+            self._named(repo, "rail-absent")
+        message = str(caught.exception)
+        self.assertIn("rail-absent", message)
+        self.assertIn("rail-a", message)
+
+    def test_a_completed_rail_is_not_an_authorization_to_execute(self) -> None:
+        repo = self._coordination({"rail-a": "completed"})
+        with self.assertRaises(ClaudeActivationError) as caught:
+            self._named(repo, "rail-a")
+        self.assertIn("completed", str(caught.exception))
+
+    def test_a_blocked_rail_is_not_an_authorization_to_execute(self) -> None:
+        repo = self._coordination({"rail-a": "blocked"})
+        with self.assertRaises(ClaudeActivationError) as caught:
+            self._named(repo, "rail-a")
+        self.assertIn("blocked", str(caught.exception))
+
+    def test_only_ready_and_running_are_resolvable_named_statuses(self) -> None:
+        from ai_dev_flow.control_plane import RAIL_STATUSES
+
+        resolvable = set(activation.NAMED_RAIL_STATUSES)
+        self.assertEqual(resolvable, {"ready", "running"})
+        for status in RAIL_STATUSES:
+            with self.subTest(status=status):
+                repo = self._coordination({"rail-a": status}, name=f"coord-{status}")
+                if status in resolvable:
+                    self.assertEqual(self._named(repo, "rail-a").status, status)
+                else:
+                    with self.assertRaises(ClaudeActivationError):
+                        self._named(repo, "rail-a")
+
+    def test_naming_a_rail_in_a_missing_namespace_still_fails_closed(self) -> None:
+        repo = self._coordination({"rail-a": "ready"})
+        with self.assertRaises(ClaudeActivationError):
+            activation.resolve_authorized_rail(
+                repo, project="proj", ticket="issue-404", rail="rail-a"
+            )
 
 
 class ClaudeLauncherTests(unittest.TestCase):

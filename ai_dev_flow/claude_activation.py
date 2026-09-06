@@ -42,6 +42,7 @@ from .control_plane import (
     resolve_control_plane_config,
     resolve_coordination_repo,
     resolve_read_source,
+    validate_identifier,
 )
 from .json_files import (
     JsonFileError,
@@ -1090,8 +1091,53 @@ class ProductIdentity:
     ticket: str
 
 
-def resolve_product_identity(repo_root: Path) -> ProductIdentity:
-    """Canonical Git identity plus the active Flow ticket, or fail closed."""
+TICKET_PREFIX = "issue-"
+
+
+def _named_issue_number(ticket: str) -> int:
+    """The issue number an explicitly named ticket identifies, or fail closed.
+
+    Ticket identity is ``issue-<n>`` throughout this runtime and the number is
+    load-bearing: claim evidence is matched on it. A ticket that does not
+    reconstruct exactly from the number it appears to carry is refused rather
+    than resolved against a scope the caller did not name.
+    """
+    candidate = ticket.strip()
+    try:
+        validate_identifier(candidate, label="ticket")
+    except ControlPlaneError as exc:
+        raise ClaudeActivationError(str(exc)) from exc
+
+    digits = candidate[len(TICKET_PREFIX) :] if candidate.startswith(TICKET_PREFIX) else ""
+    # Round-tripping the number rejects shapes such as `issue-007`, which name a
+    # scope directory that is not the one the number would resolve.
+    if not digits.isdigit() or int(digits) <= 0 or f"{TICKET_PREFIX}{int(digits)}" != candidate:
+        raise ClaudeActivationError(
+            f"Cannot resolve a ticket identity from '{ticket}'. Name the ticket as "
+            f"{TICKET_PREFIX}<n>, for example {TICKET_PREFIX}79."
+        )
+    return int(digits)
+
+
+def resolve_product_identity(
+    repo_root: Path,
+    *,
+    project: str | None = None,
+    ticket: str | None = None,
+) -> ProductIdentity:
+    """Canonical Git identity plus the active Flow ticket, or fail closed.
+
+    A caller may name the control-plane scope instead of deriving it from
+    workspace state. That is the legitimate claimless case: an independent
+    reviewer works in a disposable clone with no Flow workflow by contract, and
+    starting one so discovery can read ``activeIssueNumber`` would acquire a
+    claim. Naming the scope replaces only the derivation that needed workflow
+    state; Git repository identity is still read from the workspace, because it
+    is available in any clone and costs nothing to prove.
+
+    Naming is validated, not trusted: an unusable project or ticket identifier
+    fails closed rather than resolving against a scope nobody authorized.
+    """
     try:
         repository = GitRemoteGitHubCurrentRepositoryResolver(
             repo_root=repo_root
@@ -1102,6 +1148,22 @@ def resolve_product_identity(repo_root: Path) -> ProductIdentity:
         ) from exc
 
     owner, name = repository.split("/", 1)
+
+    if project is not None:
+        try:
+            name = validate_identifier(project, label="project")
+        except ControlPlaneError as exc:
+            raise ClaudeActivationError(str(exc)) from exc
+
+    if ticket is not None:
+        issue_number = _named_issue_number(ticket)
+        return ProductIdentity(
+            repository=repository,
+            owner=owner,
+            project=name,
+            issue_number=issue_number,
+            ticket=f"{TICKET_PREFIX}{issue_number}",
+        )
 
     state_path = workflow_state_file_for_repo_root(repo_root)
     try:
@@ -1121,7 +1183,7 @@ def resolve_product_identity(repo_root: Path) -> ProductIdentity:
         owner=owner,
         project=name,
         issue_number=issue_number,
-        ticket=f"issue-{issue_number}",
+        ticket=f"{TICKET_PREFIX}{issue_number}",
     )
 
 
@@ -1150,14 +1212,62 @@ def resolve_control_plane_source(cache: Path) -> ReadSource:
         ) from exc
 
 
+# Which durable statuses an explicitly named rail may be resolved at.
+#
+# `ready` is authorized and not yet launched. `running` is authorized and
+# already launched, which is the normal state of the rail an executor was
+# launched onto: requiring `ready` made the launched executor unable to resolve
+# its own rail, because launching it is exactly what moved it off `ready`.
+#
+# `blocked` and `completed` are deliberately excluded. Neither is an instruction
+# to execute -- a blocked rail is stopped and a completed rail is already
+# accepted -- so resolving either would let a session resume work the
+# orchestrator has stopped or closed. Naming a rail is a request to resolve a
+# rail the orchestrator opened, never authority to reopen one it did not.
+NAMED_RAIL_STATUSES = ("ready", "running")
+
+
+def _resolve_named_rail(
+    states: list[RailState], rail: str, *, project: str, ticket: str
+) -> RailState:
+    """Exactly the rail the caller named, or fail closed saying why."""
+    present = ", ".join(f"{state.identifier}={state.status}" for state in states)
+    named = [state for state in states if state.identifier == rail]
+    if not named:
+        raise ClaudeActivationError(
+            f"Rail '{rail}' does not exist in {project}/{ticket}. Present rails: "
+            f"{present}. The orchestrator owns rail authorization."
+        )
+
+    state = named[0]
+    if state.status not in NAMED_RAIL_STATUSES:
+        raise ClaudeActivationError(
+            f"Rail '{rail}' in {project}/{ticket} is {state.status}, which is not an "
+            "authorization to execute. Only "
+            f"{' or '.join(NAMED_RAIL_STATUSES)} rails can be resolved. The "
+            "orchestrator must publish an open rail for this work."
+        )
+    return state
+
+
 def resolve_authorized_rail(
     cache: Path,
     *,
     project: str,
     ticket: str,
     source: ReadSource | None = None,
+    rail: str | None = None,
 ) -> RailState:
-    """Exactly one ready rail, using the existing deterministic rail reader."""
+    """The authorized rail, using the existing deterministic rail reader.
+
+    Unnamed, this is what it has always been: exactly one `ready` rail in the
+    scope, ambiguous or absent otherwise.
+
+    Named, it is exactly the rail the caller identified, resolvable at `ready`
+    or `running`. Naming widens which *status* is authorized, because a launched
+    rail is `running`; it never widens which *rail* is, and it never makes a
+    closed rail executable.
+    """
     resolved_source = resolve_control_plane_source(cache) if source is None else source
 
     try:
@@ -1172,6 +1282,9 @@ def resolve_authorized_rail(
             f"Control-plane scope {project}/{ticket} has no rails. The orchestrator "
             "owns rail authorization."
         )
+
+    if rail is not None:
+        return _resolve_named_rail(states, rail, project=project, ticket=ticket)
 
     ready = [state for state in states if state.status == "ready"]
     if not ready:
@@ -1199,14 +1312,23 @@ def discover(
     coordination_repository: str = DEFAULT_COORDINATION_REPOSITORY,
     cache: Path | None = None,
     runtime_root: Path | None = None,
+    rail: str | None = None,
+    project: str | None = None,
+    ticket: str | None = None,
 ) -> dict:
     """Resolve the authorized rail and prove what produced every reported value.
 
     Discovery is read-only. It resolves paths, reads durable state through the
     existing readers, and fails closed; it never acquires a claim, writes
-    coordination state, or moves anything in the product repository.
+    coordination state, or moves anything in the product repository. That is
+    unchanged by naming: naming replaces reads, it does not add writes.
+
+    A caller may name the rail and the scope it belongs to. That is the launched
+    executor whose rail is now `running`, and the independent reviewer whose
+    disposable clone holds no claim and no Flow workflow to derive a ticket
+    from. Naming nothing keeps the original behavior exactly.
     """
-    identity = resolve_product_identity(repo_root)
+    identity = resolve_product_identity(repo_root, project=project, ticket=ticket)
 
     runtime_path, runtime_revision = resolve_runtime_provenance(runtime_root)
     skill_path, skill_revision = resolve_claude_flow_skill_provenance(runtime_root)
@@ -1221,9 +1343,11 @@ def discover(
     workspace = resolve_workspace_provenance(repo_root)
     claim = resolve_claim_provenance(repo_root, identity)
 
-    rail = resolve_authorized_rail(
-        coordination.cache, project=identity.project, ticket=identity.ticket
+    rail_state = resolve_authorized_rail(
+        coordination.cache, project=identity.project, ticket=identity.ticket, rail=rail
     )
+
+    scope = f"{identity.project}/{identity.ticket}"
 
     return {
         "repository": identity.repository,
@@ -1244,13 +1368,22 @@ def discover(
         "coordinationSource": coordination.source,
         "coordinationReconciliation": coordination.reconciliation,
         "coordinationRepository": coordination_repository,
-        "railId": rail.identifier,
-        "railStatus": rail.status,
-        "railPath": f"{identity.project}/{identity.ticket}/rails/{rail.identifier}/rail.md",
-        "handoffPath": f"{identity.project}/{identity.ticket}/rails/{rail.identifier}/handoff.md",
+        "railId": rail_state.identifier,
+        "railStatus": rail_state.status,
+        "railPath": f"{scope}/rails/{rail_state.identifier}/rail.md",
+        "handoffPath": f"{scope}/rails/{rail_state.identifier}/handoff.md",
         "sources": {
             "repository": f"git remote origin in {repo_root}, normalized to owner/repo",
-            "ticket": f"activeIssueNumber in {workflow_state_file_for_repo_root(repo_root)}",
+            "project": (
+                f"explicitly named project {identity.project}"
+                if project is not None
+                else "repository name from git remote origin"
+            ),
+            "ticket": (
+                f"explicitly named ticket {identity.ticket}"
+                if ticket is not None
+                else f"activeIssueNumber in {workflow_state_file_for_repo_root(repo_root)}"
+            ),
             "runtimeRevision": runtime_revision.source,
             "claudeFlowSkillRevision": skill_revision.source,
             "workspace": workspace["workspace"].source,
@@ -1259,7 +1392,12 @@ def discover(
             "worktreeId": workspace["worktree"].source,
             "claim": claim.source,
             "controlPlane": coordination.source,
-            "rail": f"single ready rail in {identity.project}/{identity.ticket}",
+            "rail": (
+                f"explicitly named rail {rail_state.identifier} ({rail_state.status}) "
+                f"in {scope}"
+                if rail is not None
+                else f"single ready rail in {scope}"
+            ),
         },
     }
 
@@ -1739,6 +1877,18 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     discover_parser.add_argument("--repo-root", help="Product repository; defaults to the current one.")
     discover_parser.add_argument("--cache", help="Control-plane cache path override.")
+    discover_parser.add_argument(
+        "--rail",
+        help="Stable semantic rail identifier; resolve exactly this rail, ready or running.",
+    )
+    discover_parser.add_argument(
+        "--project",
+        help="Stable project identifier; defaults to the repository name.",
+    )
+    discover_parser.add_argument(
+        "--ticket",
+        help="Stable ticket identifier as issue-<n>; defaults to the active Flow workflow.",
+    )
     discover_parser.add_argument("--json", action="store_true", help="Emit machine-readable output.")
 
     subparsers.add_parser(
@@ -1858,6 +2008,9 @@ def main(argv: list[str] | None = None) -> int:
     result = discover(
         repo_root,
         cache=Path(arguments.cache).expanduser() if arguments.cache else None,
+        rail=arguments.rail,
+        project=arguments.project,
+        ticket=arguments.ticket,
     )
 
     if arguments.json:

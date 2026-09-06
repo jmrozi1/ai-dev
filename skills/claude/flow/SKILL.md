@@ -21,17 +21,28 @@ ai-dev discover
 ```
 
 This reports canonical repository identity, the active ticket, the control-plane
-scope, and the single authorized rail. Follow only that rail.
+scope, and the authorized rail. Follow only that rail.
+
+Unnamed, discovery derives everything from the workspace and authorizes the one
+`ready` rail in the scope. When you were launched onto a named rail, or you are
+reviewing from a workspace that holds no claim, name what you were given:
+
+```bash
+ai-dev discover --rail <rail-id> --project <project> --ticket issue-<n>
+```
+
+Naming does not weaken authorization; it says which rail and scope to read.
+Details are in Naming an Assigned Rail below.
 
 ## Discovery Contract
 
 | Need | Source |
 | --- | --- |
 | Repository identity | `git remote get-url origin`, normalized to `owner/repo` |
-| Project namespace | the repository name |
-| Ticket | `activeIssueNumber` in Flow workflow state, as `issue-<n>` |
+| Project namespace | the repository name, or an explicitly named `--project` |
+| Ticket | `activeIssueNumber` in Flow workflow state, as `issue-<n>`, or an explicitly named `--ticket issue-<n>` |
 | Workspace | the Issue #50 claim registry |
-| Rail | the single `ready` rail in the control-plane scope |
+| Rail | unnamed: the single `ready` rail in the control-plane scope. Named with `--rail`: exactly that rail, resolvable at `ready` or `running` |
 | Executing runtime | the AI Dev checkout owning the running module, and its revision |
 | Routing instructions | this skill's file and revision in that runtime |
 
@@ -41,6 +52,39 @@ data is unavailable or malformed and you need to prove what the repository is.
 Discovery and status report the source of every value they print. Report those
 sources as they were reported to you. Do not restate a value without its source,
 and do not carry a value forward from an earlier session in place of reading it.
+A value you named is reported as explicitly named, so a named scope is never
+mistaken for one a reader derived.
+
+### Naming an Assigned Rail
+
+Two legitimate situations cannot be served by derivation alone.
+
+- **You were launched onto a rail.** The orchestrator moves a rail it launches
+  from `ready` to `running`, so the rail you are executing is exactly the one
+  the unnamed path refuses. Name it.
+- **You are reviewing from a claimless workspace.** An independent reviewer
+  works in a disposable clone with no Flow workflow by contract. Starting one so
+  discovery can read `activeIssueNumber` would acquire a claim and break that
+  contract. Name the scope instead.
+
+What naming does and does not change:
+
+- `--rail` resolves exactly the rail you named, and only at `ready` or
+  `running`. It never falls back to another rail, and a rail that is `blocked`
+  or `completed` is refused: a stopped rail is not an instruction to execute and
+  a completed rail is already accepted. If the rail you were given is closed,
+  report that and stop -- do not name a different one.
+- `--project` and `--ticket` supply the control-plane scope the rail lives in.
+  They replace derivation, not proof: Git repository identity is still read from
+  the workspace, and an unusable project or a ticket that is not `issue-<n>`
+  fails closed.
+- Naming adds no write and acquires no claim. `ai-dev discover` is read-only
+  whether or not you name anything.
+- Naming nothing behaves exactly as it always has.
+
+Name only what durable state gave you -- your rail authorization, or the scope
+your assignment identified. A rail id you remember, inferred, or preferred is
+not authorization.
 
 ### Coordination Repository Reconciliation
 
@@ -68,8 +112,13 @@ repository identity is unresolvable, no Flow ticket is active, no coordination
 repository can be resolved from either workspace configuration or the managed
 cache, the two identify different coordination repositories, the configured
 coordination repository is unusable, the executing runtime has no Claude Flow
-skill to route through, the project/ticket namespace does not exist, or zero or
-more than one rail is ready.
+skill to route through, the project/ticket namespace does not exist, or -- when
+no rail is named -- zero or more than one rail is ready.
+
+Naming keeps every one of those, and adds its own: a named project that is not a
+usable identifier, a named ticket that is not `issue-<n>`, a named rail that
+does not exist in the scope, and a named rail whose durable status is anything
+other than `ready` or `running`.
 
 When it stops, report exactly what it reported. Never substitute Claude memory,
 product documentation, an issue comment, a product-local handoff file,
@@ -88,6 +137,7 @@ instructions to satisfy its own preconditions.
 | Intent | Route |
 | --- | --- |
 | Resolve the authorized rail | `ai-dev discover` (add `--json` for machine-readable provenance) |
+| Resolve a rail you were explicitly assigned | `ai-dev discover --rail <rail-id>`, adding `--project <project> --ticket issue-<n>` when the workspace has no active Flow workflow |
 | Prove repository/ticket identity alone | `ai-dev identity` |
 | Inspect workspace, claim, runtime, skill, and control-plane provenance | `ai-dev status` |
 | Gather checkpoint or promotion review evidence | `ai-dev review-evidence --mode checkpoint\|promotion` |

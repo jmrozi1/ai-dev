@@ -819,6 +819,192 @@ class DiscoveryReadOnlyTests(_CoordinationFixture):
         self._assert_no_fallback_artifacts()
 
 
+class NamedRailBootstrapTests(_CoordinationFixture):
+    """Issue #79: an explicitly named rail resolves where derivation cannot.
+
+    The two cases the accepted requirement names are the launched executor,
+    whose rail is `running` because launching it is what moved it off `ready`,
+    and the independent reviewer, whose disposable clone holds no claim and no
+    Flow workflow to derive a ticket from. Neither may cost a claim or a write.
+    """
+
+    @staticmethod
+    def _content_snapshot(root: Path) -> dict:
+        snapshot = {}
+        for path in sorted(root.rglob("*")):
+            if ".git" in path.parts:
+                continue
+            if path.is_file():
+                snapshot[str(path.relative_to(root))] = path.read_bytes()
+        return snapshot
+
+    def _claim_files(self, repo: Path) -> list:
+        from ai_dev_flow.workspaces import claims_directory
+
+        directory = claims_directory(repo)
+        if not directory.is_dir():
+            return []
+        return sorted(path.name for path in directory.iterdir())
+
+    def _publish_rail(self, rail_id: str, status: str) -> None:
+        """Publish a rail at a durable status to the coordination remote."""
+        seed = self.tmp_path / "seed"
+        rail_dir = seed / "proj" / "issue-1" / "rails" / rail_id
+        rail_dir.mkdir(parents=True, exist_ok=True)
+        (rail_dir / "rail.md").write_text(
+            f"# Rail: {rail_id}\n\nStatus: {status}\nRole: executor\n", encoding="utf-8"
+        )
+        _git(seed, "add", "-A")
+        _git(seed, "commit", "--quiet", "-m", f"{rail_id} {status}")
+        _git(seed, "push", "--quiet", "origin", "main")
+
+    def _claimless_workspace(self) -> Path:
+        """A disposable review clone: a real Git identity, nothing else."""
+        repo = self.tmp_path / "review-clone"
+        repo.mkdir()
+        _git(repo, "init", "--quiet")
+        _git(repo, "remote", "add", "origin", "https://github.com/jmrozi1/proj.git")
+        (repo / "README.md").write_text("review clone\n", encoding="utf-8")
+        _git(repo, "config", "user.name", "Reviewer")
+        _git(repo, "config", "user.email", "reviewer@example.com")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "--quiet", "-m", "clone")
+        self.assertFalse((repo / ".ai-dev" / "workflow.json").exists())
+        return repo
+
+    def test_a_launched_running_rail_resolves_when_named(self) -> None:
+        self._publish_rail("the-rail", "running")
+
+        result = activation.discover(self.product, cache=self.cache, rail="the-rail")
+
+        self.assertEqual(result["railId"], "the-rail")
+        self.assertEqual(result["railStatus"], "running")
+        self.assertEqual(result["railPath"], "proj/issue-1/rails/the-rail/rail.md")
+
+    def test_the_same_running_rail_is_undiscoverable_unnamed(self) -> None:
+        # The precondition this refinement exists to remove, held as a contract:
+        # naming is what makes a launched rail resolvable, not a status widening
+        # applied to derivation.
+        self._publish_rail("the-rail", "running")
+
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.discover(self.product, cache=self.cache)
+        self.assertIn("ready", str(caught.exception))
+
+    def test_a_named_rail_resolves_with_no_claim_and_no_flow_workflow(self) -> None:
+        self._publish_rail("the-rail", "running")
+        review = self._claimless_workspace()
+
+        # Derivation genuinely cannot serve this workspace.
+        with self.assertRaises(ClaudeActivationError):
+            activation.discover(review, cache=self.cache)
+
+        result = activation.discover(
+            review, cache=self.cache, rail="the-rail", project="proj", ticket="issue-1"
+        )
+
+        self.assertEqual(result["railId"], "the-rail")
+        self.assertEqual(result["railStatus"], "running")
+        self.assertEqual(result["project"], "proj")
+        self.assertEqual(result["ticket"], "issue-1")
+        self.assertEqual(result["issueNumber"], 1)
+        # Identity is still proven from the workspace, not taken from the caller.
+        self.assertEqual(result["repository"], "jmrozi1/proj")
+        self.assertIn("none", result["claim"])
+
+    def test_named_resolution_acquires_no_claim_and_writes_nothing(self) -> None:
+        self._publish_rail("the-rail", "running")
+        review = self._claimless_workspace()
+
+        before_review = self._content_snapshot(review)
+        before_cache = self._content_snapshot(self.cache)
+        before_head = _git(self.cache, "rev-parse", "HEAD")
+        before_remote = _git(self.remote, "rev-parse", "main")
+        before_claims = self._claim_files(review)
+
+        activation.discover(
+            review, cache=self.cache, rail="the-rail", project="proj", ticket="issue-1"
+        )
+
+        self.assertEqual(self._content_snapshot(review), before_review)
+        self.assertEqual(self._content_snapshot(self.cache), before_cache)
+        self.assertEqual(_git(self.cache, "rev-parse", "HEAD"), before_head)
+        self.assertEqual(_git(self.remote, "rev-parse", "main"), before_remote)
+        self.assertEqual(self._claim_files(review), before_claims)
+        self.assertEqual(before_claims, [])
+        for relative in FORBIDDEN_FALLBACKS:
+            with self.subTest(fallback=relative):
+                self.assertFalse((review / relative).exists())
+
+    def test_a_named_closed_rail_is_refused_end_to_end(self) -> None:
+        self._publish_rail("the-rail", "completed")
+        review = self._claimless_workspace()
+
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.discover(
+                review, cache=self.cache, rail="the-rail", project="proj", ticket="issue-1"
+            )
+        self.assertIn("completed", str(caught.exception))
+
+    def test_an_unknown_named_rail_is_refused_end_to_end(self) -> None:
+        review = self._claimless_workspace()
+
+        with self.assertRaises(ClaudeActivationError) as caught:
+            activation.discover(
+                review, cache=self.cache, rail="absent-rail", project="proj", ticket="issue-1"
+            )
+        self.assertIn("absent-rail", str(caught.exception))
+
+    def test_naming_reports_the_source_that_produced_each_named_value(self) -> None:
+        self._publish_rail("the-rail", "running")
+        review = self._claimless_workspace()
+
+        result = activation.discover(
+            review, cache=self.cache, rail="the-rail", project="proj", ticket="issue-1"
+        )
+
+        sources = result["sources"]
+        for key in ("project", "ticket", "rail"):
+            with self.subTest(key=key):
+                self.assertTrue(sources.get(key))
+        # A caller-supplied value must not be reported as though a reader
+        # derived it from durable workspace state.
+        self.assertNotIn("activeIssueNumber", sources["ticket"])
+        self.assertIn("the-rail", sources["rail"])
+
+    def test_the_unnamed_path_is_untouched(self) -> None:
+        result = activation.discover(self.product, cache=self.cache)
+
+        self.assertEqual(result["railId"], "the-rail")
+        self.assertEqual(result["railStatus"], "ready")
+        self.assertEqual(result["ticket"], "issue-1")
+        self.assertIn("activeIssueNumber", result["sources"]["ticket"])
+        self.assertIn("single ready rail", result["sources"]["rail"])
+
+    def test_the_cli_accepts_the_named_options(self) -> None:
+        self._publish_rail("the-rail", "running")
+        review = self._claimless_workspace()
+
+        status = activation.main(
+            [
+                "discover",
+                "--repo-root",
+                str(review),
+                "--cache",
+                str(self.cache),
+                "--rail",
+                "the-rail",
+                "--project",
+                "proj",
+                "--ticket",
+                "issue-1",
+                "--json",
+            ]
+        )
+
+        self.assertEqual(status, 0)
+
+
 class ProvenanceReportingTests(_CoordinationFixture):
     """Issue #79: every reported value must carry the source that produced it."""
 
