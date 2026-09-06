@@ -59,9 +59,11 @@ mistaken for one a reader derived.
 
 Two legitimate situations cannot be served by derivation alone.
 
-- **You were launched onto a rail.** The orchestrator moves a rail it launches
-  from `ready` to `running`, so the rail you are executing is exactly the one
-  the unnamed path refuses. Name it.
+- **You were launched onto a rail.** A rail an orchestrator has launched may
+  stand at `running`, which the unnamed path refuses; and a scope may hold more
+  than one `ready` rail, which the unnamed path refuses as ambiguous. In both
+  cases the rail you are executing is exactly the one derivation will not give
+  you. Name it.
 - **You are reviewing from a claimless workspace.** An independent reviewer
   works in a disposable clone with no Flow workflow by contract. Starting one so
   discovery can read `activeIssueNumber` would acquire a claim and break that
@@ -141,7 +143,7 @@ instructions to satisfy its own preconditions.
 | Prove repository/ticket identity alone | `ai-dev identity` |
 | Inspect workspace, claim, runtime, skill, and control-plane provenance | `ai-dev status` |
 | Gather checkpoint or promotion review evidence | `ai-dev review-evidence --mode checkpoint\|promotion` |
-| Publish the executor handoff and take a receipt | `ai-dev publish --file <handoff> --rail <rail-id>` |
+| Publish the executor handoff and take a receipt | `ai-dev publish --file <handoff> --rail <rail-id>` -- resolves via the **unnamed** path; see the note below |
 | Locate or refresh the managed coordination cache | `ai-dev cache-path`, `ai-dev cache-sync` |
 | Run a Flow lifecycle command | the installed `flow-*` launchers (`flow-status`, `flow-commit`, ...) |
 
@@ -149,6 +151,20 @@ instructions to satisfy its own preconditions.
 read-only: they resolve and report, and never acquire a claim or write
 coordination state. `publish`, `cache-sync`, and the `flow-*` lifecycle commands
 mutate; run them only when your rail authorizes that step.
+
+**Naming reaches `discover` and nothing else.** `publish`, `status`, and
+`identity` still resolve through the unnamed path, so in exactly the two
+situations naming exists for -- a `running` rail with nothing `ready`, or more
+than one `ready` rail -- **`ai-dev publish` will refuse and `ai-dev status` will
+report the rail as unauthorized, even though `ai-dev discover --rail` just
+resolved.** That is a real boundary, not a bug to work around.
+
+Do not retry, rename a rail, or reach for Copilot-audience helpers to get past
+it. Report your evidence to the orchestrator and let it publish on your behalf;
+publication is a mutating write to shared coordination state, and extending
+named identity to it is an authorization decision the orchestrator owns. Say
+plainly which rail you resolved and that publication refused, so the reason is
+in the record rather than inferred.
 
 Claim evidence comes from `ai-dev status`, which reads the Issue #50 claim
 registry without acquiring anything. A malformed claim is reported as malformed;
