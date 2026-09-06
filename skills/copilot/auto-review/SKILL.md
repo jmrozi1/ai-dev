@@ -5,6 +5,16 @@ description: Execute approved AI Dev review evidence gathering and recording mec
 
 # Copilot Auto-Review
 
+Use `change-validation` when gathering additional product evidence. Collect the
+smallest review-sufficient evidence requested by the review owner; do not add
+full discovery, old/new suite comparisons, or mutation campaigns solely because
+the reviewer is fresh.
+
+Use `integration-signal` when reporting integration evidence: record the exact
+tested SHA, the included change range, the selected suites, the runtime, the
+outcome, and the last known green SHA. Report a result only against the commit
+it was produced on; do not present an earlier run as covering a newer commit.
+
 Execute the repository-facing mechanics of the current AI Dev review stage.
 This is the evidence and execution side of auto-review; review policy and
 materiality judgment belong to the active task contract or the ChatGPT review

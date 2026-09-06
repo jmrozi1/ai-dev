@@ -37,10 +37,13 @@ remain in the applicable canonical `SKILL.md` files.
 
 | Skill | Use when | Canonical path |
 | --- | --- | --- |
+| `change-validation` | Selecting proportionate test/review evidence for development changes, including expensive validation, pre-release compatibility, adjacent simplification, and proof-obligation retirement; not for non-development tasks. | `skills/change-validation/SKILL.md` |
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
 | `feedback-loop-design` | Designing discovery, prototyping, implementation, or validation loops when builds, live environments, screenshots, human relay, or other feedback are materially slow or costly. | `skills/feedback-loop-design/SKILL.md` |
+| `integration-signal` | Running integration validation as an asynchronous signal bound to an exact candidate commit: queueing and coalescing runs, recording tested/last-green SHAs, refusing stale greens, attributing failures from the green-to-red range, and deciding what a red run blocks; not for choosing which tests a change needs. | `skills/integration-signal/SKILL.md` |
 | `investigation-synthesis` | Preserving the durable results of substantial research, debugging, reverse engineering, or source comparison without turning the investigation into transcript documentation; route accepted findings to the smallest correct durable home and discard the rest. | `skills/investigation-synthesis/SKILL.md` |
 | `frontend-design-review` | Reviewing screenshots, implemented UI, mockups, or proposed front-end designs for unnecessary cognitive load, weak action hierarchy, redundant visual containment, or failure to prioritize the normal happy path. | `skills/frontend-design-review/SKILL.md` |
+| `module-development` | Refining a coherent requirement slice into independently constructible modules with narrow contracts and injected clocks, filesystems, repositories, process control, and networks; separating domain decisions from adapters; and developing module behavior with its local tests in a fast inner loop; not for edits with no module boundary. | `skills/module-development/SKILL.md` |
 | `requirements-driven-development` | Defining, refining, implementing, validating, or reviewing behavior that needs explicit requirements and objective evidence. | `skills/requirements-driven-development/SKILL.md` |
 | `review-process` | Atomic checkpoint/promotion process review; assess approach, intervention balance, wasted effort, and maintain/reassess ticket `Skill Candidates` through final disposition and accepted skill remediation. | `skills/review-process/SKILL.md` |
 

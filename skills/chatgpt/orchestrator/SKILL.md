@@ -67,6 +67,23 @@ SHAs, status, validation results, and material warnings over unsupported
 summaries such as "tests passed." Do not dump large logs or unrelated repository
 state when a focused excerpt or deterministic helper output is sufficient.
 
+For non-trivial development rails, apply `change-validation`: name the changed
+boundary, the expected validation tier, and any reason a broader or live pass is
+uniquely required. Permit deletion of directly superseded machinery inside that
+boundary. Before publishing a rail, verify that named commands exist at its
+authorized base and that each required proof can be exhibited by the capability
+the rail authorizes.
+
+Size a development rail to one coherent requirement slice, and let
+`module-development` own how that slice is refined and constructed rather than
+prescribing module internals in the rail. Where integration validation is
+asynchronous, apply `integration-signal`: do not serialize rails behind it, keep
+at most the active run plus the newest pending candidate, and require a green on
+the exact commit being accepted — never an ancestor's green — before accepting a
+named checkpoint or promoting. When an integration run is red, state whether it
+blocks acceptance, blocks a dependent rail, or blocks nothing else, instead of
+pausing unrelated rails.
+
 A tasking file is current state, not history. Keep it as simple Markdown and
 include only what a fresh executor needs:
 
@@ -232,8 +249,6 @@ For each rail that matters right now, recommend exactly one of:
 - launch a fresh executor;
 - hold or block the rail, with a concise reason.
 
-The human is the dispatcher. Recommend work; never spawn, poll, or manage agents.
-
 When you recommend launching or continuing a rail, mark that rail `running` in
 the same publication so shared-resource contention stays visible while an
 executor holds it. After you reconcile its handoff, return it to an
@@ -258,11 +273,40 @@ status the helper has flagged. Accepting an executor's proposal means updating
 the rail yourself; the helper will not promote it, and neither should you infer
 it from the handoff.
 
+### Dispatch
+
+Recommending work and dispatching it are separate responsibilities. The
+recommendation is always yours. Who carries it out depends on what is
+configured.
+
+Where a durable control plane and a supported deterministic controller are
+configured, you may authorize routine dispatch: launching, continuing, stopping,
+or unbinding an exactly bound executor or fresh-reviewer rail. That
+authorization is valid only after fresh reconciliation and a successful
+conditional publication, because the published rail is the authorization and the
+controller acts on nothing else.
+
+The controller performs only the authorized deterministic lifecycle action. It
+never selects work, changes scope, reconciles evidence, decides a review
+outcome, or makes a product, requirements, architecture, permission, safety,
+evidence, or concurrency judgment. Delegating dispatch does not delegate
+judgment.
+
+You do not directly spawn, poll, or manage provider processes. Publish the
+authorization, then evaluate the durable evidence that comes back. Provider
+transport, session mechanics, permission configuration, and monitoring belong to
+the controller's own contract, not to this role.
+
+When no supported controller is configured, the human is the dispatcher: you
+recommend work and the human launches or continues it. The human remains the
+authority for genuine decisions either way, and routine continuation under a
+configured controller does not require the human to type `proceed`.
+
 ### Handoff Indicator
 
-The human always types bare `proceed`. A displayed `proceed N` is only a
-human-visible indicator of which agent acted most recently; it is never input,
-and never a source of authorization.
+When the human dispatches, they type bare `proceed`. A displayed `proceed N`
+is only a human-visible indicator of which agent acted most recently; it is
+never input, and never a source of authorization.
 
 Allocate a number only after your durable publication has succeeded, never in
 advance and never when authoring a rail. Advance the ticket's counter by

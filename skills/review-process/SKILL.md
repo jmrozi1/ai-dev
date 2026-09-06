@@ -69,6 +69,15 @@ should be worked differently. Look for these failure modes:
 - **Wasted effort:** avoidable rediscovery, repeated searching, re-reading known
   state, or repeated failed approaches that reveal a process problem rather than
   a bug.
+- **Change amplification:** validation tiers, reviewer reruns, compatibility
+  work, or proof prose that are broader than the changed boundary without a
+  current risk justification. Apply `change-validation` when this judgment is
+  material.
+- **Integration serialization:** development held behind an integration run,
+  a run queued per edit rather than per coherent slice, an acceptance resting on
+  a green that predates the accepted commit, or a red run stopping work it does
+  not actually depend on. Apply `integration-signal` when this judgment is
+  material.
 - **Skill opportunity:** a new or refined skill could materially reduce recurring
   friction, preserve reusable operational knowledge, or make observed behavior
   match the intended process.
@@ -207,6 +216,11 @@ Candidates` or `Skills` section, remove the duplicate classified observation fro
 tasking process notes on the next rail rewrite. The ticket owns reviewed skill
 investment state; the tasking file carries only current execution observations
 needed for the next review.
+
+When an automated test, product fix, or accepted skill now owns an incident's
+lesson, retire superseded prose from the next rail and live state. Historical
+context remains in Git and closed issues. Do not preserve a repeated obligation
+merely because earlier rails contained it.
 
 If no process notes exist, review from the evidence that is available and say
 plainly what was unobservable, so the next rail can carry it.

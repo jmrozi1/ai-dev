@@ -45,6 +45,11 @@ requirements the work must satisfy. Keep conceptual parent and child
 traceability as lightweight as the work permits; do not impose a formal
 traceability system.
 
+Use `module-development` to carry a coherent requirement slice into
+construction: it owns refining that slice into observable behavior,
+inputs/outputs, failure behavior, dependencies, side effects, and sufficient
+evidence, and the module shape that keeps the resulting evidence assertable.
+
 When implementation, investigation, or feedback reveals newly needed behavior,
 write it as a new or refined requirement before adding it to implementation
 scope. Escalate material product, scope, architecture, or permission decisions

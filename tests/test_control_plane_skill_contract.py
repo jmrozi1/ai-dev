@@ -158,9 +158,61 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.assertIn("launch a fresh executor", self.orchestrator)
         self.assertIn("hold or block the rail, with a concise reason", self.orchestrator)
 
-    def test_orchestrator_leaves_dispatch_to_the_human(self) -> None:
-        self.assertIn("the human is the dispatcher", self.orchestrator)
-        self.assertIn("never spawn, poll, or manage agents", self.orchestrator)
+    def test_orchestrator_separates_recommendation_from_dispatch(self) -> None:
+        self.assertIn("recommending work and dispatching it are separate responsibilities", self.orchestrator)
+        self.assertIn("the recommendation is always yours", self.orchestrator)
+
+    def test_orchestrator_may_authorize_controller_executed_dispatch(self) -> None:
+        self.assertIn("where a durable control plane and a supported deterministic controller are configured", self.orchestrator)
+        self.assertIn(
+            "you may authorize routine dispatch: launching, continuing, stopping, or unbinding an exactly bound executor or fresh-reviewer rail",
+            self.orchestrator,
+        )
+        self.assertIn(
+            "valid only after fresh reconciliation and a successful conditional publication",
+            self.orchestrator,
+        )
+        self.assertIn("the published rail is the authorization and the controller acts on nothing else", self.orchestrator)
+
+    def test_controller_executes_the_action_and_holds_no_judgment(self) -> None:
+        self.assertIn("the controller performs only the authorized deterministic lifecycle action", self.orchestrator)
+        self.assertIn("never selects work, changes scope, reconciles evidence, decides a review outcome", self.orchestrator)
+        self.assertIn(
+            "makes a product, requirements, architecture, permission, safety, evidence, or concurrency judgment",
+            self.orchestrator,
+        )
+        self.assertIn("delegating dispatch does not delegate judgment", self.orchestrator)
+
+    def test_orchestrator_does_not_operate_provider_processes(self) -> None:
+        self.assertIn("you do not directly spawn, poll, or manage provider processes", self.orchestrator)
+        self.assertIn("publish the authorization, then evaluate the durable evidence that comes back", self.orchestrator)
+
+    def test_orchestrator_keeps_provider_transport_out_of_the_role(self) -> None:
+        self.assertIn(
+            "provider transport, session mechanics, permission configuration, and monitoring belong to the controller's own contract, not to this role",
+            self.orchestrator,
+        )
+        for mechanic in ("--resume", "session id", "headless", "allowlist"):
+            with self.subTest(mechanic=mechanic):
+                self.assertNotIn(mechanic, self.orchestrator)
+
+    def test_human_remains_the_dispatch_fallback(self) -> None:
+        self.assertIn("when no supported controller is configured, the human is the dispatcher", self.orchestrator)
+        self.assertIn("you recommend work and the human launches or continues it", self.orchestrator)
+        self.assertIn("the human remains the authority for genuine decisions either way", self.orchestrator)
+
+    def test_routine_continuation_needs_no_human_proceed(self) -> None:
+        self.assertIn(
+            "routine continuation under a configured controller does not require the human to type `proceed`",
+            self.orchestrator,
+        )
+
+    def test_orchestrator_no_longer_requires_unconditional_human_dispatch(self) -> None:
+        self.assertNotIn(
+            "the human is the dispatcher. recommend work; never spawn, poll, or manage agents",
+            self.orchestrator,
+        )
+        self.assertNotIn("the human always types bare `proceed`", self.orchestrator)
 
     def test_orchestrator_marks_recommended_rails_running_and_clears_them_later(self) -> None:
         self.assertIn("when you recommend launching or continuing a rail, mark that rail `running`", self.orchestrator)
@@ -210,7 +262,8 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
         self.assertIn("retry the allocation alone rather than republishing", self.executor)
 
     def test_user_never_types_the_indicator(self) -> None:
-        self.assertIn("the human always types bare `proceed`", self.orchestrator)
+        self.assertIn("when the human dispatches, they type bare `proceed`", self.orchestrator)
+        self.assertIn("it is never input, and never a source of authorization", self.orchestrator)
         self.assertIn("the user never types it", self.executor)
 
     # Status reconciliation
