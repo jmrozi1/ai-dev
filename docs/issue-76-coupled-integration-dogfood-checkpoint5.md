@@ -270,7 +270,7 @@ environment at `644a3c8`:
 | what | WSL | Windows |
 |---|---|---|
 | full integration suite | **~133 s** | 2753 s |
-| S4's affected-contract gate (`test_role_invocation`, 49 tests) | **1.677-1.729 s** | 53.7 s unloaded |
+| S4's affected-contract gate (`test_role_invocation`, 49 tests) | **~1.5-1.7 s** (8 runs) | 53.7 s unloaded |
 
 A **133-second** synchronous integration gate is not obviously intolerable. `integration-signal`'s
 opening argument — that a synchronous gate *"serializes development behind the slowest suite in the
@@ -301,8 +301,16 @@ the accepted non-passing set* — **one of two runs at the accepted tip is a red
 have rejected its own tip.** F7 says to record membership rather than counts; the missing half is
 that **membership is not deterministic**, and neither `integration-signal` nor this ticket has any
 provision for flakes: no re-run rule, no quarantine, no distinction between a failure and an
-unstable test. Six runs at that SHA now exist and five agree. That is an observation, not the
-property the acceptance gate assumes.
+unstable test. **Corrected after focused verification.** This previously read *"six runs at that SHA now exist and
+five agree."* **Wrong, and wrong in the flattering direction.** Three runs exist at `644a3c8`
+(`runW-acc2` failures=8, `rr-verify` failures=9, `rr-verify2` failures=8), of which **two agree** —
+so observed instability at the accepted tip is **1 in 3, not 1 in 6**. Six-and-five is only
+recoverable by pooling runs across **four different SHAs**, which is exactly the cross-binding F5
+exists to forbid: a result belongs to its own commit and does not pool with a neighbour's.
+
+Stated accurately: runs at `4282c71`, `c764922`, `4804621`, `e5ccf6d` and `89c688e` each produced
+the same non-passing set, and at `644a3c8` two of three did. That is an observation about a small
+sample, not the deterministic property the acceptance gate assumes.
 
 ### F5 — a result binds to an exact SHA but not to an exact environment
 
@@ -490,13 +498,15 @@ checkpoint.
 
 ## The pattern in this checkpoint's own reporting
 
-Three blocking findings across two independent reviews, and **all three are the same error**:
+**Four** findings across two independent reviews and one focused verification, and **all four are
+the same error**:
 
 | finding | the claim | what the evidence showed |
 |---|---|---|
 | **B1** | attribution cost "1 second" | 81.033 s; the 1 s came from the **broken** replay this document discredits |
 | **B2** | the mutation proved the widened assertions still fail on deletion | it failed on a **neighbouring** assertion; the widened sets were inert |
 | **B3** | "before remediation this same mutation returned green" | it failed pre-remediation too, on a different message |
+| **B4** | "six runs at that SHA exist and five agree" | three runs at that SHA, two agree; six-and-five pools four different SHAs |
 
 Every one converted an accurate underlying finding into a sharper before/after that the instrument
 does not produce. None was a fabrication and none changed a conclusion — the attribution still holds,
