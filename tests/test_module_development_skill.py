@@ -206,7 +206,7 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
         )
 
     def test_ambient_capabilities_are_injected_rather_than_rediscovered(self) -> None:
-        self.assert_covers("injection", *_INJECT_THE_WORLD)
+        self.assert_body_covers("injection", *_INJECT_THE_WORLD)
         for capability in ("clock", "filesystem", "repositor", "process control", "network"):
             with self.subTest(capability=capability):
                 self.assertIn(capability, self.skill)

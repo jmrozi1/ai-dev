@@ -18,6 +18,18 @@ def _covers(text: str, accepted: tuple[str, ...]) -> bool:
     return any(phrase in text for phrase in accepted)
 
 
+def _guidance_body(path: Path) -> str:
+    """The skill minus its frontmatter — the text an activated skill is read for.
+
+    The frontmatter `description` is a routing blurb used to pick the skill; it
+    is not where an obligation is carried. Scoping to the body keeps a section's
+    protection from being satisfied by the blurb that merely names it.
+    """
+    text = path.read_text(encoding="utf-8")
+    body = re.sub(r"\A---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.DOTALL)
+    return " ".join(body.lower().split())
+
+
 # The staleness prohibition was accepted only as "stale green", "carry a green
 # forward" or "carry it forward" -- every alternate required the word "green"
 # next to "stale" or "carry". Guidance that states the same obligation plainly,
@@ -85,11 +97,20 @@ class IntegrationSignalSkillTests(unittest.TestCase):
         self.root = Path(__file__).resolve().parents[1]
         self.path = self.root / "skills" / "integration-signal" / "SKILL.md"
         self.skill = _normalized(self.path)
+        self.body = _guidance_body(self.path)
 
     def assert_covers(self, obligation: str, *accepted: str) -> None:
         self.assertTrue(
             _covers(self.skill, accepted),
             f"integration-signal does not cover {obligation}; "
+            f"expected one of {accepted}",
+        )
+
+    def assert_body_covers(self, obligation: str, *accepted: str) -> None:
+        self.assertTrue(
+            _covers(self.body, accepted),
+            f"integration-signal's guidance body does not cover {obligation}; "
+            f"naming it in the frontmatter description does not carry it; "
             f"expected one of {accepted}",
         )
 
@@ -141,7 +162,7 @@ class IntegrationSignalSkillTests(unittest.TestCase):
         )
 
     def test_a_green_result_never_transfers_to_a_newer_candidate(self) -> None:
-        self.assert_covers(
+        self.assert_body_covers(
             "the staleness prohibition",
             *_NEVER_CARRY_A_RESULT_FORWARD,
         )
