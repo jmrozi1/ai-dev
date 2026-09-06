@@ -29,7 +29,8 @@ synchronous gate is author-owned and cheap, and integration is not that gate.
 |---|---|---|
 | all four skill modules together | 35 | **0.028 s** |
 | `tests.test_role_invocation` alone (S4's affected contract) | 49 | **84.202 s** |
-| full suite (integration) | ~3054 | **> 45 min under concurrent load** |
+| full suite (integration), Windows | 3067 | **2753 s under concurrent load** |
+| full suite (integration), WSL | 3067 | **136 s** |
 
 The spread is roughly **three thousandfold** between a slice's own gate and the
 integration suite. A synchronous integration gate would have serialized all four slices
@@ -61,8 +62,10 @@ Development never blocked on an integration result:
 
 ## Findings about the policy itself
 
-A dogfood that only confirms the policy has not tested it. Three findings, none of them
-remediated here — remediation would be the scope expansion this ticket forbids.
+A dogfood that only confirms the policy has not tested it. **Nine findings**, none of them
+remediated here — remediation would be the scope expansion this ticket forbids. F1-F4 came from
+using the policy; F5-F7 from the acceptance gate; F8 and F9 were surfaced by the independent
+review.
 
 ### F1 — exact-SHA binding implies workspace isolation, and the skill does not say so
 
@@ -106,6 +109,19 @@ which is what separates contention from the suite's own slowness. The suite does
 genuinely slow process-spawning section, so these figures are throughput under load rather
 than a controlled contention benchmark, but the recovery makes contention the dominant term
 rather than a conjecture.
+
+**Provenance limit:** the partial logs carry no timestamps and no summary lines, so these
+throughput figures are **not reproducible from any retained artifact** — they were observed live.
+They corroborate against `runA`'s recoverable average of ~67 tests/min over 2753 s, but they are not
+verifiable after the fact, and nothing in this finding should be rested on their exact values.
+
+**The sharper fact, surfaced by the independent review, is that the concurrency bought nothing at
+all.** All three reference runs were killed mid-execution and none produced a summary line, so they
+contributed **zero evidence** to this checkpoint. The attribution that actually worked was the
+single-threaded 81 s focused replay, which needed no concurrency whatever. The error was therefore
+not merely under-warned-against by the skill — it was unnecessary **on its own stated terms**, since
+the runs it raced were never required. That is the honest account, and it is less flattering than
+the one this section originally gave.
 
 The finding is that **"at most the active run plus the newest pending candidate" is not only
 a bookkeeping rule about which answers are worth having — it is also a concurrency limit
@@ -155,7 +171,7 @@ attribution requirement needs. It was attributed by the policy's own cheap path.
 | run | tested SHA | environment | result | runtime |
 |---|---|---|---|---|
 | candidate run | `c764922` | Windows 11, CPython 3.10 | **FAILED** — failures=30, errors=77, skipped=19, of 3067 | 2753 s (45.9 min) |
-| focused replay of the non-passing set | `4282c71` | Windows 11, CPython 3.10 | **failures=30, errors=77** | 1 s |
+| focused replay of the non-passing set | `4282c71` | Windows 11, CPython 3.10 | **failures=30, errors=77** | 81.033 s |
 | baseline | `4282c71` | WSL2 Linux 6.6, CPython 3.14.4 | failures=8, errors=1, skipped=6, of 3054 | 134.2 s |
 | acceptance | `c764922` | WSL2 Linux 6.6, CPython 3.14.4 | failures=8, errors=1, skipped=6, of 3067 | 135.9 s |
 | acceptance at tip | `4804621` | WSL2 Linux 6.6, CPython 3.14.4 | failures=8, errors=1, skipped=6, of 3067 | 136.4 s |
@@ -176,8 +192,9 @@ require it, and every row above is uninterpretable without it.
 The 101 distinct non-passing tests were extracted from the acceptance run and replayed
 **only they** against the published checkpoint-4 tip. The counts match exactly, so the whole
 non-passing set reproduces on a commit that predates every change in this checkpoint.
-`integration-signal` states the rule directly: *if it reproduces on the last green SHA … it
-is environmental, flaky, or older than the range.* **The range `4282c71..c764922` is
+`integration-signal` states the rule directly: *if it reproduces on the last green SHA, **or on an unrelated
+commit**, it is environmental, flaky, or older than the range.* Since `4282c71` is **not** a green
+SHA, it is the second clause that licenses this conclusion, not the first. **The range `4282c71..c764922` is
 exonerated.** Corroborating: none of the 101 tests lie in the four modules these slices touch.
 
 Root causes, all host-environmental:
@@ -191,8 +208,40 @@ Root causes, all host-environmental:
 | exit `9009` — *"Python was not found"* | 10 |
 | remainder — `os.fork`, `os.geteuid`, assorted assertions | ~17 |
 
-Attribution cost **1 second** against the ~90 minutes a whole-suite re-run across the range
-would have taken, which is the saving the policy's escalation order exists to produce.
+Attribution cost **81.033 s** against the ~90 minutes a whole-suite re-run across the range would
+have taken — the saving the policy's escalation order exists to produce.
+
+**This figure was reported as "1 second" until the independent review caught it (B1).** That number
+came from the *broken* replay's wrapper output, not from the corrected run — the same discredited
+instrument F6 exists to warn about, misread inside the document that reports F6. The conclusion is
+unchanged (~65x rather than ~6500x); the measurement was wrong and is corrected here rather than
+quietly amended.
+
+### Last known green SHA — there is none, and that is the honest entry
+
+`integration-signal` requires every run to record the **last known green SHA**. This checkpoint
+records it as **none exists anywhere in this ticket**. Checkpoint 4's accepted record is itself not
+green (8 failures, 1 error), and every run here reproduces that same set. The project's integration
+suite has no green commit to point at, so the policy's mandated field can only be filled honestly
+with an absence.
+
+This is not a defect introduced here, but the deliverable originally omitted the field rather than
+recording the absence — and "not recorded" and "none exists" are exactly the two states the policy
+elsewhere insists on distinguishing.
+
+### What the attribution did and did not demonstrate
+
+The attribution ladder has three rungs: affected tests, focused replay, then bisect. Only **focused
+replay** was exercised, and it was used to **exonerate a range**, not to localize a failure to a
+change.
+
+- **Demonstrated:** range exoneration — a red whose entire non-passing set reproduces on an earlier
+  commit is not attributable to the range between them.
+- **NOT demonstrated:** failure localization. No failure was ever traced *to* a change, because no
+  change in this checkpoint caused one. Rungs 1 and 3 were never needed and are therefore untested.
+
+Recorded explicitly so that a convenient absence of introduced failures is not read as evidence that
+localization works. It was not tried.
 
 ### F5 — a result binds to an exact SHA but not to an exact environment
 
@@ -255,24 +304,99 @@ regress deliberately: the **deliverable** carries the method, the findings, and 
 comparison, and the **final acceptance run against the final tip is recorded in the control plane**,
 which is not part of the candidate lineage. Recorded as an observation, not remediated.
 
-## Orchestrator verification, not executor trust
+### F8 — the policy has no provision for a delta no suite can observe
 
-The widened assertions in S2 were checked against the **live** skill file rather than the
-executor's own fixtures, mirroring the verification method checkpoint 4's acceptance used:
+The acceptance run initially bound to `c764922` while the tip was `4804621`, a delta of exactly one
+added `docs/` file. The reviewer verified mechanically that **no test in the repository can observe
+anything under `docs/`**: repo-wide walks cover `*.py`, `skills/**/SKILL.md` and `prompts/*.prompt.md`,
+and every other `docs/` reference names a specific file. The engineering risk was nil.
+
+But `integration-signal` says without carve-out: *do not accept a named checkpoint on a green that
+predates the commit being accepted.* Its escape clause covers a *"descendant-free equivalent whose
+change range covers it"* — and an **ancestor** is not that. The original reasoning here substituted a
+sound engineering argument for a clause the policy does not actually offer, which is the shape of
+rationalization the rule exists to prevent.
+
+Rather than rest on it, the suite was simply re-run at each true tip; in the correct environment that
+costs ~136 s, so **rigour was cheaper than the argument for skipping it**. The finding stands on its
+own: the policy has no provision for a delta that no selected suite can observe, and forces either a
+re-run or a rationalization. Recorded, not remediated.
+
+### F9 — a catalogue obligation was fixed with no test that can hold it
+
+S1 and S3 restored negative triggers to three catalogue rows. `test_skill_catalog_audience_coverage`
+ties rows only to package **names and paths**; it does not constrain description text at all.
+**Nothing prevents those triggers drifting out again.**
+
+That sits in tension with this ticket's own accepted standard — checkpoint 4's blocking finding was
+precisely that *an obligation with no test is not remembered*. Whether a catalogue blurb carries a
+substantive obligation is a fair question, and it is **not settled here**: the same question is
+already open as checkpoint 4's residual 3 for `## ChatGPT Interaction`. It is surfaced rather than
+answered, because answering it is an instrument question and instrument redesign is a separate
+checkpoint.
+
+The tension is sharpened by F3's own stated reason for making the fix: that checkpoint 6 installs
+this catalogue. If the row matters enough to correct before activation, the argument that it is too
+trivial to protect is weaker than it looks.
+
+## Orchestrator verification, and a claim it did not support
+
+The widened assertions in S2 were checked against the **live** skill file rather than the executor's
+fixtures:
 
 | step | result |
 |---|---|
 | unmutated `skills/module-development/SKILL.md` | `test_module_development_skill` **OK 11** |
-| injection section excised (awk, 7064 → 5964 bytes) | **FAILED** — *"does not cover the prohibition on reaching for ambient state inside domain logic"* |
+| injection section excised (awk, 7064 -> 5964 bytes) | **FAILED** |
 | section restored | **OK 11**, working tree clean |
 
-The widened wordings therefore still fail when the obligation is deleted; they were not
-widened into vacuity.
+**The conclusion originally drawn from this was wrong, and the independent review caught it (B2).**
+The document claimed the widened wordings "still fail when the obligation is deleted." They did not.
+The module failed on a **neighbouring pre-existing narrow assertion**; the widened set itself still
+returned `True`, because `assert_covers` reads the whole file **including YAML frontmatter** and
 
-The three findings the widening addressed were also reproduced independently from committed
-objects before the executor was dispatched: `assert_covers("injection", "inject")` carried a
-single literal with no alternates; the refinement assertion carried two inflections of one
-phrase; and the staleness alternates all required *"green"* adjacent to *"stale"*/*"carry"*.
+- `module-development`'s frontmatter says *"injected clocks/filesystems/…"*, and
+- `integration-signal`'s frontmatter contains the literal *"stale green"*.
+
+Two of the three widened assertions were therefore **inert**: they could not fail while the
+frontmatter stood, whatever the guidance body said. A green module was read as proof of protection
+that a green module could not provide — the same mistake as B1, in the section written to guard
+against exactly it.
+
+**This was not a regression from S2.** The reviewer verified at `e52c069` that the *narrow* sets were
+equally frontmatter-satisfiable, and the obligations stayed protected by neighbouring assertions
+throughout. Nothing was lost; a claim was made that the evidence never supported.
+
+### Remediated at `c8ee178`, and proved in the direction that matters
+
+Both assertions are now scoped to the guidance body via the `_guidance_body` / `assert_body_covers`
+instrument the executor had already built for this purpose — whose message states the principle
+outright: *naming it in the frontmatter description does not carry it*. The instrument was ported
+verbatim into `integration-signal`, not redesigned. `git diff --name-only e5ccf6d c8ee178 -- skills/`
+is **empty**; the change is two test files, +23/-2.
+
+Orchestrator-verified independently, with the frontmatter deliberately left intact:
+
+| step | result |
+|---|---|
+| staleness section excised, frontmatter still carrying *"stale green"* | **FAILED on its own assertion** — *"integration-signal's guidance body does not cover the staleness prohibition; naming it in the frontmatter description does not carry it"* |
+| section restored | **OK 11**, `skills/` diff empty |
+
+**Before remediation this same mutation returned green.** That is the whole finding.
+
+### A disclosure from the remediation, worth more than the fix
+
+The executor reported that the **injection** obligation could not be falsified by excising its
+section alone: `## Develop Behavior And Its Tests Together` closes with the incidental clause *"which
+is the real reason to keep the world injected."* Section-only excision therefore left the body still
+matching, and the module still failed on the neighbour — the reviewer's exact symptom, reproduced
+for a second, independent reason.
+
+So the obligation is stated in the body **twice**, and a section-excision instrument cannot falsify
+an obligation that is restated incidentally elsewhere. Every mutation result in this ticket —
+including checkpoint 4's accepted awk-excision proof — is an **upper bound** on the protection it
+demonstrates, not a measurement of it. Recorded, not remediated: fixing it is instrument design, and
+instrument design is a separate checkpoint.
 
 ## Recorded residuals — carried, not closed
 
