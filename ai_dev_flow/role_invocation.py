@@ -389,6 +389,7 @@ def open_role_session(
     launch_kwargs: Optional[Mapping] = None,
     stop_kwargs: Optional[Mapping] = None,
     ledger: Optional[AllowanceLedger] = None,
+    command_timeout: Optional[float] = None,
 ) -> OpenSession:
     """Every gate, then one launch, and the session is handed back still running.
 
@@ -433,6 +434,15 @@ def open_role_session(
     )
 
     launch_arguments = dict(launch_kwargs or {})
+    # The run bound this session may spend, stated by the operator who launched it
+    # and carried to the one parameter that enforces it. `None` is not "no bound":
+    # it means the bound `claude_worker.run_request` already applies
+    # (`DEFAULT_COMMAND_TIMEOUT_SECONDS`), which is exactly what every launch got
+    # before this parameter existed. Nothing here raises a default, and a stated
+    # value overrides a `launch_kwargs` entry of the same name because a bound named
+    # on the command line is the operator's statement and the mapping is a test seam.
+    if command_timeout is not None:
+        launch_arguments["command_timeout"] = command_timeout
     identity = None
     if ledger is not None:
         injected_mint = launch_arguments.get("new_session_id")
@@ -489,6 +499,7 @@ def invoke_role(
     launch_kwargs: Optional[Mapping] = None,
     stop_kwargs: Optional[Mapping] = None,
     ledger: Optional[AllowanceLedger] = None,
+    command_timeout: Optional[float] = None,
     while_running: Optional[Callable] = None,
 ) -> InvocationOutcome:
     """One gated launch of exactly one executor- or reviewer-role session, then stopped.
@@ -533,6 +544,7 @@ def invoke_role(
         launch_kwargs=launch_kwargs,
         stop_kwargs=stop_kwargs,
         ledger=ledger,
+        command_timeout=command_timeout,
     )
     assignment = opened.assignment
     launched = opened.launched
