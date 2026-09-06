@@ -9,6 +9,18 @@ def _normalized(path: Path) -> str:
     return " ".join(path.read_text(encoding="utf-8").lower().split())
 
 
+def _guidance_body(path: Path) -> str:
+    """The skill minus its frontmatter — the text an activated skill is read for.
+
+    The frontmatter `description` is a routing blurb used to pick the skill; it
+    is not where an obligation is carried. Scoping to the body keeps a section's
+    protection from being satisfied by the blurb that merely names it.
+    """
+    text = path.read_text(encoding="utf-8")
+    body = re.sub(r"\A---\s*\n.*?\n---\s*\n", "", text, count=1, flags=re.DOTALL)
+    return " ".join(body.lower().split())
+
+
 def _frontmatter_name(path: Path) -> str | None:
     match = re.match(
         r"^---\s*\n(.*?)\n---\s*\n", path.read_text(encoding="utf-8"), re.DOTALL
@@ -23,9 +35,10 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
     """Issue #76 deliverable 12: development architecture for requirement-shaped modules.
 
     These protect the accepted contract, not the sentences that currently carry
-    it: the dimensions a slice must be refined along, the ambient capabilities
-    that must be injected, the decision/adapter split, the inner-loop rule, and
-    the routing to sibling skills. Each obligation is satisfied by any of several
+    it: the dimensions a slice must be refined along, the shape that makes a
+    unit a module, the ambient capabilities that must be injected, the
+    decision/adapter split, the inner-loop rule, and the routing to sibling
+    skills. Each obligation is satisfied by any of several
     wordings, so a materially different but valid rewrite of the guidance keeps
     passing. Where an exact phrase is asserted it is because that phrase is the
     accepted rule itself, quoted from Issue #76.
@@ -35,11 +48,20 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
         self.root = Path(__file__).resolve().parents[1]
         self.path = self.root / "skills" / "module-development" / "SKILL.md"
         self.skill = _normalized(self.path)
+        self.body = _guidance_body(self.path)
 
     def assert_covers(self, obligation: str, *accepted: str) -> None:
         self.assertTrue(
             any(phrase in self.skill for phrase in accepted),
             f"module-development does not cover {obligation}; "
+            f"expected one of {accepted}",
+        )
+
+    def assert_body_covers(self, obligation: str, *accepted: str) -> None:
+        self.assertTrue(
+            any(phrase in self.body for phrase in accepted),
+            f"module-development's guidance body does not cover {obligation}; "
+            f"naming it in the frontmatter description does not carry it; "
             f"expected one of {accepted}",
         )
 
@@ -63,6 +85,46 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
         self.assert_covers("dependencies", "dependencies")
         self.assert_covers("side effects", "side effects")
         self.assert_covers("sufficient evidence", "sufficient evidence")
+
+    def test_modules_are_shaped_as_independently_constructible_units(self) -> None:
+        # Deliverable 12's named module-boundary rule: what makes a unit a
+        # module at all, and the seam test that says when two are really one.
+        self.assert_body_covers(
+            "a module being constructible on its own, without the rest of the system",
+            "independently constructible",
+            "independently buildable",
+            "constructed independently",
+            "without standing up the rest",
+            "without the rest of the system",
+        )
+        self.assert_body_covers(
+            "the narrow contract a module is given",
+            "narrow contract",
+            "narrow surface",
+            "small named surface",
+            "small, named surface",
+            "minimal contract",
+        )
+        self.assert_body_covers(
+            "one responsibility, drawn from the requirement rather than the layering",
+            "single responsibility",
+            "one responsibility",
+            "a responsibility drawn from",
+        )
+        self.assert_body_covers(
+            "preferring a capability boundary over a grouping by mechanism",
+            "as a capability",
+            "capability boundary",
+            "by mechanism",
+            "groups code by mechanism",
+        )
+        self.assert_body_covers(
+            "the confused-seam rule for modules that need each other's internals",
+            "confused seam",
+            "each other's internals",
+            "one another's internals",
+            "know each other's internals",
+        )
 
     def test_ambient_capabilities_are_injected_rather_than_rediscovered(self) -> None:
         self.assert_covers("injection", "inject")
