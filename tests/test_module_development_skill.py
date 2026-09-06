@@ -5,8 +5,17 @@ import re
 import unittest
 
 
+def _normalized_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
 def _normalized(path: Path) -> str:
-    return " ".join(path.read_text(encoding="utf-8").lower().split())
+    return _normalized_text(path.read_text(encoding="utf-8"))
+
+
+def _covers(text: str, accepted: tuple[str, ...]) -> bool:
+    """Whether any accepted phrasing of an obligation appears in `text`."""
+    return any(phrase in text for phrase in accepted)
 
 
 def _guidance_body(path: Path) -> str:
@@ -31,6 +40,77 @@ def _frontmatter_name(path: Path) -> str | None:
     return None if name is None else name.group(1)
 
 
+# Two obligations were pinned to a single wording: refinement-before-building was
+# accepted only as "before implementing"/"before implementation" (two inflections
+# of one phrase, not two wordings), and injection only as the literal word
+# "inject". Both are stated by plenty of valid prose that uses neither, so a
+# materially different valid rewrite of the guidance failed the ticket's own
+# permanence rule. These sets accept the obligation however it is worded, and the
+# falsifiability tests below prove they still fail when it is absent.
+_REFINE_BEFORE_BUILDING = (
+    "before implementing",
+    "before implementation",
+    "before it is implemented",
+    "before any code is written",
+    "before writing the code",
+    "before building it",
+    "before the module is built",
+    "prior to implementation",
+    "ahead of implementation",
+)
+
+_INJECT_THE_WORLD = (
+    "inject",
+    "pass in every ambient capability",
+    "passed in at the module boundary",
+    "supplied by the caller",
+    "provided by the caller",
+    "handed to the module",
+)
+
+# Fixtures for the falsifiability proofs: a materially different but valid
+# statement of each obligation, and the same guidance with that obligation
+# deleted outright.
+_REFINEMENT_REWRITE = """
+## Settle A Slice Before Any Code Is Written
+
+Six things about a coherent requirement slice are decided prior to
+implementation: the observable behavior, the inputs and outputs, the failure
+behavior, the dependencies, the side effects, and the evidence that would show
+the slice satisfied or violated.
+
+A slice whose failure behavior was discovered while coding rather than decided
+up front is the usual source of an untestable boundary.
+"""
+
+_REFINEMENT_DELETED = """
+## Settle A Slice
+
+Six things about a coherent requirement slice are decided: the observable
+behavior, the inputs and outputs, the failure behavior, the dependencies, the
+side effects, and the evidence that would show the slice satisfied or violated.
+
+A slice whose failure behavior was discovered while coding rather than decided
+is the usual source of an untestable boundary.
+"""
+
+_INJECTION_REWRITE = """
+## Hand The World In At The Boundary
+
+Domain logic never reaches out for the world. Every ambient capability a module
+needs -- the clock, the filesystem, repositories, process control, and the
+network -- is supplied by the caller at the module boundary, so the module can
+be exercised with a substitute without patching global state.
+"""
+
+_INJECTION_DELETED = """
+## Name The World A Module Touches
+
+A module's ambient capabilities are the clock, the filesystem, repositories,
+process control, and the network. Keep that list short.
+"""
+
+
 class ModuleDevelopmentSkillTests(unittest.TestCase):
     """Issue #76 deliverable 12: development architecture for requirement-shaped modules.
 
@@ -52,14 +132,14 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
 
     def assert_covers(self, obligation: str, *accepted: str) -> None:
         self.assertTrue(
-            any(phrase in self.skill for phrase in accepted),
+            _covers(self.skill, accepted),
             f"module-development does not cover {obligation}; "
             f"expected one of {accepted}",
         )
 
     def assert_body_covers(self, obligation: str, *accepted: str) -> None:
         self.assertTrue(
-            any(phrase in self.body for phrase in accepted),
+            _covers(self.body, accepted),
             f"module-development's guidance body does not cover {obligation}; "
             f"naming it in the frontmatter description does not carry it; "
             f"expected one of {accepted}",
@@ -76,8 +156,7 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
         # Refinement happens before implementation, not recovered from the code.
         self.assert_covers(
             "refining before implementation",
-            "before implementing",
-            "before implementation",
+            *_REFINE_BEFORE_BUILDING,
         )
         self.assert_covers("observable behavior", "observable behavior", "observable behaviour")
         self.assert_covers("inputs and outputs", "inputs and outputs", "inputs/outputs")
@@ -127,7 +206,7 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
         )
 
     def test_ambient_capabilities_are_injected_rather_than_rediscovered(self) -> None:
-        self.assert_covers("injection", "inject")
+        self.assert_covers("injection", *_INJECT_THE_WORLD)
         for capability in ("clock", "filesystem", "repositor", "process control", "network"):
             with self.subTest(capability=capability):
                 self.assertIn(capability, self.skill)
@@ -137,6 +216,41 @@ class ModuleDevelopmentSkillTests(unittest.TestCase):
             "rather than rediscovering",
             "do not rediscover",
         )
+
+    def test_the_widened_wordings_accept_a_rewrite_and_still_fail_on_deletion(self) -> None:
+        """The two widened obligations must be wording-independent, not vacuous.
+
+        Widening an assertion until any prose satisfies it removes the
+        protection instead of making it honest, so each set is proved both
+        ways: it accepts a materially different valid statement of the
+        obligation, and it still rejects guidance the obligation was deleted
+        from.
+        """
+        for obligation, accepted, rewrite, deleted in (
+            (
+                "refining before the slice is built",
+                _REFINE_BEFORE_BUILDING,
+                _REFINEMENT_REWRITE,
+                _REFINEMENT_DELETED,
+            ),
+            (
+                "injecting ambient capabilities at the boundary",
+                _INJECT_THE_WORLD,
+                _INJECTION_REWRITE,
+                _INJECTION_DELETED,
+            ),
+        ):
+            with self.subTest(obligation=obligation):
+                self.assertTrue(
+                    _covers(_normalized_text(rewrite), accepted),
+                    f"a valid rewrite of {obligation} is rejected, so the "
+                    f"assertion pins wording rather than the contract",
+                )
+                self.assertFalse(
+                    _covers(_normalized_text(deleted), accepted),
+                    f"guidance with {obligation} deleted is still accepted, so "
+                    f"the assertion has been widened into vacuity",
+                )
 
     def test_decisions_are_separated_from_adapters_and_return_structured_results(self) -> None:
         self.assert_covers("adapters", "adapter")
