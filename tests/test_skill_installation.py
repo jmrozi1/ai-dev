@@ -220,7 +220,7 @@ class SkillInstallationTests(unittest.TestCase):
         self.assertEqual(names.count("flow"), 3)
         # The provider-neutral executor role has exactly one shared source.
         self.assertEqual(names.count("executor"), 1)
-        self.assertEqual(len(names), 16)
+        self.assertEqual(len(names), 19)
 
     def test_real_repository_packages_install_to_flat_destination(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
@@ -245,10 +245,13 @@ class SkillInstallationTests(unittest.TestCase):
     def test_each_audience_install_includes_shared_and_selected_skills(self) -> None:
         source_repo = Path(__file__).resolve().parents[1]
         shared_names = {
+            "change-validation",
             "executor",
             "feedback-loop-design",
             "frontend-design-review",
+            "integration-signal",
             "investigation-synthesis",
+            "module-development",
             "requirements-driven-development",
             "review-process",
         }
@@ -307,13 +310,16 @@ class SkillInstallationTests(unittest.TestCase):
                 "auto-review",
                 "auto-review",
                 "auto-review",
+                "change-validation",
                 "executor",
                 "feedback-loop-design",
                 "flow",
                 "flow",
                 "flow",
                 "frontend-design-review",
+                "integration-signal",
                 "investigation-synthesis",
+                "module-development",
                 "orchestrator",
                 "requirements-driven-development",
                 "review-process",
@@ -346,13 +352,16 @@ class SkillInstallationTests(unittest.TestCase):
                 "auto-review",
                 "auto-review",
                 "auto-review",
+                "change-validation",
                 "executor",
                 "feedback-loop-design",
                 "flow",
                 "flow",
                 "flow",
                 "frontend-design-review",
+                "integration-signal",
                 "investigation-synthesis",
+                "module-development",
                 "orchestrator",
                 "requirements-driven-development",
                 "review-process",
