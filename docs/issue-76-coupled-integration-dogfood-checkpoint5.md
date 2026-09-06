@@ -1,0 +1,246 @@
+# Issue #76 execution checkpoint 5 — coupled development/integration dogfood
+
+Checkpoint 5 dogfoods the model checkpoint 4 wrote down: `skills/module-development`
+for how a slice is developed, `skills/integration-signal` for how it is validated.
+This document is the measured evidence, not a narrative of the session.
+
+**Every change dogfooded here is a previously recorded finding from this ticket's own
+checkpoint-4 review.** No new requirement was introduced to create something to test.
+
+## What was developed, and how it was gated
+
+Four candidates were submitted in order on `flow/github/jmrozi1/ai-dev/76` from the
+published checkpoint-4 tip `4282c71`.
+
+| # | SHA | slice | author | local gate | runtime |
+|---|---|---|---|---|---|
+| S1 | `e52c069` | catalogue row restored the `module-development` negative trigger | executor | `test_skill_catalog_audience_coverage` 4, `test_module_development_skill` 10, `test_integration_signal_skill` 10 — all OK | 0.010 / 0.007 / 0.006 s |
+| S2 | `3ecd4ab` | three obligations asserted by contract rather than by wording | executor | `test_module_development_skill` 11 OK, `test_integration_signal_skill` 11 OK | 0.009 / 0.006 s |
+| S3 | `5afd141` | remaining catalogue rows agreed with their skills' canon | orchestrator | 24 tests OK | 0.020 s |
+| S4 | `c764922` | integrated provider `main` `db6583c` into the candidate | orchestrator | `test_role_invocation` 49 OK; four skill modules 35 OK | 84.202 s / 0.028 s |
+
+Each gate is **the module tests plus the tests for the contracts the slice affects**, and
+nothing else. No slice ran the full suite. That is `integration-signal`'s rule that the
+synchronous gate is author-owned and cheap, and integration is not that gate.
+
+## The measurement that makes the async model load-bearing
+
+| what | tests | runtime |
+|---|---|---|
+| all four skill modules together | 35 | **0.028 s** |
+| `tests.test_role_invocation` alone (S4's affected contract) | 49 | **84.202 s** |
+| full suite (integration) | ~3054 | **> 45 min under concurrent load** |
+
+The spread is roughly **three thousandfold** between a slice's own gate and the
+integration suite. A synchronous integration gate would have serialized all four slices
+behind it. This is the cost Issue #76 exists to remove, measured on this ticket's own work.
+
+## Coalescing — three superseded candidates dropped, none re-run
+
+Policy: keep at most the active run plus the newest pending candidate.
+
+- S1 dropped when S2 arrived — S2's range `4282c71..3ecd4ab` contains S1.
+- S2 dropped when S3 arrived — S3's range contains S2.
+- S3 dropped when S4 arrived — S4's range contains S3.
+
+Three queued candidates were coalesced away and **no separate integration answer was ever
+produced for them**. Per the skill, that is a scheduling decision and not a validation
+claim: it does not assert S1-S3 were good, only that nobody needed a separate answer about
+them once S4 subsumed their range.
+
+## Continued independent work
+
+Development never blocked on an integration result:
+
+- the executor authored S1 and S2 in the candidate worktree **while run 1 was executing**
+  in a separate worktree;
+- the orchestrator authored S3, then integrated `main` as S4 and ran its 84 s gate,
+  **while runs 1 and 2 were still executing**;
+- no submission was held open awaiting an integration result, and no slice waited for a
+  green before starting.
+
+## Findings about the policy itself
+
+A dogfood that only confirms the policy has not tested it. Three findings, none of them
+remediated here — remediation would be the scope expansion this ticket forbids.
+
+### F1 — exact-SHA binding implies workspace isolation, and the skill does not say so
+
+The first integration run was started in the **shared development worktree**. Dispatching
+the executor into that same worktree would have mutated files underneath a run whose entire
+claim is to describe one exact commit. The run was stopped and restarted in a worktree
+checked out detached at the tested SHA.
+
+`integration-signal` states the recording obligation — tested SHA, range, suites, runtime,
+outcome, last green — but never says the run must execute against an **immutable checkout**
+of that SHA. Recording a SHA while executing against a mutable tree produces a result that
+is precisely as wrong as an unlabeled one, and nothing in the current text catches it.
+
+### F2 — the queue model assumes one run role, and its single-active-run rule has an unstated resource basis
+
+Two distinct problems surfaced here, and the second was found by getting it wrong.
+
+**The vocabulary gap.** The policy's "at most the active run plus the newest pending
+candidate" treats all runs as interchangeable candidate validations. This checkpoint needed
+runs with **different roles**: an acceptance run on the commit actually being accepted, and
+reference runs (the published checkpoint-4 tip, and the merge-base) whose purpose is failure
+attribution rather than candidate validation. Reference runs are not candidates and must not
+be coalesced against candidates, but the skill has no vocabulary for the distinction.
+Applied literally, the queue rule would either forbid the attribution references that the
+policy's own attribution section requires, or force them to masquerade as candidate runs.
+
+**The resource basis, measured.** Reasoning from that gap, this checkpoint started the
+acceptance run while two reference runs were still executing, rather than idling ~40
+minutes. **That was wrong, and the cost was measurable:**
+
+| concurrent full-suite runs | run 1 throughput |
+|---|---|
+| 1 | ~**82 tests/min** |
+| 3 | ~**3 tests/min** |
+| 2 (after the third run was stopped) | ~**33 tests/min** |
+
+Throughput collapsed by more than an order of magnitude and projected completion went from
+tens of minutes to hours, so the third run was stopped. Throughput then recovered roughly
+tenfold **on the same suite region, with the only change being one fewer concurrent run** —
+which is what separates contention from the suite's own slowness. The suite does contain a
+genuinely slow process-spawning section, so these figures are throughput under load rather
+than a controlled contention benchmark, but the recovery makes contention the dominant term
+rather than a conjecture.
+
+The finding is that **"at most the active run plus the newest pending candidate" is not only
+a bookkeeping rule about which answers are worth having — it is also a concurrency limit
+with a resource justification**, and the skill states only the former. A reader who
+internalizes the stated rationale ("a backlog produces results about commits no one is
+waiting on") will conclude, as this checkpoint did, that runs somebody *is* waiting on may
+safely proceed in parallel. The text gives them nothing to catch the error.
+
+### F3 — a negative-trigger gap in the catalogue was systematic, not a single row
+
+The checkpoint-4 review found the `module-development` catalogue row dropped its
+frontmatter negative trigger. The same gap held for `integration-signal` and for
+`change-validation` — the latter **accepted at checkpoint 3** — so the defect predates the
+finding that surfaced it. Corrected in S3 because checkpoint 6 installs this catalogue and
+a row reading broader than the skill it describes would otherwise be activated. No
+`SKILL.md` was changed; only the catalogue's description of them.
+
+### F4 — the policy requires recording a run's outcome but says nothing about observing one
+
+`integration-signal` requires each run to record its runtime and outcome, and it assumes those
+facts are simply available. Obtaining them from a long-running background run turned out to be
+the hard part, and naive observation produced **two false conclusions in a single session**:
+
+1. **Buffered output read as stalled progress.** Python block-buffers stdout when redirected to a
+   file, so the log lagged far behind actual execution. Progress counts derived from the log moved
+   erratically and even appeared to go backwards. Runs must be launched unbuffered (`python -u`)
+   for their logs to be a usable progress signal at all.
+2. **A broken liveness check read as a dead run.** The process check used a shell whose path
+   translation rewrote the `/FI` filter argument into a filesystem path, so the command errored and
+   the "no matching processes" branch was taken. Three healthy runs were declared dead on that
+   basis. **Nothing had died**; the check had.
+
+Both failures share a shape the skill does not warn about: **an integration signal's absence of
+news is not news.** A missing outcome can mean still running, crashed, or unobservable, and these
+must be distinguished before any of them is recorded. A monitor that watches only for success
+cannot tell them apart, and silence looks identical to progress.
+
+This is a genuine gap in deliverable 13 as written. The policy defines what to record and what a
+result binds to, but not how a run's liveness and completion are established — and an
+asynchronous model rests entirely on that.
+
+## Failure attribution — a real red, attributed to the environment rather than the range
+
+The acceptance run went **red**, which gave this checkpoint the genuine failure its
+attribution requirement needs. It was attributed by the policy's own cheap path.
+
+| run | tested SHA | environment | result | runtime |
+|---|---|---|---|---|
+| candidate run | `c764922` | Windows 11, CPython 3.10 | **FAILED** — failures=30, errors=77, skipped=19, of 3067 | 2753 s (45.9 min) |
+| focused replay of the non-passing set | `4282c71` | Windows 11, CPython 3.10 | **failures=30, errors=77** | 1 s |
+| acceptance run | `c764922` | WSL2 Linux 6.6, CPython 3.14.4 | see below | — |
+
+The environment column is not decoration: F5 below is the finding that the policy does not
+require it, and every row above is uninterpretable without it.
+
+The 101 distinct non-passing tests were extracted from the acceptance run and replayed
+**only they** against the published checkpoint-4 tip. The counts match exactly, so the whole
+non-passing set reproduces on a commit that predates every change in this checkpoint.
+`integration-signal` states the rule directly: *if it reproduces on the last green SHA … it
+is environmental, flaky, or older than the range.* **The range `4282c71..c764922` is
+exonerated.** Corroborating: none of the 101 tests lie in the four modules these slices touch.
+
+Root causes, all host-environmental:
+
+| cause | count |
+|---|---|
+| `OSError [WinError 1314]` — required privilege not held (symlink creation) | 31 |
+| `OSError [WinError 193]` — not a valid Win32 application (POSIX scripts) | 18 |
+| `AttributeError: module 'os' has no attribute 'getpgid'` | 18 |
+| `OSError [WinError 10038]` — operation on a non-socket | 7 |
+| exit `9009` — *"Python was not found"* | 10 |
+| remainder — `os.fork`, `os.geteuid`, assorted assertions | ~17 |
+
+Attribution cost **1 second** against the ~90 minutes a whole-suite re-run across the range
+would have taken, which is the saving the policy's escalation order exists to produce.
+
+### F5 — a result binds to an exact SHA but not to an exact environment
+
+This is the most consequential finding of the checkpoint.
+
+Checkpoint 4's accepted record reports **8 failures, 1 error, 5 skips**. This checkpoint's
+acceptance run reports **30 failures, 77 errors, 19 skips**. Both are honest, both are
+correctly labelled with their tested SHA, and **they describe the same code**. Checkpoint 4's
+suite ran under WSL; this one ran on Windows.
+
+`integration-signal` requires recording the tested SHA, included range, selected suites,
+runtime, outcome, and last known green SHA. **It does not require recording the
+environment.** Every field the policy demands can be filled in correctly and the result still
+be uninterpretable — worse, silently comparable against a green produced on a different
+platform. The skill's own prohibition on carrying a stale green forward has an unguarded
+sibling: **carrying a green sideways, across environments.**
+
+Concretely, this makes checkpoint 6's acceptance gate a WSL run, not a Windows one. A
+Windows "red" here is not evidence against the candidate, and a Windows "green" would not
+have been evidence for it.
+
+### F6 — a replay's summary line cannot distinguish a real result from a broken instrument
+
+The first batch replay reported `Ran 101 tests … FAILED (errors=101)` — a clean, plausible
+summary that appeared to confirm the attribution. It was worthless: every test had failed
+with `ModuleNotFoundError: No module named 'tests'` because the runner placed its own
+directory on `sys.path` instead of the worktree. The corrected replay produced
+failures=30/errors=77, matching the acceptance run exactly.
+
+**A summary line is not a result.** "101 of 101 reproduce" and "101 of 101 failed to load"
+are indistinguishable at the summary, and only the root-cause breakdown separated them. Had
+the causes not been checked, a false attribution would have been recorded with complete
+confidence. `integration-signal` requires recording an outcome but never requires evidence
+that the run measured what it claims to measure.
+
+## Orchestrator verification, not executor trust
+
+The widened assertions in S2 were checked against the **live** skill file rather than the
+executor's own fixtures, mirroring the verification method checkpoint 4's acceptance used:
+
+| step | result |
+|---|---|
+| unmutated `skills/module-development/SKILL.md` | `test_module_development_skill` **OK 11** |
+| injection section excised (awk, 7064 → 5964 bytes) | **FAILED** — *"does not cover the prohibition on reaching for ambient state inside domain logic"* |
+| section restored | **OK 11**, working tree clean |
+
+The widened wordings therefore still fail when the obligation is deleted; they were not
+widened into vacuity.
+
+The three findings the widening addressed were also reproduced independently from committed
+objects before the executor was dispatched: `assert_covers("injection", "inject")` carried a
+single literal with no alternates; the refinement assertion carried two inflections of one
+phrase; and the staleness alternates all required *"green"* adjacent to *"stale"*/*"carry"*.
+
+## Recorded residuals — carried, not closed
+
+The semantic-blindness residual from checkpoint 4 is unchanged: a section rewritten to say
+the **opposite** of its obligation still passes, as does a vocabulary stub. It is shared by
+every accepted skill test module here, was not introduced by checkpoint 4 or 5, and its
+remediation is an instrument redesign that is explicitly a separate checkpoint.
+
+Residual 3 from checkpoint 4 — whether `## ChatGPT Interaction` carries a substantive
+obligation at all — remains an **open decision**, deliberately not taken here.
