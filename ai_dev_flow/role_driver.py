@@ -145,6 +145,13 @@ class RoleLaunch:
     rail: str
     role: str
     request_kwargs: Mapping
+    # The run bound is per launch for the same reason the runtime policy is: it is
+    # a statement about one rail's work, not about this process. `None` carries no
+    # bound of its own and leaves `claude_worker`'s shipped
+    # `DEFAULT_COMMAND_TIMEOUT_SECONDS` in force, which is what every launch here
+    # got before the bound was nameable. It is defaulted, unlike the three fields
+    # above it, because it is optional on the command line that produces it.
+    command_timeout: Optional[float] = None
 
 
 @dataclass(frozen=True)
@@ -353,6 +360,7 @@ def drive_roles(
                     reference=reference,
                     request_kwargs=launch.request_kwargs,
                     package_root=package_root,
+                    command_timeout=launch.command_timeout,
                     markers=markers,
                     launch_kwargs=launch_kwargs,
                     stop_kwargs=stop_kwargs,

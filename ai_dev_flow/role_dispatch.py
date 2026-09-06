@@ -57,6 +57,33 @@ from __future__ import annotations
 # tools, which turn cap and which budget are all named on the command line, because
 # a manager that inferred any of them would be inventing an authority nobody
 # granted it.
+#
+# The run bound -- `--command-timeout`, how long the one invocation this session is
+# sent may take -- is the one exception, and it is stated as an exception rather
+# than left to be discovered. It is optional, and a run that does not name it gets
+# exactly what every run got before the flag existed: `claude_worker`'s own
+# `DEFAULT_COMMAND_TIMEOUT_SECONDS`. Until this checkpoint it was not nameable at
+# all. `session_lifecycle.launch_session` has always taken a `command_timeout` and
+# plumbed it into the send, but no word of `timeout` appeared anywhere on this path,
+# so every managed executor and reviewer session ran under a ten-minute cap that no
+# operator could raise. It is optional rather than required because making it
+# required would refuse every invocation that states everything the shipped contract
+# asks for; see `_stated_run_bound`.
+#
+# What that cap actually did, and what this flag does NOT fix. A dogfooded executor
+# session bound, worked for nine and a half minutes, committed its result, and was
+# killed by the run bound before it published its handoff. The commit is real and
+# durable in git; the binding is left nonterminal; and the control plane records
+# neither, so an orchestrator reading only the control plane concludes nothing
+# happened. That is a THIRD entry point into the recorded
+# leaked-nonterminal-binding-with-no-release-mechanism family -- after the pre-spawn
+# raise (checkpoint 79 s8b) and the readiness failure (checkpoint 82) -- and it is
+# the first of the three that occurs *after* a successful bind, on the send in
+# `session_lifecycle.launch_session`, which deliberately leaves the record `bound`
+# because bound is the truth. Raising the bound makes the timeout less likely; it
+# does not give that binding a release mechanism, and this rail did not authorize
+# building one. It is recorded here so the next reader finds the third door named
+# rather than rediscovering it from a lost session.
 
 import argparse
 import sys
@@ -97,6 +124,7 @@ from .role_invocation import (
 from .tickets import TicketModelError, TicketReference
 
 __all__ = [
+    "COMMAND_TIMEOUT_FLAG",
     "RAIL_FLAG",
     "ROLE_FLAG",
     "REASON_ROLE_UNSTATED",
@@ -111,6 +139,16 @@ __all__ = [
 # something a manager may pick from what happens to be running.
 RAIL_FLAG = "--rail"
 ROLE_FLAG = "--role"
+
+# The run bound: how long the one invocation this session is sent may take before
+# the manager stops waiting for it. It is this module's own flag rather than one
+# imported from `manager_dispatch`, because it is a bound on the role-launch path
+# only -- the orchestrator entry point keeps the run bound it already had, and
+# nothing here raises a default for any other caller.
+#
+# It is stated in seconds and it is optional, which makes it the one bound on this
+# command line with a fallback. See `_stated_run_bound` for why.
+COMMAND_TIMEOUT_FLAG = "--command-timeout"
 
 REASON_ROLE_UNSTATED = "role-unstated"
 
@@ -135,6 +173,13 @@ class RoleRunInputs:
     reference: TicketReference
     request_kwargs: Mapping
     package_root: Path
+    # The one field that may be `None`, and it is still without a default: a run
+    # must state it into the constructor, and `None` says "the run bound the worker
+    # already applies" rather than "nobody thought about it". It is not in
+    # `request_kwargs` because it is not part of the runtime request -- it bounds
+    # the send, not the session's policy -- and `launch_session` takes it as its
+    # own parameter.
+    command_timeout: Optional[float]
 
 
 def _stated_reference(arguments: argparse.Namespace) -> TicketReference:
@@ -165,6 +210,64 @@ def _stated_bounds(arguments: argparse.Namespace) -> Tuple[int, float]:
                 MAX_TURNS_FLAG, MAX_BUDGET_FLAG, arguments.max_turns, arguments.max_budget_usd
             ),
         ) from exc
+
+
+def _stated_run_bound(arguments: argparse.Namespace) -> Optional[float]:
+    """How long this session's one invocation may run, in seconds, or the shipped bound.
+
+    The same parsing and the same refusal as `_stated_bounds` -- one conversion,
+    `REASON_INVALID_RUNTIME` on failure -- because this is one more stated bound
+    beside `--max-turns` and `--max-budget-usd` and not a new kind of input.
+
+    It differs from those two in exactly one respect, deliberately: it is optional.
+    Every other runtime input on this command line is required, and the module says
+    why -- a bound a run cannot name is a bound it will not spend a session under.
+    Requiring this one would refuse every invocation that states everything the
+    shipped contract asks for, so absence keeps precisely the behaviour those runs
+    already have: nothing is passed to `launch_session`, `send_arguments` carries no
+    `timeout`, and `claude_worker.run_request` applies its own
+    `DEFAULT_COMMAND_TIMEOUT_SECONDS`. This entry point therefore raises no default
+    and lowers none; it only lets an operator say a different number.
+
+    A non-positive or non-finite bound is refused rather than carried. `run_request`
+    turns the value into `time.monotonic() + timeout`, so zero, a negative, or a NaN
+    is a deadline that has already expired: the worker would bind, the record would
+    turn `bound`, and the very first read would time out. That is not a bound, it is
+    the leaked-nonterminal-binding failure recorded at the top of this module, with
+    extra steps, and it is refused at the command line where a person can still fix
+    it.
+
+    `launch_session` also takes a `ready_timeout`, and it is deliberately NOT exposed
+    beside this one. The two bound different things: this bounds the *work*, whose
+    right value is a property of the assignment and which demonstrably needed to be
+    larger than the shipped ten minutes; `ready_timeout` bounds how long a freshly
+    spawned worker may take to say hello, which is a property of the host and the SDK
+    import and not of the rail. Nothing has shown 30 seconds to be the wrong number
+    for that, and raising it would only delay the discovery of a broken worker. When
+    a slow host does exceed it, that is its own slice with its own evidence -- and
+    its failure lands in the same leaked-binding family recorded above, at the
+    readiness door checkpoint 82 already named.
+    """
+    if arguments.command_timeout is None:
+        return None
+    try:
+        seconds = float(arguments.command_timeout)
+    except (TypeError, ValueError) as exc:
+        raise DispatchError(
+            REASON_INVALID_RUNTIME,
+            "{0} takes a number of seconds, got {1!r}".format(
+                COMMAND_TIMEOUT_FLAG, arguments.command_timeout
+            ),
+        ) from exc
+    if not seconds > 0.0 or seconds == float("inf"):
+        raise DispatchError(
+            REASON_INVALID_RUNTIME,
+            "{0} must be a positive, finite number of seconds, got {1!r}; a bound "
+            "that has already expired binds a session only to time it out".format(
+                COMMAND_TIMEOUT_FLAG, arguments.command_timeout
+            ),
+        )
+    return seconds
 
 
 def _stated_role(arguments: argparse.Namespace) -> str:
@@ -258,6 +361,7 @@ def stated_role_inputs(argv: Sequence[str]) -> Tuple[RoleRunInputs, List[str]]:
     role = _stated_role(arguments)
     _require_role_package(role, arguments.expected_skill)
     turns, budget = _stated_bounds(arguments)
+    run_bound = _stated_run_bound(arguments)
     try:
         package_root = resolve_repo_root()
     except RepositoryError as exc:
@@ -277,6 +381,7 @@ def stated_role_inputs(argv: Sequence[str]) -> Tuple[RoleRunInputs, List[str]]:
                 "max_turns": turns,
                 "max_budget_usd": budget,
             },
+            command_timeout=run_bound,
             package_root=package_root,
         ),
         list(remaining),
@@ -310,6 +415,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(MAX_TURNS_FLAG, dest="max_turns", default=None)
     parser.add_argument(MAX_BUDGET_FLAG, dest="max_budget_usd", default=None)
+    parser.add_argument(COMMAND_TIMEOUT_FLAG, dest="command_timeout", default=None)
     return parser
 
 
@@ -411,6 +517,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             reference=inputs.reference,
             request_kwargs=inputs.request_kwargs,
             package_root=inputs.package_root,
+            command_timeout=inputs.command_timeout,
             while_running=observe,
         )
     except InvocationRefused as exc:

@@ -9,7 +9,12 @@ import tempfile
 import types
 import unittest
 
-from ai_dev_flow import role_dispatch, role_invocation, workspaces
+from ai_dev_flow import (
+    role_dispatch,
+    role_driver_dispatch,
+    role_invocation,
+    workspaces,
+)
 from ai_dev_flow.authorization import (
     ACTION_CONTINUE,
     AgentSlots,
@@ -18,6 +23,7 @@ from ai_dev_flow.authorization import (
     RailObservation,
     WorkspaceObservation,
 )
+from ai_dev_flow.claude_worker import DEFAULT_COMMAND_TIMEOUT_SECONDS
 from ai_dev_flow.claude_runtime import (
     REASON_PLUGIN_ROLE_MISMATCH,
     ClaudeRuntimeError,
@@ -282,7 +288,12 @@ class RoleInvocationTestBase(unittest.TestCase):
     def _sender(self, sent=None):
         recorded = sent if sent is not None else []
 
-        def send(handle, request, *, prompt, markers=(), timeout=None):
+        def send(handle, request, *, prompt, markers=(),
+                 timeout=DEFAULT_COMMAND_TIMEOUT_SECONDS):
+            # The default is the real `run_request` default, not `None`, so what this
+            # stand-in records is the bound the session would actually have run
+            # under: an unstated bound shows up as 600.0 here exactly as it would in
+            # production, rather than as an absence a test could read either way.
             recorded.append(
                 {
                     "mode": request.mode,
@@ -290,6 +301,7 @@ class RoleInvocationTestBase(unittest.TestCase):
                     "role": request.role,
                     "prompt": prompt,
                     "expected_skill": request.expected_skill,
+                    "timeout": timeout,
                 }
             )
             return {
@@ -1128,6 +1140,247 @@ class EntryPointTests(RoleInvocationTestBase):
         # No gate of its own: the pass-through adds no refusal and no policy.
         self.assertNotIn("raise", body)
 
+class RunBoundTests(RoleInvocationTestBase):
+    """The run bound an operator states is the run bound the session is sent under.
+
+    `session_lifecycle.launch_session` has always taken a `command_timeout` and put
+    it on the send. Until this checkpoint nothing on the role-launch path could name
+    one, so every managed executor and reviewer session ran under
+    `claude_worker.DEFAULT_COMMAND_TIMEOUT_SECONDS` -- ten minutes -- and an operator
+    who needed longer had no way to ask. A dogfooded executor bound, worked for nine
+    and a half minutes, committed its result, and was killed before it published.
+
+    Every assertion below is on the value that reaches the send, which is the thing
+    that enforces the bound. None of them looks at argv, at help text, or at the
+    parser: an oracle that pins the spelling of a flag passes just as happily when
+    the flag is parsed and thrown away, which is the exact defect this rail exists
+    to close.
+    """
+
+    STATED_BOUND = 5400.0
+
+    # -- the door -----------------------------------------------------------
+
+    def test_the_run_bound_stated_at_the_door_reaches_the_send(self) -> None:
+        _outcome, sent = self._invoke(command_timeout=self.STATED_BOUND)
+        self.assertEqual([entry["timeout"] for entry in sent], [self.STATED_BOUND])
+
+    def test_an_unstated_run_bound_leaves_the_shipped_worker_bound_in_force(self) -> None:
+        """The control, and the reason the default is safe to leave alone.
+
+        Nothing is passed to `launch_session`, so `send_arguments` carries no
+        `timeout` at all and `run_request` applies its own. This entry point raises
+        no default for anybody.
+        """
+        _outcome, sent = self._invoke()
+        self.assertEqual(
+            [entry["timeout"] for entry in sent], [DEFAULT_COMMAND_TIMEOUT_SECONDS]
+        )
+
+    def test_the_open_door_carries_the_same_bound_as_the_stopping_one(self) -> None:
+        """`open_role_session` is the admission; `invoke_role` calls it.
+
+        Asserted separately because the driver reaches a launch through the open
+        door only, and a bound honoured on one door and dropped on the other is two
+        policies free to drift.
+        """
+        sent = []
+        self._open(command_timeout=self.STATED_BOUND, sent=sent)
+        self.assertEqual([entry["timeout"] for entry in sent], [self.STATED_BOUND])
+
+    def test_the_stated_bound_wins_over_a_launch_kwargs_entry(self) -> None:
+        """`launch_kwargs` is a test seam; the command line is the operator."""
+        start, _worker = self._starter()
+        send, sent = self._sender()
+        self._invoke(
+            command_timeout=self.STATED_BOUND,
+            launch_kwargs={"start": start, "send": send, "command_timeout": 12.0},
+            sent=sent,
+        )
+        self.assertEqual([entry["timeout"] for entry in sent], [self.STATED_BOUND])
+
+    # -- the command line ----------------------------------------------------
+
+    def test_the_stated_bound_is_carried_on_the_parsed_inputs(self) -> None:
+        inputs, _remaining = role_dispatch.stated_role_inputs(
+            self._role_argv(command_timeout="5400")
+        )
+        self.assertEqual(inputs.command_timeout, self.STATED_BOUND)
+        # And it is not smuggled into the runtime request, which is a different
+        # thing: it bounds the send, not the session's policy.
+        self.assertNotIn("command_timeout", inputs.request_kwargs)
+
+    def test_an_unstated_bound_parses_to_no_bound_of_its_own(self) -> None:
+        inputs, _remaining = role_dispatch.stated_role_inputs(self._role_argv())
+        self.assertIsNone(inputs.command_timeout)
+
+    def test_a_run_bound_that_is_not_a_number_is_a_stated_refusal(self) -> None:
+        from ai_dev_flow.manager_dispatch import REASON_INVALID_RUNTIME, DispatchError
+
+        with self.assertRaises(DispatchError) as caught:
+            role_dispatch.stated_role_inputs(self._role_argv(command_timeout="soon"))
+        self.assertEqual(caught.exception.reason, REASON_INVALID_RUNTIME)
+
+    def test_an_already_expired_run_bound_is_refused_rather_than_carried(self) -> None:
+        """Zero, a negative, a NaN and an infinity are not bounds.
+
+        `run_request` computes `time.monotonic() + timeout`, so the first three bind
+        a session only to time it out -- the leaked-nonterminal-binding failure with
+        extra steps -- and the fourth is the absence of a bound spelled as one.
+        Refused where a person can still fix it.
+        """
+        from ai_dev_flow.manager_dispatch import REASON_INVALID_RUNTIME, DispatchError
+
+        for stated in ("0", "-1", "nan", "inf"):
+            with self.subTest(stated=stated):
+                with self.assertRaises(DispatchError) as caught:
+                    role_dispatch.stated_role_inputs(
+                        self._role_argv(command_timeout=stated)
+                    )
+                self.assertEqual(caught.exception.reason, REASON_INVALID_RUNTIME)
+
+    # -- end to end ----------------------------------------------------------
+
+    def test_the_bound_an_operator_types_is_the_bound_the_worker_is_sent(self) -> None:
+        """argv to `run_request`, through the real entry point.
+
+        This is the assertion the rail asked for. `main` is driven with
+        `--command-timeout` against a genuinely published coordination repository, a
+        real claimed worktree, a real store and the accepted predicate; the only
+        stand-ins are `start_worker`, `run_request`, `shutdown_worker` and
+        `process_group_alive`, which are the process boundary. The number asserted
+        is the one the send was actually called with.
+        """
+        code, sent = self._run_main(command_timeout="5400")
+        self.assertEqual(code, 0)
+        self.assertEqual([entry["timeout"] for entry in sent], [self.STATED_BOUND])
+
+    def test_the_same_run_without_the_flag_is_sent_the_shipped_bound(self) -> None:
+        """The admitting control on the identical run: only the bound moves."""
+        code, sent = self._run_main()
+        self.assertEqual(code, 0)
+        self.assertEqual(
+            [entry["timeout"] for entry in sent], [DEFAULT_COMMAND_TIMEOUT_SECONDS]
+        )
+
+    def test_the_driver_carries_the_bound_the_shared_parser_accepts(self) -> None:
+        """`role_driver_dispatch` parses its groups with `stated_role_inputs`.
+
+        So `--command-timeout` is accepted there whether or not anything honours it.
+        A flag that parses and is discarded is worse than one that does not exist,
+        so the bound rides `RoleLaunch` to the same door.
+        """
+        from ai_dev_flow.role_driver import RoleLaunch
+
+        launch = RoleLaunch(
+            rail=EXECUTOR_RAIL,
+            role=EXECUTOR,
+            request_kwargs=self._request_kwargs(EXECUTOR),
+            command_timeout=self.STATED_BOUND,
+        )
+        sent = []
+        self._open(command_timeout=launch.command_timeout, sent=sent)
+        self.assertEqual([entry["timeout"] for entry in sent], [self.STATED_BOUND])
+        # And the driver's construction is the one that fills it, from the parsed
+        # inputs rather than from a default of its own.
+        driver = Path(role_driver_dispatch.__file__).read_text(encoding="utf-8")
+        self.assertIn("command_timeout=inputs.command_timeout", driver)
+
+    # -- fixtures ------------------------------------------------------------
+
+    def _role_argv(self, *, command_timeout=None, extra=()):
+        argv = [
+            "--rail", EXECUTOR_RAIL,
+            "--role", EXECUTOR,
+            "--controller-root", str(self.controller_root),
+            "--prompt-file", str(self.prompts[EXECUTOR]),
+            "--plugin-root", str(self.plugins[EXECUTOR]),
+            "--expected-skill", EXECUTOR,
+            "--allowed-tool", "Read",
+            "--max-turns", "2",
+            "--max-budget-usd", "0.25",
+            "--ticket-provider", "github",
+            "--ticket-id", "55",
+            "--ticket-repository", "jmrozi1/ai-dev",
+        ]
+        if command_timeout is not None:
+            argv.extend(["--command-timeout", command_timeout])
+        argv.extend(extra)
+        return argv
+
+    def _coordination(self):
+        """A published coordination repository carrying this rail, running, this role.
+
+        `build_snapshot` refuses a local worktree read on purpose, so the fixture is
+        genuinely published: a bare remote, a tracked branch and a real push.
+        """
+        coordination = self._init_repo("coordination")
+        bare = self.tmp_path / "coordination.git"
+        self._git(coordination, "init", "-q", "--bare", str(bare))
+        self._git(coordination, "remote", "add", "origin", str(bare))
+        self._git(coordination, "push", "-q", "-u", "origin", "main")
+        scope = coordination / PROJECT / TICKET
+        (scope / "rails" / EXECUTOR_RAIL).mkdir(parents=True)
+        (scope / "state.md").write_text("# Control Plane State\n", encoding="utf-8")
+        (scope / "rails" / EXECUTOR_RAIL / "rail.md").write_text(
+            "# Rail: {0}\n\nStatus: running\nRole: {1}\nDepends on: none\n"
+            "Shared resource: none\n\n## Goal\n\nbounded work\n".format(
+                EXECUTOR_RAIL, EXECUTOR
+            ),
+            encoding="utf-8",
+        )
+        self._git(coordination, "add", "-A")
+        self._git(coordination, "commit", "-q", "-m", "publish")
+        self._git(coordination, "push", "-q", "origin", "main")
+        return coordination
+
+    def _run_main(self, *, command_timeout=None):
+        """`role_dispatch.main` for real, with only the process boundary stood in."""
+        import contextlib
+        import io as _io
+        import unittest.mock
+
+        from ai_dev_flow import session_lifecycle as lifecycle_module
+
+        coordination = self._coordination()
+        start, _worker = self._starter()
+        send, sent = self._sender()
+        stop, alive = self._stopper()
+
+        argv = self._role_argv(
+            command_timeout=command_timeout,
+            extra=[
+                "--no-human-exclusivity",
+                "--control-plane", str(coordination),
+                "--project", PROJECT,
+                "--ticket", TICKET,
+                "--binding-root", str(self.tmp_path / "run-bindings"),
+            ],
+        )
+        out, err = _io.StringIO(), _io.StringIO()
+        with unittest.mock.patch.object(
+            role_dispatch, "resolve_repo_root", lambda cwd=None: self.workspace
+        ), unittest.mock.patch(
+            "ai_dev_flow.decision_manager_launch.resolve_repo_root",
+            lambda cwd=None: self.workspace,
+        ), unittest.mock.patch.object(
+            lifecycle_module, "start_worker", start
+        ), unittest.mock.patch.object(
+            lifecycle_module, "run_request", send
+        ), unittest.mock.patch.object(
+            lifecycle_module, "shutdown_worker", stop
+        ), unittest.mock.patch.object(
+            lifecycle_module, "process_group_alive", alive
+        ):
+            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                code = role_dispatch.main(argv)
+        if code != 0:
+            self.fail(
+                "main refused the run: exit {0}\nstdout:\n{1}\nstderr:\n{2}".format(
+                    code, out.getvalue(), err.getvalue()
+                )
+            )
+        return code, sent
 
 if __name__ == "__main__":
     unittest.main()
