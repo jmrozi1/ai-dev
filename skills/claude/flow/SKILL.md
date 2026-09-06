@@ -60,10 +60,11 @@ mistaken for one a reader derived.
 Two legitimate situations cannot be served by derivation alone.
 
 - **You were launched onto a rail.** A rail an orchestrator has launched may
-  stand at `running`, which the unnamed path refuses; and a scope may hold more
-  than one `ready` rail, which the unnamed path refuses as ambiguous. In both
-  cases the rail you are executing is exactly the one derivation will not give
-  you. Name it.
+  stand at `running`, which the unnamed path refuses when no other rail is
+  `ready` -- and silently passes over when one is. A scope may also hold more
+  than one `ready` rail, which the unnamed path refuses as ambiguous. In each
+  case the rail you are executing is the one derivation will not give you. Name
+  it.
 - **You are reviewing from a claimless workspace.** An independent reviewer
   works in a disposable clone with no Flow workflow by contract. Starting one so
   discovery can read `activeIssueNumber` would acquire a claim and break that
@@ -153,18 +154,33 @@ coordination state. `publish`, `cache-sync`, and the `flow-*` lifecycle commands
 mutate; run them only when your rail authorizes that step.
 
 **Naming reaches `discover` and nothing else.** `publish`, `status`, and
-`identity` still resolve through the unnamed path, so in exactly the two
-situations naming exists for -- a `running` rail with nothing `ready`, or more
-than one `ready` rail -- **`ai-dev publish` will refuse and `ai-dev status` will
-report the rail as unauthorized, even though `ai-dev discover --rail` just
-resolved.** That is a real boundary, not a bug to work around.
+`identity` still resolve through the unnamed path. What that costs you depends
+on what else sits in the scope, and the cases do not all look alike:
 
-Do not retry, rename a rail, or reach for Copilot-audience helpers to get past
-it. Report your evidence to the orchestrator and let it publish on your behalf;
-publication is a mutating write to shared coordination state, and extending
+| your scope | `ai-dev status` | `ai-dev publish --rail <yours>` |
+| --- | --- | --- |
+| your rail `running`, nothing `ready` | `UNAUTHORIZED - No rail ... is ready` | refuses, same reason |
+| more than one `ready` rail | `UNAUTHORIZED - More than one rail ...` | refuses, same reason |
+| your rail `running`, **one other rail `ready`** | reports **the other rail**, authorized | refuses: *"not the authorized rail"* |
+| claimless workspace | fails before rails are read: *"No active Flow issue"* | same |
+
+The third row is the trap. Nothing says `UNAUTHORIZED`, so it does not look like
+a boundary at all -- `status` simply names someone else's rail as the authorized
+one. **Always pass `--rail`.** Publishing without it does not refuse; it
+succeeds, onto whichever rail the unnamed path resolved, which is not yours.
+
+Report your evidence to the orchestrator and let it publish on your behalf.
+Publication is a mutating write to shared coordination state, and extending
 named identity to it is an authorization decision the orchestrator owns. Say
 plainly which rail you resolved and that publication refused, so the reason is
 in the record rather than inferred.
+
+Do not retry or rename a rail to get past this. **And do not route around it
+through `python -m ai_dev_flow.control_plane`**: that helper enforces artifact
+ownership but never reads rail status, so it will accept a publish the `ai-dev`
+route just refused. The shared executor contract legitimately sends local
+executors through it for ordinary publication -- this is not a prohibition on
+that helper, only on using it to convert a rail refusal into a write.
 
 Claim evidence comes from `ai-dev status`, which reads the Issue #50 claim
 registry without acquiring anything. A malformed claim is reported as malformed;
