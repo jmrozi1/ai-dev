@@ -32,9 +32,12 @@ synchronous gate is author-owned and cheap, and integration is not that gate.
 | full suite (integration), Windows | 3067 | **2753 s under concurrent load** |
 | full suite (integration), WSL | 3067 | **136 s** |
 
-The spread is roughly **three thousandfold** between a slice's own gate and the
-integration suite. A synchronous integration gate would have serialized all four slices
-behind it. This is the cost Issue #76 exists to remove, measured on this ticket's own work.
+**Corrected after re-review (N1).** This originally read *"roughly three thousandfold between a
+slice's own gate and the integration suite"*, computed as 84.202 / 0.028. That is wrong: 84.202 s is
+`test_role_invocation`, which the same table labels S4's **affected contract** — another *local*
+gate, not the integration suite. Against the integration suite the spread is **~4,900x** in WSL
+(136 s) and **~98,000x** on Windows (2753 s). The error understated its own case, which is how it
+survived.
 
 ## Coalescing — three superseded candidates dropped, none re-run
 
@@ -62,10 +65,10 @@ Development never blocked on an integration result:
 
 ## Findings about the policy itself
 
-A dogfood that only confirms the policy has not tested it. **Nine findings**, none of them
+A dogfood that only confirms the policy has not tested it. **Eleven findings**, none of them
 remediated here — remediation would be the scope expansion this ticket forbids. F1-F4 came from
-using the policy; F5-F7 from the acceptance gate; F8 and F9 were surfaced by the independent
-review.
+using the policy; F5-F7 from the acceptance gate; F8-F9 from the independent review; F10-F11 from
+the re-review, which ran the suite in both environments and twice at the accepted tip.
 
 ### F1 — exact-SHA binding implies workspace isolation, and the skill does not say so
 
@@ -229,6 +232,22 @@ This is not a defect introduced here, but the deliverable originally omitted the
 recording the absence — and "not recorded" and "none exists" are exactly the two states the policy
 elsewhere insists on distinguishing.
 
+**And the plain consequence, which this document previously stopped one sentence short of stating
+(N7).** `integration-signal` requires *"an integration run that is **green on the latest relevant
+candidate**"* before a named checkpoint is accepted. The run at `644a3c8` is
+`FAILED (failures=8, errors=1)`. **The acceptance precondition as written is unsatisfiable in this
+project**, and this checkpoint substitutes a different criterion — parity with the accepted
+non-passing set — without the policy authorizing the substitution.
+
+Parity is defensible and is what checkpoint 4 also used. But F8 names exactly this shape as a defect
+when it appears elsewhere: *a sound engineering argument substituted for a clause the policy does not
+actually offer.* The same move is being made here, at the gate itself, and it should be recorded as
+such rather than performed silently. **Checkpoint 6 inherits it**, since "merge and confirm
+fresh-session discovery" rests on the same gate.
+
+Together with F11 — parity is not even a stable property run-to-run — this is the checkpoint's
+strongest evidence that deliverable 13's acceptance gate needs a definition it does not have.
+
 ### What the attribution did and did not demonstrate
 
 The attribution ladder has three rungs: affected tests, focused replay, then bisect. Only **focused
@@ -242,6 +261,48 @@ change.
 
 Recorded explicitly so that a convenient absence of introduced failures is not read as evidence that
 localization works. It was not tried.
+
+### F10 — the cost case for asynchronous integration is largely a Windows artifact
+
+F5 concludes that the acceptance gate must run in WSL. Measured in that same authoritative
+environment at `644a3c8`:
+
+| what | WSL | Windows |
+|---|---|---|
+| full integration suite | **~133 s** | 2753 s |
+| S4's affected-contract gate (`test_role_invocation`, 49 tests) | **1.729 s** | 53.7 s unloaded |
+
+A **133-second** synchronous integration gate is not obviously intolerable. `integration-signal`'s
+opening argument — that a synchronous gate *"serializes development behind the slowest suite in the
+project"* — keeps its logic but loses most of its measured force in the environment this checkpoint
+declares authoritative for outcomes.
+
+**The checkpoint had been declaring one environment authoritative for correctness and quietly
+retaining the other for costs.** Surfaced by the re-review, which ran both. The async model may
+still be right for larger suites or slower hosts; what is not supportable is citing Windows numbers
+to justify it while ruling Windows results inadmissible.
+
+### F11 — parity-as-green is not deterministic, and the ticket has no flake provision
+
+The re-reviewer ran the full suite twice in WSL at the accepted tip `644a3c8`:
+
+| run | result |
+|---|---|
+| first | `failures=9, errors=1` — **one extra failure** |
+| second | `failures=8, errors=1` — non-passing set identical by id to the accepted one |
+
+The extra failure was `test_nothing_bounded_out_of_the_launcher_leaks_a_decision_body`, which
+asserts the literal `"4242"` is absent from launcher output while the launcher prints the real epoch
+second — and that minute contained `4242`. A genuine time-dependent flake in Issue #55 code on
+`main`, **not introduced by this candidate**.
+
+The consequence is sharp: under the criterion this checkpoint operates by — *green means parity with
+the accepted non-passing set* — **one of two runs at the accepted tip is a red, and the gate would
+have rejected its own tip.** F7 says to record membership rather than counts; the missing half is
+that **membership is not deterministic**, and neither `integration-signal` nor this ticket has any
+provision for flakes: no re-run rule, no quarantine, no distinction between a failure and an
+unstable test. Six runs at that SHA now exist and five agree. That is an observation, not the
+property the acceptance gate assumes.
 
 ### F5 — a result binds to an exact SHA but not to an exact environment
 
@@ -382,7 +443,24 @@ Orchestrator-verified independently, with the frontmatter deliberately left inta
 | staleness section excised, frontmatter still carrying *"stale green"* | **FAILED on its own assertion** — *"integration-signal's guidance body does not cover the staleness prohibition; naming it in the frontmatter description does not carry it"* |
 | section restored | **OK 11**, `skills/` diff empty |
 
-**Before remediation this same mutation returned green.** That is the whole finding.
+**A correction, made after the re-review caught it (B3).** This section previously closed with
+*"Before remediation this same mutation returned green."* **That was false.** Excising the whole
+section also removes the text the *neighbouring* assertions match, so the module failed
+pre-remediation too — on a different message (*"does not cover refusing an ancestor's green for a
+descendant"*). Reproduced both ways. The module-level outcome is **unchanged** by the remediation;
+what changed is **which assertion inside the method fires**, and whether the widened one is inert
+under frontmatter or live on the body.
+
+A mutation that does isolate the difference at module level exists, and it is not a section
+excision — delete **lines 57-60 only**, the heading and lead paragraph, keeping the bullets:
+
+| mutation: delete `integration-signal` lines 57-60 | result |
+|---|---|
+| **pre**-remediation test module (`e5ccf6d`) | **OK 11** — green, obligation gone, nothing noticed |
+| **post**-remediation test module (`644a3c8`) | **FAILED** on the widened assertion's own message |
+
+That is the real before/after, and it shows the remediation is load-bearing. The earlier claim
+was a punchier version of a true finding, and the instrument does not produce it.
 
 ### A disclosure from the remediation, worth more than the fix
 
@@ -393,10 +471,74 @@ matching, and the module still failed on the neighbour — the reviewer's exact 
 for a second, independent reason.
 
 So the obligation is stated in the body **twice**, and a section-excision instrument cannot falsify
-an obligation that is restated incidentally elsewhere. Every mutation result in this ticket —
-including checkpoint 4's accepted awk-excision proof — is an **upper bound** on the protection it
-demonstrates, not a measurement of it. Recorded, not remediated: fixing it is instrument design, and
-instrument design is a separate checkpoint.
+an obligation that is restated incidentally elsewhere. The re-review confirmed this independently and
+found a **further instance neither the executor nor this document had cited**: at `4282c71`, excising
+`## Shape Modules As Independently Constructible Units` still fails on a *different* assertion,
+because *"independently constructible"* also appears at line 8, the skill's own opening paragraph.
+
+Every mutation result in this ticket is therefore an **upper bound** on the protection it
+demonstrates, not a measurement of it — **at clause granularity**.
+
+**That qualifier matters and an earlier draft omitted it.** It does *not* impeach checkpoint 4's
+acceptance: the re-reviewer re-ran that proof at `4282c71` and it still fails on **its own test
+method's own assertion** (`failures=1`, that exact test; restored `OK 10`). Checkpoint 4's accepted
+result survives at test-method granularity. Stated without the qualifier, this finding reads as
+self-impeachment of accepted work with no defect behind it, which would be false.
+
+Recorded, not remediated: fixing it is instrument design, and instrument design is a separate
+checkpoint.
+
+## The pattern in this checkpoint's own reporting
+
+Three blocking findings across two independent reviews, and **all three are the same error**:
+
+| finding | the claim | what the evidence showed |
+|---|---|---|
+| **B1** | attribution cost "1 second" | 81.033 s; the 1 s came from the **broken** replay this document discredits |
+| **B2** | the mutation proved the widened assertions still fail on deletion | it failed on a **neighbouring** assertion; the widened sets were inert |
+| **B3** | "before remediation this same mutation returned green" | it failed pre-remediation too, on a different message |
+
+Every one converted an accurate underlying finding into a sharper before/after that the instrument
+does not produce. None was a fabrication and none changed a conclusion — the attribution still holds,
+the remediation is still load-bearing, the range is still exonerated. But **the deliverable that
+reports "a summary line is not a result" (F6) made the summary-line mistake three times**, and each
+was caught by a reviewer rather than by the author.
+
+That is worth recording as bluntly as the policy findings. This checkpoint's own evidence is the
+strongest argument in it for adversarial review being non-optional: the errors were not in the code,
+which was checked mechanically at every step, but in the **prose asserting what the code had shown**
+— the one artifact no test covers.
+
+Two further reporting errors, both corrected above rather than defended: the headline cost ratio was
+computed against the wrong denominator (N1), and the cost case for the whole async model rested on
+numbers from the environment this checkpoint rules inadmissible (F10).
+
+## Findings surfaced by the re-review and recorded without remediation
+
+- **N4 — frontmatter-satisfiability is systemic.** An AST sweep found at least seven further
+  whole-file-scoped assertions satisfied by frontmatter alone: `integration-signal` L134, L156, L157,
+  L216 and the required-fields `assertIn`s; `module-development` L256, L293. Outside the remediation
+  rail's scope, correctly. But F3 made exactly this "systematic, not a single instance"
+  generalization for the catalogue rows, and it was available here and not made.
+- **N5 — the falsifiability proof no longer exercises the path it certifies.** The
+  proof-of-non-vacuity tests still call `_covers(_normalized_text(fixture), ...)` while the live
+  assertions now call `assert_body_covers`. Equivalent today, because the fixtures carry no
+  frontmatter — but that is the same seam that let B2 through.
+- **N8 — run artifacts do not carry their SHA or environment.** Five WSL logs are distinguishable
+  only by filename and mtime; the SHA lives in a disposable checkout's `HEAD`, not in the record.
+  `runA.status` does it correctly for the Windows run. Given F1 and F5, that field belongs in the
+  artifact.
+- **N9 — "continued independent work" is weaker than presented.** Committer timestamps put all four
+  slices at 08:13-08:17; `runA` started 08:55. The substantive claim holds — no submission blocked on
+  an integration answer — but the specific claim that S1-S4 were authored *while runs executed* rests
+  on the three reference runs this document concedes contributed zero evidence, whose logs carry no
+  timestamps. Not refutable, not verifiable.
+- **N10 — coalescing has no retained artifact.** Checkpoint 5 names superseded-run coalescing as a
+  thing to dogfood, and the evidence for it is prose. A two-line queue log would have been the proof,
+  and its absence is conspicuous in the document that raised the reference-run vocabulary gap (F2).
+- **N11 — the suite invocation is not recorded.** "Selected suites" is a required field of the
+  policy's own record, and the command determines it. Two different invocations were used across
+  these runs; immaterial here (same 3067 tests), but unrecorded.
 
 ## Recorded residuals — carried, not closed
 
