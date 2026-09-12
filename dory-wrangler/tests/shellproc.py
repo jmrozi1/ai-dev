@@ -78,6 +78,18 @@ class ShellProcess(object):
     def post(self, path, payload=None):
         return self._request("POST", path, payload if payload is not None else {})
 
+    def raw(self, method, path, payload=None):
+        """Status and undecoded body, for routes that do not serve JSON."""
+        url = "http://127.0.0.1:%d%s" % (self.port, path)
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        headers = {"Content-Type": "application/json"} if data else {}
+        request = Request(url, data=data, headers=headers, method=method)
+        try:
+            with urlopen(request, timeout=15) as response:
+                return response.status, response.read().decode("utf-8", "replace")
+        except HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8", "replace")
+
     def status_of(self, method, path, payload=None):
         """Return only the status code, treating an error response as data."""
         try:

@@ -10,6 +10,7 @@ from dory_wrangler import atomic
 from dory_wrangler.errors import (
     ConcurrencyRefused,
     NotFound,
+    StoreError,
     ProvenanceRefused,
     StoreCorrupt,
     TransitionRefused,
@@ -154,11 +155,46 @@ class TestMessages(StoreCase):
             self.store.read_messages(self.chat_id)
 
     def test_a_leftover_temp_file_is_never_history(self):
-        self.store.append_user_message(self.chat_id, "one")
+        """Both filters that keep an interrupted write out of history, separately.
+
+        `_json_names` excludes a name twice over: once because it carries the
+        temp prefix and once because it does not end in `.json`. This test used
+        a single decoy named `.tmp-abc`, which is excluded by the *suffix*
+        rule -- so deleting the temp-prefix filter entirely left it green. Each
+        decoy below can only be excluded by one of the two rules, so removing
+        either rule is a test failure.
+        """
+        first = self.store.append_user_message(self.chat_id, "one")
         directory = os.path.join(self.root, "chats", self.chat_id, "messages")
+
+        # Only the temp-prefix filter can reject this one: it is a complete,
+        # contract-valid record whose name ends in `.json`.
+        temp_named = os.path.join(
+            directory, atomic.TEMP_PREFIX + "5f3a9c1d" + ".json"
+        )
+        with open(temp_named, "w") as handle:
+            json.dump({
+                "record_type": "message", "record_version": 1,
+                "message_id": "msg_" + "b" * 24, "chat_id": self.chat_id,
+                "sequence": 2, "author": "user",
+                "created_at": "2026-09-12T12:00:00Z",
+                "content": {"content_type": "text/plain", "text": "half-written"},
+                "session_id": None, "source_event_id": None,
+            }, handle)
+
+        # Only the suffix filter can reject this one: no temp prefix.
+        with open(os.path.join(directory, "00000002.json.part"), "w") as handle:
+            handle.write('{"record_type": "message"')  # deliberately truncated
+
+        # And the original decoy, which either rule would reject.
         with open(os.path.join(directory, atomic.TEMP_PREFIX + "abc"), "w") as handle:
             handle.write('{"record_type": "message"')  # deliberately truncated
-        self.assertEqual(len(self.store.read_messages(self.chat_id)), 1)
+
+        history = self.store.read_messages(self.chat_id)
+        self.assertEqual(
+            [m["message_id"] for m in history], [first["message_id"]],
+            "an interrupted write's artifact reached the user-visible history",
+        )
         self.assertStoreValid()
 
 
@@ -388,6 +424,97 @@ class TestDiagnostics(StoreCase):
         self.assertEqual([e["sequence"] for e in narrowed], [3, 4, 5])
         # It is a retrieval, not a view: preserved records come back unchanged.
         self.assertTrue(all(e["record_type"] == "diagnostic_event" for e in narrowed))
+
+    def test_the_out_of_band_retrieval_refuses_a_session_id_that_is_not_one(self):
+        """Contract section 3: no filename may substitute for an identifier.
+
+        `session_id` becomes a path component in this call, so a value that is
+        not an opaque identifier must be refused rather than resolved. Two
+        concrete consequences are checked here, not just the refusal: a relative
+        `session_id` must not return another chat's preserved events, and it
+        must not reach a directory outside the store root.
+        """
+        other_id = self.store.create_chat("Somebody else")["chat_id"]
+        other_session, other_event, _m = answered_turn(
+            self.store, other_id, "their question", "their private answer"
+        )
+        other_sid = other_session["session_id"]
+        # The events really are there, so a leak would have something to leak.
+        self.assertTrue(
+            self.store.read_diagnostic_events(other_id, session_id=other_sid)
+        )
+
+        outside = os.path.join(self.root, "not-the-store")
+        os.makedirs(outside)
+        with open(os.path.join(outside, "00000001.json"), "w") as handle:
+            json.dump({
+                "record_type": "diagnostic_event", "record_version": 1,
+                "event_id": "evt_" + "a" * 24, "chat_id": self.chat_id,
+                "session_id": self.sid, "sequence": 1,
+                "received_at": "2026-09-12T12:00:00Z", "source": "agent",
+                "interpretation": "recognized", "interpreted_type": "assistant_text",
+                "raw": {"encoding": "utf-8", "body": "planted outside the store root"},
+            }, handle)
+
+        cross_chat = os.path.join("..", other_id, other_sid)
+        reaches_out = os.path.relpath(
+            outside, os.path.join(self.root, "diagnostics", self.chat_id)
+        )
+        # Both halves of "opaque identifier": a value that is not an identifier
+        # at all, and a value that is a perfectly well-formed identifier of the
+        # wrong kind. The second matters because the weakest plausible version
+        # of this guard -- reject traversal, or accept any well-formed id --
+        # passes the first half and lets a chat or event id address a session.
+        bad_session_ids = (
+            cross_chat, reaches_out, "../..", "ses_not a real id",
+            "not-an-identifier", "", ".", "/etc",
+            other_id, other_event["event_id"], self.chat_id,
+            "ses_" + "z" * 40, "SES_" + "a" * 12,
+        )
+        for bad in bad_session_ids:
+            with self.assertRaises(NotFound, msg=(
+                    "read_diagnostic_events resolved %r as a session; nothing but "
+                    "an opaque session identifier may address a session" % (bad,))):
+                self.store.read_diagnostic_events(self.chat_id, session_id=bad)
+
+        # The same property on every other diagnostic entry point, all of which
+        # address a session through `_events_dir`. V1 was one path out of five
+        # that skipped this check, so the check is asserted on all five.
+        for bad in bad_session_ids:
+            for call in (
+                lambda sid: self.store.next_event_sequence(self.chat_id, sid),
+                lambda sid: self.store.read_diagnostic_event(
+                    self.chat_id, sid, other_event["event_id"]),
+                lambda sid: self.store.read_all_events_of_session(self.chat_id, sid),
+                lambda sid: self.store.append_diagnostic_event(
+                    self.chat_id, sid, 1, "launcher", "unrecognized", None, "{}"),
+            ):
+                with self.assertRaises(StoreError, msg=(
+                        "a diagnostic entry point resolved %r as a session" % (bad,))):
+                    call(bad)
+
+        # And the chat half of the address, which is also a path component here.
+        for bad_chat in ("../..", os.path.join("..", other_id), "not-a-chat-id",
+                         other_sid, ""):
+            with self.assertRaises(StoreError, msg=(
+                    "read_diagnostic_events resolved %r as a chat" % (bad_chat,))):
+                self.store.read_diagnostic_events(bad_chat)
+
+        # The property, not the refusal: nothing this call can be asked for
+        # returns a record belonging to another chat or from outside the root.
+        mine = self.store.read_diagnostic_events(self.chat_id)
+        self.assertTrue(mine)
+        for record in mine:
+            self.assertEqual(record["chat_id"], self.chat_id)
+        self.assertNotIn(
+            other_event["event_id"], [r["event_id"] for r in mine],
+            "another chat's preserved event came back from this chat's retrieval",
+        )
+        self.assertNotIn(
+            "planted outside the store root",
+            json.dumps(mine),
+            "the retrieval read a record from outside the store root",
+        )
 
     def test_an_unrecognized_event_is_preserved_verbatim(self):
         body = "¡raw bytes, unparsed!"

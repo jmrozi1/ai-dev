@@ -890,6 +890,15 @@ class ChatStore(object):
         if not isinstance(limit, int) or limit < 1:
             raise ValidationRefused("limit must be a positive integer")
         limit = min(limit, DIAGNOSTIC_PAGE_MAX)
+        # Contract section 3: an identifier is opaque and "no ordering,
+        # timestamp, or filename may substitute for it". `session_id` becomes a
+        # path component below, so it is checked here exactly as `_events_dir`
+        # checks it. Without this a relative `session_id` addresses another
+        # chat's preserved events, or a directory outside the store root
+        # entirely, while the caller believes it named the chat it passed in --
+        # which also defeats correlation rule P3 at the retrieval layer.
+        if session_id is not None and not ids.is_id(session_id, "ses"):
+            raise NotFound("%r is not a session identifier" % (session_id,))
         self.read_chat(chat_id)
         base = os.path.join(self.diagnostics_dir, chat_id)
         if not os.path.isdir(base):

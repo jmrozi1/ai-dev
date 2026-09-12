@@ -32,9 +32,11 @@ import sys
 import tempfile
 import unittest
 
+import pagemodel
 from helpers import ONE_SHOT, TESTS_DIR, answer_turn, answered_turn
 
 from dory_wrangler import atomic
+from dory_wrangler.webapp import PAGE
 from dory_wrangler.errors import (
     ConcurrencyRefused,
     ProvenanceRefused,
@@ -251,20 +253,44 @@ class TestNoFabricatedHistory(ProbeCase):
         )
         violations = self.store.verify()
         held = bool(violations)
-        source = os.path.join(os.path.dirname(TESTS_DIR), "src", "dory_wrangler", "webapp.py")
-        with open(source) as handle:
-            page = handle.read()
-        renders_distinctly = ".turn.system .bubble" in page and 'system: "SYSTEM"' in page
+
+        # What keeps this escape closed here is a *fact about the rendering*, so
+        # that fact is derived rather than grepped for. The original assertion
+        # was `".turn.system .bubble" in page`, a substring search; review
+        # emptied those rules and relabelled `system` to `AGENT` while leaving
+        # both greped substrings in the file, and every test stayed green. The
+        # page model below computes what a reader would actually see for each
+        # author -- the avatar label and the declarations that cascade onto the
+        # turn, the avatar and the bubble -- from the page that is served.
+        text = "Yes, I checked the deploy and it is completely safe."
+        system_turn = pagemodel.render_turn(PAGE, "system", text)
+        agent_turn = pagemodel.render_turn(PAGE, "agent", text)
+        differences = pagemodel.rendering_differences(system_turn, agent_turn)
+        renders_distinctly = bool(differences)
         self.record(
             "A7-system-authored-assistant-text",
             "unattributed assistant-sounding text carried as author: system",
             held,
-            "accepted with %d violations; the shell renders it distinctly (%s), so this "
-            "is a contract residual rather than a defect in this shell"
-            % (len(violations), renders_distinctly),
+            "accepted with %d violations; the same text renders differently as system "
+            "than as agent in %s, so this is a contract residual rather than a defect "
+            "in this shell" % (len(violations), ", ".join(differences) or "nothing"),
         )
-        self.assertTrue(renders_distinctly,
-                        "the one thing keeping A7 closed here is the distinct rendering")
+        self.assertTrue(
+            renders_distinctly,
+            "the one thing keeping A7 closed here is that a system turn does not "
+            "look like an agent turn, and it now does: identical avatar label %r "
+            "and identical styling. Nothing in the record model bounds system "
+            "text, so this rendering is the whole guard."
+            % (system_turn["avatar_text"],),
+        )
+        # Naming the facets keeps the probe honest about *why* it is closed: an
+        # author class with no CSS behind it is invisible, so a difference in
+        # class names alone would not count and is excluded from the model.
+        self.assertIn("avatar_text", differences,
+                      "a system turn no longer carries its own label")
+        self.assertIn("bubble_style", differences,
+                      "a system turn's text is no longer styled apart from an "
+                      "agent's")
 
     def test_a8_agent_output_without_an_agent(self):
         chat_id = self.store.create_chat("Never ran")["chat_id"]
@@ -427,25 +453,51 @@ class TestContiguity(ProbeCase):
 
 class TestAtomicityProbes(ProbeCase):
     def test_c1_a_complete_looking_temp_file_is_still_not_history(self):
+        """The decoy must be a name the reader would otherwise read.
+
+        This probe wrote its decoy as `.tmp-sneaky`, with no `.json` suffix, so
+        what skipped it was the suffix filter and not the temp-prefix filter the
+        probe claims to be attacking: review deleted the temp-prefix filter and
+        every test stayed green. The decoy now ends in `.json`, so the only
+        thing that can keep it out of history is the guard under attack.
+
+        A second decoy carries the suffix rule in the same way, so neither
+        filter can be removed without this probe reporting an escape.
+        """
         chat_id = self.store.create_chat("Temp")["chat_id"]
-        self.store.append_user_message(chat_id, "one")
+        first = self.store.append_user_message(chat_id, "one")
         directory = os.path.join(self.root, "chats", chat_id, "messages")
-        # A fully valid record, written under a temp name. If the reader
-        # accepted it, an interrupted write would become history.
-        with open(os.path.join(directory, atomic.TEMP_PREFIX + "sneaky"), "w") as handle:
-            json.dump({
-                "record_type": "message", "record_version": 1,
-                "message_id": "msg_fromatempfile1", "chat_id": chat_id,
-                "sequence": 2, "author": "user",
-                "created_at": "2026-09-12T12:00:00Z",
-                "content": {"content_type": "text/plain", "text": "half-written"},
-                "session_id": None, "source_event_id": None,
-            }, handle)
-        messages = self.store.read_messages(chat_id)
-        held = len(messages) == 1
+        # A fully valid record, written under a temp name that would be read if
+        # the temp prefix were not filtered. If the reader accepted it, an
+        # interrupted write would become history.
+        decoy = {
+            "record_type": "message", "record_version": 1,
+            "message_id": "msg_fromatempfile1", "chat_id": chat_id,
+            "sequence": 2, "author": "user",
+            "created_at": "2026-09-12T12:00:00Z",
+            "content": {"content_type": "text/plain", "text": "half-written"},
+            "session_id": None, "source_event_id": None,
+        }
+        temp_named = atomic.TEMP_PREFIX + "5neaky" + ".json"
+        with open(os.path.join(directory, temp_named), "w") as handle:
+            json.dump(decoy, handle)
+        # And one that only the suffix rule excludes: no temp prefix at all.
+        suffix_only = dict(decoy, message_id="msg_fromabackupfile")
+        with open(os.path.join(directory, "00000002.json.part"), "w") as handle:
+            json.dump(suffix_only, handle)
+
+        try:
+            messages = self.store.read_messages(chat_id)
+            detail = "history holds %r" % [m["message_id"] for m in messages]
+        except StoreError as exc:
+            messages = None
+            detail = "read_messages failed closed on the decoy: %s" % exc
+        held = messages is not None and \
+            [m["message_id"] for m in messages] == [first["message_id"]]
         self.record("C1-valid-record-under-a-temp-name",
-                    "a complete, contract-valid record left under an interrupted write's name",
-                    held, "history length %d" % len(messages))
+                    "a complete, contract-valid record left under an interrupted "
+                    "write's name, and under a name that is not a record name",
+                    held, detail)
 
     def test_c2_fault_injection_is_inert_without_the_environment(self):
         """The crash hook must not be reachable by anything but the test harness."""
