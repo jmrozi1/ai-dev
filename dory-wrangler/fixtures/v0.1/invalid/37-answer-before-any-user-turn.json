@@ -1,0 +1,172 @@
+{
+  "fixture": {
+    "name": "answer-before-any-user-turn",
+    "expect": "reject",
+    "reason_code": "TURN_INSTRUCTION_MISSING",
+    "description": "One persistent agent answers twice on one launch packet, with the second delivery unrecorded. The first answer is written ahead of every user message so that it begins no exchange. A run of agent messages is an occasion on which the agent produced output whether or not a user message precedes it in the transcript, and no honest chat has the agent speaking before the user, so hiding an answer at the front of the history does not lower the floor."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_speakfirst0001",
+      "title": "Answer written ahead of the turn",
+      "created_at": "2026-09-12T23:00:00Z",
+      "updated_at": "2026-09-12T23:01:25Z",
+      "state": "open"
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_speakfirst0001",
+      "chat_id": "cht_speakfirst0001",
+      "created_at": "2026-09-12T23:00:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "running",
+      "agent_handle": "agent-z001",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T23:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_speakfirst0001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T23:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_speakfirst0001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T23:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_speakfirst0001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_speakfirst0001",
+      "chat_id": "cht_speakfirst0001",
+      "session_id": "ses_speakfirst0001",
+      "bound_at": "2026-09-12T23:00:03Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_speakfirst0001",
+      "chat_id": "cht_speakfirst0001",
+      "session_id": "ses_speakfirst0001",
+      "created_at": "2026-09-12T23:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What does the launch boundary do?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_speakfirst0001",
+      "session_id": "ses_speakfirst0001",
+      "observed_at": "2026-09-12T23:00:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-z001"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_speakfirst0001",
+      "chat_id": "cht_speakfirst0001",
+      "session_id": "ses_speakfirst0001",
+      "sequence": 1,
+      "received_at": "2026-09-12T23:00:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It hides how an agent is started.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_speakfirst0002",
+      "chat_id": "cht_speakfirst0001",
+      "session_id": "ses_speakfirst0001",
+      "sequence": 2,
+      "received_at": "2026-09-12T23:01:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It has no status, health, or poll operation.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_speakfirst0002",
+      "chat_id": "cht_speakfirst0001",
+      "sequence": 1,
+      "author": "agent",
+      "created_at": "2026-09-12T13:00:50Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Answer one."
+      },
+      "session_id": "ses_speakfirst0001",
+      "source_event_id": "evt_speakfirst0001"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_speakfirst0001",
+      "chat_id": "cht_speakfirst0001",
+      "sequence": 2,
+      "author": "user",
+      "created_at": "2026-09-12T13:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "First turn."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_speakfirst0004",
+      "chat_id": "cht_speakfirst0001",
+      "sequence": 3,
+      "author": "agent",
+      "created_at": "2026-09-12T13:00:55Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Answer two."
+      },
+      "session_id": "ses_speakfirst0001",
+      "source_event_id": "evt_speakfirst0002"
+    }
+  ]
+}
