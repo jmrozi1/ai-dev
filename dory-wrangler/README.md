@@ -17,6 +17,7 @@ Release intent and the checkpoint roadmap are `jmrozi1/ai-dev` #81.
 | `fixtures/v0.1/valid/` | store snapshots the contract must accept, including both continuation modes and both restart outcomes |
 | `fixtures/v0.1/invalid/` | store snapshots the contract must reject, each naming the rule it violates |
 | `validator/validate_contract.py` | the executable form of the contract |
+| `harness/` | the swappable single-agent launch boundary (#87), its two launcher implementations, and its tests |
 
 ## Validating
 
@@ -29,6 +30,6 @@ declared expectation, `1` when any did not, `2` on a usage or input error.
 
 ## Status
 
-v0.1 defines the contract (#85). It does not implement the chat UI (#86), the
-launcher (#87), or the event pipeline (#88). No observability (#82), supervision
+v0.1 defines the contract (#85) and the launch boundary with its launchers
+(#87). It does not implement the chat UI (#86) or the event pipeline (#88). No observability (#82), supervision
 (#83), or multi-agent (#84) behavior is in scope.
