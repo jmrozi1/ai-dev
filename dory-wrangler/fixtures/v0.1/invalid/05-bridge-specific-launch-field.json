@@ -1,0 +1,86 @@
+{
+  "fixture": {
+    "name": "bridge-specific-launch-field",
+    "expect": "reject",
+    "reason_code": "BRIDGE_SPECIFIC_FIELD",
+    "description": "The launch packet carries host and bridge mechanics. The seam must be hostable unchanged by both the Linux development launcher and the internal VS Code/network bridge launcher."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_bridgefld0001",
+      "title": "Leaky seam",
+      "created_at": "2026-09-12T17:00:00Z",
+      "updated_at": "2026-09-12T17:00:05Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_bridgefld0001",
+      "chat_id": "cht_bridgefld0001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T17:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Draft the note."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_bridgefld0001",
+      "chat_id": "cht_bridgefld0001",
+      "created_at": "2026-09-12T17:00:02Z",
+      "launcher_id": "internal-bridge",
+      "state": "launching",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T17:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T17:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_bridgefld0001",
+      "chat_id": "cht_bridgefld0001",
+      "session_id": "ses_bridgefld0001",
+      "bound_at": "2026-09-12T17:00:02Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_bridgefld0001",
+      "chat_id": "cht_bridgefld0001",
+      "session_id": "ses_bridgefld0001",
+      "created_at": "2026-09-12T17:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Draft the note.",
+      "command": "code --folder-uri vscode-remote://ssh-remote+rocky9/home/dory"
+    }
+  ]
+}

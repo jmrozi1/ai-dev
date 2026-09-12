@@ -1,0 +1,130 @@
+{
+  "fixture": {
+    "name": "agent-failure",
+    "expect": "accept",
+    "description": "The agent launched and ran, then ended in failure. The failure is recorded as a session outcome, is distinguishable from a launch failure, and is not fabricated into chat text."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_agentfail0001",
+      "title": "Rebuild the index",
+      "created_at": "2026-09-12T11:00:00Z",
+      "updated_at": "2026-09-12T11:00:40Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_agentfail0001",
+      "chat_id": "cht_agentfail0001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T11:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Rebuild the search index."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_agentfail0001",
+      "chat_id": "cht_agentfail0001",
+      "created_at": "2026-09-12T11:00:02Z",
+      "launcher_id": "dev-local",
+      "state": "failed",
+      "agent_handle": "agent-91ba",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T11:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T11:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T11:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_agentfail0001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "failed",
+          "owner": "launcher",
+          "at": "2026-09-12T11:00:39Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_agentfail0001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_agentfail0001",
+      "chat_id": "cht_agentfail0001",
+      "session_id": "ses_agentfail0001",
+      "bound_at": "2026-09-12T11:00:02Z",
+      "released_at": "2026-09-12T11:00:39Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_agentfail0001",
+      "chat_id": "cht_agentfail0001",
+      "session_id": "ses_agentfail0001",
+      "created_at": "2026-09-12T11:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Rebuild the search index."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_agentfail0001",
+      "session_id": "ses_agentfail0001",
+      "observed_at": "2026-09-12T11:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-91ba"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_agentfail0001",
+      "chat_id": "cht_agentfail0001",
+      "session_id": "ses_agentfail0001",
+      "sequence": 1,
+      "received_at": "2026-09-12T11:00:39Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_failed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_failed\",\"exit\":2,\"stderr\":\"index lock held\"}"
+      }
+    }
+  ]
+}

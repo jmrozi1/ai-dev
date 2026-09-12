@@ -1,0 +1,193 @@
+{
+  "fixture": {
+    "name": "malformed-and-unsupported-events",
+    "expect": "accept",
+    "description": "An unrecognized event and a malformed event are preserved verbatim as diagnostic evidence, correlated to chat and session, and never enter the chat transcript."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_malformed0001",
+      "title": "Try the new plugin",
+      "created_at": "2026-09-12T13:00:00Z",
+      "updated_at": "2026-09-12T13:00:44Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_malformed0001",
+      "chat_id": "cht_malformed0001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T13:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What event types does the plugin actually emit?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_malformed0001",
+      "chat_id": "cht_malformed0001",
+      "created_at": "2026-09-12T13:00:02Z",
+      "launcher_id": "dev-local",
+      "state": "completed",
+      "agent_handle": "agent-c30d",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T13:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T13:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T13:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_malformed0001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T13:00:43Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_malformed0004"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_malformed0001",
+      "chat_id": "cht_malformed0001",
+      "session_id": "ses_malformed0001",
+      "bound_at": "2026-09-12T13:00:02Z",
+      "released_at": "2026-09-12T13:00:43Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_malformed0001",
+      "chat_id": "cht_malformed0001",
+      "session_id": "ses_malformed0001",
+      "created_at": "2026-09-12T13:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What event types does the plugin actually emit?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_malformed0001",
+      "session_id": "ses_malformed0001",
+      "observed_at": "2026-09-12T13:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-c30d"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_malformed0001",
+      "chat_id": "cht_malformed0001",
+      "session_id": "ses_malformed0001",
+      "sequence": 1,
+      "received_at": "2026-09-12T13:00:20Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"I will list what I emit as I go.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_malformed0002",
+      "chat_id": "cht_malformed0001",
+      "session_id": "ses_malformed0001",
+      "sequence": 2,
+      "received_at": "2026-09-12T13:00:26Z",
+      "source": "agent",
+      "interpretation": "unrecognized",
+      "interpreted_type": null,
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"tool_progress_v3\",\"pct\":40}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_malformed0003",
+      "chat_id": "cht_malformed0001",
+      "session_id": "ses_malformed0001",
+      "sequence": 3,
+      "received_at": "2026-09-12T13:00:31Z",
+      "source": "agent",
+      "interpretation": "malformed",
+      "interpreted_type": null,
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"truncated pay"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_malformed0004",
+      "chat_id": "cht_malformed0001",
+      "session_id": "ses_malformed0001",
+      "sequence": 4,
+      "received_at": "2026-09-12T13:00:43Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_malformed0002",
+      "chat_id": "cht_malformed0001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T13:00:20Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "I will list what I emit as I go."
+      },
+      "session_id": "ses_malformed0001",
+      "source_event_id": "evt_malformed0001"
+    }
+  ]
+}

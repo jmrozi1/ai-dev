@@ -1,0 +1,161 @@
+{
+  "fixture": {
+    "name": "normal-agent-completion",
+    "expect": "accept",
+    "description": "One agent is bound to a chat, launched, produces a recognized assistant event that becomes user-visible history, completes, and the binding is released."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_complete00001",
+      "title": "Explain the launch seam",
+      "created_at": "2026-09-12T10:00:00Z",
+      "updated_at": "2026-09-12T10:00:31Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_complete00001",
+      "chat_id": "cht_complete00001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T10:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Summarise how the launch boundary is supposed to work."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_complete00001",
+      "chat_id": "cht_complete00001",
+      "created_at": "2026-09-12T10:00:03Z",
+      "launcher_id": "dev-local",
+      "state": "completed",
+      "agent_handle": "agent-7f21",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T10:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T10:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T10:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_complete00001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T10:00:30Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_complete00002"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_complete00001",
+      "chat_id": "cht_complete00001",
+      "session_id": "ses_complete00001",
+      "bound_at": "2026-09-12T10:00:03Z",
+      "released_at": "2026-09-12T10:00:30Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_complete00001",
+      "chat_id": "cht_complete00001",
+      "session_id": "ses_complete00001",
+      "created_at": "2026-09-12T10:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Summarise how the launch boundary is supposed to work."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_complete00001",
+      "session_id": "ses_complete00001",
+      "observed_at": "2026-09-12T10:00:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-7f21"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_complete00001",
+      "chat_id": "cht_complete00001",
+      "session_id": "ses_complete00001",
+      "sequence": 1,
+      "received_at": "2026-09-12T10:00:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"The launch boundary hides how an agent is started.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_complete00002",
+      "chat_id": "cht_complete00001",
+      "session_id": "ses_complete00001",
+      "sequence": 2,
+      "received_at": "2026-09-12T10:00:30Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_complete00002",
+      "chat_id": "cht_complete00001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T10:00:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "The launch boundary hides how an agent is started."
+      },
+      "session_id": "ses_complete00001",
+      "source_event_id": "evt_complete00001"
+    }
+  ]
+}

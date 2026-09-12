@@ -1,0 +1,120 @@
+{
+  "fixture": {
+    "name": "launch-failure",
+    "expect": "accept",
+    "description": "The launch never produced a live agent. The session ends in launch_failed with a distinguishable failure category, separate from an agent that ran and failed."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_launchfail001",
+      "title": "Draft the release note",
+      "created_at": "2026-09-12T12:00:00Z",
+      "updated_at": "2026-09-12T12:00:12Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_launchfail001",
+      "chat_id": "cht_launchfail001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T12:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Draft the v0.1 release note."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_launchfail001",
+      "chat_id": "cht_launchfail001",
+      "created_at": "2026-09-12T12:00:02Z",
+      "launcher_id": "internal-bridge",
+      "state": "launch_failed",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T12:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T12:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "launch_failed",
+          "owner": "launcher",
+          "at": "2026-09-12T12:00:11Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_launchfail001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_launchfail001",
+      "chat_id": "cht_launchfail001",
+      "session_id": "ses_launchfail001",
+      "bound_at": "2026-09-12T12:00:02Z",
+      "released_at": "2026-09-12T12:00:11Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_launchfail001",
+      "chat_id": "cht_launchfail001",
+      "session_id": "ses_launchfail001",
+      "created_at": "2026-09-12T12:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Draft the v0.1 release note."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_launchfail001",
+      "session_id": "ses_launchfail001",
+      "observed_at": "2026-09-12T12:00:11Z",
+      "outcome": "failed",
+      "failure_category": "unavailable",
+      "detail": "launch prerequisite not satisfied"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_launchfail001",
+      "chat_id": "cht_launchfail001",
+      "session_id": "ses_launchfail001",
+      "sequence": 1,
+      "received_at": "2026-09-12T12:00:11Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "launch_failed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"launch_failed\",\"category\":\"unavailable\"}"
+      }
+    }
+  ]
+}

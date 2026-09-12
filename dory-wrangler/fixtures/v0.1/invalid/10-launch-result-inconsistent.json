@@ -1,0 +1,106 @@
+{
+  "fixture": {
+    "name": "launch-result-inconsistent",
+    "expect": "reject",
+    "reason_code": "LAUNCH_RESULT_INCONSISTENT",
+    "description": "A launch result claims acceptance and simultaneously carries a failure category. Launch outcomes must stay distinguishable rather than blending success and failure."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_badresult0001",
+      "title": "Both at once",
+      "created_at": "2026-09-12T22:00:00Z",
+      "updated_at": "2026-09-12T22:00:06Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_badresult0001",
+      "chat_id": "cht_badresult0001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T22:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Launch."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_badresult0001",
+      "chat_id": "cht_badresult0001",
+      "created_at": "2026-09-12T22:00:02Z",
+      "launcher_id": "dev-local",
+      "state": "running",
+      "agent_handle": "agent-2b01",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T22:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T22:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T22:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_badresult0001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_badresult0001",
+      "chat_id": "cht_badresult0001",
+      "session_id": "ses_badresult0001",
+      "bound_at": "2026-09-12T22:00:02Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_badresult0001",
+      "chat_id": "cht_badresult0001",
+      "session_id": "ses_badresult0001",
+      "created_at": "2026-09-12T22:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Launch."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_badresult0001",
+      "session_id": "ses_badresult0001",
+      "observed_at": "2026-09-12T22:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-2b01",
+      "failure_category": "rejected"
+    }
+  ]
+}

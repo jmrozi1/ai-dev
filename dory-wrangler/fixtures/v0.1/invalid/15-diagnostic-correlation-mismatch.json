@@ -1,0 +1,160 @@
+{
+  "fixture": {
+    "name": "diagnostic-correlation-mismatch",
+    "expect": "reject",
+    "reason_code": "CORRELATION_MISMATCH",
+    "description": "A chat renders a message derived from an event preserved under a different chat. Diagnostic evidence is correlated by chat and session, and that correlation is load-bearing."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_crossa000001",
+      "title": "Chat A",
+      "created_at": "2026-09-13T04:00:00Z",
+      "updated_at": "2026-09-13T04:00:30Z",
+      "state": "open"
+    },
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_crossb000001",
+      "title": "Chat B",
+      "created_at": "2026-09-13T04:00:00Z",
+      "updated_at": "2026-09-13T04:00:30Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_crossa000001",
+      "chat_id": "cht_crossa000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-13T04:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Ask A."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_crossb000001",
+      "chat_id": "cht_crossb000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-13T04:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Ask B."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_crossb000001",
+      "chat_id": "cht_crossb000001",
+      "created_at": "2026-09-13T04:00:02Z",
+      "launcher_id": "dev-local",
+      "state": "running",
+      "agent_handle": "agent-5e01",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-13T04:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-13T04:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-13T04:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_crossb000001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_crossb000001",
+      "chat_id": "cht_crossb000001",
+      "session_id": "ses_crossb000001",
+      "bound_at": "2026-09-13T04:00:02Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_crossb000001",
+      "chat_id": "cht_crossb000001",
+      "session_id": "ses_crossb000001",
+      "created_at": "2026-09-13T04:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Ask B."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_crossb000001",
+      "session_id": "ses_crossb000001",
+      "observed_at": "2026-09-13T04:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-5e01"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_crossb000001",
+      "chat_id": "cht_crossb000001",
+      "session_id": "ses_crossb000001",
+      "sequence": 1,
+      "received_at": "2026-09-13T04:00:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Answer for B.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_crossa000002",
+      "chat_id": "cht_crossa000001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-13T04:00:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Answer for B."
+      },
+      "session_id": "ses_crossb000001",
+      "source_event_id": "evt_crossb000001"
+    }
+  ]
+}

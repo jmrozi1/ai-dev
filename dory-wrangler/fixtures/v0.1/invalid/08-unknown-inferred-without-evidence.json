@@ -1,0 +1,115 @@
+{
+  "fixture": {
+    "name": "unknown-inferred-without-evidence",
+    "expect": "reject",
+    "reason_code": "UNKNOWN_INFERRED_WITHOUT_EVIDENCE",
+    "description": "A session is moved to 'unknown' on a harness action with no integration observation behind it. 'unknown' must come from an explicit observation, never from absence or a timer."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_inferunk00001",
+      "title": "Assumed stall",
+      "created_at": "2026-09-12T20:00:00Z",
+      "updated_at": "2026-09-12T20:10:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_inferunk00001",
+      "chat_id": "cht_inferunk00001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T20:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Build it."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_inferunk00001",
+      "chat_id": "cht_inferunk00001",
+      "created_at": "2026-09-12T20:00:02Z",
+      "launcher_id": "dev-local",
+      "state": "unknown",
+      "agent_handle": "agent-ff01",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T20:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T20:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T20:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_inferunk00001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T20:10:00Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_inferunk00001",
+      "chat_id": "cht_inferunk00001",
+      "session_id": "ses_inferunk00001",
+      "bound_at": "2026-09-12T20:00:02Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_inferunk00001",
+      "chat_id": "cht_inferunk00001",
+      "session_id": "ses_inferunk00001",
+      "created_at": "2026-09-12T20:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Build it."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_inferunk00001",
+      "session_id": "ses_inferunk00001",
+      "observed_at": "2026-09-12T20:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-ff01"
+    }
+  ]
+}

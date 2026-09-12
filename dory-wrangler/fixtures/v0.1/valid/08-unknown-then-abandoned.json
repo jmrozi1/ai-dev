@@ -1,0 +1,155 @@
+{
+  "fixture": {
+    "name": "unknown-then-abandoned",
+    "expect": "accept",
+    "description": "The event stream closed without a terminal lifecycle event. That is an explicit observation, so the session becomes 'unknown' rather than being reported as completed or failed. Only an explicit user action, never a timer, moves it to a terminal state."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_unknown000001",
+      "title": "Silent agent",
+      "created_at": "2026-09-12T15:00:00Z",
+      "updated_at": "2026-09-12T15:30:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_unknown000001",
+      "chat_id": "cht_unknown000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T15:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Run the migration."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_unknown000001",
+      "chat_id": "cht_unknown000001",
+      "created_at": "2026-09-12T15:00:02Z",
+      "launcher_id": "internal-bridge",
+      "state": "abandoned",
+      "agent_handle": "agent-d4e0",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T15:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T15:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T15:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_unknown000001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T15:12:00Z",
+          "evidence": {
+            "kind": "stream_end",
+            "ref": null
+          }
+        },
+        {
+          "from": "unknown",
+          "to": "abandoned",
+          "owner": "user",
+          "at": "2026-09-12T15:30:00Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_unknown000001",
+      "chat_id": "cht_unknown000001",
+      "session_id": "ses_unknown000001",
+      "bound_at": "2026-09-12T15:00:02Z",
+      "released_at": "2026-09-12T15:30:00Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_unknown000001",
+      "chat_id": "cht_unknown000001",
+      "session_id": "ses_unknown000001",
+      "created_at": "2026-09-12T15:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Run the migration."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_unknown000001",
+      "session_id": "ses_unknown000001",
+      "observed_at": "2026-09-12T15:00:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-d4e0"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_unknown000001",
+      "chat_id": "cht_unknown000001",
+      "session_id": "ses_unknown000001",
+      "sequence": 1,
+      "received_at": "2026-09-12T15:04:00Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Starting the migration.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_unknown000002",
+      "chat_id": "cht_unknown000001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T15:04:00Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Starting the migration."
+      },
+      "session_id": "ses_unknown000001",
+      "source_event_id": "evt_unknown000001"
+    }
+  ]
+}

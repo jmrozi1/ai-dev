@@ -1,0 +1,119 @@
+{
+  "fixture": {
+    "name": "launch-outcome-unknown",
+    "expect": "accept",
+    "description": "The launcher returned neither an acceptance nor a classified failure. The session is 'unknown' on the launcher's own explicit report, the binding stays open because the session is not terminal, and no outcome is invented."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_unklaunch0001",
+      "title": "Ambiguous launch",
+      "created_at": "2026-09-12T16:00:00Z",
+      "updated_at": "2026-09-12T16:00:20Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_unklaunch0001",
+      "chat_id": "cht_unklaunch0001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T16:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Try again."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_unklaunch0001",
+      "chat_id": "cht_unklaunch0001",
+      "created_at": "2026-09-12T16:00:02Z",
+      "launcher_id": "internal-bridge",
+      "state": "unknown",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T16:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T16:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": null
+          }
+        },
+        {
+          "from": "launching",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T16:00:19Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_unklaunch0001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_unklaunch0001",
+      "chat_id": "cht_unklaunch0001",
+      "session_id": "ses_unklaunch0001",
+      "bound_at": "2026-09-12T16:00:02Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_unklaunch0001",
+      "chat_id": "cht_unklaunch0001",
+      "session_id": "ses_unklaunch0001",
+      "created_at": "2026-09-12T16:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Try again."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_unklaunch0001",
+      "session_id": "ses_unklaunch0001",
+      "observed_at": "2026-09-12T16:00:19Z",
+      "outcome": "unknown",
+      "detail": "bridge returned no usable acknowledgement payload"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_unklaunch0001",
+      "chat_id": "cht_unklaunch0001",
+      "session_id": "ses_unklaunch0001",
+      "sequence": 1,
+      "received_at": "2026-09-12T16:00:19Z",
+      "source": "launcher",
+      "interpretation": "malformed",
+      "interpreted_type": null,
+      "raw": {
+        "encoding": "utf-8",
+        "body": "<!DOCTYPE html><html><head><title>502"
+      }
+    }
+  ]
+}
