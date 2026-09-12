@@ -32,7 +32,7 @@ owners **and executable preconditions**, where each transition's `evidence.ref`
 must resolve to a real record in the state the precondition requires; message
 provenance; launch and delivery packet portability and declared bounds; launch
 result consistency; declared launcher capabilities; and a durable instruction
-record for every answered user turn.
+record for every occasion on which the agent produced an answer.
 
 Two rules are worth calling out because they are what the executable form is
 for:

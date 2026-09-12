@@ -1,0 +1,201 @@
+{
+  "fixture": {
+    "name": "stateless-launcher-addressing",
+    "expect": "accept",
+    "description": "A launcher that remembers nothing between calls serves a whole session. It declares the shape of the only internal path proven to work today -- fresh_binding and one_shot -- and every operation after 'launch' is addressed by the agent_handle the launcher itself returned: a first re-attachment that fails, a second that succeeds, and a user stop that is confirmed. The harness restarts twice in the middle of this and carries nothing across but the durable records, the handle among them. Nothing here requires the launcher to hold a session-to-agent mapping, a live process, or any memory of having been called (contract 6.1). Note what a store can and cannot show: it cannot show which arguments were passed, only that every operation which addressed the agent was issued by a harness that already held the handle."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_stateless0001",
+      "title": "Ask the bridge agent one thing",
+      "created_at": "2026-09-12T11:00:00Z",
+      "updated_at": "2026-09-13T09:10:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_stateless0001",
+      "chat_id": "cht_stateless0001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T11:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What does the launcher have to remember between calls?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_stateless0001",
+      "chat_id": "cht_stateless0001",
+      "created_at": "2026-09-12T11:00:03Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "terminated",
+      "agent_handle": "agent-h7f2",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T11:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_stateless0001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T11:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_stateless0001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T11:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_stateless0001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-13T09:00:00Z",
+          "evidence": {
+            "kind": "observation",
+            "ref": "obs_stateless0001"
+          }
+        },
+        {
+          "from": "unknown",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-13T09:05:00Z",
+          "evidence": {
+            "kind": "observation",
+            "ref": "obs_stateless0002"
+          }
+        },
+        {
+          "from": "running",
+          "to": "terminated",
+          "owner": "user",
+          "at": "2026-09-13T09:10:00Z",
+          "evidence": {
+            "kind": "observation",
+            "ref": "obs_stateless0003"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_stateless0001",
+      "chat_id": "cht_stateless0001",
+      "session_id": "ses_stateless0001",
+      "bound_at": "2026-09-12T11:00:03Z",
+      "released_at": "2026-09-13T09:10:00Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_stateless0001",
+      "chat_id": "cht_stateless0001",
+      "session_id": "ses_stateless0001",
+      "created_at": "2026-09-12T11:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What does the launcher have to remember between calls?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_stateless0001",
+      "session_id": "ses_stateless0001",
+      "observed_at": "2026-09-12T11:00:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-h7f2",
+      "detail": "one-shot call returned the agent's response and exited"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_stateless0001",
+      "chat_id": "cht_stateless0001",
+      "session_id": "ses_stateless0001",
+      "sequence": 1,
+      "received_at": "2026-09-12T11:00:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Nothing. You hand me the handle every time.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_stateless0002",
+      "chat_id": "cht_stateless0001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T11:00:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Nothing. You hand me the handle every time."
+      },
+      "session_id": "ses_stateless0001",
+      "source_event_id": "evt_stateless0001"
+    },
+    {
+      "record_type": "session_observation",
+      "record_version": 1,
+      "observation_id": "obs_stateless0001",
+      "chat_id": "cht_stateless0001",
+      "session_id": "ses_stateless0001",
+      "observed_at": "2026-09-13T09:00:00Z",
+      "kind": "reattach_failed",
+      "detail": "first restart: events(agent-h7f2, 1) returned no attachment"
+    },
+    {
+      "record_type": "session_observation",
+      "record_version": 1,
+      "observation_id": "obs_stateless0002",
+      "chat_id": "cht_stateless0001",
+      "session_id": "ses_stateless0001",
+      "observed_at": "2026-09-13T09:05:00Z",
+      "kind": "reattached",
+      "detail": "second restart: events(agent-h7f2, 1) attached and replayed from sequence 1; the launcher process from the launch is long gone"
+    },
+    {
+      "record_type": "session_observation",
+      "record_version": 1,
+      "observation_id": "obs_stateless0003",
+      "chat_id": "cht_stateless0001",
+      "session_id": "ses_stateless0001",
+      "observed_at": "2026-09-13T09:10:00Z",
+      "kind": "stop_confirmed",
+      "detail": "stop(agent-h7f2, 'user ended the chat') acknowledged by a launcher invocation that had never been called before"
+    }
+  ]
+}
