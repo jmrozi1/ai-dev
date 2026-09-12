@@ -12,9 +12,9 @@ first.
 The executable form of this contract is
 [`../../validator/validate_contract.py`](../../validator/validate_contract.py).
 Every rule stated here with a violation code in `SMALL_CAPS` is enforced there.
-**Not all of them are demonstrated by a fixture.** Of the 44 violation codes the
-validator enforces, 24 are exercised by a rejection fixture under
-[`../../fixtures/v0.1`](../../fixtures/v0.1) and 20 are not. All 20 have been
+**Not all of them are demonstrated by a fixture.** Of the 48 violation codes the
+validator enforces, 29 are exercised by a rejection fixture under
+[`../../fixtures/v0.1`](../../fixtures/v0.1) and 19 are not. All 19 have been
 probed and fire correctly, so this is a regression-coverage gap rather than a
 correctness one; closing it is known carried work, tracked as review finding F8.
 An earlier revision of this paragraph claimed every code was fixture-demonstrated
@@ -149,8 +149,10 @@ transcript renders.
   (`FABRICATED_AGENT_MESSAGE`). This is the structural guarantee that agent
   history is transcribed evidence rather than narration.
 - The cited event must be `interpretation: "recognized"`
-  (`MALFORMED_EVENT_RENDERED`), and must belong to the same chat and session
-  (`CORRELATION_MISMATCH`).
+  (`MALFORMED_EVENT_RENDERED`), must be `source: "agent"`
+  (`NON_AGENT_EVENT_RENDERED`), and must belong to the same chat and session
+  (`CORRELATION_MISMATCH`). Launcher and harness output is diagnostic; only the
+  agent's own output is ever chat.
 - `author: "user"` and `author: "system"` must carry `null` in both fields
   (`MESSAGE_PROVENANCE_INVALID`). A user turn is not derived from the
   integration.
@@ -184,9 +186,29 @@ attributable to a durable record rather than being lost.
 #90 can partition evidence by environment. It is opaque: no behavior may branch
 on its value.
 
-`agent_handle` is the opaque handle the launcher returned. A session in state
-`running` must carry one (`SESSION_HANDLE_MISSING`). It is meaningful only to
-the launcher that issued it.
+`agent_handle` is the opaque handle the launcher returned. A session that ever
+reached `running` must carry one (`SESSION_HANDLE_MISSING`), and any handle a
+session carries must be one an accepted `launch_result` for that same session
+actually returned (`SESSION_HANDLE_NOT_ISSUED`). It is meaningful only to the
+launcher that issued it.
+
+Provenance is not tidiness. `stop` (6.1) and restart re-attachment (5.4) both
+address the agent through this field, so a handle nobody issued makes both
+target nothing, and it would do so silently: the harness would record a
+`reattach_failed` for an agent that was never unreachable. Requiring the handle
+to be *present* is not the same as requiring it to *exist*. Together with
+`SESSION_HANDLE_MISSING` this closes the route in which a session reaches
+`running` through `launching -> unknown -> running` — where the launcher never
+accepted anything and therefore never returned a handle — and then simply
+declares one.
+
+Both halves are needed and neither is sufficient. `SESSION_HANDLE_MISSING` is
+stated over having *reached* `running` rather than over sitting in it, because a
+session that ran with no handle at all and then moved to a terminal state
+satisfies a current-state rule vacuously, while a provenance rule has nothing to
+check when the field is absent. Keyed the narrow way the two rules dodge each
+other, and the same unlaunched session runs, emits agent-sourced events, and has
+them rendered as chat.
 
 **`launcher_capabilities` records what the launcher that served this session
 declared it can do.** These are declared properties of an implementation. This
@@ -569,6 +591,14 @@ than an error (7). Such a launcher cannot observe a stream ending, so
 could not have been seen is the one-shot form of inferring from silence. It
 reaches `unknown` through causes 1, 3, 4, 5 and 6 instead.
 
+The rejection is of the assertion, not of one way of spelling it. A
+`diagnostic_event` of `interpreted_type: "stream_end"` on such a session is
+rejected outright (`STREAM_END_UNSUPPORTED`), whichever evidence channel cites
+it or whether anything cites it at all. Blocking only `evidence.kind:
+"stream_end"` would leave the same claim reachable as an ordinary `event`
+citation, which is a check of the citation rather than of the fact it stands
+for.
+
 This contract does not require event granularity that may not exist. It requires
 that whatever arrives is preserved, ordered, and attributable.
 
@@ -659,7 +689,16 @@ guarantees are not allowed to be weaker on turn four than on turn one.
 
 A `delivery_request` is permitted only on a session whose launcher declared
 `continuation: "persistent"` and which actually reached `running`
-(`DELIVERY_NOT_SUPPORTED`).
+(`DELIVERY_NOT_SUPPORTED`), and it must not have been created after that session
+entered its terminal state (`DELIVERY_AFTER_AGENT_EXIT`). `deliver` sends text
+to an agent that is already running; once the session is terminal the agent is
+gone, so such a packet reached nobody and must not be recorded as though it
+had. The comparison is strictly *after*: a `created_at` equal to the terminal
+transition's `at` is accepted, because at one-second granularity a delivery that
+genuinely preceded the exit can share its timestamp, and rejecting the tie would
+fail an honest store to no purpose — a store willing to write a false
+`created_at` can write an earlier one just as easily, which is the timestamp
+ceiling rather than this rule's boundary.
 
 **Every answered user turn has a durable instruction record.** For each chat, the
 number of instruction packets — `launch_request` plus `delivery_request` — must
@@ -668,6 +707,23 @@ be at least the number of user messages the agent went on to answer
 they are made equivalent: `persistent` records one launch and N-1 deliveries,
 `fresh_binding` records N launches, and either way what was sent is preserved for
 every turn.
+
+**Only packets that could have reached an agent count toward that floor.** A
+packet counts only if its session actually reached `running`. A `launch_request`
+on a session that never ran is precisely the packet that was *not* delivered —
+that is what a launch failure is — so counting it would let a chat satisfy the
+floor with decoy sessions that hold a packet and terminate in `launch_failed`,
+while every turn after the first stayed integration-blind. That is the condition
+this rule exists to make visible, so it may not be satisfiable by records of
+things that did not happen.
+
+**Known residual, stated rather than implied.** This is a count, not a per-turn
+pairing: a chat can still satisfy it with packets that were real but sent at the
+wrong moments. Closing that requires ordering instruction records against
+messages in time, which is unsound while timestamp and `sequence` coherence is
+unchecked, and is therefore sequenced behind that work rather than approximated
+here. What is closed is the structural half: a packet must belong to a session
+that ran, and a delivery must predate that session's end.
 
 ## 7. Diagnostic preservation
 
@@ -696,6 +752,15 @@ primary discovery output of v0.1 and the direct input to #89 and #90.
 started — that is what a launch failure is — but the agent may not. Without this,
 a session that never launched can still emit recognized events and have them
 rendered as user-visible chat, which routes around the lifecycle entirely.
+
+**This rule alone does not deliver that.** It constrains only agent-sourced
+events, while a message may cite any event on its session, so the same
+never-launched session renders the same invented text by sourcing the event to
+the launcher instead — and because it never reached `running`, no cardinality
+rule and no turn rule sees it either. The guarantee is the pair: this rule plus
+the message-side requirement that an `author: "agent"` message cite an
+`agent`-sourced event (4.2, `NON_AGENT_EVENT_RENDERED`). Neither half is
+sufficient on its own, and the sentence above is only true of the pair.
 
 **P3. Correlation.** Every event carries `chat_id`, `session_id`, and a
 `sequence` that is contiguous from 1 within its session. Those three answer

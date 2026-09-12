@@ -1,0 +1,192 @@
+{
+  "fixture": {
+    "name": "ran-with-no-launch-and-no-handle",
+    "expect": "reject",
+    "reason_code": "SESSION_HANDLE_MISSING",
+    "description": "Found by attacking fixture 31's repair rather than testing it. The same launching -> unknown -> running route with no accepted launch, but the session declares no agent_handle at all and then goes terminal. A handle rule keyed on the session's current state never fires, and a provenance rule has nothing to check when the field is absent, so the two rules dodge each other. The session ran, produced agent-sourced events, and had them rendered as chat, with nothing in the store that could stop it or re-attach to it."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_b1nohandle01",
+      "title": "B1",
+      "created_at": "2026-09-12T16:00:00Z",
+      "updated_at": "2026-09-12T16:02:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_b1nohandle1",
+      "chat_id": "cht_b1nohandle01",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T16:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Do the thing."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_b1nohandle1",
+      "chat_id": "cht_b1nohandle01",
+      "created_at": "2026-09-12T16:00:02Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T16:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_b1nohandle1"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T16:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_b1nohandle1"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T16:00:09Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_b1nohandle1"
+          }
+        },
+        {
+          "from": "unknown",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T16:00:20Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_b1nohandle1"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T16:01:00Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_b1nohandle3"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_b1nohandle1",
+      "chat_id": "cht_b1nohandle01",
+      "session_id": "ses_b1nohandle1",
+      "bound_at": "2026-09-12T16:00:02Z",
+      "released_at": "2026-09-12T16:01:00Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_b1nohandle1",
+      "chat_id": "cht_b1nohandle01",
+      "session_id": "ses_b1nohandle1",
+      "created_at": "2026-09-12T16:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Do the thing."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_b1nohandle1",
+      "session_id": "ses_b1nohandle1",
+      "observed_at": "2026-09-12T16:00:09Z",
+      "outcome": "unknown",
+      "detail": "no acknowledgement"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_b1nohandle1",
+      "chat_id": "cht_b1nohandle01",
+      "session_id": "ses_b1nohandle1",
+      "sequence": 1,
+      "received_at": "2026-09-12T16:00:20Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "agent_started",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"agent_started\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_b1nohandle2",
+      "chat_id": "cht_b1nohandle01",
+      "session_id": "ses_b1nohandle1",
+      "sequence": 2,
+      "received_at": "2026-09-12T16:00:30Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Invented.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_b1nohandle3",
+      "chat_id": "cht_b1nohandle01",
+      "session_id": "ses_b1nohandle1",
+      "sequence": 3,
+      "received_at": "2026-09-12T16:01:00Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "agent_exit",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"agent_exit\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_b1nohandle2",
+      "chat_id": "cht_b1nohandle01",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T16:00:31Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Invented."
+      },
+      "session_id": "ses_b1nohandle1",
+      "source_event_id": "evt_b1nohandle2"
+    }
+  ]
+}

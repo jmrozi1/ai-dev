@@ -1,0 +1,179 @@
+{
+  "fixture": {
+    "name": "delivery-after-the-agent-exited",
+    "expect": "reject",
+    "reason_code": "DELIVERY_AFTER_AGENT_EXIT",
+    "description": "Contract 6.4: 'deliver' sends text to an agent that is already running. This delivery was created thirty minutes after the session reached 'completed'. DELIVERY_NOT_SUPPORTED sees only that the launcher declared 'persistent' and that 'running' appears somewhere in the history, so the packet validates and counts toward the turn floor while no agent ever received it."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_r4latedlv001",
+      "title": "Late delivery",
+      "created_at": "2026-09-12T15:00:00Z",
+      "updated_at": "2026-09-12T15:32:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4latedlv01",
+      "chat_id": "cht_r4latedlv001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T15:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Check disk usage."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_r4latedlv01",
+      "chat_id": "cht_r4latedlv001",
+      "created_at": "2026-09-12T15:00:02Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "persist-9ac4",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T15:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_r4latedlv01"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T15:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_r4latedlv01"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T15:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_r4latedlv01"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T15:01:00Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_r4latedlv02"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_r4latedlv01",
+      "chat_id": "cht_r4latedlv001",
+      "session_id": "ses_r4latedlv01",
+      "bound_at": "2026-09-12T15:00:02Z",
+      "released_at": "2026-09-12T15:01:00Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_r4latedlv01",
+      "chat_id": "cht_r4latedlv001",
+      "session_id": "ses_r4latedlv01",
+      "created_at": "2026-09-12T15:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Check disk usage."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_r4latedlv01",
+      "session_id": "ses_r4latedlv01",
+      "observed_at": "2026-09-12T15:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "persist-9ac4"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r4latedlv01",
+      "chat_id": "cht_r4latedlv001",
+      "session_id": "ses_r4latedlv01",
+      "sequence": 1,
+      "received_at": "2026-09-12T15:00:30Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Root is at 61%.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4latedlv02",
+      "chat_id": "cht_r4latedlv001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T15:00:31Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Root is at 61%."
+      },
+      "session_id": "ses_r4latedlv01",
+      "source_event_id": "evt_r4latedlv01"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r4latedlv02",
+      "chat_id": "cht_r4latedlv001",
+      "session_id": "ses_r4latedlv01",
+      "sequence": 2,
+      "received_at": "2026-09-12T15:01:00Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "agent_exit",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"agent_exit\",\"code\":0}"
+      }
+    },
+    {
+      "record_type": "delivery_request",
+      "record_version": 1,
+      "delivery_id": "dlv_r4latedlv01",
+      "chat_id": "cht_r4latedlv001",
+      "session_id": "ses_r4latedlv01",
+      "sequence": 1,
+      "created_at": "2026-09-12T15:31:00Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "And now check inode usage.",
+      "acknowledged": null
+    }
+  ]
+}

@@ -801,16 +801,49 @@ def validate_store(report, records):
             report.add("DANGLING_REFERENCE", where, "%s %r has no %s record" % (kind, value, label))
         return target
 
+    # Handles the launcher actually issued, per session. Contract 4.3: agent_handle
+    # "is the opaque handle the launcher returned", and 5.4 re-attaches through it.
+    # A handle is a fact about the launch boundary, so its provenance is the
+    # accepted launch_result that returned it -- never the session's own assertion.
+    issued_handles = {}
+    for result in by_type["launch_result"]:
+        if result.get("outcome") != "accepted":
+            continue
+        sid = result.get("session_id")
+        handle = result.get("agent_handle")
+        if isinstance(sid, str) and isinstance(handle, str) and handle:
+            issued_handles.setdefault(sid, set()).add(handle)
+
     # --- sessions -------------------------------------------------------
     for i, session in enumerate(by_type["agent_session"]):
         where = record_where(i, session)
         ref(where, "chat_id", session.get("chat_id"), chats, "chat")
-        if session.get("state") == "running" and not session.get("agent_handle"):
+        # Keyed on having *reached* running, not on sitting in it. Keying on the
+        # current state lets a session run with no handle at all and then move to a
+        # terminal state, which dodges this rule and SESSION_HANDLE_NOT_ISSUED
+        # together -- the latter has nothing to check when the field is absent.
+        if "running" in _transition_targets(session) and not session.get("agent_handle"):
             report.add(
                 "SESSION_HANDLE_MISSING",
                 where,
-                "a running session must carry the agent_handle the launcher returned",
+                "session %s reached 'running' but carries no agent_handle; a session that "
+                "ran must record the handle the launcher returned, or nothing can stop it "
+                "or re-attach to it"
+                % session.get("session_id"),
             )
+        handle = session.get("agent_handle")
+        if isinstance(handle, str) and handle:
+            issued = issued_handles.get(session.get("session_id"), set())
+            if handle not in issued:
+                report.add(
+                    "SESSION_HANDLE_NOT_ISSUED",
+                    where,
+                    "session %s carries agent_handle %r, but no accepted launch_result for "
+                    "this session returned it (issued: %s). A handle nobody issued cannot be "
+                    "stopped and cannot be re-attached to"
+                    % (session.get("session_id"), handle,
+                       ", ".join(sorted(issued)) if issued else "none"),
+                )
         _validate_preconditions(
             report, where, session,
             {
@@ -846,6 +879,19 @@ def validate_store(report, records):
                     "user-visible history may only be derived from a recognized event; "
                     "event %s is %r"
                     % (message.get("source_event_id"), event.get("interpretation")),
+                )
+            # Contract 7 P2a, message side. AGENT_OUTPUT_WITHOUT_AGENT keeps a
+            # never-launched session from sourcing an event to the agent; without
+            # this, the same text arrives as chat by being sourced to the launcher
+            # instead, on a session no cardinality or turn rule can see.
+            if event is not None and event.get("source") != "agent":
+                report.add(
+                    "NON_AGENT_EVENT_RENDERED",
+                    where,
+                    "an agent-authored message must be transcribed from an event the agent "
+                    "produced; event %s has source %r. Launcher and harness output is "
+                    "diagnostic, never chat"
+                    % (message.get("source_event_id"), event.get("source")),
                 )
         elif author in ("user", "system"):
             if message.get("source_event_id") is not None:
@@ -1062,6 +1108,17 @@ def validate_store(report, records):
                     "session %s never entered 'running'; there was no agent to deliver to"
                     % delivery.get("session_id"),
                 )
+            exited_at = _terminal_at(session)
+            created_at = delivery.get("created_at")
+            if (exited_at is not None and isinstance(created_at, str)
+                    and TS_RE.match(created_at) and created_at > exited_at):
+                report.add(
+                    "DELIVERY_AFTER_AGENT_EXIT",
+                    where,
+                    "delivery was created at %s, after session %s reached terminal state %r "
+                    "at %s; 'deliver' sends text to an agent that is already running"
+                    % (created_at, delivery.get("session_id"), session.get("state"), exited_at),
+                )
         session_id = delivery.get("session_id")
         seq = delivery.get("sequence")
         if isinstance(session_id, str) and isinstance(seq, int) and not isinstance(seq, bool):
@@ -1086,6 +1143,28 @@ def validate_store(report, records):
                 "event is sourced to the agent, but session %s never entered 'running'; "
                 "there was no agent to produce it"
                 % event.get("session_id"),
+            )
+
+    # --- a one-shot launcher has no stream -------------------------------
+    # Contract 6.1: a launcher declaring response_shape 'one_shot' returns the
+    # agent's response from the call and "cannot observe a stream ending". The
+    # evidence-kind guard covers the citation channel; this covers the fact, so
+    # the same assertion cannot be smuggled in as an ordinary 'event'.
+    for i, event in enumerate(by_type["diagnostic_event"]):
+        if event.get("interpreted_type") != STREAM_END_TYPE:
+            continue
+        session = sessions.get(event.get("session_id"))
+        if session is None:
+            continue
+        capabilities = session.get("launcher_capabilities")
+        shape = capabilities.get("response_shape") if isinstance(capabilities, dict) else None
+        if shape == "one_shot":
+            report.add(
+                "STREAM_END_UNSUPPORTED",
+                record_where(i, event),
+                "event is typed %r, but session %s declares response_shape 'one_shot', "
+                "which has no stream to end"
+                % (STREAM_END_TYPE, event.get("session_id")),
             )
 
     # --- one user turn opens at most one agent ---------------------------
@@ -1153,9 +1232,16 @@ def validate_store(report, records):
     # Contract 6.2/6.4: the exact text sent to the agent is preserved for every
     # turn, not only the first. Without this, a chat served by one persistent
     # agent records what was sent at launch and nothing afterwards.
+    # Only a packet on a session that actually reached 'running' can have reached an
+    # agent. A launch_request on a session that never ran is the packet that was not
+    # sent, which is exactly what a launch failure is; counting it lets a chat pad
+    # the floor with decoy sessions and leave every later turn integration-blind.
     instructions_by_chat = {}
     for packet in by_type["launch_request"] + by_type["delivery_request"]:
         chat_id = packet.get("chat_id")
+        session = sessions.get(packet.get("session_id"))
+        if session is None or "running" not in _transition_targets(session):
+            continue
         if isinstance(chat_id, str):
             instructions_by_chat[chat_id] = instructions_by_chat.get(chat_id, 0) + 1
 
@@ -1186,6 +1272,27 @@ def validate_store(report, records):
                 "packet(s); every turn sent to an agent must be durably recorded"
                 % (chat_id, answered, recorded),
             )
+
+
+def _terminal_at(session):
+    """When the session entered its current terminal state, else None.
+
+    This is an ordering of two recorded timestamps, of the same kind the record
+    shapes already require (TIME_REGRESSION). It is not an elapsed-time rule and
+    infers nothing from silence: no duration is computed and no threshold exists.
+    """
+    if session.get("state") not in TERMINAL_SESSION_STATES:
+        return None
+    transitions = session.get("transitions")
+    if not isinstance(transitions, list) or not transitions:
+        return None
+    last = transitions[-1]
+    if not isinstance(last, dict) or last.get("to") != session.get("state"):
+        return None
+    at = last.get("at")
+    if isinstance(at, str) and TS_RE.match(at):
+        return at
+    return None
 
 
 def _transition_targets(session):
