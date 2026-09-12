@@ -1218,6 +1218,44 @@ class TestMutations(unittest.TestCase):
             "test_store.TestBindings.test_one_agent_per_chat",
         )
 
+    def test_m0_a_mutation_run_does_not_write_findings_into_the_probe_table(self):
+        """The probe table is handoff evidence, so it has to be right.
+
+        Every mutation below runs a guard test with its guard broken. Those
+        nested runs are supposed to fail; what they must not do is append to the
+        probe table, because a broken-on-purpose probe recorded as an escape
+        turns the report into a list of findings that are not real. This
+        happened: before the suppression, `--report` claimed eight findings where
+        there are three and named held guards as escapes. Mechanical mutation of
+        the suppression itself left the whole suite green, so it is tested here
+        rather than trusted.
+        """
+        before = list(_RESULTS)
+        _NESTED.append("m0-probe")
+        try:
+            ProbeCase.record(self, "M0-not-a-real-finding",
+                             "record a probe result while a mutation is running",
+                             True, "should not reach the table")
+        finally:
+            _NESTED.pop()
+        self.assertEqual(
+            before, _RESULTS,
+            "a probe recorded during a mutation run reached the table; the "
+            "report would publish findings that are artifacts of the probes",
+        )
+
+        # ...and the counterpart, so this is not passing because `record` has
+        # stopped recording altogether.
+        ProbeCase.record(self, "M0-not-a-real-finding",
+                         "record a probe result outside a mutation run",
+                         True, "should reach the table")
+        self.assertEqual(
+            len(before) + 1, len(_RESULTS),
+            "record() stopped recording outside mutation runs too, which would "
+            "empty the probe table instead of keeping it honest",
+        )
+        _RESULTS.pop()
+
     def test_m6_without_the_addressability_guard_at_all(self):
         self._mutate(
             "M6-addressability-guard-removed",
