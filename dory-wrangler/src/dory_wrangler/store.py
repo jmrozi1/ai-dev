@@ -69,6 +69,19 @@ MAX_TITLE_CHARS = 200
 DIAGNOSTIC_PAGE_DEFAULT = 100
 DIAGNOSTIC_PAGE_MAX = 1000
 
+# Observation kinds that can only be produced by an operation which addressed an
+# already-launched agent. Contract 6.1 gives `stop`, `events` and `deliver` the
+# `agent_handle` as their only address and requires a launcher to remember
+# nothing between calls, so the harness cannot have issued any of these without
+# holding a handle.
+#
+# `reattach_failed` is deliberately absent, for the same reason the contract
+# exempts it: a session interrupted in `launching` never received a handle, so
+# failing to re-attach is the true record of exactly that.
+ADDRESSING_OBSERVATION_KINDS = frozenset(
+    ("stop_confirmed", "stop_unconfirmed", "reattached", "stream_read_failed")
+)
+
 _MAX_SEQUENCE_RETRIES = 64
 
 
@@ -599,6 +612,19 @@ class ChatStore(object):
             self._write_session_file(chat_id, session, binding, create=True)
         return session, binding
 
+    def _issued_handles(self, chat_id, session_id):
+        """The handles an accepted `launch_result` actually returned for a session.
+
+        One derivation, used by every rule that needs it. Contract 4.3 and 6.1
+        both turn on which handles a launcher genuinely issued, and two copies of
+        that computation is how a rule and its enforcement drift apart.
+        """
+        issued = set()
+        for result in self.read_launch_results(chat_id, session_id):
+            if result.get("outcome") == "accepted" and result.get("agent_handle"):
+                issued.add(result["agent_handle"])
+        return issued
+
     def set_agent_handle(self, chat_id, session_id, handle):
         """Record the handle the launcher returned.
 
@@ -613,10 +639,7 @@ class ChatStore(object):
             if not os.path.isfile(path):
                 raise NotFound("no session %s on chat %s" % (session_id, chat_id))
             session, binding = self._read_session_file(path)
-            issued = set()
-            for result in self.read_launch_results(chat_id, session_id):
-                if result.get("outcome") == "accepted" and result.get("agent_handle"):
-                    issued.add(result["agent_handle"])
+            issued = self._issued_handles(chat_id, session_id)
             if handle not in issued:
                 raise ValidationRefused(
                     "no accepted launch_result for session %s returned handle %r "
@@ -625,6 +648,43 @@ class ChatStore(object):
                 )
             session["agent_handle"] = handle
             self._write_session_file(chat_id, session, binding)
+        return session
+
+    def _require_addressable(self, chat_id, session_id, what):
+        """Refuse an operation that addresses an agent nothing gave us a handle for.
+
+        Contract 6.1: `stop`, `events` and `deliver` take the `agent_handle` the
+        launcher returned, and a launcher is required to remember nothing between
+        calls. An operation recorded against a session with no issued handle
+        therefore reached the agent by some other route, and the only other route
+        is launcher-side memory -- the exact arrangement the seam exists to
+        forbid.
+
+        Stated over the handle the launcher *issued*, not over the field being
+        populated. Keyed on the session's own field alone this would test the
+        label on the claim: it would pass for any string written there, and it
+        would be leaning on `set_agent_handle` to supply the fact behind it. That
+        is the defect this ticket family has produced repeatedly, so this check
+        carries its own fact and re-derives issuance from the packets.
+        """
+        session = self.read_session(chat_id, session_id)
+        handle = session.get("agent_handle")
+        issued = self._issued_handles(chat_id, session_id)
+        # Membership is the whole test, and deliberately so. A type or
+        # emptiness check alongside it would be unreachable: `issued` holds
+        # only non-empty strings, a session whose `agent_handle` is neither a
+        # string nor null is rejected as BAD_FIELD_TYPE by `read_session` above
+        # before this line runs, and `None not in issued` is already true. A
+        # clause that cannot fail is a clause no test can prove, and the
+        # mechanical mutation probe on this rail found exactly that -- removing
+        # it changed nothing anywhere.
+        if handle not in issued:
+            raise ValidationRefused(
+                "%s addresses session %s, for which the launcher issued no handle "
+                "(carried: %r; issued: %s); contract 6.1 addresses an agent through "
+                "the handle the launcher returned, so there is nothing to pass"
+                % (what, session_id, handle, ", ".join(sorted(issued)) or "none")
+            )
         return session
 
     def append_transition(self, chat_id, session_id, expected_state, to_state, owner,
@@ -741,6 +801,7 @@ class ChatStore(object):
         return self._append_packet(chat_id, record, "launch_result-" + request_id)
 
     def append_delivery_request(self, chat_id, session_id, instruction_text):
+        self._require_addressable(chat_id, session_id, "a delivery")
         existing = self._read_packets(chat_id, "delivery_request", session_id)
         record = {
             "record_type": "delivery_request",
@@ -763,7 +824,15 @@ class ChatStore(object):
         did. Nothing here is created by elapsed time, by silence, or by an
         absent record, and this store has no code path that creates one without
         a caller naming the interaction it attempted.
+
+        A kind that could only have come from addressing a live agent is refused
+        unless the launcher issued a handle for the session (contract 6.1). The
+        exemptions are the kinds that record something other than a reached
+        agent: `launch_timeout`, and `reattach_failed` on a session that never
+        got a handle to re-attach with.
         """
+        if kind in ADDRESSING_OBSERVATION_KINDS:
+            self._require_addressable(chat_id, session_id, "a %r observation" % kind)
         self.read_session(chat_id, session_id)
         record = {
             "record_type": "session_observation",

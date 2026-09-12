@@ -33,7 +33,13 @@ import tempfile
 import unittest
 
 import pagemodel
-from helpers import ONE_SHOT, TESTS_DIR, answer_turn, answered_turn
+from helpers import (
+    ONE_SHOT,
+    PERSISTENT_STREAM,
+    TESTS_DIR,
+    answer_turn,
+    answered_turn,
+)
 
 from dory_wrangler import atomic
 from dory_wrangler.webapp import PAGE
@@ -42,7 +48,9 @@ from dory_wrangler.errors import (
     ProvenanceRefused,
     StoreCorrupt,
     StoreError,
+    ValidationRefused,
 )
+from dory_wrangler.service import ChatService
 from dory_wrangler.store import ChatStore
 
 # Probes whose outcome is a finding rather than a refusal. Naming them here
@@ -52,10 +60,21 @@ EXPECTED_FINDINGS = {
     "A6-transcription-is-not-checked",
     "A7-system-authored-assistant-text",
     "B7-a-truncated-tail-is-undetectable",
-    "H1-turn-floor-rejects-an-honest-chat",
 }
 
+# H1, the turn-instruction floor rejecting an honest chat, was an expected
+# finding here until the contract correction at 7afe8df. It is closed, so it is
+# no longer listed above; `TestClosedContractFindings` keeps the shapes it
+# documented under test rather than deleting the evidence along with the finding.
+
 _RESULTS = []
+
+# Depth counter for mutation probes. A mutation probe runs a guard test *inside*
+# another test, with the guard deliberately broken; if that nested run were
+# allowed to append to the probe table, every mutation would publish a fake
+# finding and the handoff's own evidence would be wrong. The nested run still
+# fails -- that is the whole point of it -- it just does not get counted.
+_NESTED = []
 
 
 class ProbeCase(unittest.TestCase):
@@ -67,9 +86,10 @@ class ProbeCase(unittest.TestCase):
         self.store = ChatStore(self.root)
 
     def record(self, name, attack, held, detail):
-        _RESULTS.append(
-            {"name": name, "attack": attack, "held": held, "detail": detail}
-        )
+        if not _NESTED:
+            _RESULTS.append(
+                {"name": name, "attack": attack, "held": held, "detail": detail}
+            )
         if name in EXPECTED_FINDINGS:
             self.assertFalse(
                 held,
@@ -744,49 +764,345 @@ class TestVerificationIntegrity(ProbeCase):
 # ---------------------------------------------------------------------------
 
 
-class TestContractFindings(ProbeCase):
-    def test_h1_the_turn_floor_rejects_an_honest_chat(self):
-        """FINDING. A user who sends twice before an answer makes the chat invalid.
+class TestClosedContractFindings(ProbeCase):
+    """H1, closed by the contract correction, kept under test as a regression.
 
-        Contract 6.4's floor counts every user message before the last agent
-        message as "answered", and counts only packets on sessions that reached
-        `running`. Two honest and reachable v0.1 sequences therefore produce a
-        store the validator rejects:
+    Until 7afe8df the turn-instruction floor counted the user messages preceding
+    the last agent message and called them "answered turns". Three honest and
+    reachable v0.1 histories were therefore rejected by the validator, and this
+    file carried H1 as an expected finding. The floor now counts the occasions on
+    which the agent produced an answer, so all three validate.
 
-          * the user sends a second turn while the first agent is still running
-            (one agent per chat means no second session, so no second packet);
-          * the first launch fails and a later turn succeeds (the failed
-            session's packet does not count).
+    The finding is gone; the shapes are not. Deleting these with the finding
+    would leave #86's own send path -- which records a user turn unconditionally
+    and refuses nothing -- resting on a rule nothing exercises. Each test below
+    drives the shape through the real store and requires the store to be clean,
+    so a floor that regresses toward counting user messages fails here rather
+    than in a fixture nobody runs against a live store.
+    """
 
-        Neither involves a fabricated record. The chat is exactly what happened.
-        This is not #86's to fix: the rule lives in the contract and the packets
-        live in #87, so it is reported rather than worked around, and no
-        #86-produced store can trigger it because #86 writes no packets and no
-        agent messages.
+    def assertNoTurnFloorViolation(self, chat_id):
+        violations = self.store.verify()
+        self.assertEqual(
+            [], [v for v in violations if v[0] == "TURN_INSTRUCTION_MISSING"],
+            "the corrected floor (contract 6.4) rejected an honest chat: %s" % (violations,),
+        )
+        return violations
+
+    def test_a_second_turn_sent_while_the_agent_is_running(self):
+        """#86 records the second turn; one agent per chat means no second packet.
+
+        This is the user-visible side of the interaction #87 raised. #86's shell
+        does not refuse a send because an agent is busy -- `send_user_message`
+        makes the turn durable and only then notifies the listener -- so the
+        history really does hold two user messages against one instruction
+        packet. The old floor called that a missing packet.
         """
         chat_id = self.store.create_chat("Two turns, one answer")["chat_id"]
         first = self.store.append_user_message(chat_id, "please look at the build")
-        # A launch that fails: no agent, so its packet does not count.
-        session, _b = self.store.create_session(chat_id, first["message_id"],
-                                                "dev-local", ONE_SHOT)
+        session, _b = self.store.create_session(
+            chat_id, first["message_id"], "dev-local", ONE_SHOT
+        )
+        sid = session["session_id"]
+        request = self.store.append_launch_request(chat_id, sid, "please look at the build")
+        self.store.append_transition(
+            chat_id, sid, "pending", "launching", "harness",
+            {"kind": "harness_action", "ref": request["request_id"]},
+        )
+        handle = "agent-" + sid[-6:]
+        self.store.append_launch_result(
+            chat_id, request["request_id"], sid, "accepted", agent_handle=handle
+        )
+        self.store.append_transition(
+            chat_id, sid, "launching", "running", "launcher",
+            {"kind": "launch_result", "ref": request["request_id"]},
+        )
+        self.store.set_agent_handle(chat_id, sid, handle)
+
+        # The user sends again while that agent is still running. Nothing refuses.
+        service = ChatService(self.store)
+        service.send_user_message(chat_id, "any luck?")
+        # And a second agent is still refused, so there is no second packet.
+        second = self.store.read_messages(chat_id)[-1]
+        with self.assertRaises(ConcurrencyRefused):
+            self.store.create_session(chat_id, second["message_id"], "dev-local", ONE_SHOT)
+
+        event, _c = self.store.append_diagnostic_event(
+            chat_id, sid, self.store.next_event_sequence(chat_id, sid),
+            "agent", "recognized", "assistant_text",
+            '{"type":"assistant_text","text":"the build failed on line 12"}',
+        )
+        self.store.append_agent_message(
+            chat_id, sid, event["event_id"], "the build failed on line 12"
+        )
+        self.assertEqual(
+            ["user", "user", "agent"],
+            [m["author"] for m in self.store.read_messages(chat_id)],
+        )
+        self.assertEqual([], self.assertNoTurnFloorViolation(chat_id))
+
+    def test_a_failed_launch_followed_by_a_later_successful_turn(self):
+        chat_id = self.store.create_chat("Retry")["chat_id"]
+        first = self.store.append_user_message(chat_id, "please look at the build")
+        session, _b = self.store.create_session(
+            chat_id, first["message_id"], "dev-local", ONE_SHOT
+        )
         self.store.append_launch_request(chat_id, session["session_id"], "please look")
-        self.store.append_transition(chat_id, session["session_id"], "pending",
-                                     "launch_failed", "harness",
-                                     {"kind": "harness_action", "ref": None})
-        # The user tries again, and this time an agent answers.
+        self.store.append_transition(
+            chat_id, session["session_id"], "pending", "launch_failed", "harness",
+            {"kind": "harness_action", "ref": None},
+        )
         second = self.store.append_user_message(chat_id, "any luck?")
         answer_turn(self.store, chat_id, second, "the build failed on line 12")
+        self.assertEqual([], self.assertNoTurnFloorViolation(chat_id))
 
-        codes = set(code for code, _w, _d in self.store.verify())
-        held = "TURN_INSTRUCTION_MISSING" not in codes
-        self.record(
-            "H1-turn-floor-rejects-an-honest-chat",
-            "a failed launch followed by a later successful turn, with no fabricated record",
-            held,
-            "the validator emits %s for a chat that records exactly what happened; "
-            "reachable by #87 the moment a launch fails or a user sends twice"
-            % sorted(codes),
+    def test_a_turn_that_reached_no_agent_at_all(self):
+        chat_id = self.store.create_chat("Nobody home")["chat_id"]
+        self.store.append_user_message(chat_id, "hello?")
+        self.assertEqual([], self.assertNoTurnFloorViolation(chat_id))
+
+    def test_the_floor_is_still_a_floor(self):
+        """The correction weakened the rule; it did not remove it.
+
+        A chat holding an answer with no instruction packet behind it is still
+        rejected. Without this, the three tests above would pass equally well
+        against a floor that had been deleted outright.
+        """
+        chat_id = self.store.create_chat("No packet")["chat_id"]
+        user = self.store.append_user_message(chat_id, "q")
+        session, _b = self.store.create_session(
+            chat_id, user["message_id"], "dev-local", ONE_SHOT
         )
+        sid = session["session_id"]
+        request = self.store.append_launch_request(chat_id, sid, "q")
+        self.store.append_transition(
+            chat_id, sid, "pending", "launching", "harness",
+            {"kind": "harness_action", "ref": request["request_id"]},
+        )
+        handle = "agent-" + sid[-6:]
+        self.store.append_launch_result(
+            chat_id, request["request_id"], sid, "accepted", agent_handle=handle
+        )
+        self.store.append_transition(
+            chat_id, sid, "launching", "running", "launcher",
+            {"kind": "launch_result", "ref": request["request_id"]},
+        )
+        self.store.set_agent_handle(chat_id, sid, handle)
+        event, _c = self.store.append_diagnostic_event(
+            chat_id, sid, self.store.next_event_sequence(chat_id, sid),
+            "agent", "recognized", "assistant_text",
+            '{"type":"assistant_text","text":"a"}',
+        )
+        self.store.append_agent_message(chat_id, sid, event["event_id"], "a")
+        # Two separated answer runs, one packet: the floor must still bite.
+        self.store.append_user_message(chat_id, "again")
+        event2, _c2 = self.store.append_diagnostic_event(
+            chat_id, sid, self.store.next_event_sequence(chat_id, sid),
+            "agent", "recognized", "assistant_text",
+            '{"type":"assistant_text","text":"b"}',
+        )
+        self.store.append_agent_message(chat_id, sid, event2["event_id"], "b")
+        codes = set(code for code, _w, _d in self.store.verify())
+        self.assertIn(
+            "TURN_INSTRUCTION_MISSING", codes,
+            "two answer occasions behind one packet must still be rejected; the "
+            "floor was weakened in one shape, not deleted",
+        )
+
+
+class TestTheLaunchSeamCarriesTheHandle(ProbeCase):
+    """Contract 6.1/4.3: a launcher must remember nothing between calls.
+
+    No store holds an argument list, so nothing here can show that an
+    implementation passed the handle rather than the session id. What a store
+    can show is the fact the signature exists to guarantee: every operation that
+    addressed an agent was issued by a harness that had the handle in hand. #86
+    implements no launcher, but it is the only writer of these records, so the
+    refusal belongs here.
+    """
+
+    def running_session(self, with_handle=True):
+        """A session the harness might address, with or without an issued handle.
+
+        `with_handle=False` leaves the session in `launching` with no
+        `launch_result` at all, because that is the only honest way to have
+        none: contract 4.6 already requires an `accepted` result to carry a
+        non-empty handle, so a launch that returned nothing is a launch that has
+        not returned yet. This is the state a harness restart finds (contract
+        5.4), and it is the state fixtures invalid/38 and invalid/39 describe.
+        """
+        chat_id = self.store.create_chat("Seam")["chat_id"]
+        user = self.store.append_user_message(chat_id, "go")
+        session, _b = self.store.create_session(
+            chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM
+        )
+        sid = session["session_id"]
+        request = self.store.append_launch_request(chat_id, sid, "go")
+        self.store.append_transition(
+            chat_id, sid, "pending", "launching", "harness",
+            {"kind": "harness_action", "ref": request["request_id"]},
+        )
+        if not with_handle:
+            return chat_id, sid
+        handle = "agent-" + sid[-6:]
+        self.store.append_launch_result(
+            chat_id, request["request_id"], sid, "accepted", agent_handle=handle
+        )
+        self.store.append_transition(
+            chat_id, sid, "launching", "running", "launcher",
+            {"kind": "launch_result", "ref": request["request_id"]},
+        )
+        self.store.set_agent_handle(chat_id, sid, handle)
+        return chat_id, sid
+
+    def test_a_stop_on_a_session_with_no_handle_is_refused(self):
+        chat_id, sid = self.running_session(with_handle=False)
+        held, detail = False, "the store recorded a stop on an agent it had no address for"
+        try:
+            self.store.append_session_observation(chat_id, sid, "stop_confirmed")
+        except ValidationRefused as exc:
+            held, detail = True, "refused: %s" % exc
+        self.record("C1-stop-without-an-issued-handle",
+                    "record a confirmed stop on a session the launcher gave no handle for",
+                    held, detail)
+
+    def test_a_delivery_on_a_session_with_no_handle_is_refused(self):
+        chat_id, sid = self.running_session(with_handle=False)
+        held, detail = False, "the store recorded a delivery to an agent it had no address for"
+        try:
+            self.store.append_delivery_request(chat_id, sid, "follow-up")
+        except ValidationRefused as exc:
+            held, detail = True, "refused: %s" % exc
+        self.record("C1-delivery-without-an-issued-handle",
+                    "deliver a follow-up turn to a session the launcher gave no handle for",
+                    held, detail)
+
+    def test_a_handle_written_but_never_issued_cannot_unlock_addressing(self):
+        """The guard carries its own fact instead of borrowing it.
+
+        Keyed on the session's `agent_handle` field alone, the check would test
+        the label on the claim: any string on the session would satisfy it. Here
+        the field is forced on disk without an issuing `launch_result`, which is
+        exactly what `set_agent_handle` refuses to do, and addressing must still
+        be refused.
+        """
+        chat_id, sid = self.running_session(with_handle=False)
+        path = self.store._session_path(chat_id, sid)
+        session, binding = self.store._read_session_file(path)
+        session["agent_handle"] = "a-handle-nobody-issued"
+        self.store._write_session_file(chat_id, session, binding)
+        self.assertEqual(
+            "a-handle-nobody-issued",
+            self.store.read_session(chat_id, sid)["agent_handle"],
+        )
+        held, detail = False, "a handle the launcher never issued unlocked addressing"
+        try:
+            self.store.append_delivery_request(chat_id, sid, "follow-up")
+        except ValidationRefused as exc:
+            held, detail = True, "refused: %s" % exc
+        self.record("C1-an-unissued-handle-does-not-unlock-addressing",
+                    "write a handle onto the session that no launch_result returned",
+                    held, detail)
+
+    def test_reattach_failed_is_exempt_because_there_was_nothing_to_address(self):
+        """Contract 5.4: a session interrupted in `launching` never got a handle.
+
+        Refusing this kind would make the store unable to record a true history,
+        which is the failure mode the turn floor had just been corrected for.
+        """
+        chat_id, sid = self.running_session(with_handle=False)
+        held, detail = True, "recorded, as the contract requires"
+        try:
+            self.store.append_session_observation(chat_id, sid, "reattach_failed")
+        except ValidationRefused as exc:
+            held, detail = False, "the store refused a true history: %s" % exc
+        self.record("C1-reattach-failed-stays-recordable",
+                    "record a failed re-attachment on a session that never got a handle",
+                    held, detail)
+
+    def test_a_handle_of_the_wrong_type_fails_closed_before_the_guard_runs(self):
+        """What lets the guard be a single membership test.
+
+        `_require_addressable` asks only whether the carried handle is one the
+        launcher issued. That is safe because a session whose `agent_handle` is
+        neither a string nor null never survives being read: the record is
+        rejected as `BAD_FIELD_TYPE` by the fail-closed read (contract D3). This
+        test holds that reasoning up; without it, simplifying the condition
+        would have rested on an argument nothing checked.
+        """
+        chat_id, sid = self.running_session(with_handle=False)
+        path = self.store._session_path(chat_id, sid)
+        raw = json.load(open(path))
+        raw["session"]["agent_handle"] = ["not", "a", "string"]
+        with open(path, "w") as fh:
+            fh.write(json.dumps(raw))
+        held, detail = False, "an unhashable handle reached the membership test"
+        try:
+            self.store.append_delivery_request(chat_id, sid, "follow-up")
+        except StoreCorrupt as exc:
+            held, detail = True, "refused on read: %s" % exc
+        except TypeError as exc:  # pragma: no cover - the failure this pins
+            detail = "raised TypeError rather than failing closed: %s" % exc
+        self.record("C1-a-malformed-handle-fails-closed-first",
+                    "put a non-string handle on the session and address the agent",
+                    held, detail)
+
+    def test_only_an_accepted_launch_can_put_a_handle_on_the_record(self):
+        """The premise `_issued_handles` rests on, held up rather than assumed.
+
+        `_issued_handles` counts a handle only from an `accepted` result. The
+        mechanical mutation probe on this rail removed that filter and nothing
+        went red, which is true and worth knowing: contract 4.6 already forbids
+        a `failed` or `unknown` result to carry an `agent_handle` at all, so a
+        non-accepted result with a handle cannot exist to be miscounted. That is
+        an argument, and an untested argument is how this ticket family has
+        repeatedly lost a guarantee. So it is tested, at both doors -- the write
+        that would create one and the read that would return one.
+        """
+        chat_id, sid = self.running_session(with_handle=False)
+        request = self.store.read_launch_requests(chat_id, sid)[0]
+        refusals = []
+        for outcome, extra in (("failed", {"failure_category": "launcher_error"}),
+                               ("unknown", {})):
+            try:
+                self.store.append_launch_result(
+                    chat_id, request["request_id"], sid, outcome,
+                    agent_handle="a-handle-from-a-launch-that-did-not-succeed", **extra
+                )
+            except ValidationRefused as exc:
+                refusals.append(str(exc))
+        wrote = len(refusals) == 2
+
+        # And the read door: put one on disk behind the store's back.
+        path = os.path.join(self.root, "chats", chat_id, "packets",
+                            "launch_result-%s.json" % request["request_id"])
+        with open(path, "w") as fh:
+            json.dump({
+                "record_type": "launch_result", "record_version": 1,
+                "request_id": request["request_id"], "session_id": sid,
+                "observed_at": "2026-09-12T00:00:00.000000Z", "outcome": "failed",
+                "failure_category": "launcher_error",
+                "agent_handle": "a-handle-from-a-launch-that-did-not-succeed",
+            }, fh)
+        read_closed = False
+        try:
+            self.store._issued_handles(chat_id, sid)
+        except StoreCorrupt:
+            read_closed = True
+
+        held = wrote and read_closed
+        self.record(
+            "C1-a-failed-launch-cannot-issue-a-handle",
+            "return a handle from a launch that failed, at the write door and the read door",
+            held,
+            "write refused twice: %s; read failed closed: %s" % (wrote, read_closed),
+        )
+
+    def test_addressing_a_session_that_has_a_handle_is_allowed(self):
+        chat_id, sid = self.running_session(with_handle=True)
+        self.store.append_delivery_request(chat_id, sid, "follow-up")
+        self.store.append_session_observation(chat_id, sid, "stop_confirmed")
+        self.assertEqual([], self.store.verify())
 
 
 # ---------------------------------------------------------------------------
@@ -811,9 +1127,11 @@ class TestMutations(unittest.TestCase):
     def _mutate(self, name, attack, target, attribute, replacement, guard_test):
         original = getattr(target, attribute)
         setattr(target, attribute, replacement)
+        _NESTED.append(name)
         try:
             still_passes = _run(guard_test)
         finally:
+            _NESTED.pop()
             setattr(target, attribute, original)
         held = not still_passes
         _RESULTS.append({
@@ -900,6 +1218,87 @@ class TestMutations(unittest.TestCase):
             "test_store.TestBindings.test_one_agent_per_chat",
         )
 
+    def test_m6_without_the_addressability_guard_at_all(self):
+        self._mutate(
+            "M6-addressability-guard-removed",
+            "let any operation address a session the launcher gave no handle for",
+            ChatStore, "_require_addressable",
+            lambda self, chat_id, session_id, what: None,
+            "test_adversarial.TestTheLaunchSeamCarriesTheHandle"
+            ".test_a_stop_on_a_session_with_no_handle_is_refused",
+        )
+
+    def test_m7_with_the_addressability_guard_keyed_on_the_label(self):
+        """The weakening that would make the guard test the label, not the fact.
+
+        This is the shape the previous rail found three times: a check that reads
+        the field the record carries instead of re-deriving the fact behind it.
+        Here it means trusting the session's own `agent_handle` without asking
+        whether a launcher ever issued it.
+        """
+        def label_only(self, chat_id, session_id, what):
+            session = self.read_session(chat_id, session_id)
+            handle = session.get("agent_handle")
+            if not (isinstance(handle, str) and handle):
+                raise ValidationRefused("no handle on session %s" % session_id)
+            return session
+
+        self._mutate(
+            "M7-addressability-keyed-on-the-carried-field",
+            "trust the handle written on the session instead of the one a launcher issued",
+            ChatStore, "_require_addressable", label_only,
+            "test_adversarial.TestTheLaunchSeamCarriesTheHandle"
+            ".test_a_handle_written_but_never_issued_cannot_unlock_addressing",
+        )
+
+    def test_m8_without_the_issuance_derivation(self):
+        """The other half of M7: the guard's own fact supply.
+
+        `_require_addressable` asks `_issued_handles` what the launcher actually
+        returned. With that answering "everything", the guard still runs and
+        still reads the right field, and is still worthless.
+        """
+        self._mutate(
+            "M8-issuance-derivation-removed",
+            "make every handle look issued, however it got onto the session",
+            ChatStore, "_issued_handles",
+            lambda self, chat_id, session_id: {"a-handle-nobody-issued"},
+            "test_adversarial.TestTheLaunchSeamCarriesTheHandle"
+            ".test_a_handle_written_but_never_issued_cannot_unlock_addressing",
+        )
+
+    def test_m9_with_the_reattach_failed_exemption_inverted(self):
+        """The exemption is load-bearing in the other direction.
+
+        Contract 5.4 requires a session interrupted in `launching` to be able to
+        record that re-attachment failed. Adding that kind to the addressing set
+        makes the store refuse a true history -- the failure mode the turn floor
+        was just corrected for -- so something must notice.
+        """
+        import dory_wrangler.store as store_module
+
+        self._mutate(
+            "M9-reattach-failed-exemption-inverted",
+            "require a handle for the one observation that records never having got one",
+            store_module, "ADDRESSING_OBSERVATION_KINDS",
+            frozenset(store_module.ADDRESSING_OBSERVATION_KINDS | {"reattach_failed"}),
+            "test_adversarial.TestTheLaunchSeamCarriesTheHandle"
+            ".test_reattach_failed_is_exempt_because_there_was_nothing_to_address",
+        )
+
+    def test_m10_without_the_observation_kind_filter(self):
+        """The set is what connects the guard to the operations that need it."""
+        import dory_wrangler.store as store_module
+
+        self._mutate(
+            "M10-addressing-kind-set-emptied",
+            "declare that no observation kind implies a reached agent",
+            store_module, "ADDRESSING_OBSERVATION_KINDS", frozenset(),
+            "test_adversarial.TestTheLaunchSeamCarriesTheHandle"
+            ".test_a_stop_on_a_session_with_no_handle_is_refused",
+        )
+
+
 
 # ---------------------------------------------------------------------------
 # Reporting
@@ -919,7 +1318,8 @@ def report():
         "test_adversarial.TestReopenFidelity",
         "test_adversarial.TestOneAgentPerChat",
         "test_adversarial.TestVerificationIntegrity",
-        "test_adversarial.TestContractFindings",
+        "test_adversarial.TestClosedContractFindings",
+        "test_adversarial.TestTheLaunchSeamCarriesTheHandle",
         "test_adversarial.TestMutations",
     ])
     stream = io.StringIO()
