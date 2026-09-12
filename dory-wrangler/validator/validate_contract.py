@@ -125,6 +125,20 @@ UNRESOLVED_OBSERVATION_KINDS = frozenset(
     ("stop_unconfirmed", "reattach_failed", "stream_read_failed")
 )
 
+# Observation kinds that can only be produced by an operation that addressed an
+# already-launched agent. Contract 6.1 gives 'stop', 'events' and 'deliver' the
+# agent_handle as their only address, so the harness cannot have issued any of
+# these without holding one.
+#
+# 'reattach_failed' is deliberately absent. A session interrupted in 'launching'
+# never received a handle, so there is nothing to address and a failed
+# re-attachment is the honest record of exactly that (contract 5.4). Requiring a
+# handle for it would reject a true history, which is the failure mode this
+# contract has already made once.
+ADDRESSING_OBSERVATION_KINDS = frozenset(
+    ("stop_confirmed", "stop_unconfirmed", "reattached", "stream_read_failed")
+)
+
 CONTINUATION_MODES = ("persistent", "fresh_binding")
 
 RESPONSE_SHAPES = ("stream", "one_shot")
@@ -806,6 +820,10 @@ def validate_store(report, records):
     # A handle is a fact about the launch boundary, so its provenance is the
     # accepted launch_result that returned it -- never the session's own assertion.
     issued_handles = {}
+    # When each handle became available to the harness: the earliest accepted
+    # launch_result that returned it. Contract 4.3 -- the harness cannot address
+    # an agent before the launcher has told it how.
+    handle_issued_at = {}
     for result in by_type["launch_result"]:
         if result.get("outcome") != "accepted":
             continue
@@ -813,6 +831,11 @@ def validate_store(report, records):
         handle = result.get("agent_handle")
         if isinstance(sid, str) and isinstance(handle, str) and handle:
             issued_handles.setdefault(sid, set()).add(handle)
+            at = result.get("observed_at")
+            if isinstance(at, str) and TS_RE.match(at):
+                seen_at = handle_issued_at.get((sid, handle))
+                if seen_at is None or at < seen_at:
+                    handle_issued_at[(sid, handle)] = at
 
     # --- sessions -------------------------------------------------------
     for i, session in enumerate(by_type["agent_session"]):
@@ -1203,6 +1226,77 @@ def validate_store(report, records):
         session = ref(where, "session_id", observation.get("session_id"), sessions, "agent_session")
         if session is not None and session.get("chat_id") != observation.get("chat_id"):
             report.add("CORRELATION_MISMATCH", where, "observation session belongs to a different chat")
+
+    # --- addressing an agent requires a handle the harness recorded -------
+    # Contract 6.1: 'stop', 'events' and 'deliver' take the agent_handle the
+    # launcher returned, and nothing else on the seam names an agent. A launcher
+    # is therefore required to remember nothing between calls, and the harness is
+    # forbidden to depend on one that does.
+    #
+    # The signature is an interface property: no store holds an argument list, so
+    # nothing here can show that an implementation passed the handle rather than
+    # the session id. What a store can show is the fact the signature exists to
+    # guarantee -- that every operation which addressed an agent was issued by a
+    # harness that had the handle in hand at the time. A record of such an
+    # operation on a session with no issued handle means the agent was reached by
+    # some other route, and the only other route is launcher-side memory.
+    addressing_records = []
+    for i, observation in enumerate(by_type["session_observation"]):
+        if observation.get("kind") in ADDRESSING_OBSERVATION_KINDS:
+            addressing_records.append(
+                (record_where(i, observation), observation, observation.get("observed_at"),
+                 "a %r observation" % observation.get("kind"))
+            )
+    for i, delivery in enumerate(by_type["delivery_request"]):
+        addressing_records.append(
+            (record_where(i, delivery), delivery, delivery.get("created_at"), "a delivery")
+        )
+
+    for where, record, when, label in addressing_records:
+        sid = record.get("session_id")
+        session = sessions.get(sid) if isinstance(sid, str) else None
+        if session is None:
+            continue  # DANGLING_REFERENCE already reported
+        # Stated over the handle the launcher *issued*, not over the field being
+        # populated. Keyed on the field alone this rule would test the label on
+        # the claim -- a store could satisfy it by writing any string -- and would
+        # be standing on SESSION_HANDLE_NOT_ISSUED to supply the fact behind it.
+        # A rule that goes vacuous when a neighbouring rule's keying shifts is the
+        # defect this ticket family has now produced seven times, so this one
+        # carries its own fact.
+        handle = session.get("agent_handle")
+        issued = issued_handles.get(sid, set())
+        if not (isinstance(handle, str) and handle and handle in issued):
+            report.add(
+                "ADDRESSED_WITHOUT_HANDLE",
+                where,
+                "%s is recorded on session %s, for which the launcher issued no handle "
+                "(carried: %r; issued: %s). 'stop', 'events' and 'deliver' address the "
+                "agent through the handle the launcher returned (6.1), so the harness had "
+                "nothing to pass and could only have asked the launcher to resolve the "
+                "session from state of its own"
+                % (label, sid, handle,
+                   ", ".join(sorted(issued)) if issued else "none"),
+            )
+            continue
+        issued_at = handle_issued_at.get((sid, handle))
+        if issued_at is None:
+            continue  # the issuing result has no usable timestamp; BAD_TIMESTAMP covers it
+        if not (isinstance(when, str) and TS_RE.match(when)):
+            continue
+        # Whole-second granularity, ties accepted: a launch_result and the first
+        # operation on its handle can honestly share a timestamp, and rejecting
+        # the tie would fail a true store to no purpose. Comparing the fixed-width
+        # second prefix also keeps an optional fractional part from sorting wrong.
+        if when[:19] < issued_at[:19]:
+            report.add(
+                "ADDRESSED_BEFORE_HANDLE_ISSUED",
+                where,
+                "%s on session %s is dated %s, before the accepted launch_result issued "
+                "handle %r at %s; the harness cannot have addressed an agent whose handle "
+                "it did not yet have"
+                % (label, sid, when, handle, issued_at),
+            )
 
     # --- the declared instruction bound, where one was measured -----------
     for i, packet in enumerate(by_type["launch_request"] + by_type["delivery_request"]):

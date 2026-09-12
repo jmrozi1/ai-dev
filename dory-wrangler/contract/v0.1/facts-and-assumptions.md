@@ -156,6 +156,17 @@ names what would have to change if the claim is false.
   *Claim to test:* the handle the internal launch returns is sufficient to stop
   that agent, without the caller supplying host or process detail; and whether
   the handle survives a harness restart well enough to re-attach through it.
+  *Narrowed, 2026-09-12:* A3 is now the whole of what the seam asks of a
+  launcher's memory. Contract 6.1 was corrected so that `stop`, `events` and
+  `deliver` take the handle rather than the `session_id`, because the earlier
+  signatures silently assumed a second and much larger capability — that a
+  launcher can map a harness session id to an agent from state of its own that
+  outlives a harness restart. The only internal path proven to work is a
+  one-shot script with no process and no storage, which cannot, and the
+  contract now says in 6.1 that no launcher is required to. What #90 must test
+  is therefore A3 exactly as written and nothing beyond it: hand the launcher
+  back the handle it returned and see whether that is enough. Reported as
+  contract defect C1 by #87.
   *Exposure:* the `stop` operation and the `running -> terminated` transition.
   The design now has a fallback if A3 is false: an unconfirmed stop and a failed
   re-attachment are recorded observations that carry the session to `unknown`,

@@ -12,9 +12,12 @@ first.
 The executable form of this contract is
 [`../../validator/validate_contract.py`](../../validator/validate_contract.py).
 Every rule stated here with a violation code in `SMALL_CAPS` is enforced there.
-**Not all of them are demonstrated by a fixture.** Of the 48 violation codes the
-validator enforces, 29 are exercised by a rejection fixture under
-[`../../fixtures/v0.1`](../../fixtures/v0.1) and 19 are not. All 19 have been
+**Not all of them are demonstrated by a fixture.** Of the 52 violation codes the
+validator enforces, 31 are exercised by a rejection fixture under
+[`../../fixtures/v0.1`](../../fixtures/v0.1) and 21 are not. (This count is
+recomputed whenever a revision moves it; the figure this paragraph carried
+before the launch-seam addressing fix had gone stale by two codes and two
+fixtures, which is the same class of drift as the rules it describes.) All 19 have been
 probed and fire correctly, so this is a regression-coverage gap rather than a
 correctness one; closing it is known carried work, tracked as review finding F8.
 An earlier revision of this paragraph claimed every code was fixture-demonstrated
@@ -192,8 +195,34 @@ session carries must be one an accepted `launch_result` for that same session
 actually returned (`SESSION_HANDLE_NOT_ISSUED`). It is meaningful only to the
 launcher that issued it.
 
-Provenance is not tidiness. `stop` (6.1) and restart re-attachment (5.4) both
-address the agent through this field, so a handle nobody issued makes both
+**This field is the address.** `stop`, `events`, and `deliver` (6.1) each take
+the handle, and nothing else on the seam identifies an agent. The harness
+records it durably precisely so that it can address the agent again after the
+harness has restarted, and so that a launcher never has to remember which agent
+belonged to which session. Storing the handle is not bookkeeping about the
+agent; it is the whole means of reaching it.
+
+Two rules follow from that and are enforced against the store, because the
+signature itself is an interface property no store snapshot can show:
+
+- A record that could only have been produced by addressing the agent — a
+  `session_observation` of kind `stop_confirmed`, `stop_unconfirmed`,
+  `reattached`, or `stream_read_failed`, or any `delivery_request` — may exist
+  only on a session that carries a handle (`ADDRESSED_WITHOUT_HANDLE`). A
+  harness with no handle has nothing to pass, so such a record can only mean the
+  launcher was asked to resolve the agent from state of its own, which 6.1
+  forbids anyone to depend on.
+- `reattach_failed` is deliberately **not** in that list. A session interrupted
+  in `launching` never received a handle, so after a restart there is nothing to
+  address and the honest record of that is exactly a failed re-attachment (5.4).
+  Requiring a handle for it would make a true history unrepresentable.
+- Such a record may not predate the accepted `launch_result` that issued the
+  handle (`ADDRESSED_BEFORE_HANDLE_ISSUED`), compared at whole-second
+  granularity with ties accepted. Addressing an agent before its handle existed
+  means the harness reached it by some other route.
+
+Provenance is not tidiness. Because `stop` (6.1) and restart re-attachment (5.4)
+both address the agent through this field, a handle nobody issued makes both
 target nothing, and it would do so silently: the harness would record a
 `reattach_failed` for an agent that was never unreachable. Requiring the handle
 to be *present* is not the same as requiring it to *exist*. Together with
@@ -466,8 +495,13 @@ define it is what produces a chat nobody can use.
 
 A `running` session with an open binding is a legal durable state. After a
 restart the harness must, for each non-terminal session, attempt to re-attach to
-the agent through the stored `agent_handle` and record what came back as a
-`session_observation` (4.7). Both outcomes are representable:
+the agent by calling `events(agent_handle, after_sequence)` with the stored
+handle, and record what came back as a `session_observation` (4.7). **The stored
+handle is the whole of what the harness carries across the restart, and it has
+to be enough**: the launcher may be a script that was not running a moment ago
+and remembers nothing (6.1), so re-attachment may not depend on the launcher
+recognising a session id, a caller, or a previous call. Both outcomes are
+representable:
 
 - `reattached` — the session continues as it was. If it was driven to `unknown`
   first, `unknown -> running` returns it (fixture
@@ -481,9 +515,14 @@ binding is released, and the chat can bind a new agent. **The user is never
 stuck**, and the harness never resolves this on its own. The same applies when
 `stop` itself fails: an unconfirmed stop is cause 4 above, not a dead end.
 
-A session interrupted in `launching` is the second case of this shape. If the
-launch outcome cannot be recovered, an `obs_` of kind `reattach_failed` carries
-it to `unknown`, and the user may abandon it. **A retry is a new session with its
+A session interrupted in `launching` is the second case of this shape, and it is
+the case in which there is no handle at all: the launch was never accepted, so
+nothing was ever returned to address. There is therefore nothing to call, the
+attempt fails without being made, and an `obs_` of kind `reattach_failed`
+carries the session to `unknown`, from which the user may abandon it. This is
+why `reattach_failed` is the one observation kind that does not require a handle
+(4.3); every other one records an operation that could only have been issued
+with one. **A retry is a new session with its
 own launch packet, never a second packet on the old one** — one launch attempt,
 one session, one run identity (4.3, 6.2), and a double-launch stays visible as
 two sessions rather than hiding inside one.
@@ -523,13 +562,91 @@ behavior on this side of the seam.
 | Operation | Input | Output | Always available |
 | --- | --- | --- | --- |
 | `launch` | `launch_request` (6.2) | `launch_result` (6.3) | yes |
-| `stop` | `session_id`, reason string | acknowledgement, or a failure category | yes |
-| `events` | `session_id`, `after_sequence` | see *Reading what the agent produced* below | yes |
-| `deliver` | `session_id`, delivery packet (6.4) | `launch_result`-shaped acknowledgement | **only if declared** |
+| `stop` | `agent_handle`, reason string | acknowledgement, or a failure category | yes |
+| `events` | `agent_handle`, `after_sequence` | see *Reading what the agent produced* below | yes |
+| `deliver` | `agent_handle`, delivery packet (6.4) | `launch_result`-shaped acknowledgement | **only if declared** |
 
 There is **no** `status`, `health`, `poll`, or `describe` operation. v0.1 learns
 what the agent is doing only from what the boundary reports. Adding an
 interrogation operation is #82's decision.
+
+#### What a launcher must remember between calls: nothing
+
+**Every operation that addresses an already-launched agent takes the
+`agent_handle` that launcher itself returned from `launch`, and nothing else
+identifies the agent.** A launcher is therefore not required to remember
+anything between calls: no session-to-agent mapping, no durable state of its
+own, no live process surviving the call, and no memory of having been called
+before. A launcher that is a one-shot script, started afresh for every
+operation and gone when it returns, is a **first-class implementation of this
+boundary**, not a degraded one.
+
+Three consequences follow and each is normative.
+
+1. **The harness never passes `session_id` across this seam as an address.**
+   `session_id` is the harness's own identity for a run (4.3) and is meaningless
+   to a launcher. `chat_id`, `request_id` and `delivery_id` appear inside the
+   instruction packets as correlation (6.2, 6.4) and are likewise not addresses.
+   The handle is the only address.
+2. **No operation may require a previous call in the same launcher process.**
+   `events(handle, 0)` issued by a harness that has just started must behave as
+   it would for the process that launched the agent, and `stop(handle, reason)`
+   must too. This is what makes contract 5.4 achievable: after a restart the
+   harness has the handle and nothing else, and that must be enough.
+3. **The harness never depends on launcher-side memory, and may not be written
+   as though it could.** The harness owns all durable state (D1), the handle
+   included, and re-supplies it on every call. A launcher *may* keep state of
+   its own — a persistent one almost certainly will — but the boundary is
+   specified so that no launcher *must*, and no correct harness behavior may
+   rest on one that does.
+
+The previous revision of this table gave `stop`, `events`, and `deliver` the
+input `session_id` while 4.3 said they address the agent through
+`agent_handle`. Those reconcile only if the launcher can resolve a `session_id`
+to an agent from state of its own that survives a harness restart. The only
+internal path proven to work today — a one-shot script that takes instruction
+text and returns the agent's response — has no process to hold such a mapping
+and no storage to put it in, so requiring it would have placed durable state
+behind the seam, contradicting D1, and would have made the boundary satisfiable
+only by the development launcher. That is the exact failure this seam exists to
+prevent. This follows the same rule already applied to continuation: **do not
+assume unproven internal capability.** Reported as a contract defect by #87.
+
+This was resolved by putting the handle on the seam rather than by declaring
+handle resolution a launcher capability. A capability would have kept the
+failing arrangement expressible and legal — a launcher could declare that it
+resolves session ids, and a harness could then be written to rely on it — and it
+would have added a third capability axis for #86, #87 and #88 to be invariant
+under, with two signatures for one operation. The unconditional form admits
+every launcher the capability form would have admitted, including launchers that
+do keep their own mapping, since such a launcher may simply ignore the handle it
+is given. It has one signature, and it makes the sentence above true of every
+launcher without a store having to declare anything.
+
+**What a store can and cannot show.** The operation signatures are an interface
+property: no store snapshot contains an argument list, so no fixture can prove
+that an implementation passed the handle rather than the session id, and none
+here claims to. What a store *can* show is the fact the signature exists to
+guarantee — that the harness only ever addressed an agent whose handle it had
+durably recorded — and that is enforced (`ADDRESSED_WITHOUT_HANDLE`,
+`ADDRESSED_BEFORE_HANDLE_ISSUED`, below and in 4.3). Checking the signature
+itself is #87's obligation at its own boundary.
+
+**Known residual, stated rather than implied.** A store records what came back,
+never the call that fetched it. An `events` call that returned nothing therefore
+leaves no record at all, so a harness that asked a launcher to resolve a session
+id and got nothing back is indistinguishable from a harness that never called.
+Concretely: launcher-sourced `diagnostic_event` records on a session that was
+never accepted and never got a handle are accepted, because the honest reading
+is that the `launch` call itself returned that output — which is exactly what
+fixtures `valid/05-launch-failure` and `valid/09-launch-outcome-unknown` are.
+Rejecting the shape would reject those true histories, and the two are not
+separable from the records. Closing it would need a durable record of each
+boundary call, which is new machinery this correction does not introduce, or a
+time-based inference, which section 1 forbids outright. What is closed is every
+operation whose outcome the store *does* record: a stop, a re-attachment, a
+failed stream read, and a delivery each leave a record, and each is now checked
+against the handle.
 
 #### `deliver` is a declared capability, not an assumption
 
@@ -557,9 +674,11 @@ it by default.
 
 #### Reading what the agent produced
 
-`events(session_id, after_sequence)` returns raw payloads from the session,
-ordered, each carrying the `sequence` under which it is preserved (4.5).
-`after_sequence: 0` means from the beginning.
+`events(agent_handle, after_sequence)` returns raw payloads from the agent that
+handle names, ordered, each carrying the `sequence` under which it is preserved
+(4.5). `after_sequence: 0` means from the beginning. The handle is the address;
+the caller already knows which session it is reading, because it is the caller
+that recorded the handle against that session.
 
 - **It is resumable and may be called any number of times.** A caller that was
   interrupted resumes by passing the last `sequence` it stored. Delivery is

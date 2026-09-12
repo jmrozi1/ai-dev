@@ -1,0 +1,129 @@
+{
+  "fixture": {
+    "name": "stop-on-a-session-with-no-handle",
+    "expect": "reject",
+    "reason_code": "ADDRESSED_WITHOUT_HANDLE",
+    "description": "A launch whose outcome was 'unknown' returned no handle, so the harness never learned how to address this agent. The store nonetheless records a confirmed stop and terminates the session on it. With no handle there is nothing to pass to 'stop' (6.1), so the only way this call could have been made is by handing the launcher a session id and asking it to resolve the agent from state of its own -- exactly the cross-restart launcher memory the seam may not require. Nothing else in the validator catches this: SESSION_HANDLE_MISSING is keyed on having reached 'running', which this session never did, and SESSION_HANDLE_NOT_ISSUED has no field to check when the handle is simply absent."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_nohandlestop1",
+      "title": "Stop something we cannot name",
+      "created_at": "2026-09-12T12:00:00Z",
+      "updated_at": "2026-09-12T12:10:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_nohandlestop1",
+      "chat_id": "cht_nohandlestop1",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T12:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Start an agent on the seam question."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_nohandlestop1",
+      "chat_id": "cht_nohandlestop1",
+      "created_at": "2026-09-12T12:00:03Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "terminated",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T12:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_nohandlestop1"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T12:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_nohandlestop1"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T12:00:09Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_nohandlestop1"
+          }
+        },
+        {
+          "from": "unknown",
+          "to": "terminated",
+          "owner": "user",
+          "at": "2026-09-12T12:10:00Z",
+          "evidence": {
+            "kind": "observation",
+            "ref": "obs_nohandlestop1"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_nohandlestop1",
+      "chat_id": "cht_nohandlestop1",
+      "session_id": "ses_nohandlestop1",
+      "bound_at": "2026-09-12T12:00:03Z",
+      "released_at": "2026-09-12T12:10:00Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_nohandlestop1",
+      "chat_id": "cht_nohandlestop1",
+      "session_id": "ses_nohandlestop1",
+      "created_at": "2026-09-12T12:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Start an agent on the seam question."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_nohandlestop1",
+      "session_id": "ses_nohandlestop1",
+      "observed_at": "2026-09-12T12:00:09Z",
+      "outcome": "unknown",
+      "detail": "the call returned nothing usable, so no handle was ever issued"
+    },
+    {
+      "record_type": "session_observation",
+      "record_version": 1,
+      "observation_id": "obs_nohandlestop1",
+      "chat_id": "cht_nohandlestop1",
+      "session_id": "ses_nohandlestop1",
+      "observed_at": "2026-09-12T12:10:00Z",
+      "kind": "stop_confirmed",
+      "detail": "stop acknowledged for session ses_nohandlestop1"
+    }
+  ]
+}
