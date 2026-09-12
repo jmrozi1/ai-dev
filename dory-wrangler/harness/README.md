@@ -22,7 +22,8 @@ it.
 | `launchers/dev_agent.py` | the local development agent program `dev_local` starts. Not part of the boundary. |
 | `launchers/scripted_stub.py` | a second, non-production launcher, selected only by configuration. |
 | `launchers/registry.py` | configuration to launcher. Adding the internal bridge is one module and one entry here. |
-| `tests/` | the suite, including `test_adversarial.py`. |
+| `tests/internal_bridge.py` | **test material, not a launcher this product ships**: a faithful model of the proven internal path, written against the seam alone. Registered nowhere and imported by no product module. |
+| `tests/` | the suite, including `test_adversarial.py` and `test_internal_bridge.py`. |
 
 ## Running it
 
@@ -30,11 +31,13 @@ it.
 python3 dory-wrangler/harness/tests/run_tests.py
 ```
 
-Python 3 standard library only; no test framework beyond `unittest`. Four phases:
-the unit suite; every store the suite produced handed to
-`dory-wrangler/validator/validate_contract.py` on the command line; the
-contract's own fixtures; and the accurate stores that the known-defective
-`TURN_INSTRUCTION_MISSING` rule currently rejects, reported rather than enforced.
+Python 3 standard library only; no test framework beyond `unittest`. Three
+phases: the unit suite; every store the suite produced handed to
+`dory-wrangler/validator/validate_contract.py` on the command line; and the
+contract's own fixtures. The fourth phase this file used to describe held the
+accurate stores that the old `TURN_INSTRUCTION_MISSING` rule rejected; #85
+corrected that rule at `4ff8b63`, so those stores are ordinary phase-two stores
+now and live in `tests/test_turn_floor_regression.py`.
 
 ## Choosing a launcher
 
@@ -67,6 +70,28 @@ about the bridge.
 or internally. The enforcement mechanism is live and tested; the value is #90's
 to supply (U2).
 
+## The handle is the address
+
+`stop`, `events` and `deliver` each take the `agent_handle` the launcher returned
+from its own `launch`, and nothing else on the seam names an agent. `session_id`
+is the harness's identity for a run: it travels inside the instruction packets as
+correlation and is never an address.
+
+**A launcher is therefore required to remember nothing between calls** -- no
+session-to-agent mapping, no durable state, no live process surviving the call,
+no memory of having been called before. A one-shot script, started afresh for
+every operation and gone when it returns, is a first-class implementation of this
+boundary rather than a degraded one, and that is what makes contract 5.4
+achievable: after a restart the harness holds the handle and nothing else, and
+that has to be enough.
+
+The harness enforces its own half. It refuses to issue an addressing operation,
+or to write a record claiming one happened, for a session that carries no handle
+-- a session whose launch outcome was `unknown`, or one a restart interrupted in
+`launching`. `reattach_failed` is the one observation kind exempt from that,
+because the attempt fails without being made. The user is not stuck: `abandon` is
+contract 5.4's exit from exactly that state and needs no handle.
+
 ## What is deliberately absent
 
 No `status`, `health`, `poll`, or `describe` operation. No timer, inactivity
@@ -90,8 +115,39 @@ in `session_manager.py` is the one function a later answer changes.
 4. It maps its own failure modes onto the five abstract categories. An inactive
    user session and an uninitialised bridge are `unavailable`; the specifics stay
    inside the launcher and travel only in `detail`, which is never parsed.
-5. One entry in `launchers/registry.py`.
+   `detail` is rendered and never parsed, so passing it an exception object
+   rather than `str(exc)` is coerced rather than refused.
+5. **It synthesises an `agent_handle` if its transport issues none.** Handles are
+   opaque, so this is legal, and `LaunchResult` refuses `accepted` without one.
+6. **It buffers the response and serves it through `events`.** On a one-shot path
+   `launch` returns an outcome, not text, so the response cannot travel back
+   through the call that obtained it.
+7. **It emits a launcher-sourced `session_completed` or `session_failed` after
+   every response.** A bridge that reports the agent's text and nothing about its
+   exit leaves the session `running` forever, and every later turn is refused
+   until the user presses Stop. This is the difference between a working chat and
+   one that needs a manual Stop between every turn, and it is the obligation
+   easiest to miss.
+8. **It honours `after_sequence`.** `events` is resumable by sequence; a page
+   that does not advance is refused with a stated `LaunchBoundaryError` rather
+   than read again. Whether the internal bridge can resume is recorded as unknown
+   (C5), so this is the likeliest place an internal launcher first meets the seam.
+9. One entry in `launchers/registry.py`.
 
 Nothing else changes. `tests/test_swappability.py` runs the full chat loop
-against a launcher defined in the test file and registered nowhere, which is that
-claim in executable form.
+against a launcher defined in the test file and registered nowhere, and
+`tests/internal_bridge.py` is a faithful model of the proven internal path --
+one-shot, a blocking `launch` that returns the response with it, no issued
+handle, no state across a restart, no measured bound -- run through the whole
+chat loop by `tests/test_internal_bridge.py`. Three turns on it produce the same
+transcript as every other launcher and a store the contract validator accepts,
+and contract 6.1's four operations were sufficient: no operation, field, or
+capability was added for it. Start there rather than from this list alone.
+
+What that model also establishes, as product properties rather than defects:
+the user's Stop cannot reach a turn in flight, so contract 5.2's
+`running -> terminated` is unreachable on the one-shot shape; the agent has no
+memory of the chat; a dead bridge is discoverable only by attempting a turn; and
+a restart with a live session ends in `unknown`, whose only exit is the user's
+`abandon`. Each has a named test in `tests/test_internal_bridge.py`, and each is
+an affordance decision for #86 and #88 rather than something to fix here.

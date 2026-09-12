@@ -23,14 +23,11 @@ FIXTURE_OUT = os.environ.get(
     "DORY_TEST_STORE_DIR",
     os.path.join(tempfile.gettempdir(), "dory-wrangler-issue-87-stores"))
 SCRATCH = os.path.join(tempfile.gettempdir(), "dory-wrangler-issue-87-scratch")
-# Stores #87 produced that are accurate records of what happened and that the
-# contract validator currently rejects under the known-defective
-# TURN_INSTRUCTION_MISSING rule. Kept apart so the #85 fix can be validated
-# against real cases from this work rather than invented ones. They declare
-# `expect: accept` because that is #87's position on them.
-DIVERGENCE_OUT = os.environ.get(
-    "DORY_DIVERGENCE_STORE_DIR",
-    os.path.join(tempfile.gettempdir(), "dory-wrangler-issue-87-divergent-stores"))
+# There is no separate divergence directory any more. #85 corrected the
+# turn-instruction floor at `4ff8b63`, so the stores that used to be exported
+# there as `expect: accept` regression material are now ordinary stores in
+# phase 2 -- see `test_turn_floor_regression.py`. Keeping a second directory
+# would have been the workaround, not the fix.
 
 if HARNESS not in sys.path:
     sys.path.insert(0, HARNESS)
@@ -74,14 +71,6 @@ class StoreCheck(object):
             self.fail("expected the validator to emit %s; it emitted %s"
                       % (code, ", ".join(found) or "nothing"))
         return found
-
-    def keep_divergent(self, store, name, description):
-        """An accurate store the known-defective turn-floor rule rejects."""
-        if not os.path.isdir(DIVERGENCE_OUT):
-            os.makedirs(DIVERGENCE_OUT)
-        store.write_snapshot_fixture(
-            os.path.join(DIVERGENCE_OUT, "%s.json" % name), name,
-            expect="accept", description=description)
 
     def keep(self, store, name, description=None):
         """Write the store out in fixture form so the CLI validator can be run

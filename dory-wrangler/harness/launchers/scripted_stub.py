@@ -83,9 +83,12 @@ class ScriptedStubLauncher(LaunchBoundary):
     ``events_raise``
         raise on the next ``events`` call, so a reader-side failure can be
         distinguished from an end of stream.
-    ``resume_sessions``
-        session ids this instance can re-attach to, as a launcher with durable
-        state of its own would after a harness restart.
+    ``resume_handles``
+        agent handles this instance can re-attach to, as a launcher with durable
+        state of its own would after a harness restart. Keyed on the handle
+        because the handle is the seam's only address (contract 6.1): a launcher
+        is not given a session id to resolve and is required to remember nothing
+        between calls.
     ``on_launch``
         a callable invoked inside ``launch``, for re-entrancy probes.
     """
@@ -110,9 +113,12 @@ class ScriptedStubLauncher(LaunchBoundary):
         self._unknown_type = bool(options.get("unknown_type"))
         self._events_raise = options.get("events_raise")
         self._on_launch = options.get("on_launch")
+        # Keyed on the agent handle this launcher itself issued. Contract 6.1
+        # gives `stop`, `events` and `deliver` the handle as their only address;
+        # the session id never crosses the seam as one.
         self._sessions = {}
-        for session_id in options.get("resume_sessions") or []:
-            self._sessions[session_id] = _Session("stub-resumed-%s" % session_id)
+        for handle in options.get("resume_handles") or []:
+            self._sessions[handle] = _Session(handle)
         self._lock = threading.RLock()
         self._counter = 0
         # Observable facts a probe can check, so a claim about what this launcher
@@ -120,6 +126,9 @@ class ScriptedStubLauncher(LaunchBoundary):
         self.launch_calls = []
         self.deliver_calls = []
         self.stop_calls = []
+        # Every address this launcher was actually handed, in order. A claim
+        # about what crossed the seam never has to be taken on trust.
+        self.addressed = []
 
     @classmethod
     def from_options(cls, options):
@@ -153,41 +162,44 @@ class ScriptedStubLauncher(LaunchBoundary):
             handle = "stub-agent-%04d" % self._counter
         session = _Session(handle)
         with self._lock:
-            self._sessions[instruction.session_id] = session
+            self._sessions[handle] = session
         self._produce_turn(session, instruction.instruction_text)
         return LaunchResult(OUTCOME_ACCEPTED, agent_handle=handle)
 
     # -- deliver -----------------------------------------------------------
 
-    def deliver(self, session_id, instruction):
+    def deliver(self, agent_handle, instruction):
         if not self._capabilities.supports_delivery:
             # Not a fallback and not a degradation: this launcher declared
             # `fresh_binding`, so a later turn is served by a new launch that
             # the user's own turn opened.
-            return LaunchBoundary.deliver(self, session_id, instruction)
+            return LaunchBoundary.deliver(self, agent_handle, instruction)
         self.deliver_calls.append(instruction)
-        session = self._session(session_id)
+        self.addressed.append(("deliver", agent_handle))
+        session = self._session(agent_handle)
         self._produce_turn(session, instruction.instruction_text)
         return DeliveryAck(True)
 
     # -- events ------------------------------------------------------------
 
-    def events(self, session_id, after_sequence):
+    def events(self, agent_handle, after_sequence):
+        self.addressed.append(("events", agent_handle))
         if self._events_raise:
             category = self._events_raise if self._events_raise in FAILURE_CATEGORIES \
                 else "internal_error"
             self._events_raise = None
             raise LauncherError(category, "the stub could not read the stream")
-        session = self._session(session_id)
+        session = self._session(agent_handle)
         ready = [p for p in session.payloads if p.sequence > after_sequence]
         ended = session.stream_ended and self._capabilities.has_stream
         return EventsPage(ready, stream_ended=ended)
 
     # -- stop --------------------------------------------------------------
 
-    def stop(self, session_id, reason):
-        self.stop_calls.append((session_id, reason))
-        self._session(session_id)
+    def stop(self, agent_handle, reason):
+        self.stop_calls.append((agent_handle, reason))
+        self.addressed.append(("stop", agent_handle))
+        self._session(agent_handle)
         if self._stop_confirms == "raise":
             raise LauncherError("internal_error", "the stub could not reach the agent")
         return StopAck(bool(self._stop_confirms),
@@ -196,13 +208,13 @@ class ScriptedStubLauncher(LaunchBoundary):
 
     # -- private -----------------------------------------------------------
 
-    def _session(self, session_id):
+    def _session(self, agent_handle):
         with self._lock:
-            session = self._sessions.get(session_id)
+            session = self._sessions.get(agent_handle)
         if session is None:
             raise LauncherError(
                 "unavailable",
-                "this launcher has no record of session %s" % session_id)
+                "this launcher has no record of agent %s" % agent_handle)
         return session
 
     def _emit(self, session, source, interpretation, body, interpreted_type=None,

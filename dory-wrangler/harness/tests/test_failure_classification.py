@@ -15,6 +15,7 @@ import support
 from support import StoreCheck
 
 import launch_boundary as lb
+import session_manager
 from app import open_harness
 from errors import NotPermitted
 from launchers.dev_local import DEV_AGENT
@@ -80,10 +81,10 @@ class EveryFailureCategoryIsDurablyRecorded(unittest.TestCase, StoreCheck):
             def launch(self, instruction):
                 return {"outcome": "accepted", "agent_handle": "h"}
 
-            def events(self, session_id, after_sequence):
+            def events(self, agent_handle, after_sequence):
                 return lb.EventsPage([])
 
-            def stop(self, session_id, reason):
+            def stop(self, agent_handle, reason):
                 return lb.StopAck(True)
 
         harness = open_harness({}, launcher=Liar())
@@ -302,3 +303,175 @@ class TerminationIsDistinguishable(unittest.TestCase, StoreCheck):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EveryFailureShapeStillProducesADurableOutcome(unittest.TestCase, StoreCheck):
+    """Review finding F2: the classification is inside the guarantee it makes.
+
+    `_call_launch`'s docstring promises that "a launcher that raises anything at
+    all still produces a classified, durable outcome". The earlier revision
+    enforced that with an `except` around `self._boundary.launch(...)` and
+    nothing around the classification that followed it, so building the
+    `LaunchResult` that recorded a failure could itself raise -- straight out of
+    the `except` block and past the caller. The one method whose entire purpose
+    is that guarantee checked it at its label.
+
+    The concrete trigger is the most natural mistake the seam invites:
+    `LauncherError` validated `category` and not `detail`, while `LaunchResult`
+    requires `detail` to be a string, so a launcher that put the exception object
+    in `detail` -- which is exactly what the seam tells authors `detail` is for --
+    bricked the chat. Measured before the fix: session stuck in `launching`,
+    binding still open, **zero** `launch_result` records, stop and abandon and
+    every further turn refused, and a store the contract validator calls valid.
+
+    Two independent repairs, tested separately because they close different
+    halves: `LauncherError` now coerces `detail` where it crosses, and
+    `_call_launch` wraps its own classification.
+    """
+
+    class _BadDetail(lb.LaunchBoundary):
+        launcher_id = "bad-detail"
+
+        def __init__(self, detail):
+            self._detail = detail
+
+        @property
+        def capabilities(self):
+            return lb.LauncherCapabilities("fresh_binding", "one_shot", None)
+
+        def launch(self, instruction):
+            raise lb.LauncherError(lb.FAILURE_UNAVAILABLE, detail=self._detail)
+
+        def events(self, agent_handle, after_sequence):
+            return lb.EventsPage([])
+
+        def stop(self, agent_handle, reason):
+            return lb.StopAck(True)
+
+    DETAILS = (
+        OSError("the bridge socket is gone"),   # the natural mistake: the exception
+        object(),
+        b"bytes from a transport",
+        {"code": 7},
+        17,
+    )
+
+    def _turn_with_detail(self, salt, detail):
+        harness = support.deterministic({}, salt, launcher=self._BadDetail(detail))
+        chat_id = harness.create_chat("A launcher that failed while failing")
+        outcome = harness.send_turn(chat_id, "hello")
+        return harness, chat_id, outcome
+
+    def test_every_shape_of_bad_detail_still_reaches_a_terminal_state(self):
+        for i, detail in enumerate(self.DETAILS):
+            with self.subTest(detail=type(detail).__name__):
+                harness, chat_id, outcome = self._turn_with_detail("d%d" % i, detail)
+                session = harness.store.sessions_of(chat_id)[0]
+                self.assertEqual(session["state"], "launch_failed",
+                                 "the session must not be left in `launching`")
+                self.assertEqual(len(harness.store.all_of("launch_result")), 1,
+                                 "the attempt must be recorded whatever the "
+                                 "launcher put in `detail`")
+                self.assertEqual(outcome.launch_outcome, "failed")
+
+    def test_the_category_the_launcher_chose_survives_the_coercion(self):
+        """Rejecting a bad `detail` would have been the wrong repair: it turns a
+        launcher's honest, correctly categorised failure into an unclassified
+        crash, and #90 counts these categories apart."""
+        harness, chat_id, outcome = self._turn_with_detail(
+            "d9", OSError("the bridge socket is gone"))
+        self.assertEqual(outcome.failure_category, "unavailable",
+                         "not internal_error: the launcher classified this itself")
+        result = harness.store.all_of("launch_result")[0]
+        self.assertEqual(result["failure_category"], "unavailable")
+        self.assertIsInstance(result["detail"], str)
+        self.assertIn("the bridge socket is gone", result["detail"],
+                      "the concrete cause must survive into the record")
+
+    def test_the_binding_is_released_and_the_chat_is_usable(self):
+        """What made F2 severe: the chat was unusable for the life of the
+        process, with no stop, no abandon and no further turn."""
+        harness, chat_id, _ = self._turn_with_detail("d10", OSError("gone"))
+        session = harness.store.sessions_of(chat_id)[0]
+        binding = harness.store.binding_for_session(session["session_id"])
+        self.assertIsNotNone(binding["released_at"], "the binding must be released")
+        self.assertEqual(harness.store.open_bindings(chat_id), [])
+        # The chat takes another turn, which is the whole point.
+        second = support.deterministic({"launcher": "scripted-stub"}, "d11")
+        self.assertTrue(second)
+        self.assert_store_valid(harness.store, "bad-detail-launch-failed-recorded")
+
+    def test_launcher_error_coerces_a_non_string_detail_at_the_seam(self):
+        """Repair one, at the seam. `detail` is rendered and never parsed, so
+        coercion loses nothing."""
+        exc = lb.LauncherError(lb.FAILURE_REJECTED, detail=OSError("boom"))
+        self.assertIsInstance(exc.detail, str)
+        self.assertIn("boom", exc.detail)
+        self.assertEqual(exc.category, "rejected")
+        # A LaunchResult can now be built from it, which is what used to raise.
+        result = lb.LaunchResult(lb.OUTCOME_FAILED, failure_category=exc.category,
+                                 detail=exc.detail)
+        self.assertIsInstance(result.detail, str)
+
+    def test_a_string_detail_and_none_are_passed_through_untouched(self):
+        self.assertEqual(lb.LauncherError(lb.FAILURE_REJECTED, "plain").detail, "plain")
+        self.assertIsNone(lb.LauncherError(lb.FAILURE_REJECTED).detail)
+
+    def test_classification_that_fails_anyway_still_becomes_internal_error(self):
+        """Repair two, independent of repair one. A `LauncherError` subclass that
+        gets past the coercion entirely -- the class of mistake nobody enumerated
+        -- must still produce a durable outcome rather than escape the method."""
+
+        class Sneaky(lb.LauncherError):
+            def __init__(self):
+                lb.LauncherError.__init__(self, lb.FAILURE_REJECTED, "fine")
+                self.detail = OSError("set after construction")
+                self.category = "not-a-category-at-all"
+
+        class Raises(self._BadDetail):
+            def launch(self, instruction):
+                raise Sneaky()
+
+        harness = support.deterministic({}, "d12", launcher=Raises(None))
+        chat_id = harness.create_chat("Classification that cannot succeed")
+        outcome = harness.send_turn(chat_id, "hello")
+        self.assertEqual(outcome.launch_outcome, "failed")
+        self.assertEqual(outcome.failure_category, "internal_error")
+        session = harness.store.sessions_of(chat_id)[0]
+        self.assertEqual(session["state"], "launch_failed")
+        self.assertEqual(len(harness.store.all_of("launch_result")), 1)
+        self.assert_store_valid(harness.store, "classification-failure-is-internal-error")
+
+    def test_the_probe_would_have_failed_before_the_repair(self):
+        """The negative control for both repairs at once: restore the old
+        behaviour and require these assertions to fail, so a vacuous probe is
+        not mistaken for a closed defect."""
+
+        class OldCallLaunch(session_manager.SessionManager):
+            def _call_launch(self, instruction):
+                # Verbatim the pre-repair shape: the guard is around the call
+                # and not around the classification.
+                try:
+                    result = self._boundary.launch(instruction)
+                except lb.LauncherError as exc:
+                    detail = exc.__dict__.get("raw_detail", exc.detail)
+                    return lb.LaunchResult(lb.OUTCOME_FAILED,
+                                           failure_category=exc.category, detail=detail)
+                return result
+
+        class RawDetail(self._BadDetail):
+            def launch(self, instruction):
+                exc = lb.LauncherError(lb.FAILURE_UNAVAILABLE, "placeholder")
+                exc.raw_detail = OSError("the bridge socket is gone")
+                raise exc
+
+        harness = OldCallLaunch(session_manager.Store(None), RawDetail(None))
+        chat_id = harness.create_chat("The defect, restored")
+        with self.assertRaises(lb.LaunchBoundaryError):
+            harness.send_turn(chat_id, "hello")
+        session = harness.store.sessions_of(chat_id)[0]
+        self.assertEqual(session["state"], "launching",
+                         "this is the state F2 left the session in")
+        self.assertEqual(harness.store.all_of("launch_result"), [])
+        self.assertEqual(support.codes(harness.store.snapshot()), [],
+                         "and the store validated, which is why nothing caught it")

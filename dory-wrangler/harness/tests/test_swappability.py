@@ -36,6 +36,7 @@ class OutOfTreeLauncher(lb.LaunchBoundary):
         self._handle_prefix = handle_prefix
         self._sessions = {}
         self._counter = 0
+        self.addressed = []
 
     @property
     def capabilities(self):
@@ -61,25 +62,30 @@ class OutOfTreeLauncher(lb.LaunchBoundary):
 
     def launch(self, instruction):
         self._counter += 1
+        handle = "%s-%d" % (self._handle_prefix, self._counter)
         session = []
-        self._sessions[instruction.session_id] = session
+        # Keyed on the handle: contract 6.1 gives the three addressing
+        # operations the handle and nothing else.
+        self._sessions[handle] = session
         self._turn(session, instruction.instruction_text)
-        return lb.LaunchResult(lb.OUTCOME_ACCEPTED,
-                               agent_handle="%s-%d" % (self._handle_prefix, self._counter))
+        return lb.LaunchResult(lb.OUTCOME_ACCEPTED, agent_handle=handle)
 
-    def deliver(self, session_id, instruction):
+    def deliver(self, agent_handle, instruction):
         if not self._capabilities.supports_delivery:
-            return lb.LaunchBoundary.deliver(self, session_id, instruction)
-        self._turn(self._sessions[session_id], instruction.instruction_text)
+            return lb.LaunchBoundary.deliver(self, agent_handle, instruction)
+        self.addressed.append(("deliver", agent_handle))
+        self._turn(self._sessions[agent_handle], instruction.instruction_text)
         return lb.DeliveryAck(True)
 
-    def events(self, session_id, after_sequence):
-        session = self._sessions.get(session_id)
+    def events(self, agent_handle, after_sequence):
+        self.addressed.append(("events", agent_handle))
+        session = self._sessions.get(agent_handle)
         if session is None:
-            raise lb.LauncherError("unavailable", "no such session")
+            raise lb.LauncherError("unavailable", "no such agent")
         return lb.EventsPage([p for p in session if p.sequence > after_sequence])
 
-    def stop(self, session_id, reason):
+    def stop(self, agent_handle, reason):
+        self.addressed.append(("stop", agent_handle))
         return lb.StopAck(True)
 
 
@@ -157,20 +163,92 @@ class NothingAboveTheSeamKnowsALauncher(unittest.TestCase):
                     "%s names %r, so the chat and session layers are not "
                     "launcher-independent" % (module_name, name))
 
-    def test_no_behaviour_branches_on_a_launcher_id(self):
-        """`launcher_id` is opaque (contract 4.3). Two launchers that differ only
-        in id and in what their handles look like must produce identical chats."""
-        transcripts = []
-        states = []
-        for prefix in ("opaque", "host-buildbox-07-pid-3319"):
-            launcher = OutOfTreeLauncher(handle_prefix=prefix)
-            launcher.launcher_id = "out-of-tree"
+    # The two arms of the `launcher_id` experiment. They differ in the id and in
+    # the shape of the handles, and in nothing else.
+    ARMS = (("out-of-tree", "opaque"),
+            ("other-launcher", "host-buildbox-07-pid-3319"))
+
+    def _run_arm(self, launcher_id, handle_prefix, manager=None):
+        launcher = OutOfTreeLauncher(handle_prefix=handle_prefix)
+        launcher.launcher_id = launcher_id
+        if manager is None:
             harness = open_harness({}, launcher=launcher)
-            chat_id = run_three_turns(harness, "Opaque")
-            transcripts.append(harness.transcript(chat_id))
-            states.append([s["state"] for s in harness.store.sessions_of(chat_id)])
-        self.assertEqual(transcripts[0], transcripts[1])
-        self.assertEqual(states[0], states[1])
+        else:
+            harness = manager(store_module.Store(None), launcher)
+        chat_id = run_three_turns(harness, "Opaque")
+        sessions = harness.store.sessions_of(chat_id)
+        return {
+            "transcript": harness.transcript(chat_id),
+            "states": [s["state"] for s in sessions],
+            "recorded_ids": [s["launcher_id"] for s in sessions],
+            "handles": [s["agent_handle"] for s in sessions],
+            "packets": [p["instruction_text"]
+                        for p in harness.store.all_of("launch_request")],
+        }
+
+    def test_no_behaviour_branches_on_a_launcher_id(self):
+        """`launcher_id` is opaque (contract 4.3). Two launchers that differ in
+        id, and in what their handles look like, must produce identical chats.
+
+        **An earlier revision of this test was review finding F4**: it assigned
+        `launcher.launcher_id = "out-of-tree"` inside *both* arms of its loop,
+        which was already `OutOfTreeLauncher`'s own value, so the assignment was
+        a no-op and the arms differed only in the handle prefix. The claim it
+        made was true -- `launcher_id` is written into the session record and
+        read nowhere -- but the evidence offered for it tested the label. The
+        repair is not "vary it and hope": the varied thing is now *asserted to
+        have actually differed*, and to have differed **in the store**, before
+        anything is concluded from the arms agreeing.
+        """
+        arms = [self._run_arm(launcher_id, prefix)
+                for launcher_id, prefix in self.ARMS]
+
+        # 1. The input really varied.
+        self.assertNotEqual(self.ARMS[0][0], self.ARMS[1][0])
+        # 2. It reached the store, so the experiment exercised a real difference
+        #    rather than two runs of the same configuration.
+        self.assertEqual(arms[0]["recorded_ids"],
+                         [self.ARMS[0][0]] * len(arms[0]["recorded_ids"]))
+        self.assertEqual(arms[1]["recorded_ids"],
+                         [self.ARMS[1][0]] * len(arms[1]["recorded_ids"]))
+        self.assertTrue(arms[0]["recorded_ids"])
+        self.assertNotEqual(arms[0]["recorded_ids"], arms[1]["recorded_ids"])
+        # 3. The handles differed too, so nothing downstream could have been
+        #    matching on those instead.
+        self.assertNotEqual(arms[0]["handles"], arms[1]["handles"])
+        # 4. And with all of that varied, the chat is identical.
+        self.assertEqual(arms[0]["transcript"], arms[1]["transcript"])
+        self.assertEqual(arms[0]["transcript"], expected_transcript())
+        self.assertEqual(arms[0]["states"], arms[1]["states"])
+        self.assertEqual(arms[0]["packets"], arms[1]["packets"])
+
+    def test_the_comparison_fails_against_a_harness_that_does_branch_on_it(self):
+        """The teeth. Without this, an all-passing comparison is consistent with
+        a comparison that cannot tell anything apart -- which is exactly how F4
+        survived a 37-probe suite written against this defect class."""
+
+        class BranchesOnTheLauncherId(session_manager.SessionManager):
+            def _launch_turn(self, chat_id, text):
+                if self._boundary.launcher_id == "other-launcher":
+                    text = "[%s] %s" % (self._boundary.launcher_id, text)
+                return session_manager.SessionManager._launch_turn(self, chat_id, text)
+
+        arms = [self._run_arm(launcher_id, prefix, manager=BranchesOnTheLauncherId)
+                for launcher_id, prefix in self.ARMS]
+        self.assertNotEqual(arms[0]["transcript"], arms[1]["transcript"],
+                            "the comparison cannot tell two different chats apart, "
+                            "so it proves nothing")
+        self.assertNotEqual(arms[0]["packets"], arms[1]["packets"])
+
+    def test_the_repaired_evidence_would_fail_on_the_defective_version(self):
+        """And the specific defect F4 named: holding the id constant across the
+        arms must now be caught by the test itself, not by a reviewer."""
+        arms = [self._run_arm("out-of-tree", prefix)
+                for _, prefix in self.ARMS]
+        self.assertEqual(arms[0]["recorded_ids"], arms[1]["recorded_ids"],
+                         "this is the no-op assignment F4 described")
+        with self.assertRaises(AssertionError):
+            self.assertNotEqual(arms[0]["recorded_ids"], arms[1]["recorded_ids"])
 
     def test_the_session_manager_takes_its_launcher_by_injection(self):
         parameters = inspect.signature(session_manager.SessionManager.__init__).parameters

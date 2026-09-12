@@ -117,12 +117,17 @@ class DurableRecordsAreCanonical(unittest.TestCase, StoreCheck):
             "i", store_path=self.path)
         chat_id = harness.create_chat("Restart, recovered")
         harness.send_turn(chat_id, "are you there?")
-        session_id = harness.store.non_terminal_sessions(chat_id)[0]["session_id"]
+        live = harness.store.non_terminal_sessions(chat_id)[0]
+        session_id = live["session_id"]
+        # The address the reopened launcher is given is the handle the store
+        # recorded, which is the whole of what the harness carries across a
+        # restart (contract 5.4, 6.1).
+        handle = live["agent_handle"]
 
         reopened = support.deterministic(
             {"launcher": "scripted-stub",
              "options": {"continuation": "persistent", "response_shape": "stream",
-                         "resume_sessions": [session_id]}},
+                         "resume_handles": [handle]}},
             "j", store_path=self.path, start=support.RESTARTED)
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "running")])
         kinds = [o["kind"] for o in reopened.store.observations_of(session_id)]
@@ -227,7 +232,7 @@ class EventsAreResumable(unittest.TestCase, StoreCheck):
         session = harness.store.sessions_of(chat_id)[0]
         before = harness.store.events_of(session["session_id"])
 
-        page = harness._boundary.events(session["session_id"], 0)
+        page = harness._boundary.events(session["agent_handle"], 0)
         self.assertTrue(page.payloads, "the launcher must replay from sequence 1")
         for payload in page.payloads:
             self.assertIsNone(harness._preserve(session, payload),

@@ -164,15 +164,20 @@ class DevLocalLauncher(LaunchBoundary):
                                     "could not send the instruction: %s" % exc)
 
         with self._lock:
-            self._sessions[instruction.session_id] = session
+            # Keyed on the handle this launcher issued, because the handle is the
+            # seam's only address (contract 6.1). A launcher is never handed a
+            # session id to resolve and is required to remember nothing between
+            # calls; this one keeps live processes, so it does remember, but
+            # nothing above the seam may depend on that.
+            self._sessions[handle] = session
         return LaunchResult(OUTCOME_ACCEPTED, agent_handle=handle)
 
     # -- deliver -----------------------------------------------------------
 
-    def deliver(self, session_id, instruction):
+    def deliver(self, agent_handle, instruction):
         if not self._capabilities.supports_delivery:
-            return LaunchBoundary.deliver(self, session_id, instruction)
-        session = self._session(session_id)
+            return LaunchBoundary.deliver(self, agent_handle, instruction)
+        session = self._session(agent_handle)
         with session.lock:
             try:
                 session.process.stdin.write(
@@ -184,8 +189,8 @@ class DevLocalLauncher(LaunchBoundary):
 
     # -- events ------------------------------------------------------------
 
-    def events(self, session_id, after_sequence):
-        session = self._session(session_id)
+    def events(self, agent_handle, after_sequence):
+        session = self._session(agent_handle)
         with session.lock:
             if self._profile == "one_shot":
                 ready = [p for p in session.payloads if p.sequence > after_sequence]
@@ -255,8 +260,8 @@ class DevLocalLauncher(LaunchBoundary):
 
     # -- stop --------------------------------------------------------------
 
-    def stop(self, session_id, reason):
-        session = self._session(session_id)
+    def stop(self, agent_handle, reason):
+        session = self._session(agent_handle)
         with session.lock:
             if session.process.poll() is not None:
                 _release_pipes(session.process)
@@ -283,18 +288,18 @@ class DevLocalLauncher(LaunchBoundary):
 
     # -- private -----------------------------------------------------------
 
-    def _session(self, session_id):
+    def _session(self, agent_handle):
         with self._lock:
-            session = self._sessions.get(session_id)
+            session = self._sessions.get(agent_handle)
         if session is None:
-            # A fresh launcher after a harness restart holds no session state.
+            # A fresh launcher after a harness restart holds no agent state.
             # Re-attachment through this path therefore fails, which the harness
             # records as `reattach_failed` -- an observation, not a conclusion
             # about whether the agent is alive.
             raise LauncherError(
                 FAILURE_UNAVAILABLE,
-                "this launcher has no live record of session %s; a development agent "
-                "process does not survive the harness that started it" % session_id)
+                "this launcher has no live record of agent %s; a development agent "
+                "process does not survive the harness that started it" % agent_handle)
         return session
 
     def _agent_payload(self, session, line):

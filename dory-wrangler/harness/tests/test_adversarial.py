@@ -63,8 +63,8 @@ class AOneShotLauncherCannotObserveAStreamEnding(unittest.TestCase, StoreCheck):
         typed `stream_end`, just set the page's end-of-stream flag instead."""
 
         class FlagsAnEndWithoutSayingIt(ScriptedStubLauncher):
-            def events(self, session_id, after_sequence):
-                page = ScriptedStubLauncher.events(self, session_id, after_sequence)
+            def events(self, agent_handle, after_sequence):
+                page = ScriptedStubLauncher.events(self, agent_handle, after_sequence)
                 return lb.EventsPage(page.payloads, stream_ended=True)
 
         launcher = FlagsAnEndWithoutSayingIt({"continuation": "fresh_binding",
@@ -763,3 +763,129 @@ class TheHarnessRefusesToWriteAnUnreadableHistory(unittest.TestCase, StoreCheck)
             session = harness.store.get("agent_session", event["session_id"])
             self.assertEqual(event["chat_id"], session["chat_id"])
         self.assert_store_valid(harness.store, "payload-attribution")
+
+
+class ALauncherThatCannotResumeIsRefusedRatherThanSpunOn(unittest.TestCase, StoreCheck):
+    """Review finding F1, and the shape it hid behind.
+
+    `events` is resumable **by sequence** (contract 6.1): the caller resumes by
+    passing the last sequence it stored. A launcher that ignores `after_sequence`
+    and replays its whole page therefore answers every read with the same page.
+    `_drain` used to fail closed on a sequence *gap* but not on a non-advancing
+    *replay*, so it looped: review measured 2001 `events` calls in under twenty
+    seconds, the chat lock held throughout and nothing durable written -- a hung
+    UI at full CPU rather than a stated refusal.
+
+    The existing probe, `test_replaying_the_whole_stream_stores_nothing_twice`,
+    is green and always would have been: it tests replay for *duplication*
+    against a launcher that does honour `after_sequence`. Duplication and
+    termination are different guarantees, and the second was checked at the
+    label of the first.
+
+    Whether the internal bridge can resume at all is **unknown**
+    (facts-and-assumptions C5), which is why this is the likeliest internal
+    failure mode rather than a curiosity.
+
+    Nothing here measures a duration or compares a threshold. The refusal is
+    about a fact the launcher supplied -- this page advanced nothing -- and the
+    tests below bound the number of *calls*, never the time they take.
+    """
+
+    class _Replaying(lb.LaunchBoundary):
+        """Correct in every respect but one: it ignores `after_sequence`."""
+
+        launcher_id = "replaying"
+
+        def __init__(self, terminal=False):
+            self._terminal = terminal
+            self._payloads = {}
+            self.events_calls = 0
+
+        @property
+        def capabilities(self):
+            return lb.LauncherCapabilities("fresh_binding", "one_shot", None)
+
+        def launch(self, instruction):
+            import json
+            reply = "answer to: %s" % instruction.instruction_text.strip()
+            payloads = [lb.EventPayload(
+                1, lb.SOURCE_AGENT, lb.INTERPRETATION_RECOGNIZED,
+                json.dumps({"type": "assistant_text", "text": reply}).encode("utf-8"),
+                interpreted_type=lb.PAYLOAD_ASSISTANT_TEXT, text=reply)]
+            if self._terminal:
+                payloads.append(lb.EventPayload(
+                    2, lb.SOURCE_LAUNCHER, lb.INTERPRETATION_RECOGNIZED,
+                    json.dumps({"type": "session_completed"}).encode("utf-8"),
+                    interpreted_type=lb.PAYLOAD_SESSION_COMPLETED))
+            self._payloads["replay-agent-1"] = payloads
+            return lb.LaunchResult(lb.OUTCOME_ACCEPTED, agent_handle="replay-agent-1")
+
+        def events(self, agent_handle, after_sequence):
+            self.events_calls += 1
+            if self.events_calls > 50:
+                raise AssertionError(
+                    "the drain did not terminate: %d events calls" % self.events_calls)
+            return lb.EventsPage(list(self._payloads[agent_handle]))
+
+        def stop(self, agent_handle, reason):
+            return lb.StopAck(True)
+
+    def test_probe_a_launcher_that_ignores_after_sequence_is_refused(self):
+        launcher = self._Replaying()
+        harness = open_harness({}, launcher=launcher)
+        chat_id = harness.create_chat("A launcher that cannot resume")
+        with self.assertRaises(lb.LaunchBoundaryError) as caught:
+            harness.send_turn(chat_id, "hello")
+        self.assertIn("ignored after_sequence", str(caught.exception))
+
+    def test_the_refusal_is_immediate_and_not_a_slower_spin(self):
+        """The property that matters is termination, so it is asserted over the
+        number of calls the launcher received rather than over elapsed time. A
+        fix that merely made the loop slower would pass a wall-clock test."""
+        launcher = self._Replaying()
+        harness = open_harness({}, launcher=launcher)
+        chat_id = harness.create_chat("Bounded")
+        with self.assertRaises(lb.LaunchBoundaryError):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(launcher.events_calls, 2,
+                         "one read that advanced, one that did not, then the "
+                         "refusal -- there is nothing further to ask")
+
+    def test_the_chat_is_usable_afterwards_rather_than_locked(self):
+        """What made F1 severe was not the loop but the held lock: nothing else
+        could reach the chat. A refusal must leave the lock released."""
+        launcher = self._Replaying()
+        harness = open_harness({}, launcher=launcher)
+        chat_id = harness.create_chat("Still usable")
+        with self.assertRaises(lb.LaunchBoundaryError):
+            harness.send_turn(chat_id, "hello")
+        session = harness.store.sessions_of(chat_id)[0]
+        self.assertEqual(session["state"], "running",
+                         "the refusal says nothing about whether the agent is alive")
+        # The lock is free, so the user's own exits still work.
+        harness.stop_agent(chat_id, "the launcher cannot resume")
+        self.assertIn(harness.store.get("agent_session", session["session_id"])["state"],
+                      ("terminated", "unknown"))
+        support.end_chat(harness, chat_id)
+        self.assert_store_valid(harness.store, "replay-refused-chat-still-usable")
+
+    def test_a_replaying_launcher_that_does_reach_a_terminal_event_is_not_refused(self):
+        """The control. The refusal must be about non-advancement, not about
+        replay: a launcher that replays but whose first page ends the session
+        never asks a second time, and must be served normally."""
+        launcher = self._Replaying(terminal=True)
+        harness = open_harness({}, launcher=launcher)
+        chat_id = harness.create_chat("Replay that terminates")
+        harness.send_turn(chat_id, "hello")
+        self.assertEqual(launcher.events_calls, 1)
+        self.assertEqual(harness.store.sessions_of(chat_id)[0]["state"], "completed")
+        self.assert_store_valid(harness.store, "replay-that-terminates-is-served")
+
+    def test_a_launcher_that_honours_after_sequence_is_untouched(self):
+        """The other control: the ordinary path must not have been narrowed."""
+        harness = stub_harness("f1c", continuation="persistent",
+                               response_shape="stream")
+        chat_id = run_three_turns(harness, "Resumable, as specified")
+        self.assertEqual(len(harness.transcript(chat_id)), 6)
+        support.end_chat(harness, chat_id)
+        self.assert_store_valid(harness.store, "after-sequence-honoured-control")

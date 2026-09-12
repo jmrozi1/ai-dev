@@ -65,6 +65,21 @@ AUTHORIZED_TRANSITIONS = {
     ("unknown", "abandoned"): "user",
 }
 
+# Contract 4.3/6.1: observation kinds that can only be produced by an operation
+# which addressed an already-launched agent. `stop`, `events` and `deliver` take
+# the `agent_handle` and nothing else, so the harness cannot honestly record any
+# of these for a session whose handle it never received. Kept here as the
+# harness's own fail-closed rule rather than left to a validator run afterwards,
+# and drift-guarded against the validator's copy in the test suite.
+#
+# `reattach_failed` is deliberately absent, exactly as in the validator: a
+# session interrupted in `launching`, or one whose launch outcome came back
+# `unknown`, never received a handle, so the attempt fails without being made
+# and a failed re-attachment is the honest record of precisely that (5.4).
+ADDRESSING_OBSERVATION_KINDS = frozenset(
+    ("stop_confirmed", "stop_unconfirmed", "reattached", "stream_read_failed")
+)
+
 
 class TurnOutcome(object):
     """What one user turn produced. Evidence, not narration."""
@@ -239,6 +254,25 @@ class SessionManager(object):
                 "was never sent must not be stored as though it had been" % (size, bound)
             )
 
+    def _agent_handle(self, session):
+        """The address contract 6.1 gives every operation after `launch`.
+
+        `stop`, `events` and `deliver` take the handle the launcher returned and
+        nothing else; a launcher is required to remember nothing between calls,
+        so a session with no handle is a session the harness has no way to
+        reach. Failing closed here is the harness's half of that rule, and it is
+        what keeps the harness from being written as though launcher-side memory
+        could stand in for the handle.
+        """
+        handle = session.get("agent_handle")
+        if not (isinstance(handle, str) and handle):
+            raise LaunchBoundaryError(
+                "session %s carries no agent_handle, so there is nothing to "
+                "address: contract 6.1 gives `stop`, `events` and `deliver` the "
+                "handle the launcher returned and nothing else"
+                % (session["session_id"],))
+        return handle
+
     def _launch_turn(self, chat_id, text):
         existing = self._active_session(chat_id)
         if existing is not None:
@@ -313,7 +347,27 @@ class SessionManager(object):
         durable outcome: the five categories are the distinctions #90 must be
         able to count, so an unclassified crash becomes `internal_error` rather
         than a lost session or an invented success.
+
+        **The guarantee covers the classification too** (review finding F2). An
+        earlier revision wrapped only `self._boundary.launch(...)`, so building
+        the `LaunchResult` that classified a failure could itself raise --
+        out of the `except` block, past the caller, leaving the session stuck in
+        `launching` with its binding open and no `launch_result` written at all.
+        The one method whose entire purpose is "every failure becomes a durable
+        outcome" checked that at its label. Everything this method does is now
+        inside the guarantee, and the fallback below cannot fail: its category is
+        a module constant and its detail is built by this method.
         """
+        try:
+            return self._classify_launch(instruction)
+        except Exception as exc:  # noqa: BLE001 - including our own classification
+            return LaunchResult(
+                OUTCOME_FAILED, failure_category=FAILURE_INTERNAL_ERROR,
+                detail="the launch outcome could not be classified: %s: %s"
+                       % (type(exc).__name__, exc),
+            )
+
+    def _classify_launch(self, instruction):
         try:
             result = self._boundary.launch(instruction)
         except LauncherError as exc:
@@ -334,6 +388,10 @@ class SessionManager(object):
 
     def _deliver_turn(self, chat_id, session, text):
         session_id = session["session_id"]
+        # Resolved before anything durable is written: a `delivery_request` is a
+        # record that the harness addressed the agent, and it may not exist on a
+        # session with no handle (contract 4.3, ADDRESSED_WITHOUT_HANDLE).
+        agent_handle = self._agent_handle(session)
         self._check_declared_bound(text)
         user_message_id = self._append_message(chat_id, "user", text)
 
@@ -359,7 +417,7 @@ class SessionManager(object):
         self._store.put(packet)
 
         try:
-            ack = self._boundary.deliver(session_id, instruction)
+            ack = self._boundary.deliver(agent_handle, instruction)
         except LauncherError as exc:
             ack = DeliveryAck(None, detail="%s: %s" % (exc.category, exc.detail))
         if not isinstance(ack, DeliveryAck):
@@ -384,13 +442,14 @@ class SessionManager(object):
         #83's gap rather than something to paper over with a timer.
         """
         session_id = session["session_id"]
+        agent_handle = self._agent_handle(session)
         capabilities = self._boundary.capabilities
         agent_messages = []
 
         while True:
             after = self._store.last_event_sequence(session_id)
             try:
-                page = self._boundary.events(session_id, after)
+                page = self._boundary.events(agent_handle, after)
             except LauncherError as exc:
                 # A reader-side failure is not an end of stream. It says nothing
                 # about whether the agent is alive (contract 4.7, 6.1).
@@ -415,6 +474,7 @@ class SessionManager(object):
             turn_complete = False
             reached_terminal = False
             stream_end_event_id = None
+            stored_any = False
 
             for payload in page.payloads:
                 if payload.interpreted_type == PAYLOAD_STREAM_END:
@@ -422,6 +482,7 @@ class SessionManager(object):
                 event_id = self._preserve(session, payload)
                 if event_id is None:
                     continue  # a replayed (session_id, sequence); already stored
+                stored_any = True
                 if payload.is_chat_text:
                     agent_messages.append(
                         self._append_message(session["chat_id"], "agent", payload.text,
@@ -454,6 +515,31 @@ class SessionManager(object):
                 return agent_messages
             if turn_complete or not page.payloads:
                 return agent_messages
+            if not stored_any:
+                # Review finding F1. `events` is resumable *by sequence*: the
+                # caller resumes by passing the last sequence it stored, so a
+                # page in which every payload was already stored means the
+                # launcher did not honour `after_sequence` and the next call
+                # would ask the same question and get the same answer. Looping
+                # is then unbounded, with the chat lock held and nothing durable
+                # written -- a hung UI at full CPU rather than a stated refusal,
+                # and whether the internal bridge can resume at all is unknown
+                # (facts-and-assumptions C5).
+                #
+                # This is a refusal about a fact the launcher supplied, not an
+                # inference from elapsed time: no duration is measured and no
+                # threshold compared. It is the mirror of the sequence-gap
+                # refusal in `_preserve`, which the earlier revision had and this
+                # one lacked -- the existing replay probe tested replay for
+                # *duplication*, which is a different guarantee from the drain
+                # *terminating*.
+                raise LaunchBoundaryError(
+                    "launcher returned %d payload(s) for session %s after sequence "
+                    "%d and every one of them was already stored; `events` is "
+                    "resumable by sequence (contract 6.1), so a page that does not "
+                    "advance means the launcher ignored after_sequence and reading "
+                    "again cannot make progress"
+                    % (len(page.payloads), session_id, after))
 
     def _reject_unsupported_stream_end(self, payload, capabilities):
         if not capabilities.has_stream:
@@ -529,8 +615,22 @@ class SessionManager(object):
                 raise NotPermitted(
                     "session %s is in state %r; only a running or unknown agent can be "
                     "stopped" % (session["session_id"], session["state"]))
+            handle = session.get("agent_handle")
+            if not (isinstance(handle, str) and handle):
+                # An `unknown` session whose launch was never accepted -- an
+                # `unknown` launch outcome, or a restart that interrupted the
+                # launch -- never received a handle. `stop` takes the handle and
+                # nothing else (6.1), so there is nothing to address and a stop
+                # observation here would claim an operation that cannot have
+                # happened. The user is not stuck: `abandon` is 5.4's exit from
+                # exactly this state, and it needs no handle because it is the
+                # user's decision rather than an observation of the agent.
+                raise NotPermitted(
+                    "session %s never received an agent_handle, so there is nothing "
+                    "to stop; abandon it instead (contract 5.4)"
+                    % (session["session_id"],))
             try:
-                ack = self._boundary.stop(session["session_id"], reason)
+                ack = self._boundary.stop(handle, reason)
             except LauncherError as exc:
                 ack = None
                 detail = "%s: %s" % (exc.category, exc.detail)
@@ -595,18 +695,27 @@ class SessionManager(object):
             self._release_binding(session_id)
             return "launch_failed"
 
-        if state == "launching":
-            # Contract 5.4's second case. The launch outcome was never recorded,
-            # so it cannot be recovered and there is no handle to address.
+        handle = session.get("agent_handle")
+        if not (isinstance(handle, str) and handle):
+            # Contract 5.4's second case, stated over the fact rather than over
+            # the state name. `events` takes the handle and nothing else, so a
+            # session that never received one has nothing to address and the
+            # attempt fails without being made. Two shapes reach here: a session
+            # interrupted in `launching`, and one whose launch outcome came back
+            # `unknown`. `reattach_failed` is the one observation kind that needs
+            # no handle, for exactly this reason (contract 4.3).
             observation_id = self._record_observation(
                 session, "reattach_failed",
-                "the launch outcome was not recorded before the restart, so there is no "
-                "issued handle to re-attach through")
-            self._transition(session, "unknown", "launcher", "observation", observation_id)
+                "session %s carries no agent_handle -- its launch was never accepted, "
+                "so no handle was ever issued and there is nothing to re-attach "
+                "through" % (session_id,))
+            if state != "unknown":
+                self._transition(session, "unknown", "launcher", "observation",
+                                 observation_id)
             return "unknown"
 
         try:
-            self._boundary.events(session_id, self._store.last_event_sequence(session_id))
+            self._boundary.events(handle, self._store.last_event_sequence(session_id))
         except LauncherError as exc:
             observation_id = self._record_observation(
                 session, "reattach_failed", "%s: %s" % (exc.category, exc.detail))
@@ -699,6 +808,13 @@ class SessionManager(object):
         self._store.put(binding)
 
     def _record_observation(self, session, kind, detail):
+        # The harness's own copy of contract 4.3's rule, applied where the record
+        # is written rather than left to a validator run afterwards. Every kind
+        # here but `reattach_failed` records an operation that took the handle as
+        # its address, so writing one for a session with no handle would be a
+        # record of something that cannot have happened.
+        if kind in ADDRESSING_OBSERVATION_KINDS:
+            self._agent_handle(session)
         observation_id = self._ids("obs")
         self._store.put({
             "record_type": "session_observation", "record_version": 1,

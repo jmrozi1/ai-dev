@@ -17,6 +17,14 @@ Mechanics hidden inside the *value* of an allowed field are accepted by design:
 `agent_handle` is opaque and `detail` is never parsed, so neither can influence
 behaviour on this side of the seam.
 
+**The handle is the only address (contract 6.1).** `stop`, `events` and
+`deliver` each take the `agent_handle` the launcher returned from `launch`. A
+launcher is required to remember nothing between calls -- no session-to-agent
+mapping, no live process, no memory of having been called before -- because the
+harness owns all durable state and re-supplies the handle on every call. The
+harness's own half of that rule is enforced in `session_manager`, which refuses
+to issue an addressing operation for a session that carries no handle.
+
 **There is no `status`, `health`, `poll`, or `describe` operation, and there is
 no timer.** Nothing here takes a timeout, a deadline, an interval, or a retry
 count. `events` blocks until the launcher has something to report; an agent that
@@ -101,6 +109,17 @@ class LauncherError(Exception):
     `category` is one of FAILURE_CATEGORIES. The concrete cause -- an inactive
     user session, an uninitialised bridge -- stays inside the launcher and
     travels only in `detail`, which is never parsed.
+
+    **`detail` is rendered, never validated.** The seam tells launcher authors
+    to put the concrete cause here, so the likeliest thing they will pass is the
+    exception object itself rather than `str(exc)`. `LaunchResult` requires
+    `detail` to be a string, and an earlier revision of this class let a non-string
+    through unchecked: the harness then raised while classifying the launcher's own
+    failure, leaving the session stuck in `launching` with no `launch_result`
+    written at all (review finding F2). Rejecting it here would be worse, not
+    better -- it turns a launcher's honest, correctly categorised failure into an
+    unclassified crash. Coercion loses nothing, because nothing on this side of
+    the seam parses `detail`.
     """
 
     def __init__(self, category, detail=None):
@@ -109,6 +128,8 @@ class LauncherError(Exception):
                 "failure category %r is not one of %s"
                 % (category, "/".join(FAILURE_CATEGORIES))
             )
+        if detail is not None and not isinstance(detail, str):
+            detail = "%s: %s" % (type(detail).__name__, detail)
         Exception.__init__(self, "%s: %s" % (category, detail or ""))
         self.category = category
         self.detail = detail
@@ -486,12 +507,22 @@ class LaunchBoundary(object):
 
     Operations, and there are exactly these:
 
-    ==============  ================================  ==============================
-    `launch`        `LaunchInstruction`               `LaunchResult`
-    `stop`          session id, reason string         `StopAck`, or `LauncherError`
-    `events`        session id, after_sequence        `EventsPage`, or `LauncherError`
-    `deliver`       session id, `DeliveryInstruction` `DeliveryAck`  -- **if declared**
-    ==============  ================================  ==============================
+    ==============  ==================================  ==============================
+    `launch`        `LaunchInstruction`                 `LaunchResult`
+    `stop`          `agent_handle`, reason string       `StopAck`, or `LauncherError`
+    `events`        `agent_handle`, after_sequence      `EventsPage`, or `LauncherError`
+    `deliver`       `agent_handle`, `DeliveryInstruction` `DeliveryAck` -- **if declared**
+    ==============  ==================================  ==============================
+
+    **A launcher must remember nothing between calls (contract 6.1).** Every
+    operation that addresses an already-launched agent takes the `agent_handle`
+    that this launcher returned from its own `launch`, and nothing else here
+    names an agent. `session_id` is the harness's identity for a run; it travels
+    inside the instruction packets as correlation and is never an address. A
+    one-shot script, started afresh for every operation and gone when it
+    returns, is therefore a first-class implementation of this boundary rather
+    than a degraded one, and `events(handle, 0)` issued by a harness that has
+    just started must behave as it would for the process that launched the agent.
 
     There is no `status`, `health`, `poll`, or `describe`. v0.1 learns what the
     agent is doing only from what the boundary reports.
@@ -506,13 +537,13 @@ class LaunchBoundary(object):
     def launch(self, instruction):
         raise NotImplementedError
 
-    def stop(self, session_id, reason):
+    def stop(self, agent_handle, reason):
         raise NotImplementedError
 
-    def events(self, session_id, after_sequence):
+    def events(self, agent_handle, after_sequence):
         raise NotImplementedError
 
-    def deliver(self, session_id, instruction):
+    def deliver(self, agent_handle, instruction):
         """Send further text to an agent that is already running.
 
         Available **only** when the launcher declares
