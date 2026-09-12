@@ -700,13 +700,27 @@ fail an honest store to no purpose — a store willing to write a false
 `created_at` can write an earlier one just as easily, which is the timestamp
 ceiling rather than this rule's boundary.
 
-**Every answered user turn has a durable instruction record.** For each chat, the
-number of instruction packets — `launch_request` plus `delivery_request` — must
-be at least the number of user messages the agent went on to answer
-(`TURN_INSTRUCTION_MISSING`). This holds under both continuation modes and is how
-they are made equivalent: `persistent` records one launch and N-1 deliveries,
-`fresh_binding` records N launches, and either way what was sent is preserved for
-every turn.
+**Every answer the agent produced has a durable instruction record.** For each
+chat, the number of instruction packets — `launch_request` plus
+`delivery_request` — must be at least the number of *occasions* on which the
+agent produced an answer (`TURN_INSTRUCTION_MISSING`). An occasion is one
+maximal run of consecutive agent messages in the chat's ordered history. A run
+is counted once however many messages it contains, because one instruction can
+produce several recognized events and therefore several transcribed messages.
+`system` messages are neither user nor agent and are ignored. This holds under
+both continuation modes and is how they are made equivalent: `persistent`
+records one launch and N-1 deliveries, `fresh_binding` records N launches, and
+either way what was sent is preserved for every turn.
+
+**The floor counts the agent's answers, not the user's messages.** A user
+message is not evidence that anything was sent to an agent, and the earlier form
+of this rule — count the user messages preceding the last agent message — was
+wrong for that reason. It rejected accurate histories in at least three
+reachable shapes: a user sending twice before an answer arrives; a launch that
+fails, so the turn reached nobody, followed by a later successful turn; and a
+turn that reached no agent at all. None of those is a missing packet. Only the
+agent having answered demonstrates that an instruction was sent, so only that is
+counted. Fixtures `valid/16`, `valid/17` and `valid/18` are those three shapes.
 
 **Only packets that could have reached an agent count toward that floor.** A
 packet counts only if its session actually reached `running`. A `launch_request`
@@ -724,6 +738,24 @@ messages in time, which is unsound while timestamp and `sequence` coherence is
 unchecked, and is therefore sequenced behind that work rather than approximated
 here. What is closed is the structural half: a packet must belong to a session
 that ran, and a delivery must predate that session's end.
+
+**What counting answers does not catch, stated plainly.** Because a run of
+consecutive agent messages counts once, a chat that writes every answer
+consecutively is charged for one occasion however many turns those answers
+really served. A store in which the agent was sent turn two over an unrecorded
+delivery, and which orders the transcript as *user, user, agent, agent* rather
+than *user, agent, user, agent*, satisfies this floor. The earlier form of the
+rule rejected that shape — but it rejected the honest chat of the same shape
+too, and it could not tell them apart, so what it had was not detection. The
+two stores are genuinely indistinguishable from the records: one instruction
+legitimately produces several events, and nothing ties a delivery to the turn it
+carried. Separating them needs the per-turn pairing sequenced behind timestamp
+and `sequence` coherence. Until then this floor catches under-recording in a
+chat whose answers are interleaved with its turns, which is what a live chat
+looks like, and does not catch it in a chat whose answers are all written after
+its turns. An agent message run that precedes every user message is still
+counted, because no honest chat has the agent speaking first
+(`invalid/37`).
 
 ## 7. Diagnostic preservation
 

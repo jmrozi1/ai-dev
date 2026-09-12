@@ -1228,14 +1228,37 @@ def validate_store(report, records):
                 % (size, packet.get("session_id"), bound),
             )
 
-    # --- every answered user turn has a durable instruction record --------
+    # --- every turn the agent answered has a durable instruction record ---
     # Contract 6.2/6.4: the exact text sent to the agent is preserved for every
     # turn, not only the first. Without this, a chat served by one persistent
     # agent records what was sent at launch and nothing afterwards.
+    #
     # Only a packet on a session that actually reached 'running' can have reached an
     # agent. A launch_request on a session that never ran is the packet that was not
     # sent, which is exactly what a launch failure is; counting it lets a chat pad
     # the floor with decoy sessions and leave every later turn integration-blind.
+    #
+    # What the floor counts on the other side is the number of times the agent
+    # *answered*, not the number of messages the user typed. A user message is not
+    # itself evidence that anything was sent to an agent: the user may send twice
+    # before an answer arrives, a launch may fail so the turn reached nobody, and a
+    # turn may reach no agent at all. Counting user messages treated all three as
+    # missing packets and rejected accurate stores.
+    #
+    # An occasion is a maximal run of consecutive agent messages in the chat's own
+    # ordered history. Each run is one occasion on which the agent demonstrably
+    # produced output, and every such occasion required a packet to have been sent.
+    # A run is counted once however many messages it contains, because one
+    # instruction can produce several recognized events and therefore several
+    # transcribed messages. 'system' messages are neither user nor agent and are
+    # ignored here exactly as before (carried finding R6). A run that precedes every
+    # user message is still an occasion: no honest chat has the agent speaking
+    # first, so writing an answer at the front of the history must not lower the
+    # floor.
+    #
+    # This is still a count and not a per-turn pairing: it reads the recorded order
+    # of the chat's own messages and computes no duration, compares no message to a
+    # packet, and consults no clock.
     instructions_by_chat = {}
     for packet in by_type["launch_request"] + by_type["delivery_request"]:
         chat_id = packet.get("chat_id")
@@ -1249,27 +1272,31 @@ def validate_store(report, records):
     for message in by_type["message"]:
         chat_id = message.get("chat_id")
         seq = message.get("sequence")
+        author = message.get("author")
         if not isinstance(chat_id, str) or not isinstance(seq, int) or isinstance(seq, bool):
             continue
-        bucket = turns_by_chat.setdefault(chat_id, {"user": [], "last_agent": None})
-        if message.get("author") == "user":
-            bucket["user"].append(seq)
-        elif message.get("author") == "agent":
-            if bucket["last_agent"] is None or seq > bucket["last_agent"]:
-                bucket["last_agent"] = seq
+        if author not in ("user", "agent"):
+            continue
+        turns_by_chat.setdefault(chat_id, []).append((seq, author))
 
     for chat_id in sorted(turns_by_chat):
-        bucket = turns_by_chat[chat_id]
-        if bucket["last_agent"] is None:
+        ordered = sorted(turns_by_chat[chat_id], key=lambda item: item[0])
+        answered = 0
+        previous = None
+        for _, author in ordered:
+            if author == "agent" and previous != "agent":
+                answered += 1
+            previous = author
+        if answered == 0:
             continue
-        answered = len([s for s in bucket["user"] if s < bucket["last_agent"]])
         recorded = instructions_by_chat.get(chat_id, 0)
         if recorded < answered:
             report.add(
                 "TURN_INSTRUCTION_MISSING",
                 "chat %s" % chat_id,
-                "chat %s shows %d answered user turn(s) but preserves only %d instruction "
-                "packet(s); every turn sent to an agent must be durably recorded"
+                "chat %s shows %d occasion(s) on which the agent produced an answer "
+                "but preserves only %d instruction packet(s); every turn sent to an "
+                "agent must be durably recorded"
                 % (chat_id, answered, recorded),
             )
 
