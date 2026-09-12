@@ -39,9 +39,11 @@ ID_PREFIXES = {
     "binding_id": "bnd",
     "event_id": "evt",
     "request_id": "req",
+    "delivery_id": "dlv",
+    "observation_id": "obs",
 }
 
-ID_RE = re.compile(r"^(cht|msg|ses|bnd|evt|req)_[0-9a-z]{8,32}$")
+ID_RE = re.compile(r"^(cht|msg|ses|bnd|evt|req|dlv|obs)_[0-9a-z]{8,32}$")
 TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$")
 LAUNCHER_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 
@@ -54,6 +56,8 @@ RECORD_TYPES = (
     "agent_binding",
     "launch_request",
     "launch_result",
+    "delivery_request",
+    "session_observation",
     "diagnostic_event",
 )
 
@@ -94,10 +98,40 @@ AUTHORIZED_TRANSITIONS = {
     ("unknown", "abandoned"): "user",
 }
 
-EVIDENCE_KINDS = ("event", "stream_end", "launch_result", "user_action", "harness_action")
+EVIDENCE_KINDS = (
+    "event",
+    "stream_end",
+    "launch_result",
+    "observation",
+    "user_action",
+    "harness_action",
+)
 
 # Evidence kinds that count as an explicit observation of the integration.
-OBSERVED_EVIDENCE_KINDS = frozenset(("event", "stream_end", "launch_result"))
+OBSERVED_EVIDENCE_KINDS = frozenset(("event", "stream_end", "launch_result", "observation"))
+
+# session_observation kinds. Each records the outcome of an attempted boundary
+# interaction. None of them is an inference from elapsed time or from silence.
+OBSERVATION_KINDS = (
+    "stop_confirmed",
+    "stop_unconfirmed",
+    "reattached",
+    "reattach_failed",
+    "stream_read_failed",
+)
+
+# Observations that leave the agent's liveness undeterminable.
+UNRESOLVED_OBSERVATION_KINDS = frozenset(
+    ("stop_unconfirmed", "reattach_failed", "stream_read_failed")
+)
+
+CONTINUATION_MODES = ("persistent", "fresh_binding")
+
+RESPONSE_SHAPES = ("stream", "one_shot")
+
+# The interpreted_type a launcher-sourced event must carry to be usable as the
+# end-of-stream signal section 6.1 requires.
+STREAM_END_TYPE = "stream_end"
 
 LAUNCH_OUTCOMES = ("accepted", "failed", "unknown")
 
@@ -115,7 +149,57 @@ EVENT_SOURCES = ("launcher", "agent", "harness")
 
 MESSAGE_AUTHORS = ("user", "agent", "system")
 
-MAX_INSTRUCTION_BYTES = 65536
+# Contract section 5.2: the precondition column, in executable form.
+#
+# (from_state, to_state) -> {admissible evidence kind: what evidence.ref must
+# resolve to}. An evidence kind absent from the mapping is not admissible for
+# that transition; a ref that does not satisfy the named requirement means the
+# precondition was not met. The requirement tokens are handled in
+# _check_evidence_requirement.
+TRANSITION_PRECONDITIONS = {
+    (None, "pending"): {"user_action": "user_message"},
+    ("pending", "launching"): {"harness_action": "launch_request"},
+    ("pending", "launch_failed"): {"harness_action": "no_ref"},
+    ("launching", "running"): {"launch_result": "result_accepted"},
+    ("launching", "launch_failed"): {"launch_result": "result_failed"},
+    ("launching", "unknown"): {
+        "launch_result": "result_unknown",
+        "observation": "observation_unresolved",
+    },
+    ("running", "completed"): {"event": "event_recognized"},
+    ("running", "failed"): {"event": "event_recognized"},
+    ("running", "terminated"): {"observation": "observation_stop_confirmed"},
+    ("running", "unknown"): {
+        "event": "event_any",
+        "stream_end": "event_stream_end",
+        "observation": "observation_unresolved",
+    },
+    ("unknown", "running"): {
+        "event": "event_recognized",
+        "observation": "observation_reattached",
+    },
+    ("unknown", "completed"): {"event": "event_recognized"},
+    ("unknown", "failed"): {"event": "event_recognized"},
+    ("unknown", "terminated"): {"observation": "observation_stop_confirmed"},
+    ("unknown", "abandoned"): {"user_action": "no_ref"},
+}
+
+# Anti-drift guard. The authorized-transition table and the precondition table
+# are two halves of contract section 5.2's table; a row present in one and not
+# the other is exactly the prose/executable divergence this contract exists to
+# prevent, and it is a programming error rather than a store violation.
+assert set(TRANSITION_PRECONDITIONS) == set(AUTHORIZED_TRANSITIONS), (
+    "section 5.2 owner table and precondition table disagree: %r"
+    % sorted(set(TRANSITION_PRECONDITIONS) ^ set(AUTHORIZED_TRANSITIONS))
+)
+
+# There is deliberately no MAX_INSTRUCTION_BYTES constant here. No
+# instruction-payload bound is asserted by this contract: the bound is a measured
+# property of a launcher, declared per session in
+# agent_session.launcher_capabilities.instruction_bound_bytes, and its only
+# honest value today is null. An earlier revision hard-coded 65536, a number
+# invented in the contract document and enforced as though measured.
+# See facts-and-assumptions.md, known-unproven claim U2.
 MAX_TITLE_CHARS = 200
 
 # Field names that leak host, transport, or bridge mechanics into the launch
@@ -179,6 +263,7 @@ RECORD_SPECS = {
         "chat_id": ("id:cht", True),
         "created_at": ("ts", True),
         "launcher_id": ("str", True),
+        "launcher_capabilities": ("obj", True),
         "state": ("enum:" + "|".join(SESSION_STATES), True),
         "agent_handle": ("str?", False),
         "transitions": ("list", True),
@@ -207,6 +292,24 @@ RECORD_SPECS = {
         "failure_category": ("str?", False),
         "detail": ("str?", False),
     },
+    "delivery_request": {
+        "delivery_id": ("id:dlv", True),
+        "chat_id": ("id:cht", True),
+        "session_id": ("id:ses", True),
+        "sequence": ("int", True),
+        "created_at": ("ts", True),
+        "instruction_encoding": ("enum:utf-8", True),
+        "instruction_text": ("str", True),
+        "acknowledged": ("bool?", True),
+    },
+    "session_observation": {
+        "observation_id": ("id:obs", True),
+        "chat_id": ("id:cht", True),
+        "session_id": ("id:ses", True),
+        "observed_at": ("ts", True),
+        "kind": ("enum:" + "|".join(OBSERVATION_KINDS), True),
+        "detail": ("str?", True),
+    },
     "diagnostic_event": {
         "event_id": ("id:evt", True),
         "chat_id": ("id:cht", True),
@@ -223,6 +326,14 @@ RECORD_SPECS = {
 CONTENT_SPEC = {
     "content_type": ("enum:text/plain", True),
     "text": ("str", True),
+}
+
+# The capabilities a launcher declares for the session it served. These are
+# declared properties of an implementation, never assumptions of this contract.
+CAPABILITIES_SPEC = {
+    "continuation": ("enum:" + "|".join(CONTINUATION_MODES), True),
+    "response_shape": ("enum:" + "|".join(RESPONSE_SHAPES), True),
+    "instruction_bound_bytes": ("int?", True),
 }
 
 RAW_SPEC = {
@@ -304,6 +415,14 @@ def check_fields(report, where, obj, spec, allow_unknown=False):
             if isinstance(value, bool) or not isinstance(value, int):
                 report.add("BAD_FIELD_TYPE", where, "'%s' must be an integer" % field)
                 usable = False
+        elif kind == "int?":
+            if value is not None and (isinstance(value, bool) or not isinstance(value, int)):
+                report.add("BAD_FIELD_TYPE", where, "'%s' must be an integer or null" % field)
+                usable = False
+        elif kind == "bool?":
+            if value is not None and not isinstance(value, bool):
+                report.add("BAD_FIELD_TYPE", where, "'%s' must be true, false, or null" % field)
+                usable = False
         elif kind == "obj":
             if not isinstance(value, dict):
                 report.add("BAD_FIELD_TYPE", where, "'%s' must be an object" % field)
@@ -372,6 +491,8 @@ OWN_ID_FIELD = {
     "agent_binding": "binding_id",
     "launch_request": "request_id",
     "launch_result": "request_id",
+    "delivery_request": "delivery_id",
+    "session_observation": "observation_id",
     "diagnostic_event": "event_id",
 }
 
@@ -383,7 +504,10 @@ def record_where(index, record):
         own = OWN_ID_FIELD.get(rtype)
         if own:
             keys.append(own)
-        keys.extend(["chat_id", "message_id", "session_id", "binding_id", "request_id", "event_id"])
+        keys.extend([
+            "chat_id", "message_id", "session_id", "binding_id",
+            "request_id", "delivery_id", "observation_id", "event_id",
+        ])
         for key in keys:
             if isinstance(record.get(key), str):
                 return "records[%d] %s %s" % (index, rtype, record[key])
@@ -451,23 +575,29 @@ def validate_record(report, index, record):
         launcher_id = record.get("launcher_id")
         if isinstance(launcher_id, str) and not LAUNCHER_ID_RE.match(launcher_id):
             report.add("BAD_FIELD_TYPE", where, "launcher_id must match [a-z0-9][a-z0-9-]{0,63}")
+        capabilities = record.get("launcher_capabilities")
+        if isinstance(capabilities, dict):
+            check_fields(report, where + " launcher_capabilities", capabilities, CAPABILITIES_SPEC)
+            bound = capabilities.get("instruction_bound_bytes")
+            if isinstance(bound, int) and not isinstance(bound, bool) and bound < 1:
+                report.add(
+                    "FIELD_OUT_OF_RANGE",
+                    where + " launcher_capabilities",
+                    "instruction_bound_bytes must be null (not measured) or >= 1",
+                )
         _validate_transitions(report, where, record)
 
-    elif rtype == "launch_request":
+    elif rtype in ("launch_request", "delivery_request"):
+        if rtype == "delivery_request":
+            seq = record.get("sequence")
+            if isinstance(seq, int) and not isinstance(seq, bool) and seq < 1:
+                report.add("FIELD_OUT_OF_RANGE", where, "sequence must be >= 1")
         text = record.get("instruction_text")
         if isinstance(text, str):
             try:
-                size = len(text.encode("utf-8"))
+                text.encode("utf-8")
             except UnicodeEncodeError:
                 report.add("INSTRUCTION_TEXT_NOT_UTF8", where, "instruction_text is not encodable as UTF-8")
-                size = 0
-            if size > MAX_INSTRUCTION_BYTES:
-                report.add(
-                    "INSTRUCTION_TEXT_TOO_LARGE",
-                    where,
-                    "instruction_text is %d bytes; the bounded packet limit is %d"
-                    % (size, MAX_INSTRUCTION_BYTES),
-                )
 
     elif rtype == "launch_result":
         _validate_launch_result(report, where, record)
@@ -637,15 +767,7 @@ def validate_store(report, records):
             continue
         by_type[rtype].append(record)
 
-        id_field = {
-            "chat": "chat_id",
-            "message": "message_id",
-            "agent_session": "session_id",
-            "agent_binding": "binding_id",
-            "launch_request": "request_id",
-            "launch_result": "request_id",
-            "diagnostic_event": "event_id",
-        }[rtype]
+        id_field = OWN_ID_FIELD[rtype]
         rid = record.get(id_field)
         if isinstance(rid, str):
             key = (rtype, rid)
@@ -658,6 +780,16 @@ def validate_store(report, records):
     sessions = dict((s["session_id"], s) for s in by_type["agent_session"] if isinstance(s.get("session_id"), str))
     events = dict((e["event_id"], e) for e in by_type["diagnostic_event"] if isinstance(e.get("event_id"), str))
     requests = dict((r["request_id"], r) for r in by_type["launch_request"] if isinstance(r.get("request_id"), str))
+    messages = dict((m["message_id"], m) for m in by_type["message"] if isinstance(m.get("message_id"), str))
+    observations = dict(
+        (o["observation_id"], o) for o in by_type["session_observation"]
+        if isinstance(o.get("observation_id"), str)
+    )
+    results_by_request = {}
+    for result in by_type["launch_result"]:
+        rid = result.get("request_id")
+        if isinstance(rid, str) and rid not in results_by_request:
+            results_by_request[rid] = result
 
     def ref(where, kind, value, table, label):
         if value is None:
@@ -679,6 +811,16 @@ def validate_store(report, records):
                 where,
                 "a running session must carry the agent_handle the launcher returned",
             )
+        _validate_preconditions(
+            report, where, session,
+            {
+                "messages": messages,
+                "events": events,
+                "requests": requests,
+                "results_by_request": results_by_request,
+                "observations": observations,
+            },
+        )
 
     # --- messages -------------------------------------------------------
     seen_msg_seq = {}
@@ -753,6 +895,7 @@ def validate_store(report, records):
 
     # --- bindings -------------------------------------------------------
     open_by_chat = {}
+    open_by_session = {}
     for i, binding in enumerate(by_type["agent_binding"]):
         where = record_where(i, binding)
         ref(where, "chat_id", binding.get("chat_id"), chats, "chat")
@@ -766,6 +909,9 @@ def validate_store(report, records):
             chat_id = binding.get("chat_id")
             if isinstance(chat_id, str):
                 open_by_chat.setdefault(chat_id, []).append((binding.get("binding_id"), where))
+            session_id = binding.get("session_id")
+            if isinstance(session_id, str):
+                open_by_session.setdefault(session_id, []).append((binding.get("binding_id"), where))
             if state in TERMINAL_SESSION_STATES:
                 report.add(
                     "BINDING_OPEN_ON_TERMINAL_SESSION",
@@ -790,6 +936,48 @@ def validate_store(report, records):
                 "CONCURRENT_BINDING",
                 entries[1][1],
                 "chat %s has %d open agent bindings (%s); v0.1 permits at most one"
+                % (chat_id, len(entries), ", ".join(str(e[0]) for e in entries)),
+            )
+
+    # --- one agent per chat (contract 1, 4.4) ----------------------------
+    # The binding cardinality rule above is bookkeeping about records. The
+    # defining v0.1 rule is about agents, so it is enforced directly: a session
+    # that is not terminal denotes an agent that may still be alive, every such
+    # session must be held by exactly one open binding, and a chat may have at
+    # most one of them.
+    active_by_chat = {}
+    for i, session in enumerate(by_type["agent_session"]):
+        where = record_where(i, session)
+        session_id = session.get("session_id")
+        if session.get("state") in TERMINAL_SESSION_STATES:
+            continue
+        chat_id = session.get("chat_id")
+        if isinstance(chat_id, str) and isinstance(session_id, str):
+            active_by_chat.setdefault(chat_id, []).append((session_id, where))
+        held = open_by_session.get(session_id, []) if isinstance(session_id, str) else []
+        if not held:
+            report.add(
+                "UNBOUND_ACTIVE_SESSION",
+                where,
+                "session %s is in non-terminal state %r but no open agent_binding holds it; "
+                "an agent that may still be alive must be bound to its chat"
+                % (session_id, session.get("state")),
+            )
+        elif len(held) > 1:
+            report.add(
+                "UNBOUND_ACTIVE_SESSION",
+                where,
+                "session %s is held by %d open bindings (%s); exactly one is permitted"
+                % (session_id, len(held), ", ".join(str(h[0]) for h in sorted(held))),
+            )
+
+    for chat_id in sorted(active_by_chat):
+        entries = sorted(active_by_chat[chat_id])
+        if len(entries) > 1:
+            report.add(
+                "CONCURRENT_SESSION",
+                entries[1][1],
+                "chat %s has %d non-terminal agent sessions (%s); v0.1 is one agent per chat"
                 % (chat_id, len(entries), ", ".join(str(e[0]) for e in entries)),
             )
 
@@ -847,6 +1035,412 @@ def validate_store(report, records):
                     "launcher accepted the launch but session %s never entered 'running'"
                     % result.get("session_id"),
                 )
+
+    # --- deliveries ------------------------------------------------------
+    seen_delivery_seq = {}
+    for i, delivery in enumerate(by_type["delivery_request"]):
+        where = record_where(i, delivery)
+        ref(where, "chat_id", delivery.get("chat_id"), chats, "chat")
+        session = ref(where, "session_id", delivery.get("session_id"), sessions, "agent_session")
+        if session is not None and session.get("chat_id") != delivery.get("chat_id"):
+            report.add("CORRELATION_MISMATCH", where, "delivery session belongs to a different chat")
+        if session is not None:
+            capabilities = session.get("launcher_capabilities")
+            mode = capabilities.get("continuation") if isinstance(capabilities, dict) else None
+            if mode != "persistent":
+                report.add(
+                    "DELIVERY_NOT_SUPPORTED",
+                    where,
+                    "session %s declares continuation %r; delivering to an already-running "
+                    "agent requires a launcher that declares 'persistent'"
+                    % (delivery.get("session_id"), mode),
+                )
+            if "running" not in _transition_targets(session):
+                report.add(
+                    "DELIVERY_NOT_SUPPORTED",
+                    where,
+                    "session %s never entered 'running'; there was no agent to deliver to"
+                    % delivery.get("session_id"),
+                )
+        session_id = delivery.get("session_id")
+        seq = delivery.get("sequence")
+        if isinstance(session_id, str) and isinstance(seq, int) and not isinstance(seq, bool):
+            seen_delivery_seq.setdefault(session_id, []).append((seq, where))
+
+    _check_sequences(report, seen_delivery_seq, "session", "delivery")
+
+    # --- agent output presupposes an agent -------------------------------
+    # A launcher may report before anything ran; an agent may not. An event
+    # sourced to the agent on a session that never reached 'running' is output
+    # from an agent that was never started.
+    for i, event in enumerate(by_type["diagnostic_event"]):
+        if event.get("source") != "agent":
+            continue
+        session = sessions.get(event.get("session_id"))
+        if session is None:
+            continue
+        if "running" not in _transition_targets(session):
+            report.add(
+                "AGENT_OUTPUT_WITHOUT_AGENT",
+                record_where(i, event),
+                "event is sourced to the agent, but session %s never entered 'running'; "
+                "there was no agent to produce it"
+                % event.get("session_id"),
+            )
+
+    # --- one user turn opens at most one agent ---------------------------
+    # The user sending a turn is the user action that opens the next binding.
+    # Two sessions that both ran on the strength of the same turn means one of
+    # them was opened by something other than a user turn.
+    served_by_turn = {}
+    for i, session in enumerate(by_type["agent_session"]):
+        transitions = session.get("transitions")
+        if not isinstance(transitions, list) or not transitions:
+            continue
+        first = transitions[0]
+        if not isinstance(first, dict) or first.get("from") is not None:
+            continue
+        evidence = first.get("evidence")
+        opener = evidence.get("ref") if isinstance(evidence, dict) else None
+        if not isinstance(opener, str) or opener not in messages:
+            continue
+        if "running" not in _transition_targets(session):
+            continue  # a session that never ran is a retry of the same turn
+        if opener in served_by_turn:
+            report.add(
+                "TURN_ALREADY_SERVED",
+                record_where(i, session),
+                "message %s already opened session %s, which ran; a later binding is "
+                "opened by a later user turn, never by the harness on its own"
+                % (opener, served_by_turn[opener]),
+            )
+        else:
+            served_by_turn[opener] = session.get("session_id")
+
+    # --- session observations --------------------------------------------
+    for i, observation in enumerate(by_type["session_observation"]):
+        where = record_where(i, observation)
+        ref(where, "chat_id", observation.get("chat_id"), chats, "chat")
+        session = ref(where, "session_id", observation.get("session_id"), sessions, "agent_session")
+        if session is not None and session.get("chat_id") != observation.get("chat_id"):
+            report.add("CORRELATION_MISMATCH", where, "observation session belongs to a different chat")
+
+    # --- the declared instruction bound, where one was measured -----------
+    for i, packet in enumerate(by_type["launch_request"] + by_type["delivery_request"]):
+        where = record_where(i, packet)
+        session = sessions.get(packet.get("session_id"))
+        if session is None:
+            continue
+        capabilities = session.get("launcher_capabilities")
+        if not isinstance(capabilities, dict):
+            continue
+        bound = capabilities.get("instruction_bound_bytes")
+        if not isinstance(bound, int) or isinstance(bound, bool) or bound < 1:
+            continue  # not measured; this contract asserts no bound of its own
+        text = packet.get("instruction_text")
+        if not isinstance(text, str):
+            continue
+        size = len(text.encode("utf-8"))
+        if size > bound:
+            report.add(
+                "INSTRUCTION_TEXT_TOO_LARGE",
+                where,
+                "instruction_text is %d bytes; session %s declares a measured bound of %d"
+                % (size, packet.get("session_id"), bound),
+            )
+
+    # --- every answered user turn has a durable instruction record --------
+    # Contract 6.2/6.4: the exact text sent to the agent is preserved for every
+    # turn, not only the first. Without this, a chat served by one persistent
+    # agent records what was sent at launch and nothing afterwards.
+    instructions_by_chat = {}
+    for packet in by_type["launch_request"] + by_type["delivery_request"]:
+        chat_id = packet.get("chat_id")
+        if isinstance(chat_id, str):
+            instructions_by_chat[chat_id] = instructions_by_chat.get(chat_id, 0) + 1
+
+    turns_by_chat = {}
+    for message in by_type["message"]:
+        chat_id = message.get("chat_id")
+        seq = message.get("sequence")
+        if not isinstance(chat_id, str) or not isinstance(seq, int) or isinstance(seq, bool):
+            continue
+        bucket = turns_by_chat.setdefault(chat_id, {"user": [], "last_agent": None})
+        if message.get("author") == "user":
+            bucket["user"].append(seq)
+        elif message.get("author") == "agent":
+            if bucket["last_agent"] is None or seq > bucket["last_agent"]:
+                bucket["last_agent"] = seq
+
+    for chat_id in sorted(turns_by_chat):
+        bucket = turns_by_chat[chat_id]
+        if bucket["last_agent"] is None:
+            continue
+        answered = len([s for s in bucket["user"] if s < bucket["last_agent"]])
+        recorded = instructions_by_chat.get(chat_id, 0)
+        if recorded < answered:
+            report.add(
+                "TURN_INSTRUCTION_MISSING",
+                "chat %s" % chat_id,
+                "chat %s shows %d answered user turn(s) but preserves only %d instruction "
+                "packet(s); every turn sent to an agent must be durably recorded"
+                % (chat_id, answered, recorded),
+            )
+
+
+def _transition_targets(session):
+    targets = set()
+    if isinstance(session.get("transitions"), list):
+        for transition in session["transitions"]:
+            if isinstance(transition, dict) and isinstance(transition.get("to"), str):
+                targets.add(transition["to"])
+    return targets
+
+
+def _validate_preconditions(report, where, session, tables):
+    """Contract 5.2 precondition column and 5.3 evidence rules, executably.
+
+    Each transition names an evidence kind that must be admissible for that
+    transition, and a reference that must resolve to a real record in the store
+    establishing that the precondition actually held. A claim of an observation
+    is not an observation.
+    """
+    transitions = session.get("transitions")
+    if not isinstance(transitions, list):
+        return
+
+    session_id = session.get("session_id")
+    chat_id = session.get("chat_id")
+    capabilities = session.get("launcher_capabilities")
+    response_shape = capabilities.get("response_shape") if isinstance(capabilities, dict) else None
+
+    for i, transition in enumerate(transitions):
+        if not isinstance(transition, dict):
+            continue
+        twhere = "%s transitions[%d]" % (where, i)
+        frm = transition.get("from")
+        to = transition.get("to")
+        key = (frm, to)
+        admissible = TRANSITION_PRECONDITIONS.get(key)
+        if admissible is None:
+            continue  # unauthorized pairs are already reported as such
+
+        evidence = transition.get("evidence")
+        if not isinstance(evidence, dict):
+            continue  # shape failure already reported
+        kind = evidence.get("kind")
+        ref_value = evidence.get("ref")
+
+        if kind == "stream_end" and response_shape == "one_shot":
+            report.add(
+                "EVIDENCE_KIND_UNSUPPORTED",
+                twhere,
+                "session %s declares response_shape 'one_shot', which returns a response "
+                "rather than a stream; 'stream_end' is not an observation it can make"
+                % session_id,
+            )
+
+        if kind not in admissible:
+            report.add(
+                "PRECONDITION_NOT_MET",
+                twhere,
+                "%s -> %s admits evidence.kind in %s, not %r"
+                % (frm, to, "/".join(sorted(admissible)), kind),
+            )
+            if to == "unknown":
+                report.add(
+                    "UNKNOWN_INFERRED_WITHOUT_EVIDENCE",
+                    twhere,
+                    "'unknown' was concluded without an admissible integration observation",
+                )
+            continue
+
+        failure = _check_evidence_requirement(
+            admissible[kind], ref_value, session_id, chat_id, tables
+        )
+        if failure is None:
+            continue
+
+        code, detail = failure
+        report.add(code, twhere, "%s -> %s: %s" % (frm, to, detail))
+        if to == "unknown":
+            report.add(
+                "UNKNOWN_INFERRED_WITHOUT_EVIDENCE",
+                twhere,
+                "'unknown' cites evidence %r that does not resolve to a record in this "
+                "store, so it rests on the claim of an observation rather than one"
+                % ref_value,
+            )
+
+
+def _check_evidence_requirement(requirement, ref_value, session_id, chat_id, tables):
+    """Return None when satisfied, else (violation code, detail)."""
+    if requirement == "no_ref":
+        if ref_value is not None:
+            return ("EVIDENCE_REF_INVALID", "no record applies, so evidence.ref must be null")
+        return None
+
+    if ref_value is None:
+        return ("EVIDENCE_REF_INVALID", "evidence.ref is required and must name a record")
+    if not isinstance(ref_value, str) or not ID_RE.match(ref_value):
+        return (
+            "EVIDENCE_REF_INVALID",
+            "evidence.ref %r is not a well-formed identifier" % (ref_value,),
+        )
+
+    if requirement == "user_message":
+        message = tables["messages"].get(ref_value)
+        if not ref_value.startswith("msg_") or message is None:
+            return ("EVIDENCE_REF_INVALID", "evidence.ref %r names no message record" % ref_value)
+        if message.get("author") != "user":
+            return (
+                "PRECONDITION_NOT_MET",
+                "a session is opened by a user turn; message %s is authored by %r"
+                % (ref_value, message.get("author")),
+            )
+        if message.get("chat_id") != chat_id:
+            return (
+                "CORRELATION_MISMATCH",
+                "message %s belongs to a different chat than the session it opens" % ref_value,
+            )
+        return None
+
+    if requirement.startswith("result_"):
+        request = tables["requests"].get(ref_value)
+        if not ref_value.startswith("req_") or request is None:
+            return (
+                "EVIDENCE_REF_INVALID",
+                "evidence.ref %r names no launch_request record" % ref_value,
+            )
+        if request.get("session_id") != session_id:
+            return (
+                "CORRELATION_MISMATCH",
+                "launch_request %s belongs to a different session" % ref_value,
+            )
+        result = tables["results_by_request"].get(ref_value)
+        if result is None:
+            return (
+                "PRECONDITION_NOT_MET",
+                "the launcher's report is what authorizes this transition, and request %s "
+                "has no launch_result" % ref_value,
+            )
+        expected = {
+            "result_accepted": "accepted",
+            "result_failed": "failed",
+            "result_unknown": "unknown",
+        }[requirement]
+        if result.get("outcome") != expected:
+            return (
+                "PRECONDITION_NOT_MET",
+                "this transition requires launch outcome %r; request %s reports %r"
+                % (expected, ref_value, result.get("outcome")),
+            )
+        if expected == "accepted" and not result.get("agent_handle"):
+            return (
+                "PRECONDITION_NOT_MET",
+                "an accepted launch must return a handle before a session may run",
+            )
+        if expected == "failed" and not result.get("failure_category"):
+            return (
+                "PRECONDITION_NOT_MET",
+                "a failed launch must name a failure category #90 can count",
+            )
+        return None
+
+    if requirement == "launch_request":
+        request = tables["requests"].get(ref_value)
+        if not ref_value.startswith("req_") or request is None:
+            return (
+                "EVIDENCE_REF_INVALID",
+                "evidence.ref %r names no launch_request record; a session may not be "
+                "launched without the bounded packet that was sent" % ref_value,
+            )
+        if request.get("session_id") != session_id:
+            return (
+                "CORRELATION_MISMATCH",
+                "launch_request %s belongs to a different session" % ref_value,
+            )
+        return None
+
+    if requirement.startswith("event_"):
+        event = tables["events"].get(ref_value)
+        if not ref_value.startswith("evt_") or event is None:
+            return (
+                "EVIDENCE_REF_INVALID",
+                "evidence.ref %r names no diagnostic_event record" % ref_value,
+            )
+        if event.get("session_id") != session_id:
+            return (
+                "CORRELATION_MISMATCH",
+                "diagnostic_event %s belongs to a different session" % ref_value,
+            )
+        if event.get("source") not in ("agent", "launcher"):
+            return (
+                "PRECONDITION_NOT_MET",
+                "a transition authorized by an observation of the integration must cite an "
+                "event the integration produced; %s has source %r. What the harness itself "
+                "observed is a session_observation, not an event it received"
+                % (ref_value, event.get("source")),
+            )
+        if requirement == "event_recognized" and event.get("interpretation") != "recognized":
+            return (
+                "PRECONDITION_NOT_MET",
+                "this transition requires a recognized event; %s is %r"
+                % (ref_value, event.get("interpretation")),
+            )
+        if requirement == "event_stream_end":
+            if event.get("source") != "launcher" or event.get("interpreted_type") != STREAM_END_TYPE:
+                return (
+                    "PRECONDITION_NOT_MET",
+                    "end-of-stream must be signalled by the launcher and preserved as a "
+                    "launcher-sourced %r event; %s is source %r, type %r. A reader-side "
+                    "read failure is a session_observation, not an end of stream"
+                    % (STREAM_END_TYPE, ref_value, event.get("source"),
+                       event.get("interpreted_type")),
+                )
+            if event.get("interpretation") != "recognized":
+                return (
+                    "PRECONDITION_NOT_MET",
+                    "the end-of-stream signal must be recognized; %s is %r"
+                    % (ref_value, event.get("interpretation")),
+                )
+        return None
+
+    if requirement.startswith("observation_"):
+        observation = tables["observations"].get(ref_value)
+        if not ref_value.startswith("obs_") or observation is None:
+            return (
+                "EVIDENCE_REF_INVALID",
+                "evidence.ref %r names no session_observation record" % ref_value,
+            )
+        if observation.get("session_id") != session_id:
+            return (
+                "CORRELATION_MISMATCH",
+                "session_observation %s belongs to a different session" % ref_value,
+            )
+        kind = observation.get("kind")
+        if requirement == "observation_stop_confirmed" and kind != "stop_confirmed":
+            return (
+                "PRECONDITION_NOT_MET",
+                "terminating requires a confirmed stop; observation %s is %r"
+                % (ref_value, kind),
+            )
+        if requirement == "observation_reattached" and kind != "reattached":
+            return (
+                "PRECONDITION_NOT_MET",
+                "resuming requires a successful re-attachment; observation %s is %r"
+                % (ref_value, kind),
+            )
+        if requirement == "observation_unresolved" and kind not in UNRESOLVED_OBSERVATION_KINDS:
+            return (
+                "PRECONDITION_NOT_MET",
+                "'unknown' requires an observation that left liveness undeterminable "
+                "(one of %s); observation %s is %r"
+                % ("/".join(sorted(UNRESOLVED_OBSERVATION_KINDS)), ref_value, kind),
+            )
+        return None
+
+    raise AssertionError("unknown evidence requirement %r" % requirement)  # pragma: no cover
 
 
 def _check_sequences(report, grouped, owner_label, item_label):

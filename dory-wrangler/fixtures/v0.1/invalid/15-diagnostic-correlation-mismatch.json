@@ -62,6 +62,11 @@
       "chat_id": "cht_crossb000001",
       "created_at": "2026-09-13T04:00:02Z",
       "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
       "state": "running",
       "agent_handle": "agent-5e01",
       "transitions": [
@@ -72,7 +77,7 @@
           "at": "2026-09-13T04:00:02Z",
           "evidence": {
             "kind": "user_action",
-            "ref": null
+            "ref": "msg_crossb000001"
           }
         },
         {
@@ -82,7 +87,7 @@
           "at": "2026-09-13T04:00:03Z",
           "evidence": {
             "kind": "harness_action",
-            "ref": null
+            "ref": "req_crossb000001"
           }
         },
         {

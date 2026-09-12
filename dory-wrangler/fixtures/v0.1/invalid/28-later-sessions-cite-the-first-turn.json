@@ -1,0 +1,461 @@
+{
+  "fixture": {
+    "name": "later-sessions-cite-the-first-turn",
+    "expect": "reject",
+    "reason_code": "TURN_ALREADY_SERVED",
+    "description": "A fresh-binding chat in which the second and third agents were both opened on the strength of the first user turn. The user sending a turn is what opens the next binding, so an agent opened against a turn that already has one was opened by something else -- which is the harness autonomy v0.1 does not grant."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_fresh00000001",
+      "title": "Continuation: fresh binding",
+      "created_at": "2026-09-12T10:00:00Z",
+      "updated_at": "2026-09-12T10:02:25Z",
+      "state": "open"
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_fresh000001",
+      "chat_id": "cht_fresh00000001",
+      "created_at": "2026-09-12T10:00:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "agent-f001",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T10:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_fresh0001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T10:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_fresh000001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T10:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_fresh000001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T10:00:30Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_fresh000002"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_fresh000001",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000001",
+      "bound_at": "2026-09-12T10:00:03Z",
+      "released_at": "2026-09-12T10:00:30Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_fresh000001",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000001",
+      "created_at": "2026-09-12T10:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What does the launch boundary do?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_fresh000001",
+      "session_id": "ses_fresh000001",
+      "observed_at": "2026-09-12T10:00:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-f001"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_fresh000001",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000001",
+      "sequence": 1,
+      "received_at": "2026-09-12T10:00:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It hides how an agent is started.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_fresh000002",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000001",
+      "sequence": 2,
+      "received_at": "2026-09-12T10:00:30Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_fresh000002",
+      "chat_id": "cht_fresh00000001",
+      "created_at": "2026-09-12T10:01:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "agent-f002",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T10:01:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_fresh0001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T10:01:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_fresh000002"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T10:01:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_fresh000002"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T10:01:30Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_fresh000004"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_fresh000002",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000002",
+      "bound_at": "2026-09-12T10:01:03Z",
+      "released_at": "2026-09-12T10:01:30Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_fresh000002",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000002",
+      "created_at": "2026-09-12T10:01:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "And what does it deliberately not do?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_fresh000002",
+      "session_id": "ses_fresh000002",
+      "observed_at": "2026-09-12T10:01:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-f002"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_fresh000003",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000002",
+      "sequence": 1,
+      "received_at": "2026-09-12T10:01:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It has no status, health, or poll operation.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_fresh000004",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000002",
+      "sequence": 2,
+      "received_at": "2026-09-12T10:01:30Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_fresh000003",
+      "chat_id": "cht_fresh00000001",
+      "created_at": "2026-09-12T10:02:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "agent-f003",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T10:02:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_fresh0001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T10:02:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_fresh000003"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T10:02:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_fresh000003"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T10:02:30Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_fresh000006"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_fresh000003",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000003",
+      "bound_at": "2026-09-12T10:02:03Z",
+      "released_at": "2026-09-12T10:02:30Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_fresh000003",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000003",
+      "created_at": "2026-09-12T10:02:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Who may stop a running agent in v0.1?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_fresh000003",
+      "session_id": "ses_fresh000003",
+      "observed_at": "2026-09-12T10:02:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-f003"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_fresh000005",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000003",
+      "sequence": 1,
+      "received_at": "2026-09-12T10:02:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Only the user. The harness has no such authority.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_fresh000006",
+      "chat_id": "cht_fresh00000001",
+      "session_id": "ses_fresh000003",
+      "sequence": 2,
+      "received_at": "2026-09-12T10:02:30Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_fresh0001",
+      "chat_id": "cht_fresh00000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T10:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What does the launch boundary do?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_fresh0002",
+      "chat_id": "cht_fresh00000001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T10:00:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "It hides how an agent is started."
+      },
+      "session_id": "ses_fresh000001",
+      "source_event_id": "evt_fresh000001"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_fresh0003",
+      "chat_id": "cht_fresh00000001",
+      "sequence": 3,
+      "author": "user",
+      "created_at": "2026-09-12T10:01:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "And what does it deliberately not do?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_fresh0004",
+      "chat_id": "cht_fresh00000001",
+      "sequence": 4,
+      "author": "agent",
+      "created_at": "2026-09-12T10:01:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "It has no status, health, or poll operation."
+      },
+      "session_id": "ses_fresh000002",
+      "source_event_id": "evt_fresh000003"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_fresh0005",
+      "chat_id": "cht_fresh00000001",
+      "sequence": 5,
+      "author": "user",
+      "created_at": "2026-09-12T10:02:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Who may stop a running agent in v0.1?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_fresh0006",
+      "chat_id": "cht_fresh00000001",
+      "sequence": 6,
+      "author": "agent",
+      "created_at": "2026-09-12T10:02:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Only the user. The harness has no such authority."
+      },
+      "session_id": "ses_fresh000003",
+      "source_event_id": "evt_fresh000005"
+    }
+  ]
+}

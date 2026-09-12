@@ -1,0 +1,91 @@
+{
+  "fixture": {
+    "name": "running-without-launch-packet",
+    "expect": "reject",
+    "reason_code": "EVIDENCE_REF_INVALID",
+    "description": "A session reaches 'running' while the store contains no launch_request and no launch_result anywhere. This is the store that made the bounded-packet rule opt-in: omit the record and nothing about the instruction is checked. The precondition column is now executable, so the packet must exist."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_nopacket00001",
+      "title": "Launched from nowhere",
+      "created_at": "2026-09-12T20:00:00Z",
+      "updated_at": "2026-09-12T20:00:06Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_nopacket00001",
+      "chat_id": "cht_nopacket00001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T20:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Summarise how the launch boundary is supposed to work."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_nopacket00001",
+      "chat_id": "cht_nopacket00001",
+      "created_at": "2026-09-12T20:00:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "running",
+      "agent_handle": "agent-n001",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T20:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_nopacket00001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T20:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_nopacket00001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T20:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_nopacket00001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_nopacket00001",
+      "chat_id": "cht_nopacket00001",
+      "session_id": "ses_nopacket00001",
+      "bound_at": "2026-09-12T20:00:03Z",
+      "released_at": null
+    }
+  ]
+}

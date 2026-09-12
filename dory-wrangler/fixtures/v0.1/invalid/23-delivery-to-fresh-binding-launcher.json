@@ -1,0 +1,153 @@
+{
+  "fixture": {
+    "name": "delivery-to-fresh-binding-launcher",
+    "expect": "reject",
+    "reason_code": "DELIVERY_NOT_SUPPORTED",
+    "description": "A delivery to an already-running agent served by a launcher that declares continuation 'fresh_binding'. Continuation is a declared capability of an implementation, so a store may not use one the launcher never claimed."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_nodeliver0001",
+      "title": "Second turn",
+      "created_at": "2026-09-12T22:00:00Z",
+      "updated_at": "2026-09-12T22:01:02Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_nodeliver0001",
+      "chat_id": "cht_nodeliver0001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T22:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What does the launch boundary do?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_nodeliver0001",
+      "chat_id": "cht_nodeliver0001",
+      "created_at": "2026-09-12T22:00:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "running",
+      "agent_handle": "agent-d001",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T22:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_nodeliver0001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T22:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_nodeliver0001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T22:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_nodeliver0001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_nodeliver0001",
+      "chat_id": "cht_nodeliver0001",
+      "session_id": "ses_nodeliver0001",
+      "bound_at": "2026-09-12T22:00:03Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_nodeliver0001",
+      "chat_id": "cht_nodeliver0001",
+      "session_id": "ses_nodeliver0001",
+      "created_at": "2026-09-12T22:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What does the launch boundary do?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_nodeliver0001",
+      "session_id": "ses_nodeliver0001",
+      "observed_at": "2026-09-12T22:00:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-d001"
+    },
+    {
+      "record_type": "delivery_request",
+      "record_version": 1,
+      "delivery_id": "dlv_nodeliver0001",
+      "chat_id": "cht_nodeliver0001",
+      "session_id": "ses_nodeliver0001",
+      "sequence": 1,
+      "created_at": "2026-09-12T22:01:02Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "And what does it deliberately not do?",
+      "acknowledged": true
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_nodeliver0001",
+      "chat_id": "cht_nodeliver0001",
+      "session_id": "ses_nodeliver0001",
+      "sequence": 1,
+      "received_at": "2026-09-12T22:00:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It hides how an agent is started.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_nodeliver0002",
+      "chat_id": "cht_nodeliver0001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T22:00:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "It hides how an agent is started."
+      },
+      "session_id": "ses_nodeliver0001",
+      "source_event_id": "evt_nodeliver0001"
+    }
+  ]
+}

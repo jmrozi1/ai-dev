@@ -14,7 +14,7 @@ Release intent and the checkpoint roadmap are `jmrozi1/ai-dev` #81.
 | --- | --- |
 | `contract/v0.1/contract.md` | the normative v0.1 chat, session, agent-binding, launch-boundary, and diagnostic contract |
 | `contract/v0.1/facts-and-assumptions.md` | what is proven about the integration today versus what is assumed, as claims internal dogfood can settle |
-| `fixtures/v0.1/valid/` | store snapshots the contract must accept |
+| `fixtures/v0.1/valid/` | store snapshots the contract must accept, including both continuation modes and both restart outcomes |
 | `fixtures/v0.1/invalid/` | store snapshots the contract must reject, each naming the rule it violates |
 | `validator/validate_contract.py` | the executable form of the contract |
 

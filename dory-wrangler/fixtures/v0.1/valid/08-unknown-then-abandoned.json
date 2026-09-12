@@ -2,7 +2,7 @@
   "fixture": {
     "name": "unknown-then-abandoned",
     "expect": "accept",
-    "description": "The event stream closed without a terminal lifecycle event. That is an explicit observation, so the session becomes 'unknown' rather than being reported as completed or failed. Only an explicit user action, never a timer, moves it to a terminal state."
+    "description": "The launcher signalled end-of-stream without a terminal lifecycle event, which is a preserved observation rather than silence, so the session became 'unknown'; only an explicit user action then made it terminal and released the binding."
   },
   "contract_version": "0.1",
   "records": [
@@ -37,6 +37,11 @@
       "chat_id": "cht_unknown000001",
       "created_at": "2026-09-12T15:00:02Z",
       "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
       "state": "abandoned",
       "agent_handle": "agent-d4e0",
       "transitions": [
@@ -47,7 +52,7 @@
           "at": "2026-09-12T15:00:02Z",
           "evidence": {
             "kind": "user_action",
-            "ref": null
+            "ref": "msg_unknown000001"
           }
         },
         {
@@ -57,7 +62,7 @@
           "at": "2026-09-12T15:00:03Z",
           "evidence": {
             "kind": "harness_action",
-            "ref": null
+            "ref": "req_unknown000001"
           }
         },
         {
@@ -77,7 +82,7 @@
           "at": "2026-09-12T15:12:00Z",
           "evidence": {
             "kind": "stream_end",
-            "ref": null
+            "ref": "evt_unknown000002"
           }
         },
         {
@@ -134,6 +139,22 @@
       "raw": {
         "encoding": "utf-8",
         "body": "{\"type\":\"assistant_text\",\"text\":\"Starting the migration.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_unknown000002",
+      "chat_id": "cht_unknown000001",
+      "session_id": "ses_unknown000001",
+      "sequence": 2,
+      "received_at": "2026-09-12T15:20:00Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "stream_end",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"stream_end\",\"reason\":\"closed by peer\"}"
       }
     },
     {

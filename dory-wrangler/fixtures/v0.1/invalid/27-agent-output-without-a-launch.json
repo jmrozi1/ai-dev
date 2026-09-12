@@ -1,8 +1,9 @@
 {
   "fixture": {
-    "name": "normal-agent-completion",
-    "expect": "accept",
-    "description": "One agent is bound to a chat, launched, produces a recognized assistant event that becomes user-visible history, completes, and the binding is released."
+    "name": "agent-output-without-a-launch",
+    "expect": "reject",
+    "reason_code": "AGENT_OUTPUT_WITHOUT_AGENT",
+    "description": "A session that never left 'pending' nonetheless carries agent-sourced events, one of which is rendered as user-visible chat. Nothing was ever launched, so there was no agent to produce them. Without this rule the lifecycle can be routed around entirely: keep the launch packet, skip the launch, and show the output anyway."
   },
   "contract_version": "0.1",
   "records": [
@@ -42,8 +43,7 @@
         "response_shape": "stream",
         "instruction_bound_bytes": null
       },
-      "state": "completed",
-      "agent_handle": "agent-7f21",
+      "state": "pending",
       "transitions": [
         {
           "from": null,
@@ -53,36 +53,6 @@
           "evidence": {
             "kind": "user_action",
             "ref": "msg_complete00001"
-          }
-        },
-        {
-          "from": "pending",
-          "to": "launching",
-          "owner": "harness",
-          "at": "2026-09-12T10:00:04Z",
-          "evidence": {
-            "kind": "harness_action",
-            "ref": "req_complete00001"
-          }
-        },
-        {
-          "from": "launching",
-          "to": "running",
-          "owner": "launcher",
-          "at": "2026-09-12T10:00:06Z",
-          "evidence": {
-            "kind": "launch_result",
-            "ref": "req_complete00001"
-          }
-        },
-        {
-          "from": "running",
-          "to": "completed",
-          "owner": "launcher",
-          "at": "2026-09-12T10:00:30Z",
-          "evidence": {
-            "kind": "event",
-            "ref": "evt_complete00002"
           }
         }
       ]
@@ -94,7 +64,7 @@
       "chat_id": "cht_complete00001",
       "session_id": "ses_complete00001",
       "bound_at": "2026-09-12T10:00:03Z",
-      "released_at": "2026-09-12T10:00:30Z"
+      "released_at": null
     },
     {
       "record_type": "launch_request",
@@ -105,15 +75,6 @@
       "created_at": "2026-09-12T10:00:04Z",
       "instruction_encoding": "utf-8",
       "instruction_text": "Summarise how the launch boundary is supposed to work."
-    },
-    {
-      "record_type": "launch_result",
-      "record_version": 1,
-      "request_id": "req_complete00001",
-      "session_id": "ses_complete00001",
-      "observed_at": "2026-09-12T10:00:06Z",
-      "outcome": "accepted",
-      "agent_handle": "agent-7f21"
     },
     {
       "record_type": "diagnostic_event",

@@ -37,6 +37,11 @@
       "chat_id": "cht_agentfail0001",
       "created_at": "2026-09-12T11:00:02Z",
       "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
       "state": "failed",
       "agent_handle": "agent-91ba",
       "transitions": [
@@ -47,7 +52,7 @@
           "at": "2026-09-12T11:00:02Z",
           "evidence": {
             "kind": "user_action",
-            "ref": null
+            "ref": "msg_agentfail0001"
           }
         },
         {
@@ -57,7 +62,7 @@
           "at": "2026-09-12T11:00:03Z",
           "evidence": {
             "kind": "harness_action",
-            "ref": null
+            "ref": "req_agentfail0001"
           }
         },
         {
