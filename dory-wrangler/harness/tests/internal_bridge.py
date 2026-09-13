@@ -38,8 +38,14 @@ The shape it models, from `facts-and-assumptions.md` F10:
 What that shape forces on a launcher author, all of it on this side of the seam
 and none of it above it:
 
-1. **Synthesise a handle.** `LaunchResult` refuses `accepted` without one, and
-   the script issues none. Handles are opaque, so this is legal.
+1. **Synthesise a handle, and make it unique across the launcher's own process
+   lifetimes.** `LaunchResult` refuses `accepted` without one and the script
+   issues none, so the launcher makes one up; handles are opaque, so that is
+   legal. What is *not* legal is a per-instance counter. The harness stores the
+   handle durably and hands it back to a fresh launcher process after a restart,
+   so a generator that restarts with the process re-issues a live chat's address
+   to a different agent -- see `AHandleMustBeUniqueAcrossRestartsNotOnlyWithinOne`
+   and the obligation in `harness/README.md`.
 2. **Buffer the response and serve it through `events`.** `launch` returns an
    outcome, not text, so the response cannot travel back through the call that
    obtained it.
@@ -57,6 +63,7 @@ and none of it above it:
 from __future__ import annotations
 
 import json
+import uuid
 
 import launch_boundary as lb
 
@@ -82,6 +89,18 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
         # is a harness restart, and it remembers nothing.
         self._buffers = {}
         self._counter = 0
+        # The handle must be unique across this launcher's *process lifetimes*,
+        # not merely within one. A fresh instance is a harness restart, and the
+        # harness still holds the handles the previous instance issued; a counter
+        # that starts again at one hands chat A's recorded address to chat B's
+        # live agent, and neither the harness nor the contract validator can
+        # notice, because a handle is opaque to both. Deliberately random rather
+        # than derived from the process: two instances in one process are two
+        # restarts as far as this seam is concerned. The cost is that a store
+        # produced through this launcher is no longer byte-identical run to run,
+        # which is the right trade -- a generator that is reproducible across
+        # restarts is precisely the broken one.
+        self._issuer = uuid.uuid4().hex[:12]
         # Whether this bridge can say anything about the agent's exit. False
         # models a bridge that can report only the agent's text.
         self._report_completion = report_completion
@@ -118,7 +137,7 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
                                    "the script returned nothing")
 
         self._counter += 1
-        handle = "internal-bridge-%04d" % self._counter
+        handle = "internal-bridge-%s-%04d" % (self._issuer, self._counter)
 
         payloads = [lb.EventPayload(
             1, lb.SOURCE_AGENT, lb.INTERPRETATION_RECOGNIZED,

@@ -245,6 +245,19 @@ class Store(object):
                 return r
         return None
 
+    def launch_result_of(self, session_id):
+        """The launcher's own report of how the launch ended, by session.
+
+        Item 7's companion. Contract 5.2 makes this record the precondition for
+        every transition out of `launching` but one, so the restart path has to
+        be able to read it back: after a process death the launch outcome is
+        recoverable only from here (D1), never from the launcher.
+        """
+        for r in self.all_of("launch_result"):
+            if r["session_id"] == session_id:
+                return r
+        return None
+
     def deliveries_of(self, session_id):
         rows = [d for d in self.all_of("delivery_request") if d["session_id"] == session_id]
         rows.sort(key=lambda d: d["sequence"])

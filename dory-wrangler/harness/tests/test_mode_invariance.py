@@ -362,16 +362,59 @@ class TheExperimentIsWhatItIsAndNotMore(unittest.TestCase):
 
     def test_response_shape_is_exercised_where_it_actually_matters(self):
         """Not an excuse for the above: the guards `response_shape` really does
-        control exist, are load-bearing, and are attacked in both spellings."""
-        import test_adversarial
-        cls = test_adversarial.AOneShotLauncherCannotObserveAStreamEnding
-        for name in ("test_probe_a_typed_stream_end_payload_is_refused",
-                     "test_probe_the_other_spelling_is_refused_too"):
-            self.assertTrue(hasattr(cls, name), name)
-        one_shot = lb.LauncherCapabilities("fresh_binding", "one_shot")
-        stream = lb.LauncherCapabilities("persistent", "stream")
-        self.assertFalse(one_shot.has_stream)
-        self.assertTrue(stream.has_stream)
+        control exist, are load-bearing, and are attacked in both spellings.
+
+        This used to discharge that claim with `hasattr` on two test-method names
+        in `test_adversarial.py` -- a label check inside the repair of an evidence
+        defect, and one that stayed green if either of those tests were gutted.
+        It runs the refusals itself now. The guard is the fact; the other file's
+        method names are not.
+        """
+        one_shot = {"launcher": "scripted-stub",
+                    "options": {"continuation": "fresh_binding",
+                                "response_shape": "one_shot"}}
+
+        # Spelling one: a payload typed `stream_end` from a launcher that
+        # declared it returns a response rather than a stream.
+        typed = dict(one_shot["options"], end_of_turn="stream_end")
+        harness = open_harness({"launcher": "scripted-stub", "options": typed})
+        chat_id = harness.create_chat("One-shot stream end")
+        with self.assertRaises(lb.LaunchBoundaryError) as caught:
+            harness.send_turn(chat_id, "hello")
+        self.assertIn("no stream to end", str(caught.exception))
+        self.assertNotIn("stream_end",
+                         [e["interpreted_type"]
+                          for e in harness.store.all_of("diagnostic_event")],
+                         "the refused payload must not have been stored either")
+
+        # Spelling two: never emit the payload, just set the page's flag.
+        class FlagsAnEndWithoutSayingIt(ScriptedStubLauncher):
+            def events(self, agent_handle, after_sequence):
+                page = ScriptedStubLauncher.events(self, agent_handle, after_sequence)
+                return lb.EventsPage(page.payloads, stream_ended=True)
+
+        flagged = open_harness(
+            {}, launcher=FlagsAnEndWithoutSayingIt(dict(one_shot["options"])))
+        chat_id = flagged.create_chat("One-shot flagged end")
+        with self.assertRaises(lb.LaunchBoundaryError) as caught:
+            flagged.send_turn(chat_id, "hello")
+        self.assertIn("signalled that a stream ended", str(caught.exception))
+
+        # And the capability both guards read, so a launcher that declares
+        # `stream` is not caught by either of them.
+        self.assertFalse(lb.LauncherCapabilities("fresh_binding", "one_shot").has_stream)
+        self.assertTrue(lb.LauncherCapabilities("persistent", "stream").has_stream)
+        streaming = open_harness(
+            {"launcher": "scripted-stub",
+             "options": {"continuation": "persistent", "response_shape": "stream",
+                         "end_of_turn": "stream_end"}})
+        chat_id = streaming.create_chat("A stream may end")
+        streaming.send_turn(chat_id, "hello")
+        self.assertIn("stream_end",
+                      [e["interpreted_type"]
+                       for e in streaming.store.all_of("diagnostic_event")],
+                      "the guards must key on the declared response shape, not "
+                      "refuse a stream end outright")
 
 
 if __name__ == "__main__":

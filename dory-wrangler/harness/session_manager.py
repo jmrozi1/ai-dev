@@ -695,15 +695,34 @@ class SessionManager(object):
             self._release_binding(session_id)
             return "launch_failed"
 
+        if state == "launching":
+            # `launching` is not a fact about the handle, and generalising this
+            # path to the handle alone left this shape in no branch at all
+            # (re-review N1): a `launching` session that *does* carry a handle
+            # passed the guard below and then matched neither outcome gate, so
+            # `return session["state"]` left it `launching` on every restart,
+            # for the life of the store, with stop, abandon and every turn
+            # refused. Resolving it first, from the record that says how the
+            # launch ended, is what puts every shape back in a branch.
+            state = self._resolve_interrupted_launch(session)
+            if state != "running":
+                # `launch_failed` is terminal and `unknown`'s exit is the user's
+                # `abandon`; neither has a handle to re-attach through, and
+                # nothing below applies to them.
+                return state
+
         handle = session.get("agent_handle")
         if not (isinstance(handle, str) and handle):
             # Contract 5.4's second case, stated over the fact rather than over
             # the state name. `events` takes the handle and nothing else, so a
             # session that never received one has nothing to address and the
-            # attempt fails without being made. Two shapes reach here: a session
-            # interrupted in `launching`, and one whose launch outcome came back
-            # `unknown`. `reattach_failed` is the one observation kind that needs
-            # no handle, for exactly this reason (contract 4.3).
+            # attempt fails without being made. The shape that reaches here is a
+            # session whose launch outcome came back `unknown`, which contract
+            # 6.1 forbids from carrying a handle at all; the branch stays keyed
+            # on the fact rather than on that one state name so that any other
+            # handle-less session is refused rather than addressed.
+            # `reattach_failed` is the one observation kind that needs no handle,
+            # for exactly this reason (contract 4.3).
             observation_id = self._record_observation(
                 session, "reattach_failed",
                 "session %s carries no agent_handle -- its launch was never accepted, "
@@ -729,6 +748,65 @@ class SessionManager(object):
         observation_id = self._record_observation(session, "reattached", None)
         if state == "unknown":
             self._transition(session, "running", "launcher", "observation", observation_id)
+        return session["state"]
+
+    def _resolve_interrupted_launch(self, session):
+        """Finish the launch outcome a restart interrupted, from the record of it.
+
+        `launching` means one thing and it is not a fact about the handle: the
+        launch was issued and its outcome was never written as a state. The two
+        are independent, because `_launch_turn` persists the handle and the
+        `running` transition as separate durable writes, so a process death
+        between them leaves `launching` *with* a handle.
+
+        Contract 5.2's precondition column decides what may resolve it, and for
+        every exit but one it names the launcher's own `launch_result`:
+        `launching -> running` admits `launch_result` reporting `accepted`,
+        `launching -> launch_failed` admits `failed`, `launching -> unknown`
+        admits `unknown`. D1 makes that record canonical across a restart, so the
+        harness finishes the transition it already holds the evidence for. It
+        asks the launcher nothing here: this reads the harness's own records, and
+        the re-attachment proper still happens above, through the handle.
+
+        A re-attachment cannot stand in for that evidence. `launching -> running`
+        does not admit an `observation` at all, and an accepted launch whose
+        session never entered `running` is a `LAUNCH_OUTCOME_MISMATCH` however
+        the session is later resolved -- so widening the two outcome gates below
+        to admit `launching` would trade a bricked chat for a store the contract
+        rejects. Measured both ways; see this rail's handoff.
+
+        When no usable `launch_result` survives, nothing can say how the launch
+        ended and nothing ever will: that is `unknown`, evidenced by the failed
+        re-attachment, which is the one observation kind that needs no handle.
+        """
+        session_id = session["session_id"]
+        request = self._store.launch_request_of(session_id)
+        result = self._store.launch_result_of(session_id)
+        request_id = request["request_id"] if request is not None else None
+
+        if result is not None and request_id is not None:
+            outcome = result.get("outcome")
+            if outcome == OUTCOME_ACCEPTED and result.get("agent_handle"):
+                self._transition(session, "running", "launcher", "launch_result",
+                                 request_id)
+                return session["state"]
+            if outcome == OUTCOME_FAILED:
+                self._transition(session, "launch_failed", "launcher", "launch_result",
+                                 request_id)
+                self._release_binding(session_id)
+                return session["state"]
+            if outcome == OUTCOME_UNKNOWN:
+                self._transition(session, "unknown", "launcher", "launch_result",
+                                 request_id)
+                return session["state"]
+
+        observation_id = self._record_observation(
+            session, "reattach_failed",
+            "session %s was interrupted in `launching` and no launch_result the "
+            "contract can act on survives, so how the launch ended is not "
+            "recoverable and no handle was ever issued to re-attach through"
+            % (session_id,))
+        self._transition(session, "unknown", "launcher", "observation", observation_id)
         return session["state"]
 
     # -- record plumbing ---------------------------------------------------

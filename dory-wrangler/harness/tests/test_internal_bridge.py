@@ -267,5 +267,162 @@ class ARestartWithALiveSessionNeedsAnAbandonAffordance(unittest.TestCase, StoreC
         self.assertEqual(caught.exception.category, "unavailable")
 
 
+class TheHandleIsWhatSelectsTheAgent(unittest.TestCase, StoreCheck):
+    """Re-review survivor M35, pinned.
+
+    Nothing in the internal-bridge evidence required the handle to *select*
+    anything: with a single buffered run, a launcher that ignored the address
+    entirely and served its only agent passed every test in this file. That is
+    the exact shape contract 6.1 exists to forbid, and it is the shape a one-shot
+    bridge with one buffer drifts into, so it is checked here rather than assumed
+    from how the model happens to be written.
+    """
+
+    def _two_live_agents(self):
+        launcher = InternalBridgeLauncher(report_completion=False)
+        harness = support.deterministic({}, "ib14", launcher=launcher)
+        first = harness.create_chat("Agent one")
+        harness.send_turn(first, "question one")
+        second = harness.create_chat("Agent two")
+        harness.send_turn(second, "question two")
+        handles = [harness.store.sessions_of(c)[0]["agent_handle"]
+                   for c in (first, second)]
+        return launcher, harness, handles
+
+    def test_each_handle_serves_its_own_agent_and_no_other(self):
+        launcher, _, (one, two) = self._two_live_agents()
+        self.assertNotEqual(one, two)
+        self.assertEqual([p.text for p in launcher.events(one, 0).payloads],
+                         ["answer to: question one"])
+        self.assertEqual([p.text for p in launcher.events(two, 0).payloads],
+                         ["answer to: question two"],
+                         "the handle must select the agent, not merely accompany "
+                         "the call")
+
+    def test_a_handle_this_launcher_never_issued_is_refused_even_when_it_holds_one_agent(self):
+        """The single-buffer case specifically: with exactly one agent live there
+        is an obvious wrong answer available, and it must not be given."""
+        launcher = InternalBridgeLauncher(report_completion=False)
+        harness = support.deterministic({}, "ib15", launcher=launcher)
+        chat_id = harness.create_chat("Exactly one agent")
+        harness.send_turn(chat_id, "hello")
+        handle = harness.store.sessions_of(chat_id)[0]["agent_handle"]
+
+        with self.assertRaises(lb.LauncherError) as caught:
+            launcher.events(handle + "-not-this-one", 0)
+        self.assertEqual(caught.exception.category, "unavailable")
+        with self.assertRaises(lb.LauncherError):
+            launcher.stop(handle + "-not-this-one", "the user pressed Stop")
+
+    def test_stop_addresses_the_agent_the_handle_names(self):
+        launcher, _, (one, two) = self._two_live_agents()
+        launcher.stop(two, "the user pressed Stop")
+        self.assertEqual([address for operation, address in launcher.addressed
+                          if operation == "stop"], [two])
+
+
+class AHandleMustBeUniqueAcrossRestartsNotOnlyWithinOne(unittest.TestCase, StoreCheck):
+    """Re-review survivor M37, which is also N2, pinned.
+
+    A launcher remembers nothing between calls, so a fresh instance is a harness
+    restart -- and the harness still holds every handle the previous instance
+    issued. A generator whose state restarts with the process hands a live chat's
+    recorded address to a different agent, and nothing above the seam can catch
+    it: a handle is opaque to the harness and to the validator alike, so a store
+    with two live sessions sharing one address validates. Launcher-author
+    obligation 6 in `harness/README.md` states this; this is the test that holds
+    the model to it.
+    """
+
+    def test_two_launches_on_one_instance_issue_different_handles(self):
+        launcher = InternalBridgeLauncher(report_completion=False)
+        harness = support.deterministic({}, "ib16", launcher=launcher)
+        handles = []
+        for i in range(2):
+            chat_id = harness.create_chat("Distinct handles %d" % i)
+            harness.send_turn(chat_id, "hello")
+            handles.append(harness.store.sessions_of(chat_id)[0]["agent_handle"])
+        self.assertEqual(len(set(handles)), 2, "one constant handle per launch: %r"
+                         % handles)
+
+    def test_a_fresh_instance_never_re_issues_a_handle_the_last_one_did(self):
+        """The restart, which is the half a within-process check cannot see."""
+        issued = []
+        for salt in ("ib17", "ib18", "ib19"):
+            launcher = InternalBridgeLauncher(report_completion=False)
+            harness = support.deterministic({}, salt, launcher=launcher)
+            chat_id = harness.create_chat("Restarted launcher")
+            harness.send_turn(chat_id, "hello")
+            issued.append(harness.store.sessions_of(chat_id)[0]["agent_handle"])
+        self.assertEqual(len(set(issued)), len(issued),
+                         "a fresh instance is a restart and it re-issued a handle "
+                         "the harness still holds: %r" % issued)
+
+    def test_the_first_handle_of_a_fresh_instance_reaches_nothing_of_the_old_one(self):
+        """The consequence, not the property. Chat A's recorded handle must not
+        resolve to chat B's live agent after a restart."""
+        old = InternalBridgeLauncher(report_completion=False)
+        harness_a = support.deterministic({}, "ib20", launcher=old)
+        chat_a = harness_a.create_chat("Chat A")
+        harness_a.send_turn(chat_a, "question A")
+        handle_a = harness_a.store.sessions_of(chat_a)[0]["agent_handle"]
+
+        new = InternalBridgeLauncher(report_completion=False)
+        harness_b = support.deterministic({}, "ib21", launcher=new)
+        chat_b = harness_b.create_chat("Chat B")
+        harness_b.send_turn(chat_b, "question B")
+        handle_b = harness_b.store.sessions_of(chat_b)[0]["agent_handle"]
+
+        self.assertNotEqual(handle_a, handle_b)
+        with self.assertRaises(lb.LauncherError) as caught:
+            new.events(handle_a, 0)
+        self.assertEqual(caught.exception.category, "unavailable",
+                         "chat A's dead session must not re-attach to chat B's "
+                         "live agent")
+
+
+class AOneShotBridgeCannotConfirmAStop(unittest.TestCase, StoreCheck):
+    """Re-review survivor M41, pinned.
+
+    `launch` blocks for the whole agent run and has already returned, so by the
+    time a stop can be issued the bridge has nothing left to ask. Reporting the
+    stop as *confirmed* would be the launcher inventing the one fact contract
+    5.2 makes user-owned `running -> terminated` depend on. The honesty of this
+    answer was a property of how the model was written and nothing required it.
+    """
+
+    def test_the_bridge_reports_the_stop_unconfirmed(self):
+        launcher = InternalBridgeLauncher(report_completion=False)
+        harness = support.deterministic({}, "ib22", launcher=launcher)
+        chat_id = harness.create_chat("Unconfirmed stop")
+        harness.send_turn(chat_id, "hello")
+        handle = harness.store.sessions_of(chat_id)[0]["agent_handle"]
+        ack = launcher.stop(handle, "the user pressed Stop")
+        self.assertFalse(ack.confirmed,
+                         "a one-shot bridge has nothing left to ask, so it cannot "
+                         "confirm the agent is gone")
+        self.assertTrue(ack.detail, "an unconfirmed stop must say why")
+
+    def test_the_chat_records_stop_unconfirmed_and_the_session_is_not_terminated(self):
+        """The fact the ack stands for, read off the store: an unconfirmed stop
+        is an observation, never a resolution."""
+        launcher = InternalBridgeLauncher(report_completion=False)
+        harness = support.deterministic({}, "ib23", launcher=launcher)
+        chat_id = harness.create_chat("Stop is not a resolution")
+        harness.send_turn(chat_id, "hello")
+        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
+
+        self.assertEqual(harness.stop_agent(chat_id, "the user pressed Stop"),
+                         "unknown")
+        self.assertEqual([o["kind"] for o in harness.store.observations_of(session_id)],
+                         ["stop_unconfirmed"])
+        session = harness.store.get("agent_session", session_id)
+        self.assertNotIn("terminated", [t["to"] for t in session["transitions"]],
+                         "an unconfirmed stop must not reach 5.2's user-owned "
+                         "`running -> terminated`")
+        harness.abandon(chat_id)
+        self.assert_store_valid(harness.store, "internal-bridge-stop-unconfirmed")
+
+
 if __name__ == "__main__":
     unittest.main()

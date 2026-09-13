@@ -87,10 +87,20 @@ that has to be enough.
 
 The harness enforces its own half. It refuses to issue an addressing operation,
 or to write a record claiming one happened, for a session that carries no handle
--- a session whose launch outcome was `unknown`, or one a restart interrupted in
-`launching`. `reattach_failed` is the one observation kind exempt from that,
-because the attempt fails without being made. The user is not stuck: `abandon` is
-contract 5.4's exit from exactly that state and needs no handle.
+-- a session whose launch outcome was `unknown` never received one, and contract
+6.1 forbids an `unknown` outcome from carrying one at all. `reattach_failed` is
+the one observation kind exempt from that, because the attempt fails without
+being made. The user is not stuck: `abandon` is contract 5.4's exit from exactly
+that state and needs no handle.
+
+`launching` is a separate question and not a fact about the handle, because the
+handle and the `running` transition are two durable writes and a process can die
+between them. At restart the harness finishes the interrupted transition from the
+launcher's own `launch_result`, which contract 5.2 names as the precondition for
+every exit out of `launching` but one, and falls back to `unknown` evidenced by a
+failed re-attachment when no such record survives. Every shape therefore leaves
+`launching`, which is the point: a session that no branch transitions is a chat
+with no exit at all.
 
 ## What is deliberately absent
 
@@ -119,20 +129,34 @@ in `session_manager.py` is the one function a later answer changes.
    rather than `str(exc)` is coerced rather than refused.
 5. **It synthesises an `agent_handle` if its transport issues none.** Handles are
    opaque, so this is legal, and `LaunchResult` refuses `accepted` without one.
-6. **It buffers the response and serves it through `events`.** On a one-shot path
+6. **A synthesised handle must be unique across the launcher's own process
+   lifetimes, not merely within one.** A launcher remembers nothing between
+   calls, so every operation after `launch` is served by a process that may be
+   new; the harness holds the handles the previous process issued and hands them
+   straight back to it. A generator whose state restarts with the process --- an
+   instance counter, a per-run sequence --- therefore re-issues a live chat's
+   address to a different agent, and one chat's `events`, `stop` and `deliver`
+   reach another chat's agent. Nothing above the seam can catch this: a handle is
+   opaque to the harness and to the contract validator alike, so a store in which
+   two live sessions share one address validates. Draw the handle from something
+   that does not restart with the process --- a UUID, or an identifier the
+   transport itself guarantees unique --- and never from a counter the
+   constructor initialises. `tests/internal_bridge.py` models this and
+   `AHandleMustBeUniqueAcrossRestartsNotOnlyWithinOne` holds it to it.
+7. **It buffers the response and serves it through `events`.** On a one-shot path
    `launch` returns an outcome, not text, so the response cannot travel back
    through the call that obtained it.
-7. **It emits a launcher-sourced `session_completed` or `session_failed` after
+8. **It emits a launcher-sourced `session_completed` or `session_failed` after
    every response.** A bridge that reports the agent's text and nothing about its
    exit leaves the session `running` forever, and every later turn is refused
    until the user presses Stop. This is the difference between a working chat and
    one that needs a manual Stop between every turn, and it is the obligation
    easiest to miss.
-8. **It honours `after_sequence`.** `events` is resumable by sequence; a page
+9. **It honours `after_sequence`.** `events` is resumable by sequence; a page
    that does not advance is refused with a stated `LaunchBoundaryError` rather
    than read again. Whether the internal bridge can resume is recorded as unknown
    (C5), so this is the likeliest place an internal launcher first meets the seam.
-9. One entry in `launchers/registry.py`.
+10. One entry in `launchers/registry.py`.
 
 Nothing else changes. `tests/test_swappability.py` runs the full chat loop
 against a launcher defined in the test file and registered nowhere, and
