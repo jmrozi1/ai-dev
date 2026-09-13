@@ -3482,3 +3482,345 @@ class TestTheNewGuardsRemoveNoLegalExit(CodeClosureCase):
             "unknown -> failed": unknown_failed,
             "unknown -> terminated": unknown_terminated,
         }
+
+
+class ScriptedClock(object):
+    """A wall clock whose readings are a list rather than the machine's.
+
+    The store's clock rules are stated over a clock that can step *backwards*,
+    which is the one thing a real clock will not do on demand. Every test below
+    that turns on the clock installs one of these instead of sleeping.
+    """
+
+    def __init__(self, readings):
+        self.readings = list(readings)
+        self.calls = 0
+        self._real = ids.now
+
+    def __enter__(self):
+        ids.now = self._read
+        return self
+
+    def __exit__(self, *exc):
+        ids.now = self._real
+        return False
+
+    def _read(self):
+        self.calls += 1
+        index = min(self.calls, len(self.readings)) - 1
+        return self.readings[index]
+
+
+def _stamp(second, micro=0):
+    return "2030-01-01T00:00:%02d.%06dZ" % (second, micro)
+
+
+class TestTheAddressingClockCheckIsPinnedElementByElement(CodeClosureCase):
+    """The clock check of contract 6.1, taken apart into the facts it rests on.
+
+    A mechanical sweep put five mutations into this check and its issuance
+    lookup -- the accepted tie, the outcome element, the handle element, the
+    direction of the comparison, and the timestamp type re-check -- and all five
+    left the suite green. Four of them are green because the lookup they change
+    runs over a set that can hold at most one record: a session may have one
+    launch request (`append_launch_request` refuses a second) and a request may
+    have one result (its packet file name is the request id, so exclusive
+    creation refuses a second). The remaining two are green because nothing
+    exercised the clock at the resolution the check is stated at, or against a
+    sibling session that honestly shares a handle string.
+
+    These tests supply the two missing inputs. They are stated over what the
+    store *writes*, not over which clause refused, so they pin the facts rather
+    than the phrasing.
+    """
+
+    def test_the_tie_the_check_accepts_is_a_second_and_not_an_instant(self):
+        """`stamp[:19] < issued_at[:19]` is a second-granularity comparison.
+
+        The existing tie test drives an operation dated to the same microsecond,
+        which an untruncated comparison accepts as readily as a truncated one.
+        The input that separates them is an operation in the *same second* with
+        fewer microseconds -- exactly the sub-second jitter contract 6.4 says a
+        wall clock has, and which the contract refuses to call a violation.
+        """
+        with ScriptedClock([_stamp(5, 500000)]):
+            sid, _request_id, _user = self.running()
+            issued = self.store.read_launch_results(self.chat_id, sid)[0]["observed_at"]
+        self.assertEqual(_stamp(5, 500000), issued)
+
+        with ScriptedClock([_stamp(5, 400000)]):
+            earlier = self.store.append_session_observation(
+                self.chat_id, sid, "stop_confirmed", "same second, less micro")
+        self.assertEqual(_stamp(5, 400000), earlier["observed_at"])
+
+        with ScriptedClock([_stamp(5, 900000)]):
+            later = self.store.append_session_observation(
+                self.chat_id, sid, "stop_unconfirmed", "same second, more micro")
+        self.assertEqual(_stamp(5, 900000), later["observed_at"])
+
+        # And the floor is still a floor: a whole second earlier is refused.
+        with ScriptedClock([_stamp(4, 900000)]):
+            self.assertRaises(
+                ValidationRefused,
+                lambda: self.store.append_session_observation(
+                    self.chat_id, sid, "reattached", "a second earlier"))
+        self.assertEqual([], self.store.verify())
+
+    def test_the_issuance_compared_against_is_this_session_s_own(self):
+        """Two sessions in one chat may honestly carry the same handle string.
+
+        `_handle_issued_at` scopes its lookup to the session. Nothing in the
+        suite held two sessions whose handles collide, so the scope was the one
+        element of that filter no mutation could redden. Without it the earlier
+        session answers for the later one, and an operation dated before its own
+        handle was issued is written rather than refused.
+        """
+        with ScriptedClock([_stamp(2)]):
+            first, _request_id, _user = self.running(handle="h-shared")
+            self.completed(first)
+        with ScriptedClock([_stamp(30)]):
+            second, _request_id2, _user2 = self.running(handle="h-shared", text="turn two")
+
+        self.assertEqual(_stamp(2), self.store._handle_issued_at(self.chat_id, first, "h-shared"))
+        self.assertEqual(_stamp(30), self.store._handle_issued_at(self.chat_id, second, "h-shared"))
+
+        # A moment after the first session's handle and before the second's.
+        with ScriptedClock([_stamp(10)]):
+            self.assertRaises(
+                ValidationRefused,
+                lambda: self.store.append_session_observation(
+                    self.chat_id, second, "stop_confirmed", "between the two"))
+        self.assertEqual([], self.store.verify())
+        self.assertEqual(
+            [], [o for o in self.store.read_session_observations(self.chat_id, second)],
+            "the refused observation must not be on disk")
+
+    def test_an_addressing_record_carries_the_stamp_that_was_checked(self):
+        """One reading of the clock, checked and written.
+
+        `_require_addressable` reads the clock, compares that reading to the
+        handle's issuance, and returns it. Both addressing writers record the
+        reading they were given. A writer that reads the clock again writes a
+        stamp nothing checked, and a clock that stepped back in between puts
+        `ADDRESSED_BEFORE_HANDLE_ISSUED` on disk -- the very code the check
+        exists to prevent, produced by the check passing.
+
+        Stated over the record's own field rather than over the number of clock
+        reads, because "how many times did you call `now`" is a mechanism and
+        "is the record dated when it said it was" is the fact.
+        """
+        with ScriptedClock([_stamp(5)]):
+            sid, _request_id, _user = self.running()
+
+        # Honest reading first, then a clock that has stepped back behind the
+        # handle's issuance. Only the first reading is checked.
+        with ScriptedClock([_stamp(20), _stamp(1)]):
+            observation = self.store.append_session_observation(
+                self.chat_id, sid, "stop_confirmed", "probe")
+        self.assertEqual(
+            _stamp(20), observation["observed_at"],
+            "the observation must carry the reading the check was made against")
+
+        with ScriptedClock([_stamp(21), _stamp(1)]):
+            delivery = self.store.append_delivery_request(self.chat_id, sid, "more")
+        self.assertEqual(
+            _stamp(21), delivery["created_at"],
+            "the delivery must carry the reading the check was made against")
+
+        self.assertEqual([], self.store.verify())
+
+
+class TestTheInstructionBoundIsMeasuredOrAbsent(CodeClosureCase):
+    """Contract 6.3 and the human direction behind it.
+
+    This contract asserts no instruction-payload bound of its own. The only
+    bound is one a launcher measured and the session recorded, and the only
+    honest value today is `null`. Two failure directions therefore matter and
+    both are stated here: enforcing something when nothing was measured, and
+    failing to enforce something that was.
+    """
+
+    def test_an_unmeasured_bound_is_not_a_bound_on_either_packet_type(self):
+        """`null` must bound nothing, and it must bound nothing *on both*.
+
+        The existing coverage drove only `delivery_request`. The guard is stated
+        once over every packet carrying `instruction_text`, so the launch packet
+        is the other half of the same rule and a bound that appeared on only one
+        of the pair is the shape this rail exists to close.
+        """
+        user = self.store.append_user_message(self.chat_id, "go")
+        session, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+        sid = session["session_id"]
+        self.assertIsNone(
+            session["launcher_capabilities"]["instruction_bound_bytes"],
+            "null is the only honest value this release has")
+        huge = "x" * 100000
+        request = self.store.append_launch_request(self.chat_id, sid, huge)
+        self.assertEqual(100000, len(request["instruction_text"]))
+        self.store.append_transition(
+            self.chat_id, sid, "pending", "launching", "harness",
+            {"kind": "harness_action", "ref": request["request_id"]})
+        self.store.append_launch_result(
+            self.chat_id, request["request_id"], sid, "accepted", agent_handle="h-issued")
+        self.store.append_transition(
+            self.chat_id, sid, "launching", "running", "launcher",
+            {"kind": "launch_result", "ref": request["request_id"]}, agent_handle="h-issued")
+        delivery = self.store.append_delivery_request(self.chat_id, sid, huge)
+        self.assertEqual(100000, len(delivery["instruction_text"]))
+        self.assertEqual([], self.store.verify())
+
+    def test_a_bound_below_one_is_not_a_bound_a_session_can_declare(self):
+        """`bound < 1` reads as "nothing was measured", and that must stay true.
+
+        A mutation making zero a *real* bound of zero -- so that every
+        instruction is too large -- left the whole suite green, because nothing
+        held a session declaring it. It is unreachable, and this says so by
+        driving it: the contract types the field as an integer >= 1 or null, and
+        `create_session` refuses everything below that rather than storing a
+        number the store would then enforce as though a launcher had measured
+        it.
+        """
+        for bound, code in ((0, "FIELD_OUT_OF_RANGE"),
+                            (-1, "FIELD_OUT_OF_RANGE"),
+                            (True, "BAD_FIELD_TYPE"),
+                            (False, "BAD_FIELD_TYPE"),
+                            ("8", "BAD_FIELD_TYPE")):
+            capabilities = dict(PERSISTENT_STREAM)
+            capabilities["instruction_bound_bytes"] = bound
+            user = self.store.append_user_message(self.chat_id, "go")
+            with self.assertRaises(ValidationRefused) as caught:
+                self.store.create_session(
+                    self.chat_id, user["message_id"], "dev-local", capabilities)
+            self.assertIn(code, str(caught.exception),
+                          "bound %r must be refused as %s" % (bound, code))
+        self.assertEqual([], self.store.verify())
+
+    def test_an_instruction_of_the_wrong_type_is_refused_and_not_raised_over(self):
+        """Every public write of this store fails with a `StoreError`.
+
+        The bound guard returns early on anything that is not a string, leaving
+        the refusal to the record check a line later. Narrowed to a presence
+        test it still refuses -- but on a session that declares a measured
+        bound it refuses by raising `AttributeError` out of `len(text.encode())`
+        instead, which is not a `StoreError` and is not a refusal a caller can
+        handle. The measured-bound session is the input that separates the two.
+        """
+        capabilities = dict(PERSISTENT_STREAM)
+        capabilities["instruction_bound_bytes"] = 64
+        user = self.store.append_user_message(self.chat_id, "go")
+        session, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", capabilities)
+        sid = session["session_id"]
+        for value in (123, ["x"], {"a": 1}, b"bytes", 1.5):
+            with self.assertRaises(StoreError) as caught:
+                self.store.append_launch_request(self.chat_id, sid, value)
+            self.assertIn("BAD_FIELD_TYPE", str(caught.exception),
+                          "%r must be refused as a bad field type" % (value,))
+        self.assertEqual(
+            [], self.store.read_launch_requests(self.chat_id, sid),
+            "no refused instruction may be on disk")
+        self.assertEqual([], self.store.verify())
+
+
+class TestTheReadOnlySurfaceIsDerivedNotDeclared(CodeClosureCase):
+    """`READ_ONLY` is the second axis of the write enumeration, stated as a list.
+
+    `test_every_public_write_is_in_the_enumeration` asks three questions of that
+    list -- nothing unclassified, nothing driven that is not public, nothing
+    declared that the store no longer has -- and none of them asks whether a
+    name on it writes. A mechanical mutation adding `append_launch_result` to
+    the list left all of them green. That is the defect this ticket family has
+    produced repeatedly in a new place: a check on the label of a claim rather
+    than on the fact the label stands for. A write hidden behind the label drops
+    silently out of the cross that exists to drive every write.
+
+    So the list is checked against the disk. Every name on it is exercised
+    against a store holding a full history, and the byte-for-byte content of the
+    store must be what it was.
+    """
+
+    def _digest(self, root):
+        """Every path under `root` and its bytes: a write of any kind shows up."""
+        out = {}
+        for base, dirs, names in os.walk(root):
+            dirs.sort()
+            for name in sorted(names):
+                path = os.path.join(base, name)
+                with open(path, "rb") as handle:
+                    out[os.path.relpath(path, root)] = handle.read()
+        return out
+
+    def _arguments(self, method, chat_id, sid, event_id, message_id):
+        """A plausible call for a reader, derived from its own parameter names."""
+        import inspect
+        known = {
+            "chat_id": chat_id, "session_id": sid, "event_id": event_id,
+            "message_id": message_id, "name": "probe", "sequence": 1,
+            "expect": "accept", "description": None, "include_archived": True,
+            "sequence_from": None, "sequence_to": None, "limit": None,
+        }
+        supplied = []
+        for parameter in list(inspect.signature(method).parameters.values()):
+            if parameter.kind in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD):
+                continue
+            if parameter.name in known:
+                supplied.append(known[parameter.name])
+            elif parameter.default is not parameter.empty:
+                supplied.append(parameter.default)
+            else:
+                self.fail(
+                    "no argument known for %r of %s; a reader this test cannot "
+                    "call is a reader it cannot check" % (parameter.name, method))
+        return supplied
+
+    def test_every_name_declared_read_only_writes_nothing(self):
+        sid, request_id, user = self.running()
+        event = self.agent_event(sid)
+        self.store.append_agent_message(self.chat_id, sid, event["event_id"], "hi")
+        self.store.append_delivery_request(self.chat_id, sid, "more")
+        self.store.append_session_observation(self.chat_id, sid, "stop_confirmed", "probe")
+        self.assertEqual([], self.store.verify())
+
+        enumeration = TestNoPublicSequenceProducesARejectedStore()
+        before = self._digest(self.store.root)
+        self.assertTrue(before, "the store must hold something to notice a write to")
+
+        exercised = []
+        for name in sorted(enumeration.READ_ONLY):
+            member = getattr(self.store, name)
+            if not callable(member):
+                exercised.append(name)
+                continue
+            arguments = self._arguments(
+                member, self.chat_id, sid, event["event_id"], user["message_id"])
+            try:
+                member(*arguments)
+            except StoreError:
+                # A reader may refuse; refusing is not writing.
+                pass
+            exercised.append(name)
+
+        self.assertEqual(sorted(enumeration.READ_ONLY), exercised)
+        after = self._digest(self.store.root)
+        self.assertEqual(
+            sorted(before), sorted(after),
+            "a name declared read-only added or removed a file")
+        changed = sorted(path for path in before if before[path] != after[path])
+        self.assertEqual(
+            [], changed,
+            "a name declared read-only changed %s on disk" % changed)
+        self.assertEqual([], self.store.verify())
+
+    def test_a_writer_hidden_behind_the_label_is_caught(self):
+        """The control: this check must fail when the list is wrong.
+
+        Without it, a check that exercised nothing would pass just as happily.
+        """
+        sid, _request_id, _user = self.running()
+        before = self._digest(self.store.root)
+        self.store.append_session_observation(self.chat_id, sid, "stop_confirmed", "probe")
+        after = self._digest(self.store.root)
+        self.assertNotEqual(
+            sorted(before), sorted(after),
+            "the digest must notice a write, or it notices nothing")
