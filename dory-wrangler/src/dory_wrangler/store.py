@@ -105,6 +105,54 @@ def _seq_name(sequence):
     return "%08d.json" % sequence
 
 
+def _component(value, what):
+    """One path component, or a refusal.
+
+    Contract section 3: an identifier is opaque, and "no ordering, timestamp, or
+    filename may substitute for it". A value that becomes a path component and
+    is not a single component is a value being used as a *path* -- it addresses
+    a record the caller did not name, and it does so while the caller believes
+    it named the one it passed in.
+
+    This is the store's single answer to that, and it is deliberately about the
+    shape of the string rather than about which kind of identifier it is. The
+    kind check (`ids.is_id(x, "cht")`) states what the caller must have meant;
+    this states what the filesystem will be asked to do. Both are needed and
+    neither implies the other: a kind check that is weakened, removed, or simply
+    never written for one argument of a two-argument join is exactly how this
+    defect has now reached the store twice.
+
+    Four clauses, and no more than four. `os.path.isabs(value)`,
+    `value != os.path.basename(value)` and an `os.altsep` clause were all here
+    and are all gone: the first two are implied by `os.sep in value` on this
+    platform and the third can never fire on it, so the mechanical mutation
+    probe removed each of them with every test still green. A clause that cannot
+    fail is a clause no test can prove, which is the argument
+    `_require_addressable` already makes about its own missing type check. Each
+    clause that remains is individually held (N2, N3, N9-N11, N7).
+    """
+    if not isinstance(value, str):
+        raise NotFound("%r is not a %s" % (value, what))
+    if value in ("", ".", ".."):
+        raise NotFound("%r is not a usable %s" % (value, what))
+    if os.sep in value or "\0" in value:
+        raise NotFound("%r is not a usable %s" % (value, what))
+    return value
+
+
+def _under(base, *components):
+    """Join `components` beneath `base`, each checked as a single component.
+
+    Every path this store builds from a value it did not itself derive goes
+    through here. `os.path.join` is not called on a caller-supplied value
+    anywhere else, so "a caller cannot address outside the tree it named" is a
+    property of one function rather than of every call site remembering to
+    check.
+    """
+    checked = [_component(c, "path component") for c in components]
+    return os.path.join(base, *checked)
+
+
 def _json_names(directory):
     """Record file names in a directory, temp files excluded by construction."""
     if not os.path.isdir(directory):
@@ -138,7 +186,7 @@ class ChatStore(object):
     def _chat_dir(self, chat_id):
         if not ids.is_id(chat_id, "cht"):
             raise NotFound("%r is not a chat identifier" % (chat_id,))
-        return os.path.join(self.chats_dir, chat_id)
+        return _under(self.chats_dir, chat_id)
 
     def _require_chat_dir(self, chat_id):
         path = self._chat_dir(chat_id)
@@ -466,7 +514,7 @@ class ChatStore(object):
     def _session_path(self, chat_id, session_id):
         if not ids.is_id(session_id, "ses"):
             raise NotFound("%r is not a session identifier" % (session_id,))
-        return os.path.join(self._sessions_dir(chat_id), session_id + ".json")
+        return _under(self._sessions_dir(chat_id), session_id + ".json")
 
     def _read_session_file(self, path):
         document = _loads(path)
@@ -687,8 +735,90 @@ class ChatStore(object):
             )
         return session
 
+    def _require_deliverable(self, chat_id, session_id):
+        """Refuse a delivery the contract would reject once it is on disk.
+
+        Contract 6.5 and 8.x state four preconditions for a `delivery_request`,
+        and they live within twenty lines of each other in the validator. Three
+        of them are about the *session*, and each is refused here:
+
+        * the launcher must have declared `continuation: persistent`, because
+          delivering to an already-running agent is the capability that word
+          names (`DELIVERY_NOT_SUPPORTED`);
+        * the session must have *reached* `running`, because otherwise there was
+          no agent to deliver to (`DELIVERY_NOT_SUPPORTED`, second clause --
+          the same code, a different fact, and a guard that stopped at the first
+          would be the defect this rail exists to close);
+        * the session must not have exited, because `deliver` sends text to an
+          agent that is already running (`DELIVERY_AFTER_AGENT_EXIT`).
+
+        The fourth, `ADDRESSED_WITHOUT_HANDLE`, is `_require_addressable`.
+
+        The exit check is stated over the session being terminal rather than
+        over comparing this delivery's timestamp to the terminal one. The
+        validator compares timestamps because a fixture is a history it did not
+        watch being made; this store is writing *now*, so "the agent has already
+        exited" is a fact it can read directly, and reading it directly is what
+        keeps the rule from turning into a clock comparison that a one-second
+        tie can slip through.
+        """
+        session = self._require_addressable(chat_id, session_id, "a delivery")
+        capabilities = session.get("launcher_capabilities")
+        mode = capabilities.get("continuation") if isinstance(capabilities, dict) else None
+        if mode != "persistent":
+            raise ValidationRefused(
+                "session %s declares continuation %r; delivering to an "
+                "already-running agent requires a launcher that declares "
+                "'persistent'" % (session_id, mode)
+            )
+        reached = set(
+            t["to"] for t in session["transitions"] if isinstance(t, dict)
+        )
+        if "running" not in reached:
+            raise ValidationRefused(
+                "session %s never entered 'running'; there is no agent to "
+                "deliver to" % session_id
+            )
+        if session["state"] in contract.terminal_states():
+            raise ValidationRefused(
+                "session %s is in terminal state %r; 'deliver' sends text to an "
+                "agent that is already running, and this one has exited"
+                % (session_id, session["state"])
+            )
+        return session
+
+    def _handle_entering_running(self, chat_id, session_id, session, offered):
+        """The handle this session enters `running` with, or a refusal.
+
+        Keyed on the state being *entered*, which is how contract 4.3 is keyed.
+        Both authorized routes into `running` come through here -- the launch
+        (`launching -> running`) and the re-attachment (`unknown -> running`) --
+        because a guard written for the route a reproduction printed is the
+        defect this rail exists to close, one table over.
+        """
+        issued = self._issued_handles(chat_id, session_id)
+        handle = offered if offered is not None else session.get("agent_handle")
+        if not (isinstance(handle, str) and handle and handle in issued):
+            raise ValidationRefused(
+                "session %s cannot enter 'running' without the handle the "
+                "launcher issued (offered: %r; carried: %r; issued: %s); "
+                "contract 4.3 requires a session that ever reached 'running' to "
+                "carry one, so recording the transition first would put a "
+                "rejected store on disk and leave it there if the handle never "
+                "arrived"
+                % (session_id, offered, session.get("agent_handle"),
+                   ", ".join(sorted(issued)) or "none")
+            )
+        carried = session.get("agent_handle")
+        if carried and carried != handle:
+            raise ValidationRefused(
+                "session %s already carries handle %r; a session has one agent, "
+                "and %r is not it" % (session_id, carried, handle)
+            )
+        return handle
+
     def append_transition(self, chat_id, session_id, expected_state, to_state, owner,
-                          evidence, at=None):
+                          evidence, at=None, agent_handle=None):
         """Contract 8.6: append a transition atomically with respect to the state.
 
         `expected_state` is a compare-and-swap against what the session is
@@ -697,7 +827,36 @@ class ChatStore(object):
         transition into a terminal state releases the binding in the same write,
         because the contract requires a binding to be released once its session
         is terminal and a store may not sit in between.
+
+        **The handle enters `running` in this same write.** Contract 4.3: a
+        session that ever reached `running` must carry the handle an accepted
+        `launch_result` returned (`SESSION_HANDLE_MISSING`), and that rule is
+        stated over having *reached* the state, not over sitting in it -- so it
+        is not a rule a later write can satisfy. A store that recorded the
+        transition first and the handle afterwards would be rejected by the
+        contract in between, and would stay rejected forever if the second write
+        never came: nothing in the seam requires a harness to make it, and a
+        harness that crashes between the two leaves a permanently invalid store
+        with no fault recorded anywhere. That is a window, not an event, so it is
+        closed the same way the session/binding pair is -- by making the two
+        facts one write.
+
+        `agent_handle` is therefore accepted here and refused anywhere else: it
+        is meaningful only on the write that enters `running`. Both authorized
+        transitions into `running` (`launching -> running` and
+        `unknown -> running`) go through this one check; the second is how a
+        re-attached session gets back, and it carries the handle it already had.
+
+        The handle is checked against what the launcher actually issued, not
+        against what the caller passed: `_issued_handles` is the same derivation
+        `set_agent_handle` and `_require_addressable` use, so a handle nobody
+        issued cannot enter the store through this door either.
         """
+        if agent_handle is not None and to_state != "running":
+            raise ValidationRefused(
+                "agent_handle belongs to the write that enters 'running'; this "
+                "transition goes to %r" % (to_state,)
+            )
         with self._lock(chat_id):
             path = self._session_path(chat_id, session_id)
             if not os.path.isfile(path):
@@ -730,6 +889,10 @@ class ChatStore(object):
                     "evidence": dict(evidence),
                 }
             ]
+            if to_state == "running":
+                session["agent_handle"] = self._handle_entering_running(
+                    chat_id, session_id, session, agent_handle
+                )
             session["state"] = to_state
             if to_state in contract.terminal_states() and binding.get("released_at") is None:
                 binding = dict(binding)
@@ -745,7 +908,7 @@ class ChatStore(object):
     def _append_packet(self, chat_id, record, name):
         self._check_record(record, record["record_type"])
         atomic.create_exclusive(
-            os.path.join(self._packets_dir(chat_id), name + ".json"), _dumps(record)
+            _under(self._packets_dir(chat_id), name + ".json"), _dumps(record)
         )
         return record
 
@@ -801,7 +964,7 @@ class ChatStore(object):
         return self._append_packet(chat_id, record, "launch_result-" + request_id)
 
     def append_delivery_request(self, chat_id, session_id, instruction_text):
-        self._require_addressable(chat_id, session_id, "a delivery")
+        self._require_deliverable(chat_id, session_id)
         existing = self._read_packets(chat_id, "delivery_request", session_id)
         record = {
             "record_type": "delivery_request",
@@ -862,10 +1025,23 @@ class ChatStore(object):
 
     # -- diagnostic events ----------------------------------------------
 
+    def _chat_events_dir(self, chat_id):
+        """The diagnostics directory of one chat.
+
+        Contract section 3 again, and the reason this exists at all: the
+        diagnostics tree is addressed by `chat_id` from five public methods, and
+        until this rail three of them validated the *other* argument of the same
+        join and not this one. Every diagnostics path is built from here, so the
+        check cannot be present on some of them and absent on others.
+        """
+        if not ids.is_id(chat_id, "cht"):
+            raise NotFound("%r is not a chat identifier" % (chat_id,))
+        return _under(self.diagnostics_dir, chat_id)
+
     def _events_dir(self, chat_id, session_id):
         if not ids.is_id(session_id, "ses"):
             raise NotFound("%r is not a session identifier" % (session_id,))
-        return os.path.join(self.diagnostics_dir, chat_id, session_id)
+        return _under(self._chat_events_dir(chat_id), session_id)
 
     def next_event_sequence(self, chat_id, session_id):
         directory = self._events_dir(chat_id, session_id)
@@ -916,7 +1092,7 @@ class ChatStore(object):
             },
             "diagnostic event",
         )
-        path = os.path.join(directory, _seq_name(sequence))
+        path = _under(directory, _seq_name(sequence))
         try:
             atomic.create_exclusive(path, _dumps(record))
         except FileExistsError:
@@ -969,7 +1145,7 @@ class ChatStore(object):
         if session_id is not None and not ids.is_id(session_id, "ses"):
             raise NotFound("%r is not a session identifier" % (session_id,))
         self.read_chat(chat_id)
-        base = os.path.join(self.diagnostics_dir, chat_id)
+        base = self._chat_events_dir(chat_id)
         if not os.path.isdir(base):
             return []
         session_ids = sorted(os.listdir(base)) if session_id is None else [session_id]
@@ -977,7 +1153,7 @@ class ChatStore(object):
         for sid in session_ids:
             if sid.startswith(atomic.TEMP_PREFIX):
                 continue
-            directory = os.path.join(base, sid)
+            directory = _under(base, sid)
             if not os.path.isdir(directory):
                 continue
             for name in _json_names(directory):
@@ -1039,7 +1215,7 @@ class ChatStore(object):
         for name in sorted(os.listdir(self.chats_dir)):
             if name.startswith(atomic.TEMP_PREFIX):
                 continue
-            chat_dir = os.path.join(self.chats_dir, name)
+            chat_dir = _under(self.chats_dir, name)
             if not os.path.isdir(chat_dir):
                 raise StoreCorrupt("%s is not a chat directory" % chat_dir)
             chat_id = name
@@ -1063,14 +1239,14 @@ class ChatStore(object):
         for chat_id in sorted(os.listdir(self.diagnostics_dir)):
             if chat_id.startswith(atomic.TEMP_PREFIX):
                 continue
-            base = os.path.join(self.diagnostics_dir, chat_id)
+            base = _under(self.diagnostics_dir, chat_id)
             if not os.path.isdir(base):
                 raise StoreCorrupt("%s is not a diagnostics directory" % base)
             for session_id in sorted(os.listdir(base)):
                 if session_id.startswith(atomic.TEMP_PREFIX):
                     continue
-                for name in _json_names(os.path.join(base, session_id)):
-                    path = os.path.join(base, session_id, name)
+                for name in _json_names(_under(base, session_id)):
+                    path = _under(base, session_id, name)
                     record = self._check_read(_loads(path), path)
                     if (record.get("session_id"), record.get("sequence")) in exported:
                         continue

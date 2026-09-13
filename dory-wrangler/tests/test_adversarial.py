@@ -42,9 +42,12 @@ from helpers import (
 )
 
 from dory_wrangler import atomic
+from dory_wrangler import ids
+from dory_wrangler.contract import terminal_states as contract_terminal_states
 from dory_wrangler.webapp import PAGE
 from dory_wrangler.errors import (
     ConcurrencyRefused,
+    NotFound,
     ProvenanceRefused,
     StoreCorrupt,
     StoreError,
@@ -232,8 +235,8 @@ class TestNoFabricatedHistory(ProbeCase):
         self.store.append_launch_result(chat_id, request["request_id"], sid, "accepted",
                                         agent_handle="h1")
         self.store.append_transition(chat_id, sid, "launching", "running", "launcher",
-                                     {"kind": "launch_result", "ref": request["request_id"]})
-        self.store.set_agent_handle(chat_id, sid, "h1")
+                                     {"kind": "launch_result", "ref": request["request_id"]},
+                                     agent_handle="h1")
         event, _ = self.store.append_diagnostic_event(
             chat_id, sid, 1, "agent", "recognized", "assistant_text",
             '{"type":"assistant_text","text":"the build failed on line 12"}',
@@ -816,8 +819,8 @@ class TestClosedContractFindings(ProbeCase):
         self.store.append_transition(
             chat_id, sid, "launching", "running", "launcher",
             {"kind": "launch_result", "ref": request["request_id"]},
+            agent_handle=handle,
         )
-        self.store.set_agent_handle(chat_id, sid, handle)
 
         # The user sends again while that agent is still running. Nothing refuses.
         service = ChatService(self.store)
@@ -886,8 +889,8 @@ class TestClosedContractFindings(ProbeCase):
         self.store.append_transition(
             chat_id, sid, "launching", "running", "launcher",
             {"kind": "launch_result", "ref": request["request_id"]},
+            agent_handle=handle,
         )
-        self.store.set_agent_handle(chat_id, sid, handle)
         event, _c = self.store.append_diagnostic_event(
             chat_id, sid, self.store.next_event_sequence(chat_id, sid),
             "agent", "recognized", "assistant_text",
@@ -951,8 +954,8 @@ class TestTheLaunchSeamCarriesTheHandle(ProbeCase):
         self.store.append_transition(
             chat_id, sid, "launching", "running", "launcher",
             {"kind": "launch_result", "ref": request["request_id"]},
+            agent_handle=handle,
         )
-        self.store.set_agent_handle(chat_id, sid, handle)
         return chat_id, sid
 
     def test_a_stop_on_a_session_with_no_handle_is_refused(self):
@@ -990,11 +993,24 @@ class TestTheLaunchSeamCarriesTheHandle(ProbeCase):
         path = self.store._session_path(chat_id, sid)
         session, binding = self.store._read_session_file(path)
         session["agent_handle"] = "a-handle-nobody-issued"
+        # Forced into `running` on disk as well, for the same reason the handle
+        # is forced: every *other* delivery precondition must be satisfied, so
+        # that the only thing left that can refuse is the issuance check. The
+        # store itself will no longer enter `running` without an issued handle,
+        # so this shape is unreachable through the public API -- which is why it
+        # has to be planted to be tested at all. Without this the deliverability
+        # guard refuses first and this probe silently stops measuring its guard.
+        session["transitions"] = list(session["transitions"]) + [{
+            "from": "launching", "to": "running", "owner": "launcher",
+            "at": ids.now(),
+            "evidence": {"kind": "launch_result",
+                         "ref": self.store.read_launch_requests(chat_id, sid)[0]["request_id"]},
+        }]
+        session["state"] = "running"
         self.store._write_session_file(chat_id, session, binding)
-        self.assertEqual(
-            "a-handle-nobody-issued",
-            self.store.read_session(chat_id, sid)["agent_handle"],
-        )
+        planted = self.store.read_session(chat_id, sid)
+        self.assertEqual("a-handle-nobody-issued", planted["agent_handle"])
+        self.assertEqual("running", planted["state"])
         held, detail = False, "a handle the launcher never issued unlocked addressing"
         try:
             self.store.append_delivery_request(chat_id, sid, "follow-up")
@@ -1336,6 +1352,273 @@ class TestMutations(unittest.TestCase):
             ".test_a_stop_on_a_session_with_no_handle_is_refused",
         )
 
+    # -- the guards this rail added ------------------------------------
+    #
+    # An added guard is the direction mechanical mutation is worst at: the
+    # refused input never reaches code there is anything to mutate. So each of
+    # these removes the *added* guard and requires the test written for it to
+    # go red -- and each clause is removed separately, because both findings
+    # this rail closed were guards that were complete at the granularity
+    # somebody checked them at and not one level finer.
+
+    def test_m11_without_the_handle_at_the_running_transition(self):
+        """V3's window, reopened."""
+        self._mutate(
+            "M11-running-transition-handle-requirement-removed",
+            "let a session enter 'running' with no handle and close the window later, or never",
+            ChatStore, "_handle_entering_running",
+            lambda self, chat_id, session_id, session, offered:
+                offered if offered is not None else session.get("agent_handle"),
+            "test_store.TestTheHandleEntersRunning"
+            ".test_launching_to_running_without_a_handle_is_refused",
+        )
+
+    def test_m12_with_the_running_handle_keyed_on_the_carried_field(self):
+        """The label-not-the-fact weakening, on the new door.
+
+        A second way to put the handle on the record is a second place the
+        issuance rule can go missing from.
+        """
+        def label_only(self, chat_id, session_id, session, offered):
+            handle = offered if offered is not None else session.get("agent_handle")
+            if not (isinstance(handle, str) and handle):
+                raise ValidationRefused("no handle for session %s" % session_id)
+            return handle
+
+        self._mutate(
+            "M12-running-handle-keyed-on-the-offered-value",
+            "accept whatever handle the caller passes instead of one a launcher issued",
+            ChatStore, "_handle_entering_running", label_only,
+            "test_store.TestTheHandleEntersRunning"
+            ".test_a_handle_nobody_issued_cannot_enter_through_the_transition",
+        )
+
+    def test_m13_with_the_running_guard_on_only_one_of_the_two_routes(self):
+        """Element granularity, on the pair of transitions into `running`.
+
+        Two authorized transitions enter `running`. A guard written for the one
+        a reproduction prints -- `launching -> running` -- leaves
+        `unknown -> running` open, and the contract names that second route
+        explicitly as the one a handle rule must also close. This is V2's shape
+        exactly: the right generalisation applied to one element of a pair.
+        """
+        original = ChatStore._handle_entering_running
+
+        def only_from_launching(self, chat_id, session_id, session, offered):
+            if session.get("state") == "unknown":
+                return offered if offered is not None else session.get("agent_handle")
+            return original(self, chat_id, session_id, session, offered)
+
+        self._mutate(
+            "M13-running-guard-covers-one-route-of-two",
+            "guard the launch route into 'running' and not the re-attachment route",
+            ChatStore, "_handle_entering_running", only_from_launching,
+            "test_store.TestTheHandleEntersRunning"
+            ".test_unknown_to_running_without_a_handle_is_refused",
+        )
+
+    def test_m14_without_the_persistent_precondition_on_a_delivery(self):
+        original = ChatStore._require_deliverable
+
+        def no_capability_check(self, chat_id, session_id):
+            session = self._require_addressable(chat_id, session_id, "a delivery")
+            reached = set(t["to"] for t in session["transitions"] if isinstance(t, dict))
+            if "running" not in reached:
+                raise ValidationRefused("never ran")
+            if session["state"] in contract_terminal_states():
+                raise ValidationRefused("already exited")
+            return session
+
+        self._mutate(
+            "M14-delivery-persistent-precondition-removed",
+            "deliver to an agent whose launcher never declared it could receive one",
+            ChatStore, "_require_deliverable", no_capability_check,
+            "test_store.TestDeliveryPreconditions"
+            ".test_a_delivery_needs_a_launcher_that_declared_persistent",
+        )
+
+    def test_m15_without_the_reached_running_precondition_on_a_delivery(self):
+        """The second clause of `DELIVERY_NOT_SUPPORTED`, removed on its own.
+
+        Both clauses report the same code. A probe keyed on the code passes with
+        this one gone, which is precisely how the reconciliation's repair looked
+        complete while two of four preconditions were still open.
+        """
+        def no_running_check(self, chat_id, session_id):
+            session = self._require_addressable(chat_id, session_id, "a delivery")
+            capabilities = session.get("launcher_capabilities")
+            mode = capabilities.get("continuation") if isinstance(capabilities, dict) else None
+            if mode != "persistent":
+                raise ValidationRefused("not persistent")
+            if session["state"] in contract_terminal_states():
+                raise ValidationRefused("already exited")
+            return session
+
+        self._mutate(
+            "M15-delivery-reached-running-precondition-removed",
+            "deliver to a session that never started an agent",
+            ChatStore, "_require_deliverable", no_running_check,
+            "test_store.TestDeliveryPreconditions"
+            ".test_a_delivery_needs_a_session_that_actually_ran",
+        )
+
+    def test_m16_without_the_agent_exit_precondition_on_a_delivery(self):
+        def no_exit_check(self, chat_id, session_id):
+            session = self._require_addressable(chat_id, session_id, "a delivery")
+            capabilities = session.get("launcher_capabilities")
+            mode = capabilities.get("continuation") if isinstance(capabilities, dict) else None
+            if mode != "persistent":
+                raise ValidationRefused("not persistent")
+            reached = set(t["to"] for t in session["transitions"] if isinstance(t, dict))
+            if "running" not in reached:
+                raise ValidationRefused("never ran")
+            return session
+
+        self._mutate(
+            "M16-delivery-agent-exit-precondition-removed",
+            "deliver to an agent that has already exited",
+            ChatStore, "_require_deliverable", no_exit_check,
+            "test_store.TestDeliveryPreconditions"
+            ".test_a_delivery_after_the_agent_exited_is_refused",
+        )
+
+    def test_m17_with_the_delivery_guard_back_to_the_handle_check_alone(self):
+        """The state the reconciliation left, restored.
+
+        This is what `append_delivery_request` did before this rail: one of the
+        four preconditions in that validator block, the one its reproduction
+        printed.
+        """
+        self._mutate(
+            "M17-delivery-guard-reverted-to-the-handle-check",
+            "check only that a handle was issued, as the previous repair did",
+            ChatStore, "_require_deliverable",
+            lambda self, chat_id, session_id:
+                self._require_addressable(chat_id, session_id, "a delivery"),
+            "test_store.TestDeliveryPreconditions"
+            ".test_a_delivery_needs_a_launcher_that_declared_persistent",
+        )
+
+    def test_m18_with_the_shape_and_write_enumeration_no_longer_enumerating(self):
+        """The enumeration itself, held up rather than trusted.
+
+        A 196-pair sweep that passes proves nothing until it has been shown to
+        fail. With the `running` handle requirement gone, the sweep must find
+        the store it was written to find.
+        """
+        self._mutate(
+            "M18-enumeration-notices-a-reopened-window",
+            "reopen the SESSION_HANDLE_MISSING window and ask the sweep",
+            ChatStore, "_handle_entering_running",
+            lambda self, chat_id, session_id, session, offered:
+                offered if offered is not None else session.get("agent_handle"),
+            "test_store.TestNoPublicSequenceProducesARejectedStore"
+            ".test_every_shape_crossed_with_every_write",
+        )
+
+    # -- the path-component guard --------------------------------------
+
+    def test_m19_without_the_path_component_check(self):
+        """`_under` removed entirely.
+
+        Worth stating plainly, because the mutation was first pointed at the
+        diagnostics test and stayed green: at every call site the store has
+        *today*, `_under` is a second layer. The kind checks in front of it
+        (`ids.is_id(chat_id, "cht")`, `ids.is_id(session_id, "ses")`) and the
+        contract's own `BAD_ID_FORMAT` on the packet name already refuse every
+        value that could escape, because no string matching an identifier can
+        contain a separator. So removing `_under` leaves the diagnostics tests
+        green, and saying otherwise would be the kind of claim this ticket
+        family keeps having to retract.
+
+        It earns its place as the thing that makes the property *structural*
+        rather than remembered: `TestPathComponents` requires every future join
+        of a caller's value to come through it, M22 shows that requirement
+        catches a new one, and M21 shows the kind check in front of it is itself
+        held. This mutation measures the door itself.
+        """
+        import dory_wrangler.store as store_module
+
+        self._mutate(
+            "M19-path-component-check-removed",
+            "let any string become a path component again",
+            store_module, "_under",
+            lambda base, *components: os.path.join(base, *components),
+            "test_store.TestPathComponents.test_every_escaping_component_is_refused",
+        )
+
+    def test_m20_with_the_path_component_check_weakened_to_traversal(self):
+        """The weakest plausible version of the guard.
+
+        Rejecting `..` and accepting everything else passes every traversal
+        vector and still lets a session or event identifier address a chat --
+        which is the half the first repair of this defect got right and the
+        second half nobody drove.
+        """
+        import dory_wrangler.store as store_module
+
+        def traversal_only(base, *components):
+            for component in components:
+                if not isinstance(component, str) or ".." in component:
+                    raise NotFound("%r is not a usable path component" % (component,))
+            return os.path.join(base, *components)
+
+        self._mutate(
+            "M20-path-component-check-weakened-to-traversal",
+            "filter traversal only, and let a well-formed identifier of the wrong kind through",
+            store_module, "_under", traversal_only,
+            "test_store.TestPathComponents.test_every_escaping_component_is_refused",
+        )
+
+    def test_m21_with_the_chat_identifier_check_removed_from_the_events_path(self):
+        """The two layers are independent, and both are load-bearing.
+
+        `_under` stops a value from *escaping*; `ids.is_id(chat_id, "cht")` stops
+        a well-formed identifier of the wrong kind from addressing a chat.
+        Removing the kind check leaves `_under` in place, so if the test still
+        goes red it is because it drives wrong-kind identifiers and not only
+        traversal.
+        """
+        original = ChatStore._chat_events_dir
+        import dory_wrangler.store as store_module
+
+        def no_kind_check(self, chat_id):
+            return store_module._under(self.diagnostics_dir, chat_id)
+
+        self._mutate(
+            "M21-events-path-chat-kind-check-removed",
+            "keep the escape filter but let a session or event id address a chat",
+            ChatStore, "_chat_events_dir", no_kind_check,
+            "test_store.TestDiagnostics"
+            ".test_the_diagnostics_address_refuses_a_chat_id_that_is_not_one",
+        )
+
+    def test_m22_with_a_new_unchecked_join_added_to_the_store(self):
+        """The structural check, against the defect rather than against itself.
+
+        `TestPathComponents` claims a *module-wide* property. A claim like that
+        is only worth what it catches, so this asks it about the shape it exists
+        to catch: a function that joins one of its own parameters into a path.
+        """
+        import test_store
+
+        original = test_store.TestPathComponents._store_source
+
+        def with_a_new_join(self):
+            source, path = original(self)
+            return source + (
+                "\\n\\nclass _Later(object):\\n"
+                "    def some_new_reader(self, chat_id, session_id):\\n"
+                "        return os.path.join(self.diagnostics_dir, chat_id, session_id)\\n"
+            ), path
+
+        self._mutate(
+            "M22-a-new-unchecked-join-is-caught",
+            "add a function that joins its own parameters into a path",
+            test_store.TestPathComponents, "_store_source", with_a_new_join,
+            "test_store.TestPathComponents"
+            ".test_no_parameter_is_joined_into_a_path_without_being_checked",
+        )
 
 
 # ---------------------------------------------------------------------------

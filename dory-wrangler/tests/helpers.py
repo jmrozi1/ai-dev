@@ -93,11 +93,15 @@ def answer_turn(store, chat_id, user_message, agent_text,
     store.append_launch_result(
         chat_id, request["request_id"], sid, "accepted", agent_handle=handle
     )
+    # The handle enters `running` in the same write as the transition. A store
+    # that recorded the transition first would be SESSION_HANDLE_MISSING until
+    # the next write and permanently so if that write never came, which is the
+    # window the store now refuses to open.
     store.append_transition(
         chat_id, sid, "launching", "running", "launcher",
         {"kind": "launch_result", "ref": request["request_id"]},
+        agent_handle=handle,
     )
-    store.set_agent_handle(chat_id, sid, handle)
     event, _created = store.append_diagnostic_event(
         chat_id, sid, store.next_event_sequence(chat_id, sid),
         "agent", "recognized", "assistant_text",
