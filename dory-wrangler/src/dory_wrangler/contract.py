@@ -76,6 +76,44 @@ def authorized_transitions():
     return dict(validator().AUTHORIZED_TRANSITIONS)
 
 
+def transition_precondition_violations(session, tables):
+    """Violations contract 5.2's *precondition* table finds in one session.
+
+    The companion of `authorized_transitions()`, which is 5.2's *owner* table.
+    Both halves of that table are the contract's, and the store calls them
+    rather than restating either: a second copy of the precondition column is
+    how the rule and its enforcement drift apart, and this store already carries
+    one duplicated contract constant as a reported finding.
+
+    `tables` is the same mapping the validator builds for itself -- `messages`,
+    `events`, `requests`, `results_by_request`, `observations`, each id -> record
+    -- so the store supplies the records and the contract supplies the rule.
+
+    Returns (code, where, detail) triples; empty means every transition on the
+    session satisfies its precondition.
+    """
+    v = validator()
+    checker = getattr(v, "_validate_preconditions", None)
+    if checker is None:  # pragma: no cover - the contract changed shape
+        raise RuntimeError(
+            "the contract validator no longer exposes its precondition check; "
+            "the store must not fall back to a restatement of section 5.2"
+        )
+    report = v.Report()
+    checker(report, "session", session, dict(tables))
+    return report.sorted()
+
+
+def stream_end_type():
+    """The interpreted_type a launcher-sourced end-of-stream event carries."""
+    return validator().STREAM_END_TYPE
+
+
+def evidence_table_names():
+    """The record tables the precondition check resolves evidence against."""
+    return ("messages", "events", "requests", "results_by_request", "observations")
+
+
 def contract_version():
     return validator().CONTRACT_VERSION
 

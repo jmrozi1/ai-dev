@@ -896,7 +896,7 @@ class TestClosedContractFindings(ProbeCase):
             "agent", "recognized", "assistant_text",
             '{"type":"assistant_text","text":"a"}',
         )
-        self.store.append_agent_message(chat_id, sid, event["event_id"], "a")
+        first = self.store.append_agent_message(chat_id, sid, event["event_id"], "a")
         # Two separated answer runs, one packet: the floor must still bite.
         self.store.append_user_message(chat_id, "again")
         event2, _c2 = self.store.append_diagnostic_event(
@@ -904,7 +904,18 @@ class TestClosedContractFindings(ProbeCase):
             "agent", "recognized", "assistant_text",
             '{"type":"assistant_text","text":"b"}',
         )
-        self.store.append_agent_message(chat_id, sid, event2["event_id"], "b")
+        # The store now refuses to *write* this shape, which is this rail's
+        # closure of TURN_INSTRUCTION_MISSING. The floor itself is a rule about a
+        # finished store, so it is still put to the contract -- over a history
+        # planted out of band, which is the only way left to obtain one.
+        with self.assertRaises(ProvenanceRefused):
+            self.store.append_agent_message(chat_id, sid, event2["event_id"], "b")
+        planted = dict(first)
+        planted["message_id"] = ids.new_id("msg")
+        planted["sequence"] = first["sequence"] + 2
+        planted["source_event_id"] = event2["event_id"]
+        planted["content"] = {"content_type": "text/plain", "text": "b"}
+        self.write_raw_message(chat_id, planted["sequence"], planted)
         codes = set(code for code, _w, _d in self.store.verify())
         self.assertIn(
             "TURN_INSTRUCTION_MISSING", codes,

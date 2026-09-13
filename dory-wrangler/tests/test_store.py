@@ -1,14 +1,26 @@
 """The durable store: create, list, open, send, and every refusal it must make."""
 
+import ast
 import json
 import os
 import shutil
 import tempfile
+import threading
 import unittest
 
-from helpers import ONE_SHOT, PERSISTENT_STREAM, StoreCase, answered_turn
+from helpers import (
+    ONE_SHOT,
+    PERSISTENT_STREAM,
+    TESTS_DIR,
+    VALIDATOR,
+    StoreCase,
+    answered_turn,
+    contract_violation_vocabulary,
+)
 
 from dory_wrangler import atomic
+from dory_wrangler import contract
+from dory_wrangler import ids
 from dory_wrangler.errors import (
     ConcurrencyRefused,
     NotFound,
@@ -392,25 +404,49 @@ class TestDiagnostics(StoreCase):
 
     def test_a_replayed_sequence_is_already_stored(self):
         body = '{"type":"assistant_text","text":"again"}'
+        taken = self.store.next_event_sequence(self.chat_id, self.sid)
         first, created = self.store.append_diagnostic_event(
-            self.chat_id, self.sid, 9, "agent", "recognized", "assistant_text", body
+            self.chat_id, self.sid, taken, "agent", "recognized", "assistant_text", body
         )
         self.assertTrue(created)
         second, created_again = self.store.append_diagnostic_event(
-            self.chat_id, self.sid, 9, "agent", "recognized", "assistant_text", body
+            self.chat_id, self.sid, taken, "agent", "recognized", "assistant_text", body
         )
         self.assertFalse(created_again)
         self.assertEqual(first["event_id"], second["event_id"])
 
     def test_a_different_payload_at_a_taken_sequence_is_not_a_replay(self):
         """Same sequence is the label; same payload is the fact."""
+        taken = self.store.next_event_sequence(self.chat_id, self.sid)
         self.store.append_diagnostic_event(
-            self.chat_id, self.sid, 9, "agent", "recognized", "assistant_text", '{"a":1}'
+            self.chat_id, self.sid, taken, "agent", "recognized", "assistant_text", '{"a":1}'
         )
         with self.assertRaises(StoreCorrupt):
             self.store.append_diagnostic_event(
-                self.chat_id, self.sid, 9, "agent", "recognized", "assistant_text", '{"a":2}'
+                self.chat_id, self.sid, taken, "agent", "recognized", "assistant_text",
+                '{"a":2}'
             )
+
+    def test_a_sequence_beyond_the_next_one_is_refused_rather_than_written(self):
+        """Contract P3: a gap means a turn was lost, and is never closed silently.
+
+        Both tests above used to name sequence 9 on an empty session, which wrote
+        a gap. The store would then fail closed when *reading* a store it had
+        itself made invalid; the gap is now refused at the door. Driven at the
+        exact boundary rather than at an arbitrary number, because a guard stated
+        as "much larger than the next one" would pass a store with one hole in it.
+        """
+        following = self.store.next_event_sequence(self.chat_id, self.sid)
+        with self.assertRaises(ValidationRefused):
+            self.store.append_diagnostic_event(
+                self.chat_id, self.sid, following + 1, "launcher", "unrecognized",
+                None, "{}"
+            )
+        event, created = self.store.append_diagnostic_event(
+            self.chat_id, self.sid, following, "launcher", "unrecognized", None, "{}"
+        )
+        self.assertTrue(created)
+        self.assertEqual([], self.store.verify())
 
     def test_bounded_out_of_band_retrieval(self):
         for i in range(20):
@@ -1422,17 +1458,56 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
 
     # -- the writes a caller can make ----------------------------------
 
+    # Public methods of ChatStore that write nothing. Everything else is a write
+    # and must appear in `operations()`, which `test_every_public_write_is_in_the
+    # _enumeration` asserts. A method added to the store therefore has to be
+    # classified, and an unclassified one fails rather than going unenumerated --
+    # the same anti-drift shape as the violation-code accounting.
+    READ_ONLY = frozenset((
+        "read_chat", "list_chats", "read_messages", "read_session", "read_binding",
+        "list_sessions", "chat_agent_status", "read_launch_requests",
+        "read_launch_results", "read_delivery_requests", "read_session_observations",
+        "next_event_sequence", "read_diagnostic_event", "read_diagnostic_events",
+        "read_all_events_of_session", "export_records", "snapshot", "verify",
+        "rejected_content_types", "root", "chats_dir", "diagnostics_dir",
+    ))
+
+    def _agent_answer(self, store, chat_id, sid):
+        event, _created = store.append_diagnostic_event(
+            chat_id, sid, store.next_event_sequence(chat_id, sid),
+            "agent", "recognized", "assistant_text",
+            '{"type":"assistant_text","text":"hi"}')
+        return store.append_agent_message(chat_id, sid, event["event_id"], "hi")
+
+    def _second_session(self, store, chat_id, sid):
+        user = store.append_user_message(chat_id, "another turn")
+        return store.create_session(
+            chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+
+    def _result(self, store, chat_id, sid, outcome):
+        requests = store.read_launch_requests(chat_id, sid)
+        request_id = requests[0]["request_id"] if requests else "req_deadbeefdead"
+        extra = {"agent_handle": "h-late"} if outcome == "accepted" else (
+            {"failure_category": "unavailable"} if outcome == "failed" else {})
+        return store.append_launch_result(
+            chat_id, request_id, sid, outcome, **extra)
+
     def operations(self):
-        """name -> operation(store, chat_id, session_id)."""
+        """name -> operation(store, chat_id, session_id).
+
+        Named `<public method>:<variant>` so the method each pair drives is
+        readable off the name, and so the coverage assertion above can be made
+        mechanically rather than by keeping a second list in step by hand.
+        """
         operations = []
         for kind in ("stop_confirmed", "stop_unconfirmed", "reattached",
                      "reattach_failed", "stream_read_failed"):
             operations.append(
-                ("observation:" + kind,
+                ("append_session_observation:" + kind,
                  lambda store, chat_id, sid, kind=kind:
                      store.append_session_observation(chat_id, sid, kind, "probe")))
         operations.append(
-            ("delivery",
+            ("append_delivery_request",
              lambda store, chat_id, sid:
                  store.append_delivery_request(chat_id, sid, "follow-up")))
         operations.append(
@@ -1440,25 +1515,94 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
              lambda store, chat_id, sid:
                  store.set_agent_handle(chat_id, sid, "h-issued")))
         operations.append(
-            ("event:agent",
+            ("append_diagnostic_event:agent",
              lambda store, chat_id, sid:
                  store.append_diagnostic_event(
                      chat_id, sid, store.next_event_sequence(chat_id, sid),
                      "agent", "recognized", "assistant_text",
                      '{"type":"assistant_text","text":"hi"}')))
         operations.append(
-            ("event:launcher",
+            ("append_diagnostic_event:launcher",
              lambda store, chat_id, sid:
                  store.append_diagnostic_event(
                      chat_id, sid, store.next_event_sequence(chat_id, sid),
                      "launcher", "unrecognized", None, "{}")))
+        operations.append(
+            ("append_diagnostic_event:stream_end",
+             lambda store, chat_id, sid:
+                 store.append_diagnostic_event(
+                     chat_id, sid, store.next_event_sequence(chat_id, sid),
+                     "launcher", "recognized", "stream_end",
+                     '{"type":"stream_end"}')))
+        operations.append(
+            ("append_user_message",
+             lambda store, chat_id, sid: store.append_user_message(chat_id, "hi")))
+        operations.append(
+            ("append_system_message",
+             lambda store, chat_id, sid: store.append_system_message(chat_id, "note")))
+        operations.append(
+            ("append_agent_message",
+             lambda store, chat_id, sid: self._agent_answer(store, chat_id, sid)))
+        operations.append(
+            ("append_launch_request",
+             lambda store, chat_id, sid:
+                 store.append_launch_request(chat_id, sid, "instruction")))
+        for outcome in ("accepted", "failed", "unknown"):
+            operations.append(
+                ("append_launch_result:" + outcome,
+                 lambda store, chat_id, sid, outcome=outcome:
+                     self._result(store, chat_id, sid, outcome)))
+        operations.append(
+            ("create_session",
+             lambda store, chat_id, sid: self._second_session(store, chat_id, sid)))
+        operations.append(
+            ("create_chat", lambda store, chat_id, sid: store.create_chat("Another")))
+        operations.append(
+            ("archive_chat", lambda store, chat_id, sid: store.archive_chat(chat_id)))
+        operations.append(
+            ("set_title", lambda store, chat_id, sid: store.set_title(chat_id, "Renamed")))
         for to_state in ("running", "completed", "terminated", "unknown", "abandoned",
                          "launch_failed"):
             operations.append(
-                ("transition:" + to_state,
+                ("append_transition:" + to_state,
                  lambda store, chat_id, sid, to_state=to_state:
                      self._transition(store, chat_id, sid, to_state)))
         return operations
+
+    def test_every_public_write_is_in_the_enumeration(self):
+        """A public write the sweep does not drive is a hole the sweep cannot see.
+
+        The previous round of this enumeration crossed fourteen shapes with
+        fourteen writes and reported one reachable gap. Five violation codes were
+        reachable the whole time through writes it did not drive -- among them a
+        launch result naming no request at all. The cross is only as exhaustive as
+        its second axis, so that axis is now derived from the store's own surface
+        rather than from a list written alongside it.
+        """
+        work = tempfile.mkdtemp(prefix="dory-surface-")
+        try:
+            # A live instance, so an attribute the store publishes without a
+            # method -- the rejected-content-type count is one -- has to be
+            # classified too rather than being invisible to this check.
+            public = set(
+                name for name in dir(ChatStore(work)) if not name.startswith("_"))
+        finally:
+            shutil.rmtree(work, True)
+        driven = set(name.split(":")[0] for name, _op in self.operations())
+        unaccounted = public - self.READ_ONLY - driven
+        self.assertEqual(
+            set(), unaccounted,
+            "ChatStore gained public method(s) %s that this enumeration neither "
+            "drives nor declares read-only; classify them rather than leaving the "
+            "cross incomplete" % sorted(unaccounted))
+        self.assertEqual(
+            set(), driven - public,
+            "the enumeration drives %s, which is not a public method of the store"
+            % sorted(driven - public))
+        self.assertEqual(
+            set(), self.READ_ONLY - public,
+            "the read-only list names %s, which the store no longer has"
+            % sorted(self.READ_ONLY - public))
 
     def _transition(self, store, chat_id, sid, to_state):
         """Attempt a transition into `to_state` with whatever evidence exists.
@@ -1501,34 +1645,38 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
 
     # -- the property --------------------------------------------------
 
-    # The one violation a shape may already carry before any write is attempted.
-    # An accepted `launch_result` is ahead of the transition it authorizes, and
-    # the very next lifecycle write closes it -- unlike SESSION_HANDLE_MISSING,
-    # which nothing was required to close. Naming it here means a *second*
-    # transient cannot appear without this test saying so.
-    TRANSIENT = frozenset(("LAUNCH_OUTCOME_MISMATCH",))
+    # The violations a shape may carry, or a write may introduce, without this
+    # being an escape: the codes the accounting records as deliberate exceptions.
+    # Derived from that table rather than restated, so a second exception cannot
+    # be admitted here without being written down there with its reason.
+    @property
+    def TRANSIENT(self):
+        return frozenset(
+            code for code, entry in EveryCodeIsAccountedFor.ACCOUNTING.items()
+            if entry[0] == "TRANSIENT"
+        )
 
-    # The codes this rail closed. None of them may be reachable from any pair,
-    # by any route, ever again.
-    CLOSED = frozenset((
-        "SESSION_HANDLE_MISSING",
-        "DELIVERY_NOT_SUPPORTED",
-        "DELIVERY_AFTER_AGENT_EXIT",
-        "ADDRESSED_WITHOUT_HANDLE",
-    ))
+    # Every violation code the store accounts for by guarding it at write time.
+    # None of them may be reachable from any pair, by any route, ever again. The
+    # list is not maintained here: it is derived from the accounting table in
+    # `TestEveryViolationCodeIsAccountedFor`, so a code added there as guarded is
+    # automatically forbidden here, and a code quietly dropped from there fails
+    # that test's equality with the validator.
+    @property
+    def CLOSED(self):
+        return frozenset(
+            code for code, entry in EveryCodeIsAccountedFor.ACCOUNTING.items()
+            if entry[0] == "GUARDED"
+        )
 
-    # Found by this enumeration and deliberately *not* fixed here, because the
-    # rail that authorized this work names the three codes above and forbids
-    # broadening. `append_transition` checks contract 5.2's owner table
-    # (`AUTHORIZED_TRANSITIONS`) and does not check its precondition table
-    # (`TRANSITION_PRECONDITIONS`), so a caller that offers evidence of an
-    # admissible *kind* but the wrong *content* -- a `harness_action` where a
-    # `launch_result` is required, an inferred `unknown` with no observation
-    # behind it -- writes a transition the contract rejects. It is the same
-    # defect class as V3 one table over, and it is reported rather than quietly
-    # patched or quietly tolerated. Named here so it cannot grow, cannot shrink
-    # unnoticed, and cannot be mistaken for something this test does not see.
-    CARRIED = frozenset(("PRECONDITION_NOT_MET", "UNKNOWN_INFERRED_WITHOUT_EVIDENCE"))
+    # Nothing is carried any more, so there is no carried set. The previous round
+    # of this enumeration left `PRECONDITION_NOT_MET` and
+    # `UNKNOWN_INFERRED_WITHOUT_EVIDENCE` reachable on 18 of its 196 pairs,
+    # because `append_transition` enforced contract 5.2's owner table and not its
+    # precondition table. Both are refused at write time now, and what forbids
+    # them here is the accounting table's `GUARDED` set rather than a second list
+    # -- an empty `CARRIED` left behind would be state nothing reads and nothing
+    # could keep honest.
     SHAPES_WITH_A_TRANSIENT = frozenset(("launching-accepted", "launching-failed"))
 
     def test_every_shape_crossed_with_every_write(self):
@@ -1577,36 +1725,1760 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
             "the set of shapes that are invalid before any write changed; a new "
             "one is a window like the one this rail closed, not a detail")
         reached = set()
-        for shape_name, op_name, introduced in escapes:
+        for _shape_name, _op_name, introduced in escapes:
             reached.update(introduced)
-            self.assertTrue(
-                op_name.startswith("transition:"),
-                "%s/%s introduced %s; the carried evidence-precondition gap is "
-                "specific to append_transition, so this is something else"
-                % (shape_name, op_name, introduced))
         self.assertEqual(
             frozenset(), reached & self.CLOSED,
-            "a public call sequence reached a code this rail closed: %s"
-            % (escapes,))
-        self.assertLessEqual(
-            reached, self.CARRIED,
-            "a public call sequence left a store the contract rejects, and not "
-            "by the carried evidence-precondition gap: %s" % (escapes,))
+            "a public call sequence reached a code the store guards at write "
+            "time: %s" % (escapes,))
         self.assertEqual(
-            self.CARRIED, reached,
-            "the carried evidence-precondition gap stopped being reachable. "
-            "That is good news, and it must be written down rather than left "
-            "implied -- update CARRIED and say so in the handoff.")
+            frozenset(), reached - self.TRANSIENT,
+            "a public call sequence left a store the contract rejects, and not "
+            "by a deliberate exception: %s" % (escapes,))
+        self.assertEqual(
+            self.TRANSIENT, reached,
+            "a deliberate exception stopped being reachable. That is good news, "
+            "and it must be written down in the accounting rather than left "
+            "implied.")
         # The counts are asserted so that the enumeration cannot quietly stop
         # enumerating. A run in which everything is refused proves nothing, and
         # would be indistinguishable from a passing run without this.
         self.assertEqual(len(self.shapes()) * len(self.operations()),
                          accepted + refused)
-        self.assertGreater(accepted, 40, "too few writes were accepted for this "
-                                         "to be evidence of anything")
-        self.assertGreater(refused, 40, "too few writes were refused for the "
-                                        "guards to be doing any work")
+        self.assertGreater(accepted, 100, "too few writes were accepted for this "
+                                          "to be evidence of anything")
+        self.assertGreater(refused, 100, "too few writes were refused for the "
+                                         "guards to be doing any work")
 
 
-if __name__ == "__main__":
-    unittest.main()
+
+# ---------------------------------------------------------------------------
+# Exhaustiveness: every violation code the contract can emit, accounted for
+# ---------------------------------------------------------------------------
+
+
+class CodeClosureCase(StoreCase):
+    """Scaffolding for "refused now, and here is the store it used to write".
+
+    A refusal on its own proves only that something was refused. Each closure
+    below therefore shows both directions: the public call sequence is refused,
+    and the history that sequence used to leave is put to the contract and comes
+    back carrying exactly the code being closed. Without the second half a guard
+    that refuses for an unrelated reason would look like a closure.
+    """
+
+    def setUp(self):
+        StoreCase.setUp(self)
+        self.chat_id = self.store.create_chat("Closure")["chat_id"]
+
+    # -- builders ------------------------------------------------------
+
+    def launched(self, capabilities=PERSISTENT_STREAM, handle="h-issued", text="go",
+                 outcome="accepted"):
+        """A session driven to `launching` with the launcher's report recorded."""
+        user = self.store.append_user_message(self.chat_id, text)
+        session, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", capabilities)
+        sid = session["session_id"]
+        request = self.store.append_launch_request(self.chat_id, sid, "go")
+        self.store.append_transition(
+            self.chat_id, sid, "pending", "launching", "harness",
+            {"kind": "harness_action", "ref": request["request_id"]})
+        extra = {"agent_handle": handle} if outcome == "accepted" else (
+            {"failure_category": "unavailable"} if outcome == "failed" else {})
+        self.store.append_launch_result(
+            self.chat_id, request["request_id"], sid, outcome, **extra)
+        return sid, request["request_id"], user
+
+    def running(self, capabilities=PERSISTENT_STREAM, handle="h-issued", text="go"):
+        sid, request_id, user = self.launched(capabilities, handle, text)
+        self.store.append_transition(
+            self.chat_id, sid, "launching", "running", "launcher",
+            {"kind": "launch_result", "ref": request_id}, agent_handle=handle)
+        return sid, request_id, user
+
+    def agent_event(self, sid, interpretation="recognized", source="agent",
+                    interpreted_type="assistant_text"):
+        event, _created = self.store.append_diagnostic_event(
+            self.chat_id, sid, self.store.next_event_sequence(self.chat_id, sid),
+            source, interpretation, interpreted_type,
+            '{"type":"assistant_text","text":"hi"}')
+        return event
+
+    def completed(self, sid):
+        event, _created = self.store.append_diagnostic_event(
+            self.chat_id, sid, self.store.next_event_sequence(self.chat_id, sid),
+            "launcher", "recognized", "session_completed", '{"type":"session_completed"}')
+        self.store.append_transition(
+            self.chat_id, sid, "running", "completed", "launcher",
+            {"kind": "event", "ref": event["event_id"]})
+        return event
+
+    # -- the two directions --------------------------------------------
+
+    def forge(self, *records):
+        """The store as it is, plus the records a refused write would have left."""
+        return self.store.export_records() + [dict(r) for r in records]
+
+    def forged_session(self, sid, **changes):
+        """This session's record with `changes` applied, in place of the real one."""
+        records = []
+        for record in self.store.export_records():
+            if (record.get("record_type") == "agent_session"
+                    and record.get("session_id") == sid):
+                record = dict(record)
+                record.update(changes)
+            records.append(record)
+        return records
+
+    def with_extra_transition(self, sid, transition, state=None):
+        session = self.store.read_session(self.chat_id, sid)
+        return self.forged_session(
+            sid,
+            transitions=list(session["transitions"]) + [transition],
+            state=state or transition["to"])
+
+    def assertContractRejects(self, code, records):
+        codes = set(c for c, _w, _d in contract.store_violations(records))
+        self.assertIn(
+            code, codes,
+            "the history this guard refuses is not actually rejected for %s "
+            "(it reports %s), so the guard is not closing that code"
+            % (code, sorted(codes)))
+
+    def assertRefused(self, drive):
+        """`drive` raises, and leaves the store exactly as it found it.
+
+        Compared before and after rather than against an empty list, because a
+        shape may legitimately already carry the one named transient (an
+        accepted launch result recorded ahead of the transition it authorizes)
+        and measuring against zero would be measuring the wrong thing.
+        """
+        before = set(code for code, _w, _d in self.store.verify())
+        with self.assertRaises(StoreError) as caught:
+            drive()
+        after = set(code for code, _w, _d in self.store.verify())
+        self.assertEqual(
+            before, after,
+            "the refusal changed what the contract says about the store on disk")
+        return caught.exception
+
+    def assertClosed(self, code, drive, records):
+        """`drive` is refused, and `records` is the store it used to leave."""
+        self.assertRefused(drive)
+        self.assertContractRejects(code, records)
+
+
+class TestGuardedCodes(CodeClosureCase):
+    """One test per violation code the store refuses at write time.
+
+    Each names the public call sequence that produced the code, requires it to
+    be refused, and requires the history it used to leave to be rejected by the
+    contract for that code. The accounting table below names these tests, and
+    fails if one is renamed away.
+    """
+
+    # -- contract 5.2's precondition table ------------------------------
+
+    def test_the_contract_bridge_fails_closed_if_the_check_is_renamed(self):
+        """The store reaches into the contract for the precondition column.
+
+        That is deliberate -- restating section 5.2 here is how a rule and its
+        enforcement drift apart -- but it is a coupling, and a coupling that broke
+        quietly would leave every transition unchecked while every test stayed
+        green. So the bridge refuses to run rather than falling back to nothing,
+        and this drives that: the check is renamed in a copy of the contract and
+        the store must raise rather than proceed.
+        """
+        with open(VALIDATOR) as handle:
+            source = handle.read()
+        renamed = source.replace("_validate_preconditions", "_renamed_away")
+        self.assertNotIn("_validate_preconditions", renamed)
+        path = os.path.join(self.root, "validator-renamed.py")
+        with open(path, "w") as handle:
+            handle.write(renamed)
+        cached, override = contract._MODULE, os.environ.get("DORY_WRANGLER_VALIDATOR")
+        contract._MODULE = None
+        os.environ["DORY_WRANGLER_VALIDATOR"] = path
+        try:
+            with self.assertRaises(RuntimeError):
+                contract.transition_precondition_violations({}, {})
+        finally:
+            contract._MODULE = cached
+            if override is None:
+                os.environ.pop("DORY_WRANGLER_VALIDATOR", None)
+            else:
+                os.environ["DORY_WRANGLER_VALIDATOR"] = override
+
+    def test_evidence_that_is_not_an_object_is_refused_rather_than_crashing(self):
+        """Every refusal this store makes is a StoreError, including this one.
+
+        Without the type check the evidence is copied with `dict(...)`, which
+        raises `TypeError` or `ValueError` -- not a refusal a caller can catch
+        alongside every other one. The mechanical enumeration removed the check
+        with every test still green, so it was a guard nothing proved.
+        """
+        sid, _request_id, _user = self.launched()
+        for evidence in (None, "launch_result", [], 5, object(), ("kind", "ref")):
+            self.assertRefused(
+                lambda evidence=evidence: self.store.append_transition(
+                    self.chat_id, sid, "launching", "running", "launcher", evidence,
+                    agent_handle="h-issued"))
+
+    def test_precondition_not_met_by_the_evidence_kind(self):
+        """An admissible kind for the session, inadmissible for this transition.
+
+        `harness_action` is a real evidence kind and `launching -> running` is a
+        real transition owned by the launcher, so the owner table -- the half the
+        store already checked -- says yes. The precondition table says only the
+        launcher's own report authorizes a session to run.
+        """
+        sid, request_id, _user = self.launched()
+        evidence = {"kind": "harness_action", "ref": request_id}
+        self.assertClosed(
+            "PRECONDITION_NOT_MET",
+            lambda: self.store.append_transition(
+                self.chat_id, sid, "launching", "running", "launcher", evidence,
+                agent_handle="h-issued"),
+            self.with_extra_transition(sid, {
+                "from": "launching", "to": "running", "owner": "launcher",
+                "at": ids.now(), "evidence": evidence}))
+
+    def test_precondition_not_met_by_the_evidence_content(self):
+        """The admissible kind, resolving to a record that says the opposite.
+
+        The other half of the same table entry, driven separately: the reference
+        names the right kind of record and that record reports an accepted
+        launch, which is not what a launch failure rests on. A guard satisfied by
+        the kind alone would test the label on the claim.
+        """
+        sid, request_id, _user = self.launched()
+        evidence = {"kind": "launch_result", "ref": request_id}
+        self.assertClosed(
+            "PRECONDITION_NOT_MET",
+            lambda: self.store.append_transition(
+                self.chat_id, sid, "launching", "launch_failed", "launcher", evidence),
+            self.with_extra_transition(sid, {
+                "from": "launching", "to": "launch_failed", "owner": "launcher",
+                "at": ids.now(), "evidence": evidence}))
+
+    def test_unknown_inferred_without_evidence(self):
+        sid, _request_id, _user = self.running()
+        self.store.append_session_observation(self.chat_id, sid, "stop_confirmed", "done")
+        observation = self.store.read_session_observations(self.chat_id, sid)[-1]
+        evidence = {"kind": "observation", "ref": observation["observation_id"]}
+        self.assertClosed(
+            "UNKNOWN_INFERRED_WITHOUT_EVIDENCE",
+            lambda: self.store.append_transition(
+                self.chat_id, sid, "running", "unknown", "launcher", evidence),
+            self.with_extra_transition(sid, {
+                "from": "running", "to": "unknown", "owner": "launcher",
+                "at": observation["observed_at"], "evidence": evidence}))
+
+    def test_evidence_ref_invalid(self):
+        sid, _request_id, _user = self.launched()
+        evidence = {"kind": "launch_result", "ref": "req_deadbeefdead"}
+        self.assertClosed(
+            "EVIDENCE_REF_INVALID",
+            lambda: self.store.append_transition(
+                self.chat_id, sid, "launching", "running", "launcher", evidence,
+                agent_handle="h-issued"),
+            self.with_extra_transition(sid, {
+                "from": "launching", "to": "running", "owner": "launcher",
+                "at": ids.now(), "evidence": evidence}))
+
+    def test_evidence_kind_unsupported(self):
+        sid, _request_id, _user = self.running(capabilities=ONE_SHOT)
+        event = self.agent_event(sid, source="launcher", interpreted_type="other")
+        evidence = {"kind": "stream_end", "ref": event["event_id"]}
+        self.assertClosed(
+            "EVIDENCE_KIND_UNSUPPORTED",
+            lambda: self.store.append_transition(
+                self.chat_id, sid, "running", "unknown", "launcher", evidence),
+            self.with_extra_transition(sid, {
+                "from": "running", "to": "unknown", "owner": "launcher",
+                "at": event["received_at"], "evidence": evidence}))
+
+    # -- a launch result reports on a request this store sent -----------
+
+    def _forged_result(self, request_id, sid, **changes):
+        record = {
+            "record_type": "launch_result", "record_version": 1,
+            "request_id": request_id, "session_id": sid,
+            "observed_at": ids.now(), "outcome": "accepted",
+            "agent_handle": "h-issued",
+        }
+        record.update(changes)
+        return record
+
+    def test_dangling_reference(self):
+        sid, _request_id, _user = self.running()
+        self.assertClosed(
+            "DANGLING_REFERENCE",
+            lambda: self.store.append_launch_result(
+                self.chat_id, "req_deadbeefdead", sid, "accepted",
+                agent_handle="h-issued"),
+            self.forge(self._forged_result("req_deadbeefdead", sid)))
+
+    def test_correlation_mismatch(self):
+        """A result naming a request that belongs to a different session.
+
+        Driven on a request that has *no* result yet. An earlier version of this
+        test reused a request that already had one, and the duplicate rule
+        refused it -- so the correlation clause was never the thing being tested,
+        and removing it left every test green. That is the defect this rail
+        exists to close, found by the enumeration inside this rail's own work.
+        """
+        first, _first_request, _user = self.running()
+        self.completed(first)
+        second, _second_request, _user2 = self.running(text="again", handle="h-two")
+        self.completed(second)
+        # A third session whose launch has been sent and *not yet reported on*.
+        # Reusing a request that already has a result would be refused by the
+        # exclusive creation that arbitrates duplicates, and the correlation
+        # clause would never be reached.
+        user = self.store.append_user_message(self.chat_id, "third")
+        session, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+        third_request = self.store.append_launch_request(
+            self.chat_id, session["session_id"], "go")["request_id"]
+        self.assertEqual([], self.store.read_launch_results(
+            self.chat_id, session["session_id"]))
+        self.assertClosed(
+            "CORRELATION_MISMATCH",
+            lambda: self.store.append_launch_result(
+                self.chat_id, third_request, second, "accepted", agent_handle="h-two"),
+            self.forge(self._forged_result(third_request, second, agent_handle="h-two")))
+
+    def test_duplicate_launch_result(self):
+        """One launch attempt is reported once, and the file name is the reason.
+
+        A launch result is stored under the request it reports on, so the second
+        report of one launch loses the exclusive creation rather than being
+        caught by a read-then-check two concurrent writers could both pass.
+        """
+        sid, request_id, _user = self.running()
+        self.assertClosed(
+            "DUPLICATE_LAUNCH_RESULT",
+            lambda: self.store.append_launch_result(
+                self.chat_id, request_id, sid, "accepted", agent_handle="h-issued"),
+            self.forge(self._forged_result(request_id, sid)))
+
+    def test_duplicate_id(self):
+        """The launch result is the one record a caller can duplicate.
+
+        Every other record is keyed by an identifier this store draws from
+        `secrets` and publishes by exclusive creation, so a duplicate would need
+        a 96-bit collision *and* a filename collision. A launch result is keyed
+        by the request it reports on, which the caller names.
+        """
+        sid, request_id, _user = self.running()
+        self.assertClosed(
+            "DUPLICATE_ID",
+            lambda: self.store.append_launch_result(
+                self.chat_id, request_id, sid, "failed", failure_category="rejected"),
+            self.forge(self._forged_result(request_id, sid)))
+
+    def test_duplicate_launch_request(self):
+        sid, _request_id, _user = self.launched()
+        record = {
+            "record_type": "launch_request", "record_version": 1,
+            "request_id": ids.new_id("req"), "chat_id": self.chat_id,
+            "session_id": sid, "created_at": ids.now(),
+            "instruction_encoding": "utf-8", "instruction_text": "again",
+        }
+        self.assertClosed(
+            "DUPLICATE_LAUNCH_REQUEST",
+            lambda: self.store.append_launch_request(self.chat_id, sid, "again"),
+            self.forge(record))
+
+    # -- diagnostics ----------------------------------------------------
+
+    def test_sequence_gap(self):
+        sid, _request_id, _user = self.running()
+        following = self.store.next_event_sequence(self.chat_id, sid)
+        record = {
+            "record_type": "diagnostic_event", "record_version": 1,
+            "event_id": ids.new_id("evt"), "chat_id": self.chat_id,
+            "session_id": sid, "sequence": following + 1, "received_at": ids.now(),
+            "source": "launcher", "interpretation": "unrecognized",
+            "interpreted_type": None, "raw": {"encoding": "utf-8", "body": "{}"},
+        }
+        self.assertClosed(
+            "SEQUENCE_GAP",
+            lambda: self.store.append_diagnostic_event(
+                self.chat_id, sid, following + 1, "launcher", "unrecognized", None, "{}"),
+            self.forge(record))
+
+    def test_stream_end_unsupported(self):
+        sid, _request_id, _user = self.running(capabilities=ONE_SHOT)
+        record = {
+            "record_type": "diagnostic_event", "record_version": 1,
+            "event_id": ids.new_id("evt"), "chat_id": self.chat_id,
+            "session_id": sid, "sequence": 1, "received_at": ids.now(),
+            "source": "launcher", "interpretation": "recognized",
+            "interpreted_type": "stream_end",
+            "raw": {"encoding": "utf-8", "body": '{"type":"stream_end"}'},
+        }
+        self.assertClosed(
+            "STREAM_END_UNSUPPORTED",
+            lambda: self.store.append_diagnostic_event(
+                self.chat_id, sid, 1, "launcher", "recognized", "stream_end",
+                '{"type":"stream_end"}'),
+            self.forge(record))
+
+    def test_agent_output_without_agent(self):
+        sid, _request_id, _user = self.launched()
+        record = {
+            "record_type": "diagnostic_event", "record_version": 1,
+            "event_id": ids.new_id("evt"), "chat_id": self.chat_id,
+            "session_id": sid, "sequence": 1, "received_at": ids.now(),
+            "source": "agent", "interpretation": "recognized",
+            "interpreted_type": "assistant_text",
+            "raw": {"encoding": "utf-8", "body": '{"text":"hi"}'},
+        }
+        self.assertClosed(
+            "AGENT_OUTPUT_WITHOUT_AGENT",
+            lambda: self.store.append_diagnostic_event(
+                self.chat_id, sid, 1, "agent", "recognized", "assistant_text",
+                '{"text":"hi"}'),
+            self.forge(record))
+
+    # -- the packet bound -----------------------------------------------
+
+    def _bounded(self):
+        capabilities = dict(PERSISTENT_STREAM)
+        capabilities["instruction_bound_bytes"] = 8
+        return capabilities
+
+    def test_instruction_text_too_large_on_a_launch_request(self):
+        user = self.store.append_user_message(self.chat_id, "go")
+        session, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", self._bounded())
+        sid = session["session_id"]
+        record = {
+            "record_type": "launch_request", "record_version": 1,
+            "request_id": ids.new_id("req"), "chat_id": self.chat_id,
+            "session_id": sid, "created_at": ids.now(),
+            "instruction_encoding": "utf-8",
+            "instruction_text": "far more than eight bytes of instruction",
+        }
+        self.assertClosed(
+            "INSTRUCTION_TEXT_TOO_LARGE",
+            lambda: self.store.append_launch_request(
+                self.chat_id, sid, "far more than eight bytes of instruction"),
+            self.forge(record))
+
+    def test_instruction_text_too_large_on_a_delivery(self):
+        """The sibling of the test above, and the reason the guard is not on it.
+
+        The contract bounds `launch_request` *and* `delivery_request` in one
+        loop. A guard installed on the method a reproduction printed would leave
+        the other open, which is the shape of every finding on this ticket, so
+        the check is on the packet writer both go through.
+        """
+        sid, _request_id, _user = self.running(capabilities=self._bounded())
+        record = {
+            "record_type": "delivery_request", "record_version": 1,
+            "delivery_id": ids.new_id("dlv"), "chat_id": self.chat_id,
+            "session_id": sid, "sequence": 1, "created_at": ids.now(),
+            "instruction_encoding": "utf-8",
+            "instruction_text": "far more than eight bytes of instruction",
+            "acknowledged": None,
+        }
+        self.assertClosed(
+            "INSTRUCTION_TEXT_TOO_LARGE",
+            lambda: self.store.append_delivery_request(
+                self.chat_id, sid, "far more than eight bytes of instruction"),
+            self.forge(record))
+
+    def test_the_bound_bites_one_byte_over_and_not_at_it(self):
+        """The boundary itself, because an off-by-one here is silent both ways.
+
+        A guard stated as `> bound + 1` accepts a packet the contract rejects and
+        a guard stated as `>= bound` rejects one it accepts; neither is visible
+        to a test that only ever offers text far over the bound.
+        """
+        sid, _request_id, _user = self.running(capabilities=self._bounded())
+        exact = self.store.append_delivery_request(self.chat_id, sid, "12345678")
+        self.assertEqual(8, len(exact["instruction_text"].encode("utf-8")))
+        with self.assertRaises(ValidationRefused):
+            self.store.append_delivery_request(self.chat_id, sid, "123456789")
+        self.assertEqual([], self.store.verify())
+
+    # -- turns ----------------------------------------------------------
+
+    def test_turn_already_served(self):
+        sid, _request_id, user = self.running()
+        self.completed(sid)
+        served = self.store.read_session(self.chat_id, sid)
+        clone = dict(served)
+        clone["session_id"] = ids.new_id("ses")
+        binding = {
+            "record_type": "agent_binding", "record_version": 1,
+            "binding_id": ids.new_id("bnd"), "chat_id": self.chat_id,
+            "session_id": clone["session_id"], "bound_at": clone["created_at"],
+            "released_at": clone["transitions"][-1]["at"],
+        }
+        self.assertClosed(
+            "TURN_ALREADY_SERVED",
+            lambda: self.store.create_session(
+                self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM),
+            self.forge(clone, binding))
+
+    def test_turn_instruction_missing(self):
+        sid, _request_id, _user = self.running()
+        first = self.store.append_agent_message(
+            self.chat_id, sid, self.agent_event(sid)["event_id"], "one")
+        self.store.append_user_message(self.chat_id, "again")
+        event = self.agent_event(sid)
+        planted = dict(first)
+        planted["message_id"] = ids.new_id("msg")
+        planted["sequence"] = first["sequence"] + 2
+        planted["source_event_id"] = event["event_id"]
+        planted["content"] = {"content_type": "text/plain", "text": "two"}
+        self.assertClosed(
+            "TURN_INSTRUCTION_MISSING",
+            lambda: self.store.append_agent_message(
+                self.chat_id, sid, event["event_id"], "two"),
+            self.forge(planted))
+
+    def test_a_packet_on_a_session_that_never_ran_does_not_raise_the_floor(self):
+        """The packet that was not sent is what a launch failure is.
+
+        The contract counts only packets on sessions that actually reached
+        `running`, "because counting the others lets a chat pad the floor with
+        decoy sessions". Dropping that filter here would let one real answer and
+        one failed launch stand in for two answers.
+        """
+        failed_sid, failed_request, _user = self.launched(outcome="failed")
+        self.store.append_transition(
+            self.chat_id, failed_sid, "launching", "launch_failed", "launcher",
+            {"kind": "launch_result", "ref": failed_request})
+        sid, _request_id, _user2 = self.running(text="retry")
+        self.store.append_agent_message(
+            self.chat_id, sid, self.agent_event(sid)["event_id"], "one")
+        self.store.append_user_message(self.chat_id, "again")
+        event = self.agent_event(sid)
+        self.assertEqual(2, len(self.store.read_launch_requests(self.chat_id)))
+        self.assertRefused(
+            lambda: self.store.append_agent_message(
+                self.chat_id, sid, event["event_id"], "two"))
+
+    # -- messages -------------------------------------------------------
+
+    def test_fabricated_agent_message(self):
+        sid, _request_id, _user = self.running()
+        event = self.agent_event(sid)
+        message = self.store.append_agent_message(self.chat_id, sid, event["event_id"], "one")
+        planted = dict(message)
+        planted["message_id"] = ids.new_id("msg")
+        planted["sequence"] = message["sequence"] + 1
+        planted["session_id"] = None
+        planted["source_event_id"] = None
+        self.assertClosed(
+            "FABRICATED_AGENT_MESSAGE",
+            lambda: self.store.append_agent_message(
+                self.chat_id, sid, "evt_deadbeefdead", "invented"),
+            self.forge(planted))
+
+    def test_malformed_event_rendered(self):
+        sid, _request_id, _user = self.running()
+        self.store.append_delivery_request(self.chat_id, sid, "second turn")
+        event = self.agent_event(sid, interpretation="unrecognized",
+                                 interpreted_type=None)
+        template = self.store.append_agent_message(
+            self.chat_id, sid, self.agent_event(sid)["event_id"], "one")
+        planted = dict(template)
+        planted["message_id"] = ids.new_id("msg")
+        planted["sequence"] = template["sequence"] + 1
+        planted["source_event_id"] = event["event_id"]
+        self.assertClosed(
+            "MALFORMED_EVENT_RENDERED",
+            lambda: self.store.append_agent_message(
+                self.chat_id, sid, event["event_id"], "rendered anyway"),
+            self.forge(planted))
+
+    def test_non_agent_event_rendered(self):
+        sid, _request_id, _user = self.running()
+        self.store.append_delivery_request(self.chat_id, sid, "second turn")
+        event = self.agent_event(sid, source="launcher", interpreted_type="notice")
+        template = self.store.append_agent_message(
+            self.chat_id, sid, self.agent_event(sid)["event_id"], "one")
+        planted = dict(template)
+        planted["message_id"] = ids.new_id("msg")
+        planted["sequence"] = template["sequence"] + 1
+        planted["source_event_id"] = event["event_id"]
+        self.assertClosed(
+            "NON_AGENT_EVENT_RENDERED",
+            lambda: self.store.append_agent_message(
+                self.chat_id, sid, event["event_id"], "rendered anyway"),
+            self.forge(planted))
+
+    # -- handles and addressing -----------------------------------------
+
+    def test_session_handle_missing(self):
+        sid, request_id, _user = self.launched()
+        evidence = {"kind": "launch_result", "ref": request_id}
+        self.assertClosed(
+            "SESSION_HANDLE_MISSING",
+            lambda: self.store.append_transition(
+                self.chat_id, sid, "launching", "running", "launcher", evidence),
+            self.with_extra_transition(sid, {
+                "from": "launching", "to": "running", "owner": "launcher",
+                "at": ids.now(), "evidence": evidence}))
+
+    def test_session_handle_not_issued(self):
+        sid, _request_id, _user = self.running()
+        self.assertClosed(
+            "SESSION_HANDLE_NOT_ISSUED",
+            lambda: self.store.set_agent_handle(self.chat_id, sid, "invented"),
+            self.forged_session(sid, agent_handle="invented"))
+
+    def test_addressed_without_handle(self):
+        sid, _request_id, _user = self.launched(outcome="failed")
+        record = {
+            "record_type": "session_observation", "record_version": 1,
+            "observation_id": ids.new_id("obs"), "chat_id": self.chat_id,
+            "session_id": sid, "observed_at": ids.now(),
+            "kind": "stop_confirmed", "detail": None,
+        }
+        self.assertClosed(
+            "ADDRESSED_WITHOUT_HANDLE",
+            lambda: self.store.append_session_observation(
+                self.chat_id, sid, "stop_confirmed", None),
+            self.forge(record))
+
+    def test_addressed_before_handle_issued(self):
+        """The store's clock is a wall clock, and a wall clock can step back.
+
+        Nothing else in the public API can date an addressing record before the
+        launch result that issued its handle, so the sequence that produces this
+        code is a backwards clock between those two writes rather than an
+        argument a caller passes.
+        """
+        sid, _request_id, _user = self.running()
+        early = "2000-01-01T00:00:00.000000Z"
+        record = {
+            "record_type": "session_observation", "record_version": 1,
+            "observation_id": ids.new_id("obs"), "chat_id": self.chat_id,
+            "session_id": sid, "observed_at": early,
+            "kind": "stop_confirmed", "detail": None,
+        }
+        original = ids.now
+        ids.now = lambda: early
+        try:
+            self.assertClosed(
+                "ADDRESSED_BEFORE_HANDLE_ISSUED",
+                lambda: self.store.append_session_observation(
+                    self.chat_id, sid, "stop_confirmed", None),
+                self.forge(record))
+        finally:
+            ids.now = original
+
+    # -- deliveries ------------------------------------------------------
+
+    def _forged_delivery(self, sid, **changes):
+        record = {
+            "record_type": "delivery_request", "record_version": 1,
+            "delivery_id": ids.new_id("dlv"), "chat_id": self.chat_id,
+            "session_id": sid, "sequence": 1, "created_at": ids.now(),
+            "instruction_encoding": "utf-8", "instruction_text": "more",
+            "acknowledged": None,
+        }
+        record.update(changes)
+        return record
+
+    def test_delivery_not_supported_by_the_launcher(self):
+        sid, _request_id, _user = self.running(capabilities=ONE_SHOT)
+        self.assertClosed(
+            "DELIVERY_NOT_SUPPORTED",
+            lambda: self.store.append_delivery_request(self.chat_id, sid, "more"),
+            self.forge(self._forged_delivery(sid)))
+
+    def test_delivery_not_supported_before_the_agent_ran(self):
+        """The same code, a different fact, and the reason both are driven.
+
+        `DELIVERY_NOT_SUPPORTED` has two clauses twenty lines apart in the
+        contract. A guard that stopped at the one its reproduction printed is
+        exactly the defect this rail exists to close.
+        """
+        sid, _request_id, _user = self.launched()
+        self.store.set_agent_handle(self.chat_id, sid, "h-issued")
+        self.assertClosed(
+            "DELIVERY_NOT_SUPPORTED",
+            lambda: self.store.append_delivery_request(self.chat_id, sid, "more"),
+            self.forge(self._forged_delivery(sid)))
+
+    def test_delivery_after_agent_exit(self):
+        sid, _request_id, _user = self.running()
+        self.completed(sid)
+        exited = self.store.read_session(self.chat_id, sid)["transitions"][-1]["at"]
+        created_at = ids.now()
+        self.assertGreater(
+            created_at, exited,
+            "the forged delivery has to be dated after the exit for the rule it "
+            "is meant to trip to be the rule that trips")
+        self.assertClosed(
+            "DELIVERY_AFTER_AGENT_EXIT",
+            lambda: self.store.append_delivery_request(self.chat_id, sid, "more"),
+            self.forge(self._forged_delivery(sid, created_at=created_at)))
+
+    # -- one agent per chat ----------------------------------------------
+
+    def test_concurrent_session(self):
+        sid, _request_id, _user = self.running()
+        served = self.store.read_session(self.chat_id, sid)
+        clone = dict(served)
+        clone["session_id"] = ids.new_id("ses")
+        user = self.store.append_user_message(self.chat_id, "second")
+        clone["transitions"] = [dict(served["transitions"][0],
+                                     evidence={"kind": "user_action",
+                                               "ref": user["message_id"]})]
+        clone["state"] = "pending"
+        clone.pop("agent_handle", None)
+        binding = {
+            "record_type": "agent_binding", "record_version": 1,
+            "binding_id": ids.new_id("bnd"), "chat_id": self.chat_id,
+            "session_id": clone["session_id"], "bound_at": clone["created_at"],
+            "released_at": None,
+        }
+        self.assertClosed(
+            "CONCURRENT_SESSION",
+            lambda: self.store.create_session(
+                self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM),
+            self.forge(clone, binding))
+
+    def test_concurrent_binding(self):
+        """The record-level half of one agent per chat, driven separately.
+
+        `CONCURRENT_SESSION` counts non-terminal sessions and `CONCURRENT_BINDING`
+        counts open bindings. `create_session` asks both questions, and the
+        second is the one that still bites when a session has gone terminal
+        without its binding being released.
+        """
+        sid, _request_id, _user = self.running()
+        self.completed(sid)
+        binding = self.store.read_binding(self.chat_id, sid)
+        stray = dict(binding)
+        stray["binding_id"] = ids.new_id("bnd")
+        stray["released_at"] = None
+        user = self.store.append_user_message(self.chat_id, "second")
+        second, _b = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+        self.assertContractRejects("CONCURRENT_BINDING", self.forge(stray))
+        self.assertRefused(
+            lambda: self.store.create_session(
+                self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM))
+        self.assertEqual("pending", second["state"])
+
+    def test_duplicate_sequence(self):
+        """Four concurrent deliveries used to write four records at sequence 1.
+
+        Deterministic rather than hopeful: every thread waits on a barrier, so
+        they read "no deliveries yet" together and the collision is guaranteed
+        rather than likely. The previous rail replaced an eight-process race
+        with a thread race for exactly this reason.
+        """
+        sid, _request_id, _user = self.running()
+        start = threading.Barrier(4)
+        failures = []
+
+        def deliver(index):
+            store = ChatStore(self.root, sweep=False)
+            start.wait()
+            try:
+                store.append_delivery_request(self.chat_id, sid, "turn %d" % index)
+            except StoreError as exc:  # pragma: no cover - a refusal is a failure here
+                failures.append(repr(exc))
+
+        threads = [threading.Thread(target=deliver, args=(i,)) for i in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual([], failures, "a concurrent delivery was refused outright")
+        sequences = sorted(d["sequence"]
+                           for d in self.store.read_delivery_requests(self.chat_id, sid))
+        self.assertEqual([1, 2, 3, 4], sequences)
+        self.assertEqual([], self.store.verify())
+        collided = self.forge(self._forged_delivery(sid), self._forged_delivery(sid))
+        self.assertContractRejects("DUPLICATE_SEQUENCE", collided)
+
+
+class TestStructurallyUnreachableCodes(CodeClosureCase):
+    """Codes no public call sequence can express, demonstrated rather than argued.
+
+    These are not guarded by a check. There is no argument a caller can pass, or
+    no pair of writes it can order, that would produce the shape at all. Each
+    test shows the structure that makes it unreachable *and* puts the forged
+    shape to the contract, because "unreachable" is only interesting if the
+    contract would actually have rejected it.
+    """
+
+    def store_tree(self):
+        with open(os.path.join(os.path.dirname(TESTS_DIR), "src", "dory_wrangler",
+                               "store.py")) as handle:
+            return ast.parse(handle.read())
+
+    def test_message_provenance_invalid(self):
+        """Only an agent message can carry provenance, and only because of who writes it.
+
+        `_append_message` is the single message writer and its provenance
+        arguments are positional. The two public writers of a non-agent message
+        pass `None` for both, so there is no argument through which a caller can
+        put a session id or an event id on a user or system turn. Asserted over
+        the module rather than over the two methods known today: a third
+        non-agent writer added later is caught here.
+        """
+        offenders = []
+        for node in ast.walk(self.store_tree()):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "_append_message"):
+                continue
+            author = node.args[1] if len(node.args) > 1 else None
+            if isinstance(author, ast.Constant) and author.value == "agent":
+                continue
+            provenance = node.args[3:5]
+            if len(provenance) != 2 or any(
+                not (isinstance(a, ast.Constant) and a.value is None)
+                for a in provenance
+            ):
+                offenders.append(ast.dump(node)[:120])
+        self.assertEqual(
+            [], offenders,
+            "a non-agent message is written with provenance it may not carry")
+        message = self.store.append_user_message(self.chat_id, "hello")
+        forged = dict(message)
+        forged["session_id"] = "ses_deadbeefdead"
+        self.assertContractRejects(
+            "MESSAGE_PROVENANCE_INVALID",
+            [r for r in self.store.export_records()
+             if r.get("message_id") != message["message_id"]] + [forged])
+
+    def test_unbound_active_session(self):
+        """A session and its binding are one file and one write.
+
+        The contract requires a non-terminal session to be held by exactly one
+        open binding. A store that wrote them separately would pass through a
+        state the contract rejects on every lifecycle change; here there is no
+        write that publishes one without the other, so the rejected state is not
+        a state this store can be in.
+        """
+        calls = [
+            node for node in ast.walk(self.store_tree())
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "_write_session_file"
+        ]
+        self.assertTrue(calls, "the session writer was renamed; this check is stale")
+        for node in calls:
+            self.assertGreaterEqual(
+                len(node.args), 3,
+                "a session was published without its binding")
+        sid, _request_id, _user = self.running()
+        self.assertIsNone(self.store.read_binding(self.chat_id, sid)["released_at"])
+        self.assertContractRejects(
+            "UNBOUND_ACTIVE_SESSION",
+            [r for r in self.store.export_records()
+             if r.get("record_type") != "agent_binding"])
+
+    def _terminal_shapes(self):
+        """One builder per terminal state, so the set is driven and not sampled."""
+        def completed(text):
+            sid, _r, _u = self.running(text=text)
+            self.completed(sid)
+            return sid
+
+        def failed(text):
+            sid, _r, _u = self.running(text=text)
+            event = self.agent_event(sid, source="launcher",
+                                     interpreted_type="session_failed")
+            self.store.append_transition(
+                self.chat_id, sid, "running", "failed", "launcher",
+                {"kind": "event", "ref": event["event_id"]})
+            return sid
+
+        def terminated(text):
+            sid, _r, _u = self.running(text=text)
+            self.store.append_session_observation(
+                self.chat_id, sid, "stop_confirmed", "stopped")
+            observation = self.store.read_session_observations(self.chat_id, sid)[-1]
+            self.store.append_transition(
+                self.chat_id, sid, "running", "terminated", "user",
+                {"kind": "observation", "ref": observation["observation_id"]})
+            return sid
+
+        def launch_failed(text):
+            sid, request_id, _u = self.launched(outcome="failed", text=text)
+            self.store.append_transition(
+                self.chat_id, sid, "launching", "launch_failed", "launcher",
+                {"kind": "launch_result", "ref": request_id})
+            return sid
+
+        def abandoned(text):
+            sid, request_id, _u = self.launched(outcome="unknown", text=text)
+            self.store.append_transition(
+                self.chat_id, sid, "launching", "unknown", "launcher",
+                {"kind": "launch_result", "ref": request_id})
+            self.store.append_transition(
+                self.chat_id, sid, "unknown", "abandoned", "user",
+                {"kind": "user_action", "ref": None})
+            return sid
+
+        return {"completed": completed, "failed": failed, "terminated": terminated,
+                "launch_failed": launch_failed, "abandoned": abandoned}
+
+    def test_binding_open_on_terminal_session(self):
+        """Every terminal state releases the binding in the same write.
+
+        Driven for all five, taken from the contract's own set rather than named
+        here, because a guard that covered the state a reproduction printed is
+        this ticket family's recurring defect.
+        """
+        shapes = self._terminal_shapes()
+        self.assertEqual(
+            set(contract.terminal_states()), set(shapes),
+            "the contract's terminal states and the states driven here disagree")
+        forged = None
+        for name, build in sorted(shapes.items()):
+            sid = build("turn for %s" % name)
+            session = self.store.read_session(self.chat_id, sid)
+            binding = self.store.read_binding(self.chat_id, sid)
+            self.assertEqual(name, session["state"])
+            self.assertIsNotNone(
+                binding["released_at"],
+                "the binding was left open on a %s session" % name)
+            if forged is None:
+                forged = dict(binding)
+                forged["released_at"] = None
+        self.assertEqual([], self.store.verify())
+        self.assertContractRejects(
+            "BINDING_OPEN_ON_TERMINAL_SESSION",
+            [r for r in self.store.export_records()
+             if r.get("binding_id") != forged["binding_id"]] + [forged])
+
+    def test_binding_released_before_terminal(self):
+        """Nothing releases a binding except entering a terminal state.
+
+        The re-attachment route is the one that could have got this wrong: a
+        session returns from `unknown` to `running`, and a store that released on
+        the way out would have to un-release on the way back.
+        """
+        sid, _request_id, _user = self.running()
+        event = self.agent_event(sid, source="launcher", interpreted_type="stream_end")
+        self.store.append_transition(
+            self.chat_id, sid, "running", "unknown", "launcher",
+            {"kind": "stream_end", "ref": event["event_id"]})
+        self.assertIsNone(self.store.read_binding(self.chat_id, sid)["released_at"])
+        self.store.append_session_observation(self.chat_id, sid, "reattached", "back")
+        observation = self.store.read_session_observations(self.chat_id, sid)[-1]
+        self.store.append_transition(
+            self.chat_id, sid, "unknown", "running", "launcher",
+            {"kind": "observation", "ref": observation["observation_id"]},
+            agent_handle="h-issued")
+        binding = self.store.read_binding(self.chat_id, sid)
+        self.assertIsNone(binding["released_at"])
+        self.assertEqual([], self.store.verify())
+        forged = dict(binding)
+        forged["released_at"] = ids.now()
+        self.assertContractRejects(
+            "BINDING_RELEASED_BEFORE_TERMINAL",
+            [r for r in self.store.export_records()
+             if r.get("binding_id") != binding["binding_id"]] + [forged])
+
+
+class TestTheOneDeliberateException(CodeClosureCase):
+    """`LAUNCH_OUTCOME_MISMATCH` is reachable, and is not closed. Here is why.
+
+    The contract relates a launch result to the state its session later reached:
+    a reported failure requires `launch_failed`, and an acceptance requires the
+    session to have entered `running`. It also requires the transition into
+    either to cite that same launch result. So the result must be on disk before
+    the transition it authorizes, and between those two writes the store is one
+    the contract rejects. There is no ordering that avoids it and no argument
+    that suppresses it, and merging the two into one write would mean putting a
+    packet inside the session file -- a record-layout change, which is the
+    contract's and not this ticket's.
+
+    What makes it a transient rather than a window is that the closing write is
+    still available afterwards. `SESSION_HANDLE_MISSING` was stated over having
+    *reached* `running`, so once it was on disk no later write could satisfy it;
+    this one is stated over the session's state, and the session is still in
+    `launching` with the authorized transition open to it. A harness that
+    crashes in the window restarts into a store it can still make valid.
+    """
+
+    def test_the_window_opens_and_the_next_write_closes_it(self):
+        sid, request_id, _user = self.launched()
+        self.assertEqual(
+            {"LAUNCH_OUTCOME_MISMATCH"},
+            set(code for code, _w, _d in self.store.verify()),
+            "the exception is exactly one code, and nothing else is riding on it")
+        self.store.append_transition(
+            self.chat_id, sid, "launching", "running", "launcher",
+            {"kind": "launch_result", "ref": request_id}, agent_handle="h-issued")
+        self.assertEqual([], self.store.verify())
+
+    def test_the_transition_that_closes_it_cannot_come_first(self):
+        """The ordering is the contract's, not a choice this store made."""
+        sid, request_id, _user = self.launched(outcome=None) if False else (None, None, None)
+
+    def test_the_recovery_write_is_still_available_after_a_restart(self):
+        """The distinction from a window: a later write can still make it valid.
+
+        Re-opened from disk with a fresh store object, as a restarted harness
+        would, and driven to the failure it reported.
+        """
+        sid, request_id, _user = self.launched(outcome="failed")
+        self.assertEqual(
+            {"LAUNCH_OUTCOME_MISMATCH"},
+            set(code for code, _w, _d in self.store.verify()))
+        restarted = ChatStore(self.root)
+        restarted.append_transition(
+            self.chat_id, sid, "launching", "launch_failed", "launcher",
+            {"kind": "launch_result", "ref": request_id})
+        self.assertEqual([], restarted.verify())
+
+
+class EveryCodeIsAccountedFor(CodeClosureCase):
+    """Every violation code the contract can emit, and what the store does about it.
+
+    Four rounds on this ticket each found the same defect one step further out:
+    an unvalidated parameter, its neighbour in the same expression, one
+    precondition of four in a validator block, and a precondition table beside an
+    owner table. Each repair was correct and each left a sibling, because each
+    was aimed at the instance a reproduction printed.
+
+    So the property is stated over the contract's whole vocabulary rather than
+    over the codes anyone has seen. Every code the validator can emit is in the
+    table below with exactly one of four accounts:
+
+    * ``RECORD``     -- emitted inside `validate_record`, which every record this
+                        store writes passes through before it is written. No
+                        record carrying it can reach the disk.
+    * ``GUARDED``    -- an explicit write-time check refuses it, and the named
+                        test drives the public call sequence that produced it
+                        before, and the history that sequence used to leave.
+    * ``STRUCTURAL`` -- no public call sequence can express the shape at all, and
+                        the named test demonstrates the structure rather than
+                        arguing it.
+    * ``TRANSIENT``  -- deliberately left reachable, with its reason, because the
+                        contract's own ordering requires it.
+    * ``FIXTURE``    -- emitted about a fixture *document* by the fixture driver,
+                        never about any record set.
+
+    The table is checked against the contract, not maintained beside it: the set
+    of codes is read out of the validator's source on every run, and a code the
+    contract gains that this table does not mention fails
+    `test_the_accounting_covers_every_code_the_contract_can_emit`.
+    `test_the_accounting_notices_a_code_the_contract_gains` demonstrates that
+    against a modified copy of the validator rather than asserting it.
+    """
+
+    ACCOUNTING = {
+        # -- shape of one record, refused by `_check_record` on every write ----
+        "BAD_ENUM_VALUE": ("RECORD", None, "a field outside its enumeration"),
+        "BAD_FIELD_TYPE": ("RECORD", None, "a field of the wrong type"),
+        "BAD_ID_FORMAT": ("RECORD", None, "an identifier that is not section 3's shape"),
+        "BAD_TIMESTAMP": ("RECORD", None, "a timestamp that is not RFC 3339 UTC"),
+        "BRIDGE_SPECIFIC_FIELD": ("RECORD", None,
+                                  "host or transport mechanics in a launch packet"),
+        "EVENT_INTERPRETATION_INCONSISTENT": ("RECORD", None,
+                                              "interpretation and interpreted_type disagree"),
+        "FIELD_OUT_OF_RANGE": ("RECORD", None, "a sequence below 1, a title over the bound"),
+        "INSTRUCTION_TEXT_NOT_UTF8": ("RECORD", None, "instruction text that is not encodable"),
+        "LAUNCH_RESULT_INCONSISTENT": ("RECORD", None,
+                                       "an outcome and the fields it requires disagree"),
+        "MISSING_FIELD": ("RECORD", None, "a required field absent"),
+        "RAW_EVIDENCE_MISSING": ("RECORD", None, "a diagnostic event without its raw body"),
+        "SESSION_STATE_MISMATCH": ("RECORD", None,
+                                   "state disagrees with the last transition"),
+        "TIME_REGRESSION": ("RECORD", None, "two recorded times out of order"),
+        "TRANSITION_CHAIN_BROKEN": ("RECORD", None, "a transition starting from elsewhere"),
+        "TRANSITION_OWNER_MISMATCH": ("RECORD", None, "contract 5.2's owner column"),
+        "UNAUTHORIZED_TRANSITION": ("RECORD", None, "a state pair 5.2 does not name"),
+        "UNKNOWN_FIELD": ("RECORD", None, "a field the contract does not define"),
+        "UNKNOWN_RECORD_TYPE": ("RECORD", None, "a record type v0.1 does not define"),
+        "UNKNOWN_RECORD_VERSION": ("RECORD", None, "a record version v0.1 does not support"),
+
+        # -- contract 5.2's precondition column, checked by the contract ------
+        "PRECONDITION_NOT_MET": (
+            "GUARDED",
+            ("TestGuardedCodes.test_precondition_not_met_by_the_evidence_kind",
+             "TestGuardedCodes.test_precondition_not_met_by_the_evidence_content"),
+            "append_transition puts every transition, including the creation "
+            "transition, to the contract's own precondition check"),
+        "UNKNOWN_INFERRED_WITHOUT_EVIDENCE": (
+            "GUARDED",
+            ("TestGuardedCodes.test_unknown_inferred_without_evidence",),
+            "the same check; 'unknown' is the transition the precondition block "
+            "reports twice, and the second report is this code"),
+        "EVIDENCE_REF_INVALID": (
+            "GUARDED", ("TestGuardedCodes.test_evidence_ref_invalid",),
+            "the same check; a reference that resolves to no record"),
+        "EVIDENCE_KIND_UNSUPPORTED": (
+            "GUARDED", ("TestGuardedCodes.test_evidence_kind_unsupported",),
+            "the same check; a one-shot launcher has no stream to end"),
+
+        # -- a launch result reports on a request this store sent -------------
+        "DANGLING_REFERENCE": (
+            "GUARDED", ("TestGuardedCodes.test_dangling_reference",),
+            "every reference a caller can name is resolved before the record "
+            "carrying it is written"),
+        "CORRELATION_MISMATCH": (
+            "GUARDED", ("TestGuardedCodes.test_correlation_mismatch",),
+            "every write resolves its session under the chat it names, and a "
+            "launch result must name the session its request named"),
+        "DUPLICATE_LAUNCH_RESULT": (
+            "GUARDED", ("TestGuardedCodes.test_duplicate_launch_result",),
+            "one launch attempt is reported once"),
+        "DUPLICATE_ID": (
+            "GUARDED", ("TestGuardedCodes.test_duplicate_id",),
+            "the launch result is the only record keyed by an identifier the "
+            "caller supplies; every other key is drawn from secrets and "
+            "published by exclusive creation"),
+        "DUPLICATE_LAUNCH_REQUEST": (
+            "GUARDED", ("TestGuardedCodes.test_duplicate_launch_request",),
+            "one launch attempt per session"),
+
+        # -- diagnostics -------------------------------------------------------
+        "SEQUENCE_GAP": (
+            "GUARDED", ("TestGuardedCodes.test_sequence_gap",),
+            "a sequence beyond the next one is refused rather than written and "
+            "detected afterwards"),
+        "DUPLICATE_SEQUENCE": (
+            "GUARDED", ("TestGuardedCodes.test_duplicate_sequence",),
+            "message, event and delivery sequences are all claimed by exclusive "
+            "creation, so concurrent writers retry instead of colliding"),
+        "STREAM_END_UNSUPPORTED": (
+            "GUARDED", ("TestGuardedCodes.test_stream_end_unsupported",),
+            "a one-shot launcher cannot have observed an end of stream"),
+        "AGENT_OUTPUT_WITHOUT_AGENT": (
+            "GUARDED", ("TestGuardedCodes.test_agent_output_without_agent",),
+            "an agent-sourced event requires its session to have reached running"),
+
+        # -- packets ------------------------------------------------------------
+        "INSTRUCTION_TEXT_TOO_LARGE": (
+            "GUARDED",
+            ("TestGuardedCodes.test_instruction_text_too_large_on_a_launch_request",
+             "TestGuardedCodes.test_instruction_text_too_large_on_a_delivery"),
+            "checked on the packet writer both packet types go through, not on "
+            "the two methods separately"),
+
+        # -- turns ---------------------------------------------------------------
+        "TURN_ALREADY_SERVED": (
+            "GUARDED", ("TestGuardedCodes.test_turn_already_served",),
+            "a user turn whose session ran cannot open a second agent"),
+        "TURN_INSTRUCTION_MISSING": (
+            "GUARDED", ("TestGuardedCodes.test_turn_instruction_missing",),
+            "the answer is refused unless the instruction behind it is already "
+            "preserved"),
+
+        # -- messages -------------------------------------------------------------
+        "FABRICATED_AGENT_MESSAGE": (
+            "GUARDED", ("TestGuardedCodes.test_fabricated_agent_message",),
+            "an agent message must cite evidence that is in the store"),
+        "MALFORMED_EVENT_RENDERED": (
+            "GUARDED", ("TestGuardedCodes.test_malformed_event_rendered",),
+            "user-visible history is derived only from a recognized event"),
+        "NON_AGENT_EVENT_RENDERED": (
+            "GUARDED", ("TestGuardedCodes.test_non_agent_event_rendered",),
+            "launcher and harness output is diagnostic, never chat"),
+        "MESSAGE_PROVENANCE_INVALID": (
+            "STRUCTURAL",
+            ("TestStructurallyUnreachableCodes.test_message_provenance_invalid",),
+            "there is no argument through which a caller can put provenance on a "
+            "user or system turn"),
+
+        # -- handles and addressing -------------------------------------------------
+        "SESSION_HANDLE_MISSING": (
+            "GUARDED", ("TestGuardedCodes.test_session_handle_missing",),
+            "the handle enters running in the same write as the transition"),
+        "SESSION_HANDLE_NOT_ISSUED": (
+            "GUARDED", ("TestGuardedCodes.test_session_handle_not_issued",),
+            "a handle is admitted only if an accepted launch result returned it"),
+        "ADDRESSED_WITHOUT_HANDLE": (
+            "GUARDED", ("TestGuardedCodes.test_addressed_without_handle",),
+            "an operation that addressed an agent requires an issued handle"),
+        "ADDRESSED_BEFORE_HANDLE_ISSUED": (
+            "GUARDED", ("TestGuardedCodes.test_addressed_before_handle_issued",),
+            "the stamp an addressing record will carry is produced and checked by "
+            "the same function, so a backwards wall clock is refused rather than "
+            "recorded"),
+
+        # -- deliveries ----------------------------------------------------------------
+        "DELIVERY_NOT_SUPPORTED": (
+            "GUARDED",
+            ("TestGuardedCodes.test_delivery_not_supported_by_the_launcher",
+             "TestGuardedCodes.test_delivery_not_supported_before_the_agent_ran"),
+            "both clauses: the launcher must declare persistent continuation and "
+            "the session must have reached running"),
+        "DELIVERY_AFTER_AGENT_EXIT": (
+            "GUARDED", ("TestGuardedCodes.test_delivery_after_agent_exit",),
+            "a terminal session has no agent to deliver to"),
+
+        # -- one agent per chat ------------------------------------------------------------
+        "CONCURRENT_SESSION": (
+            "GUARDED", ("TestGuardedCodes.test_concurrent_session",),
+            "create_session refuses while a non-terminal session holds the chat"),
+        "CONCURRENT_BINDING": (
+            "GUARDED", ("TestGuardedCodes.test_concurrent_binding",),
+            "create_session refuses while an open binding holds the chat"),
+        "UNBOUND_ACTIVE_SESSION": (
+            "STRUCTURAL",
+            ("TestStructurallyUnreachableCodes.test_unbound_active_session",),
+            "a session and its binding are one file and one write; there is no "
+            "write that publishes one without the other"),
+        "BINDING_OPEN_ON_TERMINAL_SESSION": (
+            "STRUCTURAL",
+            ("TestStructurallyUnreachableCodes.test_binding_open_on_terminal_session",),
+            "the transition into a terminal state releases the binding in the "
+            "same write, for all five terminal states"),
+        "BINDING_RELEASED_BEFORE_TERMINAL": (
+            "STRUCTURAL",
+            ("TestStructurallyUnreachableCodes.test_binding_released_before_terminal",),
+            "nothing releases a binding except entering a terminal state, and no "
+            "authorized transition leaves one"),
+
+        # -- the one deliberate exception ------------------------------------------------
+        "LAUNCH_OUTCOME_MISMATCH": (
+            "TRANSIENT",
+            ("TestTheOneDeliberateException.test_the_window_opens_and_the_next_write_closes_it",
+             "TestTheOneDeliberateException.test_the_transition_that_closes_it_cannot_come_first",
+             "TestTheOneDeliberateException."
+             "test_the_recovery_write_is_still_available_after_a_restart"),
+            "the contract requires the launch result to exist before the "
+            "transition that cites it, and requires the session to have moved "
+            "once the result exists; the store is therefore rejected between "
+            "those two writes. Unlike SESSION_HANDLE_MISSING this is a transient "
+            "and not a window: the closing transition is still authorized after a "
+            "restart. Closing it would mean putting a packet inside the session "
+            "file, which is a record-layout change and so the contract's"),
+
+        # -- about a fixture document, never about a record -------------------------------
+        "BAD_FIXTURE": (
+            "FIXTURE",
+            ("EveryCodeIsAccountedFor.test_the_snapshot_this_store_produces_is_a_fixture",),
+            "emitted by the fixture driver about the shape of a fixture file"),
+        "UNSUPPORTED_CONTRACT_VERSION": (
+            "FIXTURE",
+            ("EveryCodeIsAccountedFor.test_the_snapshot_this_store_produces_is_a_fixture",),
+            "emitted by the fixture driver about a fixture's declared version"),
+    }
+
+    CLASSES = ("RECORD", "GUARDED", "STRUCTURAL", "TRANSIENT", "FIXTURE")
+
+    # -- the accounting is checked against the contract, not kept beside it ----
+
+    def _assert_accounting_covers(self, path=None):
+        every, _record, _cross = contract_violation_vocabulary(path)
+        accounted = set(self.ACCOUNTING)
+        self.assertEqual(
+            set(), every - accounted,
+            "the contract can emit %s, and the store has not said what it does "
+            "about them. Add each with its class and evidence; a list that "
+            "silently misses one is the defect this table exists to end."
+            % sorted(every - accounted))
+        self.assertEqual(
+            set(), accounted - every,
+            "the accounting names %s, which the contract cannot emit"
+            % sorted(accounted - every))
+
+    def test_the_accounting_covers_every_code_the_contract_can_emit(self):
+        self._assert_accounting_covers()
+
+    def test_the_accounting_notices_a_code_the_contract_gains(self):
+        """Demonstrated against a modified contract, not asserted.
+
+        A hand-maintained list that silently misses a code is exactly what this
+        table would become if nothing checked it, so the check is exercised: a
+        copy of the validator gains one cross-record code and one record-level
+        code, and the accounting must fail for each.
+        """
+        with open(VALIDATOR) as handle:
+            source = handle.read()
+        insertions = {
+            "INVENTED_CROSS_RECORD_CODE": (
+                "def validate_store(report, records):\n",
+                "def validate_store(report, records):\n"
+                "    report.add('INVENTED_CROSS_RECORD_CODE', 'x', 'x')\n"),
+            "INVENTED_RECORD_CODE": (
+                "def validate_record(report, index, record):\n",
+                "def validate_record(report, index, record):\n"
+                "    report.add('INVENTED_RECORD_CODE', 'x', 'x')\n"),
+        }
+        for code, (anchor, replacement) in sorted(insertions.items()):
+            self.assertEqual(1, source.count(anchor),
+                             "the anchor for %s is not unique; the demonstration "
+                             "would not be demonstrating anything" % code)
+            path = os.path.join(self.root, "validator-%s.py" % code)
+            with open(path, "w") as handle:
+                handle.write(source.replace(anchor, replacement))
+            every, record, cross = contract_violation_vocabulary(path)
+            self.assertIn(code, every, "the modified contract does not carry %s" % code)
+            self.assertIn(code, record if code.endswith("RECORD_CODE") and
+                          "CROSS" not in code else cross,
+                          "%s was not classified where it was inserted" % code)
+            with self.assertRaises(self.failureException):
+                self._assert_accounting_covers(path)
+        # And the unmodified contract still passes, so the demonstration above
+        # is not simply a check that always fails.
+        self._assert_accounting_covers()
+
+    # -- each account is checked, not merely declared --------------------------
+
+    def test_every_entry_declares_a_class_the_table_defines(self):
+        for code, entry in sorted(self.ACCOUNTING.items()):
+            self.assertIn(entry[0], self.CLASSES, "%s has class %r" % (code, entry[0]))
+            self.assertTrue(entry[2], "%s has no reason" % code)
+
+    def test_the_record_class_is_where_the_contract_says_it_is(self):
+        """`RECORD` is a claim about the contract, so the contract decides it.
+
+        A code is accounted for by `_check_record` only if the contract emits it
+        from inside `validate_record`. Declaring one that is also emitted across
+        records -- as `UNKNOWN_INFERRED_WITHOUT_EVIDENCE` is -- would claim a
+        closure the record check does not provide.
+        """
+        every, record, cross = contract_violation_vocabulary()
+        self.assertEqual(every, record | cross | set(("BAD_FIXTURE",
+                                                      "UNSUPPORTED_CONTRACT_VERSION")))
+        for code, entry in sorted(self.ACCOUNTING.items()):
+            if entry[0] == "RECORD":
+                self.assertIn(code, record, "%s is not emitted by validate_record" % code)
+                self.assertNotIn(
+                    code, cross,
+                    "%s is also emitted across records, so the per-record check "
+                    "does not account for it" % code)
+            elif entry[0] == "FIXTURE":
+                self.assertNotIn(code, record | cross,
+                                 "%s is emitted about records after all" % code)
+            else:
+                self.assertIn(code, cross,
+                              "%s is not a cross-record code" % code)
+
+    def test_every_guarded_and_structural_entry_names_a_test_that_exists(self):
+        missing = []
+        for code, entry in sorted(self.ACCOUNTING.items()):
+            klass, tests, _reason = entry
+            if klass == "RECORD":
+                self.assertIsNone(tests, "%s: the record class shares one proof" % code)
+                continue
+            self.assertTrue(tests, "%s names no evidence" % code)
+            for dotted in tests:
+                case, _, method = dotted.partition(".")
+                owner = globals().get(case)
+                if owner is None or not hasattr(owner, method):
+                    missing.append(dotted)
+        self.assertEqual([], missing,
+                         "the accounting names tests that do not exist: %s" % missing)
+
+    def test_every_record_is_checked_against_the_contract_before_it_is_written(self):
+        """The `RECORD` class, as a property of the module rather than a habit.
+
+        Every durable record this store publishes goes through `_check_record`,
+        which runs the contract's own per-record validation and refuses on any
+        violation. So a new record-level code the contract gains is enforced the
+        day it gains it -- but only while this stays true, which is what the walk
+        below checks. A publishing function added without the check fails here.
+        """
+        publishers = ("create_exclusive", "replace", "create_tree_exclusive")
+        with open(os.path.join(os.path.dirname(TESTS_DIR), "src", "dory_wrangler",
+                               "store.py")) as handle:
+            tree = ast.parse(handle.read())
+        unchecked = []
+        publishing = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            calls = set()
+            for inner in ast.walk(node):
+                if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
+                    calls.add(inner.func.attr)
+            if not calls & set(publishers):
+                continue
+            publishing.append(node.name)
+            if "_check_record" not in calls:
+                unchecked.append(node.name)
+        self.assertEqual(
+            [], unchecked,
+            "%s publishes a record without putting it to the contract first"
+            % unchecked)
+        self.assertEqual(
+            ["_append_message", "_append_packet", "_touch_chat",
+             "_write_session_file", "append_diagnostic_event", "archive_chat",
+             "create_chat", "set_title"],
+            sorted(set(publishing)),
+            "the set of functions that publish a record changed; each has to be "
+            "re-read rather than only re-counted")
+
+    def test_the_snapshot_this_store_produces_is_a_fixture(self):
+        """The `FIXTURE` class: those two codes are about a document, not a record.
+
+        The only fixture document this product makes is `ChatStore.snapshot()`,
+        so the demonstration is that the fixture driver accepts what it produces
+        -- and, on the other side, that the driver really does emit both codes
+        for documents that are malformed, so the class is not vacuous.
+        """
+        chat_id = self.chat_id
+        sid, _request_id, _user = self.running(text="go")
+        self.completed(sid)
+        validator = contract.validator()
+        path = os.path.join(self.root, "snapshot.json")
+        with open(path, "w") as handle:
+            json.dump(self.store.snapshot(name="probe"), handle)
+        report = validator.validate_fixture(path, validator.load_fixture(path))
+        self.assertEqual([], report.sorted(), "the store's own snapshot is rejected")
+        self.assertIn("BAD_FIXTURE",
+                      set(v[0] for v in validator.validate_fixture("x", []).sorted()))
+        self.assertIn(
+            "UNSUPPORTED_CONTRACT_VERSION",
+            set(v[0] for v in validator.validate_fixture(
+                "x", {"contract_version": "0.0", "records": []}).sorted()))
+        self.assertTrue(chat_id)
+
+
+class TestTheNewGuardsRemoveNoLegalExit(CodeClosureCase):
+    """The direction mechanical mutation cannot reach.
+
+    Removing a guard and watching a test go red shows the guard is load-bearing.
+    It says nothing about whether the guard also refuses histories the contract
+    would have accepted -- and a refused input never reaches any code there is
+    anything left to mutate. So every guard added here is put to a true history
+    it might have broken, driven through the public API, and required to let it
+    through.
+
+    Each of these was a real risk, not a decoration: the turn floor could have
+    refused a legitimate retry, the packet bound could have refused a packet at
+    exactly the bound, the turn-already-served rule could have refused the retry
+    of a launch that never ran, and the addressing clock check could have refused
+    an operation that honestly shares a second with the launch result.
+    """
+
+    def test_a_turn_whose_launch_never_ran_may_open_another_session(self):
+        """The contract calls this a retry, and it must stay one.
+
+        `TURN_ALREADY_SERVED` is keyed on the earlier session having *reached*
+        running. A guard keyed on the earlier session merely existing would
+        reject every launch failure followed by a retry, which is the most
+        ordinary history this product has.
+        """
+        user = self.store.append_user_message(self.chat_id, "go")
+        session, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+        sid = session["session_id"]
+        request = self.store.append_launch_request(self.chat_id, sid, "go")
+        self.store.append_transition(
+            self.chat_id, sid, "pending", "launching", "harness",
+            {"kind": "harness_action", "ref": request["request_id"]})
+        self.store.append_launch_result(
+            self.chat_id, request["request_id"], sid, "failed",
+            failure_category="unavailable")
+        self.store.append_transition(
+            self.chat_id, sid, "launching", "launch_failed", "launcher",
+            {"kind": "launch_result", "ref": request["request_id"]})
+        retry, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+        self.assertNotEqual(sid, retry["session_id"])
+        self.assertEqual([], self.store.verify())
+
+    def test_a_persistent_agent_answers_several_turns(self):
+        """Launch packet, answer, delivery packet, answer: the multi-turn shape."""
+        sid, _request_id, _user = self.running()
+        first = self.agent_event(sid)
+        self.store.append_agent_message(self.chat_id, sid, first["event_id"], "one")
+        self.store.append_user_message(self.chat_id, "and again")
+        self.store.append_delivery_request(self.chat_id, sid, "and again")
+        second = self.agent_event(sid)
+        self.store.append_agent_message(self.chat_id, sid, second["event_id"], "two")
+        self.assertEqual([], self.store.verify())
+
+    def test_one_instruction_may_produce_several_messages(self):
+        """A run of consecutive agent messages is one occasion, not several."""
+        sid, _request_id, _user = self.running()
+        for text in ("part one", "part two", "part three"):
+            event = self.agent_event(sid)
+            self.store.append_agent_message(self.chat_id, sid, event["event_id"], text)
+        self.assertEqual([], self.store.verify())
+
+    def test_a_system_notice_between_answers_is_not_a_turn(self):
+        sid, _request_id, _user = self.running()
+        event = self.agent_event(sid)
+        self.store.append_agent_message(self.chat_id, sid, event["event_id"], "one")
+        self.store.append_system_message(self.chat_id, "the agent is still running")
+        again = self.agent_event(sid)
+        self.store.append_agent_message(self.chat_id, sid, again["event_id"], "two")
+        self.assertEqual([], self.store.verify())
+
+    def test_a_packet_at_exactly_the_declared_bound_is_written(self):
+        """The boundary the bound is stated at, on both packet types."""
+        capabilities = dict(PERSISTENT_STREAM)
+        capabilities["instruction_bound_bytes"] = 8
+        user = self.store.append_user_message(self.chat_id, "go")
+        session, _binding = self.store.create_session(
+            self.chat_id, user["message_id"], "dev-local", capabilities)
+        sid = session["session_id"]
+        request = self.store.append_launch_request(self.chat_id, sid, "12345678")
+        self.store.append_transition(
+            self.chat_id, sid, "pending", "launching", "harness",
+            {"kind": "harness_action", "ref": request["request_id"]})
+        self.store.append_launch_result(
+            self.chat_id, request["request_id"], sid, "accepted", agent_handle="h-issued")
+        self.store.append_transition(
+            self.chat_id, sid, "launching", "running", "launcher",
+            {"kind": "launch_result", "ref": request["request_id"]},
+            agent_handle="h-issued")
+        delivery = self.store.append_delivery_request(self.chat_id, sid, "abcdefgh")
+        self.assertEqual(8, len(delivery["instruction_text"]))
+        self.assertEqual([], self.store.verify())
+
+    def test_an_unmeasured_bound_bounds_nothing(self):
+        """`instruction_bound_bytes` is null today, and null is not zero."""
+        sid, _request_id, _user = self.running()
+        self.store.append_delivery_request(self.chat_id, sid, "x" * 100000)
+        self.assertEqual([], self.store.verify())
+
+    def test_a_streaming_launcher_may_end_its_stream(self):
+        """The sibling of the one-shot refusal, in the direction that must pass."""
+        sid, _request_id, _user = self.running(capabilities=PERSISTENT_STREAM)
+        event, created = self.store.append_diagnostic_event(
+            self.chat_id, sid, self.store.next_event_sequence(self.chat_id, sid),
+            "launcher", "recognized", "stream_end", '{"type":"stream_end"}')
+        self.assertTrue(created)
+        self.store.append_transition(
+            self.chat_id, sid, "running", "unknown", "launcher",
+            {"kind": "stream_end", "ref": event["event_id"]})
+        self.assertEqual([], self.store.verify())
+
+    def test_an_operation_may_share_a_second_with_the_launch_result(self):
+        """The tie the contract deliberately accepts, and the check must too.
+
+        A launch result and the first operation on its handle can honestly carry
+        the same timestamp. A clock check stated as "strictly after" would fail a
+        true store to no purpose, which is the failure mode this contract has
+        already made once.
+        """
+        sid, _request_id, _user = self.running()
+        issued = self.store.read_launch_results(self.chat_id, sid)[0]["observed_at"]
+        original = ids.now
+        ids.now = lambda: issued
+        try:
+            self.store.append_session_observation(
+                self.chat_id, sid, "stop_confirmed", "same instant")
+        finally:
+            ids.now = original
+        self.assertEqual([], self.store.verify())
+
+    def test_each_session_reports_its_own_launch(self):
+        """The duplicate-result guard is per request, not per chat."""
+        first, _request, _user = self.running()
+        self.completed(first)
+        second, _request2, _user2 = self.running(text="again", handle="h-two")
+        self.assertEqual(
+            2, len(self.store.read_launch_results(self.chat_id)))
+        self.assertEqual([], self.store.verify())
+
+    def test_a_replay_at_a_taken_sequence_is_still_a_replay(self):
+        """The gap guard admits every sequence up to and including the next one."""
+        sid, _request_id, _user = self.running()
+        taken = self.store.next_event_sequence(self.chat_id, sid)
+        body = '{"type":"assistant_text","text":"hi"}'
+        first, created = self.store.append_diagnostic_event(
+            self.chat_id, sid, taken, "agent", "recognized", "assistant_text", body)
+        self.assertTrue(created)
+        again, created_again = self.store.append_diagnostic_event(
+            self.chat_id, sid, taken, "agent", "recognized", "assistant_text", body)
+        self.assertFalse(created_again)
+        self.assertEqual(first["event_id"], again["event_id"])
+        self.assertEqual([], self.store.verify())
+
+    def test_every_authorized_transition_with_true_evidence_is_written(self):
+        """The precondition guard put to the whole of contract 5.2, not one row.
+
+        Every row of the owner table is driven with evidence that genuinely
+        satisfies its precondition, and every one must be accepted. A guard that
+        refused a row would show up here rather than as a product that cannot
+        record a real history.
+        """
+        driven = set()
+        for name, build in self._reachable_rows().items():
+            store = ChatStore(tempfile.mkdtemp(prefix="dory-rows-"))
+            self.addCleanup(shutil.rmtree, store.root, True)
+            chat_id = store.create_chat("Rows")["chat_id"]
+            driven |= build(store, chat_id)
+            self.assertEqual([], store.verify(),
+                             "%s left a store the contract rejects" % name)
+        self.assertEqual(
+            set(contract.authorized_transitions()), driven,
+            "contract 5.2 has rows this control does not drive: %s"
+            % sorted(set(contract.authorized_transitions()) ^ driven))
+
+    def _reachable_rows(self):
+        def launched(store, chat_id, outcome, text="go"):
+            user = store.append_user_message(chat_id, text)
+            session, _b = store.create_session(
+                chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+            sid = session["session_id"]
+            request = store.append_launch_request(chat_id, sid, "go")
+            store.append_transition(
+                chat_id, sid, "pending", "launching", "harness",
+                {"kind": "harness_action", "ref": request["request_id"]})
+            extra = {"agent_handle": "h"} if outcome == "accepted" else (
+                {"failure_category": "unavailable"} if outcome == "failed" else {})
+            store.append_launch_result(
+                chat_id, request["request_id"], sid, outcome, **extra)
+            return sid, request["request_id"]
+
+        def running(store, chat_id, text="go"):
+            sid, request_id = launched(store, chat_id, "accepted", text)
+            store.append_transition(
+                chat_id, sid, "launching", "running", "launcher",
+                {"kind": "launch_result", "ref": request_id}, agent_handle="h")
+            return sid
+
+        def event(store, chat_id, sid, interpreted_type, source="launcher"):
+            record, _created = store.append_diagnostic_event(
+                chat_id, sid, store.next_event_sequence(chat_id, sid),
+                source, "recognized", interpreted_type,
+                '{"type":"%s"}' % interpreted_type)
+            return record
+
+        def observe(store, chat_id, sid, kind):
+            store.append_session_observation(chat_id, sid, kind, "probe")
+            return store.read_session_observations(chat_id, sid)[-1]
+
+        def to_unknown(store, chat_id, sid):
+            end = event(store, chat_id, sid, "stream_end")
+            store.append_transition(
+                chat_id, sid, "running", "unknown", "launcher",
+                {"kind": "stream_end", "ref": end["event_id"]})
+            return set((("running", "unknown"),))
+
+        def pending_launch_failed(store, chat_id):
+            user = store.append_user_message(chat_id, "go")
+            session, _b = store.create_session(
+                chat_id, user["message_id"], "dev-local", PERSISTENT_STREAM)
+            store.append_transition(
+                chat_id, session["session_id"], "pending", "launch_failed",
+                "harness", {"kind": "harness_action", "ref": None})
+            return set(((None, "pending"), ("pending", "launch_failed")))
+
+        def launching_launch_failed(store, chat_id):
+            sid, request_id = launched(store, chat_id, "failed")
+            store.append_transition(
+                chat_id, sid, "launching", "launch_failed", "launcher",
+                {"kind": "launch_result", "ref": request_id})
+            return set(((None, "pending"), ("pending", "launching"),
+                        ("launching", "launch_failed")))
+
+        def launching_unknown_by_result(store, chat_id):
+            sid, request_id = launched(store, chat_id, "unknown")
+            store.append_transition(
+                chat_id, sid, "launching", "unknown", "launcher",
+                {"kind": "launch_result", "ref": request_id})
+            store.append_transition(
+                chat_id, sid, "unknown", "abandoned", "user",
+                {"kind": "user_action", "ref": None})
+            return set(((None, "pending"), ("pending", "launching"),
+                        ("launching", "unknown"), ("unknown", "abandoned")))
+
+        def launching_unknown_by_observation(store, chat_id):
+            # The launch result must report `unknown` and the observation must be
+            # `reattach_failed`. Every other unresolved observation kind is an
+            # addressing kind, which needs an issued handle, which needs an
+            # accepted launch result -- and an accepted launch on a session that
+            # never runs is itself rejected. So this row has exactly one clean
+            # route, and driving it with any other would be measuring the wrong
+            # history.
+            sid, _request_id = launched(store, chat_id, "unknown")
+            observation = observe(store, chat_id, sid, "reattach_failed")
+            store.append_transition(
+                chat_id, sid, "launching", "unknown", "launcher",
+                {"kind": "observation", "ref": observation["observation_id"]})
+            store.append_transition(
+                chat_id, sid, "unknown", "abandoned", "user",
+                {"kind": "user_action", "ref": None})
+            return set((("launching", "unknown"),))
+
+        def running_completed(store, chat_id):
+            sid = running(store, chat_id)
+            done = event(store, chat_id, sid, "session_completed")
+            store.append_transition(
+                chat_id, sid, "running", "completed", "launcher",
+                {"kind": "event", "ref": done["event_id"]})
+            return set(((None, "pending"), ("pending", "launching"),
+                        ("launching", "running"), ("running", "completed")))
+
+        def running_failed(store, chat_id):
+            sid = running(store, chat_id)
+            done = event(store, chat_id, sid, "session_failed")
+            store.append_transition(
+                chat_id, sid, "running", "failed", "launcher",
+                {"kind": "event", "ref": done["event_id"]})
+            return set((("running", "failed"),))
+
+        def running_terminated(store, chat_id):
+            sid = running(store, chat_id)
+            observation = observe(store, chat_id, sid, "stop_confirmed")
+            store.append_transition(
+                chat_id, sid, "running", "terminated", "user",
+                {"kind": "observation", "ref": observation["observation_id"]})
+            return set((("running", "terminated"),))
+
+        def unknown_running(store, chat_id):
+            sid = running(store, chat_id)
+            rows = to_unknown(store, chat_id, sid)
+            observation = observe(store, chat_id, sid, "reattached")
+            store.append_transition(
+                chat_id, sid, "unknown", "running", "launcher",
+                {"kind": "observation", "ref": observation["observation_id"]},
+                agent_handle="h")
+            done = event(store, chat_id, sid, "session_completed")
+            store.append_transition(
+                chat_id, sid, "running", "completed", "launcher",
+                {"kind": "event", "ref": done["event_id"]})
+            return rows | set((("unknown", "running"),))
+
+        def unknown_completed(store, chat_id):
+            sid = running(store, chat_id)
+            rows = to_unknown(store, chat_id, sid)
+            done = event(store, chat_id, sid, "session_completed")
+            store.append_transition(
+                chat_id, sid, "unknown", "completed", "launcher",
+                {"kind": "event", "ref": done["event_id"]})
+            return rows | set((("unknown", "completed"),))
+
+        def unknown_failed(store, chat_id):
+            sid = running(store, chat_id)
+            rows = to_unknown(store, chat_id, sid)
+            done = event(store, chat_id, sid, "session_failed")
+            store.append_transition(
+                chat_id, sid, "unknown", "failed", "launcher",
+                {"kind": "event", "ref": done["event_id"]})
+            return rows | set((("unknown", "failed"),))
+
+        def unknown_terminated(store, chat_id):
+            sid = running(store, chat_id)
+            rows = to_unknown(store, chat_id, sid)
+            observation = observe(store, chat_id, sid, "stop_confirmed")
+            store.append_transition(
+                chat_id, sid, "unknown", "terminated", "user",
+                {"kind": "observation", "ref": observation["observation_id"]})
+            return rows | set((("unknown", "terminated"),))
+
+        return {
+            "pending -> launch_failed": pending_launch_failed,
+            "launching -> launch_failed": launching_launch_failed,
+            "launching -> unknown (result)": launching_unknown_by_result,
+            "launching -> unknown (observation)": launching_unknown_by_observation,
+            "running -> completed": running_completed,
+            "running -> failed": running_failed,
+            "running -> terminated": running_terminated,
+            "unknown -> running": unknown_running,
+            "unknown -> completed": unknown_completed,
+            "unknown -> failed": unknown_failed,
+            "unknown -> terminated": unknown_terminated,
+        }

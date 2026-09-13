@@ -504,7 +504,57 @@ class ChatStore(object):
             raise ProvenanceRefused(
                 "session %s belongs to a different chat" % session_id
             )
+        self._require_instruction_recorded(chat_id)
         return self._append_message(chat_id, "agent", text, session_id, source_event_id)
+
+    def _require_instruction_recorded(self, chat_id):
+        """Refuse an answer this chat has no preserved instruction for.
+
+        Contract 6.2/6.4: the exact text sent to the agent is preserved for
+        every turn, not only the first. The contract states that as a count over
+        the finished store -- occasions on which the agent produced output must
+        not exceed the instruction packets preserved on sessions that ran
+        (`TURN_INSTRUCTION_MISSING`) -- and the same count is decidable at the
+        moment the answer is written, which is the only moment at which refusing
+        it keeps the store valid.
+
+        An occasion is a maximal run of consecutive agent messages, counted
+        exactly as the contract counts it, so the message about to be written
+        opens a new occasion only when the chat's last user-or-agent message was
+        not itself the agent's. `system` messages are neither, and are skipped
+        here for the same reason the contract skips them.
+        """
+        previous = None
+        answered = 0
+        for message in self.read_messages(chat_id):
+            author = message.get("author")
+            if author not in ("user", "agent"):
+                continue
+            if author == "agent" and previous != "agent":
+                answered += 1
+            previous = author
+        if previous != "agent":
+            answered += 1  # the message about to be written opens a new occasion
+        ran = set(
+            session["session_id"]
+            for session, _binding in self.list_sessions(chat_id)
+            if "running" in set(
+                t["to"] for t in session["transitions"] if isinstance(t, dict)
+            )
+        )
+        recorded = len([
+            packet
+            for packet in (self.read_launch_requests(chat_id)
+                           + self.read_delivery_requests(chat_id))
+            if packet.get("session_id") in ran
+        ])
+        if recorded < answered:
+            raise ProvenanceRefused(
+                "chat %s would show %d occasion(s) of agent output against %d "
+                "preserved instruction packet(s); the text sent to an agent is "
+                "recorded before the answer to it is"
+                % (chat_id, answered, recorded)
+            )
 
     # -- sessions and bindings ------------------------------------------
 
@@ -592,27 +642,22 @@ class ChatStore(object):
         exists without its binding is a state the contract rejects
         (`UNBOUND_ACTIVE_SESSION`).
 
-        The creation transition cites the `msg_` user message that caused it
-        (contract 5.2), and that message is checked to exist, to be on this
-        chat, and to be user-authored. Opening the next agent is a user action;
-        nothing here opens one on its own, and no elapsed time is consulted.
+        The creation transition cites the `msg_` user message that caused it,
+        and contract 5.2's precondition column says what that reference must
+        resolve to: a message record, in this chat, authored by the user.
+        Opening the next agent is a user action; nothing here opens one on its
+        own, and no elapsed time is consulted.
+
+        Those three facts used to be restated here as two explicit checks. They
+        are not restated any more: `_require_precondition` puts the creation
+        transition to the contract's own precondition check, exactly as
+        `append_transition` does for every other row of the same table. The
+        restatement had made the shared check unreachable on this route -- the
+        mechanical enumeration removed it with every test still green -- which is
+        the same "a repair can leave a guard nothing can prove" shape the last
+        rail reported one function over.
         """
         chat_dir = self._require_chat_dir(chat_id)
-        opener = None
-        for message in self.read_messages(chat_id):
-            if message["message_id"] == opening_message_id:
-                opener = message
-                break
-        if opener is None:
-            raise ValidationRefused(
-                "message %s is not in chat %s; a session is opened by a user turn "
-                "that is actually in this chat's history" % (opening_message_id, chat_id)
-            )
-        if opener["author"] != "user":
-            raise ValidationRefused(
-                "message %s is authored by %r; a session is opened by a user turn"
-                % (opening_message_id, opener["author"])
-            )
 
         with atomic.ChatLock(os.path.join(chat_dir, ".lock")):
             status = self.chat_agent_status(chat_id)
@@ -627,6 +672,19 @@ class ChatStore(object):
                     "that may still be alive holds this chat"
                     % (chat_id, ", ".join(status["non_terminal_sessions"]))
                 )
+            # Contract 7: one user turn opens at most one agent that runs. A
+            # later binding is opened by a later user turn, never by the harness
+            # replaying an earlier one, so a turn whose session actually reached
+            # 'running' has been served and cannot open a second.
+            for served in self._sessions_opened_by(chat_id, opening_message_id):
+                if "running" in set(
+                    t["to"] for t in served["transitions"] if isinstance(t, dict)
+                ):
+                    raise ValidationRefused(
+                        "message %s already opened session %s, which ran; a later "
+                        "agent is opened by a later user turn"
+                        % (opening_message_id, served["session_id"])
+                    )
             stamp = ids.now()
             session_id = ids.new_id("ses")
             session = {
@@ -657,8 +715,30 @@ class ChatStore(object):
                 "bound_at": stamp,
                 "released_at": None,
             }
+            self._require_precondition(
+                chat_id, session, session["transitions"][0], error=ValidationRefused)
             self._write_session_file(chat_id, session, binding, create=True)
         return session, binding
+
+    def _sessions_opened_by(self, chat_id, message_id):
+        """Sessions whose creation transition cites this user message.
+
+        Matched the way the contract matches it: the first transition, the one
+        with no prior state, and the identifier its evidence names.
+        """
+        out = []
+        for session, _binding in self.list_sessions(chat_id):
+            transitions = session.get("transitions")
+            if not isinstance(transitions, list) or not transitions:
+                continue
+            first = transitions[0]
+            if not isinstance(first, dict) or first.get("from") is not None:
+                continue
+            evidence = first.get("evidence")
+            ref = evidence.get("ref") if isinstance(evidence, dict) else None
+            if ref == message_id:
+                out.append(session)
+        return out
 
     def _issued_handles(self, chat_id, session_id):
         """The handles an accepted `launch_result` actually returned for a session.
@@ -733,7 +813,36 @@ class ChatStore(object):
                 "the handle the launcher returned, so there is nothing to pass"
                 % (what, session_id, handle, ", ".join(sorted(issued)) or "none")
             )
-        return session
+        # The stamp the addressing record will carry is produced *here*, by the
+        # same function that checks it, rather than by each caller afterwards.
+        # Contract 6.1 also forbids addressing an agent before its handle
+        # existed (`ADDRESSED_BEFORE_HANDLE_ISSUED`), and the store's clock is a
+        # wall clock: a backwards step between the launch result and this write
+        # dates the operation before the handle it used. There is no honest
+        # record of that, so it is refused rather than written or adjusted.
+        # Two callers write addressing records and a third would be added with
+        # neither check if the stamp were theirs to make.
+        stamp = ids.now()
+        issued_at = self._handle_issued_at(chat_id, session_id, handle)
+        if issued_at is not None and stamp[:19] < issued_at[:19]:
+            raise ValidationRefused(
+                "%s on session %s would be dated %s, before the accepted "
+                "launch_result issued handle %r at %s; the store's clock has "
+                "gone backwards and there is no true time to record"
+                % (what, session_id, stamp, handle, issued_at)
+            )
+        return session, stamp
+
+    def _handle_issued_at(self, chat_id, session_id, handle):
+        """When an accepted launch_result first returned this handle."""
+        earliest = None
+        for result in self.read_launch_results(chat_id, session_id):
+            if result.get("outcome") != "accepted" or result.get("agent_handle") != handle:
+                continue
+            at = result.get("observed_at")
+            if isinstance(at, str) and (earliest is None or at < earliest):
+                earliest = at
+        return earliest
 
     def _require_deliverable(self, chat_id, session_id):
         """Refuse a delivery the contract would reject once it is on disk.
@@ -762,7 +871,7 @@ class ChatStore(object):
         keeps the rule from turning into a clock comparison that a one-second
         tie can slip through.
         """
-        session = self._require_addressable(chat_id, session_id, "a delivery")
+        session, stamp = self._require_addressable(chat_id, session_id, "a delivery")
         capabilities = session.get("launcher_capabilities")
         mode = capabilities.get("continuation") if isinstance(capabilities, dict) else None
         if mode != "persistent":
@@ -785,7 +894,7 @@ class ChatStore(object):
                 "agent that is already running, and this one has exited"
                 % (session_id, session["state"])
             )
-        return session
+        return session, stamp
 
     def _handle_entering_running(self, chat_id, session_id, session, offered):
         """The handle this session enters `running` with, or a refusal.
@@ -816,6 +925,105 @@ class ChatStore(object):
                 "and %r is not it" % (session_id, carried, handle)
             )
         return handle
+
+    # -- contract 5.2's precondition table -------------------------------
+
+    def _find_event_in_chat(self, chat_id, event_id):
+        """The preserved event with this identifier anywhere in the chat.
+
+        Evidence may cite an event of another session in the same chat. The
+        contract resolves such a reference and then reports it as a
+        `CORRELATION_MISMATCH`; resolving only within the named session would
+        report it as an unresolvable reference instead, which is a different
+        (and less accurate) answer to the same question.
+        """
+        base = self._chat_events_dir(chat_id)
+        if not os.path.isdir(base):
+            return None
+        for name in sorted(os.listdir(base)):
+            if name.startswith(atomic.TEMP_PREFIX) or not ids.is_id(name, "ses"):
+                continue
+            event = self.read_diagnostic_event(chat_id, name, event_id)
+            if event is not None:
+                return event
+        return None
+
+    def _evidence_tables(self, chat_id, ref):
+        """The records contract 5.2's precondition column resolves `ref` against.
+
+        The contract supplies the rule and the store supplies the records. Only
+        the referenced record is looked up: the precondition column resolves one
+        reference per transition, so loading the chat's whole history to check
+        one of them would make every transition cost the size of the chat.
+
+        The lookup is keyed on the reference's own prefix, which is contract
+        section 3's only legible part of an identifier. A reference whose prefix
+        does not match the kind the transition requires therefore resolves to
+        nothing, and the contract reports it as an invalid reference -- the same
+        answer it gives for the same reference in a fixture.
+        """
+        tables = dict((name, {}) for name in contract.evidence_table_names())
+        if not isinstance(ref, str):
+            return tables
+        if ref.startswith("msg_"):
+            for message in self.read_messages(chat_id):
+                if message["message_id"] == ref:
+                    tables["messages"][ref] = message
+        elif ref.startswith("evt_"):
+            event = self._find_event_in_chat(chat_id, ref)
+            if event is not None:
+                tables["events"][ref] = event
+        elif ref.startswith("req_"):
+            for request in self.read_launch_requests(chat_id):
+                if request["request_id"] == ref:
+                    tables["requests"][ref] = request
+            for result in self.read_launch_results(chat_id):
+                if (result.get("request_id") == ref
+                        and ref not in tables["results_by_request"]):
+                    tables["results_by_request"][ref] = result
+        elif ref.startswith("obs_"):
+            for observation in self.read_session_observations(chat_id):
+                if observation["observation_id"] == ref:
+                    tables["observations"][ref] = observation
+        return tables
+
+    def _require_precondition(self, chat_id, session, transition,
+                              error=TransitionRefused):
+        """Refuse a transition contract 5.2's *precondition* column rejects.
+
+        `AUTHORIZED_TRANSITIONS` and `TRANSITION_PRECONDITIONS` are the two
+        halves of one table in contract section 5.2. The store checked the owner
+        half and not the precondition half, so evidence of an admissible *kind*
+        carrying the wrong *content* -- a `harness_action` naming a message where
+        a launch request is required, an `unknown` inferred from a resolved
+        observation -- wrote a transition the contract rejects.
+
+        This is stated over the table rather than over the rows a reproduction
+        printed, and it is the contract's own function that states it: the store
+        hands the referenced records to `_validate_preconditions` and refuses
+        whatever it reports. A row added to section 5.2, a requirement token
+        given a new meaning, or a new violation code raised from that block is
+        therefore enforced here on the day the contract gains it, without this
+        module changing.
+
+        Every route that appends a transition goes through here, including the
+        creation transition `create_session` writes, because a guard installed
+        on the route a finding named is the defect this rail exists to close.
+        """
+        probe = dict(session)
+        probe["transitions"] = [transition]
+        evidence = transition.get("evidence")
+        ref = evidence.get("ref") if isinstance(evidence, dict) else None
+        violations = contract.transition_precondition_violations(
+            probe, self._evidence_tables(chat_id, ref)
+        )
+        if violations:
+            detail = "; ".join("%s: %s" % (code, text) for code, _, text in violations)
+            raise error(
+                "%s -> %s does not satisfy contract 5.2: %s"
+                % (transition.get("from"), transition.get("to"), detail)
+            )
+        return transition
 
     def append_transition(self, chat_id, session_id, expected_state, to_state, owner,
                           evidence, at=None, agent_handle=None):
@@ -879,16 +1087,21 @@ class ChatStore(object):
                     "%s -> %s is owned by %r, not %r"
                     % (session["state"], to_state, authorized[key], owner)
                 )
+            if not isinstance(evidence, dict):
+                raise ValidationRefused(
+                    "a transition's evidence is an object naming what authorized "
+                    "it; %r is not one" % (evidence,)
+                )
             stamp = at or ids.now()
-            session["transitions"] = list(session["transitions"]) + [
-                {
-                    "from": session["state"],
-                    "to": to_state,
-                    "owner": owner,
-                    "at": stamp,
-                    "evidence": dict(evidence),
-                }
-            ]
+            transition = {
+                "from": session["state"],
+                "to": to_state,
+                "owner": owner,
+                "at": stamp,
+                "evidence": dict(evidence),
+            }
+            self._require_precondition(chat_id, session, transition)
+            session["transitions"] = list(session["transitions"]) + [transition]
             if to_state == "running":
                 session["agent_handle"] = self._handle_entering_running(
                     chat_id, session_id, session, agent_handle
@@ -906,11 +1119,55 @@ class ChatStore(object):
         return os.path.join(self._require_chat_dir(chat_id), "packets")
 
     def _append_packet(self, chat_id, record, name):
+        self._require_within_instruction_bound(chat_id, record)
         self._check_record(record, record["record_type"])
-        atomic.create_exclusive(
-            _under(self._packets_dir(chat_id), name + ".json"), _dumps(record)
-        )
+        try:
+            atomic.create_exclusive(
+                _under(self._packets_dir(chat_id), name + ".json"), _dumps(record)
+            )
+        except FileExistsError as exc:
+            # Exclusive creation is the arbiter between concurrent writers, and
+            # a packet file that already exists means another writer took this
+            # identity first. Raised as a refusal rather than as a bare OS error
+            # so that every public write of this store fails with a StoreError.
+            raise ConcurrencyRefused(
+                "packet %s already exists in chat %s (%s)" % (name, chat_id, exc)
+            )
         return record
+
+    def _require_within_instruction_bound(self, chat_id, record):
+        """Refuse a packet larger than the bound its session declared.
+
+        Contract 6.3: this contract asserts no instruction bound of its own. The
+        only bound is the one a launcher measured and the session recorded in
+        `launcher_capabilities.instruction_bound_bytes`, and a packet over it
+        would be a record of text that could not have been delivered.
+
+        Stated over every packet that carries `instruction_text` rather than
+        over the two methods that write one, because the contract states it over
+        `launch_request` *and* `delivery_request` together and a guard on one of
+        a pair is the defect this rail exists to close.
+        """
+        text = record.get("instruction_text")
+        if not isinstance(text, str):
+            # Either the record carries no instruction (a launch result, an
+            # observation) or it carries one of the wrong type, which
+            # `_check_record` reports as BAD_FIELD_TYPE a line later. A separate
+            # "has the field at all" test would be a clause nothing could fail.
+            return
+        session = self.read_session(chat_id, record["session_id"])
+        capabilities = session.get("launcher_capabilities")
+        bound = (capabilities.get("instruction_bound_bytes")
+                 if isinstance(capabilities, dict) else None)
+        if not isinstance(bound, int) or isinstance(bound, bool) or bound < 1:
+            return  # no measured bound; this contract asserts none of its own
+        size = len(text.encode("utf-8"))
+        if size > bound:
+            raise ValidationRefused(
+                "instruction_text is %d bytes; session %s declares a measured "
+                "bound of %d, so this text could not have been delivered"
+                % (size, record["session_id"], bound)
+            )
 
     def _read_packets(self, chat_id, record_type, session_id=None):
         directory = self._packets_dir(chat_id)
@@ -947,6 +1204,44 @@ class ChatStore(object):
 
     def append_launch_result(self, chat_id, request_id, session_id, outcome,
                              agent_handle=None, failure_category=None, detail=None):
+        """Record what the launcher reported about one launch request.
+
+        A result is a report *about a request this store actually sent*, so the
+        request has to be in this chat and has to name this session, and it may
+        be reported once. Without those three, the public API could write a
+        result naming no request at all (`DANGLING_REFERENCE`), a result naming
+        another session's request (`CORRELATION_MISMATCH`), or a second result
+        for one request (`DUPLICATE_LAUNCH_RESULT`, and `DUPLICATE_ID` with it,
+        because contract section 8 identifies a launch result by the request it
+        reports on).
+
+        The first two are one lookup. The second two are the packet's *file
+        name*, which is the request it reports on: exclusive creation refuses the
+        second report of one launch, atomically and without a read-then-check
+        that two writers could both pass. A read-then-check was written here
+        first; the mechanical enumeration removed it with everything still green,
+        because the file name was already doing the work.
+
+        There is deliberately no separate "does this session exist" check either.
+        A request is only ever written for a session that does, and the result
+        must name the request's own session, so such a check could not fail --
+        and the enumeration removed one from here, green, before it was deleted.
+        """
+        request = None
+        for candidate in self.read_launch_requests(chat_id):
+            if candidate["request_id"] == request_id:
+                request = candidate
+                break
+        if request is None:
+            raise ValidationRefused(
+                "no launch request %s in chat %s; a launch result reports on a "
+                "request this store sent" % (request_id, chat_id)
+            )
+        if request["session_id"] != session_id:
+            raise ValidationRefused(
+                "launch request %s belongs to session %s, not %s"
+                % (request_id, request["session_id"], session_id)
+            )
         record = {
             "record_type": "launch_result",
             "record_version": RECORD_VERSION,
@@ -964,21 +1259,46 @@ class ChatStore(object):
         return self._append_packet(chat_id, record, "launch_result-" + request_id)
 
     def append_delivery_request(self, chat_id, session_id, instruction_text):
-        self._require_deliverable(chat_id, session_id)
-        existing = self._read_packets(chat_id, "delivery_request", session_id)
-        record = {
-            "record_type": "delivery_request",
-            "record_version": RECORD_VERSION,
-            "delivery_id": ids.new_id("dlv"),
-            "chat_id": chat_id,
-            "session_id": session_id,
-            "sequence": len(existing) + 1,
-            "created_at": ids.now(),
-            "instruction_encoding": "utf-8",
-            "instruction_text": instruction_text,
-            "acknowledged": None,
-        }
-        return self._append_packet(chat_id, record, "delivery_request-" + record["delivery_id"])
+        """Send further text to an already-running agent.
+
+        The `sequence` is claimed by exclusive creation, not by counting. A
+        delivery used to be stored under its own opaque identifier, so two
+        writers that both read "no deliveries yet" both wrote sequence 1 and
+        neither file collided: four concurrent deliveries produced four records
+        at sequence 1 and a store the contract rejects with
+        `DUPLICATE_SEQUENCE`. Naming the file after the sequence makes the
+        filesystem the arbiter, exactly as it already is for message sequences,
+        so the loser retries against what the winner wrote.
+        """
+        session, stamp = self._require_deliverable(chat_id, session_id)
+        last_error = None
+        for _ in range(_MAX_SEQUENCE_RETRIES):
+            existing = self._read_packets(chat_id, "delivery_request", session_id)
+            sequence = max([d["sequence"] for d in existing] or [0]) + 1
+            record = {
+                "record_type": "delivery_request",
+                "record_version": RECORD_VERSION,
+                "delivery_id": ids.new_id("dlv"),
+                "chat_id": chat_id,
+                "session_id": session_id,
+                "sequence": sequence,
+                "created_at": stamp,
+                "instruction_encoding": "utf-8",
+                "instruction_text": instruction_text,
+                "acknowledged": None,
+            }
+            try:
+                return self._append_packet(
+                    chat_id, record,
+                    "delivery_request-%s-%s" % (session_id, _seq_name(sequence)[:-len(".json")]),
+                )
+            except ConcurrencyRefused as exc:
+                last_error = exc
+                continue
+        raise ConcurrencyRefused(
+            "could not claim a delivery sequence on session %s after %d attempts (%s)"
+            % (session_id, _MAX_SEQUENCE_RETRIES, last_error)
+        )
 
     def append_session_observation(self, chat_id, session_id, kind, detail=None):
         """Record what an attempted boundary interaction actually produced.
@@ -995,15 +1315,18 @@ class ChatStore(object):
         got a handle to re-attach with.
         """
         if kind in ADDRESSING_OBSERVATION_KINDS:
-            self._require_addressable(chat_id, session_id, "a %r observation" % kind)
-        self.read_session(chat_id, session_id)
+            _session, stamp = self._require_addressable(
+                chat_id, session_id, "a %r observation" % kind)
+        else:
+            self.read_session(chat_id, session_id)
+            stamp = ids.now()
         record = {
             "record_type": "session_observation",
             "record_version": RECORD_VERSION,
             "observation_id": ids.new_id("obs"),
             "chat_id": chat_id,
             "session_id": session_id,
-            "observed_at": ids.now(),
+            "observed_at": stamp,
             "kind": kind,
             "detail": detail,
         }
@@ -1074,8 +1397,30 @@ class ChatStore(object):
                     "event is sourced to the agent, but session %s never entered "
                     "'running'; there was no agent to produce it" % session_id
                 )
+        capabilities = session.get("launcher_capabilities")
+        shape = (capabilities.get("response_shape")
+                 if isinstance(capabilities, dict) else None)
+        if interpreted_type == contract.stream_end_type() and shape == "one_shot":
+            raise ValidationRefused(
+                "session %s declares response_shape 'one_shot', which returns a "
+                "response rather than a stream; there is no end of stream for it "
+                "to have observed" % session_id
+            )
         directory = self._events_dir(chat_id, session_id)
         os.makedirs(directory, exist_ok=True)
+        # Contract P3: event `sequence` is contiguous from 1 within its session,
+        # and "a gap means a turn was lost; it is never closed silently". A
+        # caller naming a sequence beyond the next one writes that gap, and the
+        # reader then fails closed on a store that is already invalid. Refusing
+        # here keeps the gap out of the store instead of detecting it afterwards.
+        next_sequence = self._next_sequence(directory)
+        if (isinstance(sequence, int) and not isinstance(sequence, bool)
+                and sequence > next_sequence):
+            raise ValidationRefused(
+                "session %s is at event sequence %d; preserving %d would leave a "
+                "gap, and a gap means a turn was lost"
+                % (session_id, next_sequence - 1, sequence)
+            )
         record = self._check_record(
             {
                 "record_type": "diagnostic_event",
