@@ -429,6 +429,23 @@ class TestDiagnostics(StoreCase):
                 '{"a":2}'
             )
 
+    def test_the_same_bytes_from_a_different_source_are_not_a_replay(self):
+        """Mutation M04 (review of convergence): the replay comparison is over the
+        preserved `raw` *and* the `source`, element by element. The same bytes
+        attributed to the launcher where the agent was stored are a
+        contradiction, not a replay, and are refused rather than silently kept."""
+        body = '{"type":"assistant_text","text":"who said this"}'
+        taken = self.store.next_event_sequence(self.chat_id, self.sid)
+        self.store.append_diagnostic_event(
+            self.chat_id, self.sid, taken, "agent", "recognized", "assistant_text", body)
+        with self.assertRaises(StoreCorrupt):
+            self.store.append_diagnostic_event(
+                self.chat_id, self.sid, taken, "launcher", "recognized", "assistant_text", body)
+        with self.assertRaises(StoreCorrupt):
+            self.store.append_diagnostic_event(
+                self.chat_id, self.sid, taken, "agent", "recognized", "assistant_text", body,
+                encoding="base64")
+
     def test_a_sequence_beyond_the_next_one_is_refused_rather_than_written(self):
         """Contract P3: a gap means a turn was lost, and is never closed silently.
 
@@ -1493,6 +1510,9 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
         # Review finding R4: the pre-flights compose would-be records and put
         # them to the write's own checks, and write nothing.
         "preflight_launch", "preflight_delivery",
+        # Review finding R8: the chat directories, for callers that go on past one
+        # unreadable chat.
+        "chat_ids",
     ))
 
     # Decision 0002, D1: the store-level lock. These write no record -- `acquire`
@@ -3976,12 +3996,70 @@ class TestTheDeliveryAcknowledgementIsWrittenOnce(CodeClosureCase):
                 (self.store.create_chat("Other")["chat_id"], sid, delivery["delivery_id"],
                  ValidationRefused),
                 ("cht_nosuchchat000", sid, delivery["delivery_id"], NotFound),
-                ("../" + self.chat_id, sid, delivery["delivery_id"], NotFound)):
+                ("../" + self.chat_id, sid, delivery["delivery_id"], NotFound),
+                # Review finding R9: no session named is not "any session". The
+                # loop never passes these; the store refuses them anyway.
+                (self.chat_id, None, delivery["delivery_id"], ValidationRefused),
+                (self.chat_id, "", delivery["delivery_id"], ValidationRefused),
+                (self.chat_id, "../" + sid, delivery["delivery_id"], ValidationRefused)):
             with self.subTest(chat=chat_id, session=session_id, delivery=delivery_id):
                 with self.assertRaises(error):
                     self.store.record_delivery_acknowledgement(
                         chat_id, session_id, delivery_id, True)
         self.assertEqual(self.packet_bytes(), before)
+
+    def test_two_concurrent_answers_to_one_delivery_record_exactly_one(self):
+        """Mutation M05 (review of convergence): "filled in once" holds between
+        concurrent callers because the read of the current answer and the write of
+        the new one are under the chat lock.
+
+        Deterministic: the first caller is parked inside the write, after it has
+        read `acknowledged: null`, until the second caller has either finished or
+        is still waiting. With the lock the second waits and then finds the
+        answer already recorded; without it the second reads `null` too, and
+        both answers are written."""
+        import threading
+        from dory_wrangler import atomic
+        sid, delivery = self.delivered()
+        parked, release = threading.Event(), threading.Event()
+        real_replace = atomic.replace
+        first_call = []
+
+        def parks_the_first(path, data):
+            if not first_call:
+                first_call.append(path)
+                parked.set()
+                release.wait(30)
+            return real_replace(path, data)
+
+        outcomes = {}
+
+        def answer(name, value):
+            store = ChatStore(self.root, sweep=False)
+            try:
+                store.record_delivery_acknowledgement(
+                    self.chat_id, sid, delivery["delivery_id"], value)
+                outcomes[name] = "recorded"
+            except ValidationRefused:
+                outcomes[name] = "refused"
+
+        atomic.replace = parks_the_first
+        try:
+            first = threading.Thread(target=answer, args=("first", True))
+            first.start()
+            self.assertTrue(parked.wait(30))
+            second = threading.Thread(target=answer, args=("second", False))
+            second.start()
+            second.join(2.0)  # with the lock it is still waiting here
+            release.set()
+            first.join(30)
+            second.join(30)
+        finally:
+            atomic.replace = real_replace
+        self.assertEqual(outcomes, {"first": "recorded", "second": "refused"})
+        stored = [d for d in self.store.read_delivery_requests(self.chat_id, sid)
+                  if d["delivery_id"] == delivery["delivery_id"]]
+        self.assertIs(stored[0]["acknowledged"], True)
 
     def test_the_file_replaced_is_the_one_that_holds_the_record(self):
         """Located by the record, replaced by the name the record gives it -- and

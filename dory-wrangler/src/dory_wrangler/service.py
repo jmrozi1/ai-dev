@@ -14,9 +14,16 @@ the shell exposes, because a restart that finds an agent nobody can reach must
 leave the user a way out.
 """
 
+from . import ids
+from .errors import StoreError
 from .wiring import open_harness
 
 DEFAULT_TITLE = "New chat"
+
+# How the conversation list shows a chat whose records cannot be read (review
+# finding R8). It is listed, so it is not silently missing; nothing from it is
+# shown, and opening it fails closed.
+UNREADABLE_TITLE = "This chat cannot be read"
 
 # A new chat is named from the user's first turn while it still carries the
 # placeholder title. This is a display convenience over text the user typed;
@@ -53,9 +60,21 @@ class ChatService(object):
         durable record. There is no session, lifecycle, or diagnostic field
         here: the conversation list is chat metadata only.
         """
-        out = []
-        for chat in self.store.list_chats():
-            messages = self.store.read_messages(chat["chat_id"])
+        out, unreadable = [], []
+        for chat_id in self.store.chat_ids():
+            if not ids.is_id(chat_id, "cht"):
+                continue  # not a chat: nothing could address or open it
+            try:
+                chat = self.store.read_chat(chat_id)
+                messages = self.store.read_messages(chat_id)
+            except StoreError:
+                # Review finding R8: one chat that cannot be read fails closed
+                # for that chat only. It is listed, with nothing from it shown,
+                # and opening it is refused; every other chat is listed as usual.
+                unreadable.append(chat_id)
+                continue
+            if chat["state"] == "archived":
+                continue
             out.append(
                 {
                     "chat_id": chat["chat_id"],
@@ -66,6 +85,11 @@ class ChatService(object):
                     "preview": messages[-1]["content"]["text"] if messages else "",
                 }
             )
+        out.sort(key=lambda c: (c["updated_at"], c["chat_id"]), reverse=True)
+        for chat_id in unreadable:
+            out.append({"chat_id": chat_id, "title": UNREADABLE_TITLE, "created_at": None,
+                        "updated_at": None, "message_count": 0, "preview": "",
+                        "unreadable": True})
         return out
 
     # -- the active conversation ---------------------------------------

@@ -698,6 +698,114 @@ class TheTurnLockGivesBackWhatItTook(unittest.TestCase, StoreCheck):
             self, lambda: harness.send_turn(chat_id, "hello")).session_state, "completed")
 
 
+class StartUpGoesOnPastOneChatItCannotReAttach(unittest.TestCase, StoreCheck):
+    """Review finding R8, and mutations M03 and M22: start-up re-attaches every
+    chat it can, and one it cannot costs only that chat."""
+
+    def unknown_chat(self, harness, title):
+        harness._boundary._launch_outcomes = ["unknown"]
+        chat_id = harness.create_chat(title)
+        harness.send_turn(chat_id, "hello")
+        return chat_id
+
+    def running_chat(self, root, title):
+        harness = SessionManager(ChatStore(root), ScriptedStubLauncher(PERSISTENT))
+        chat_id = harness.create_chat(title)
+        harness.send_turn(chat_id, "hello")
+        return chat_id
+
+    def test_one_damaged_chat_record_fails_closed_for_that_chat_only(self):
+        """R8. A damaged `chat.json` used to stop the application from starting.
+        Now the shell starts, re-attaches every other chat, lists the damaged
+        one without showing anything from it, refuses to open or act on it, and
+        every other chat works."""
+        import threading
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        from dory_wrangler import service as service_module
+        from dory_wrangler import webapp
+        root = support.scratch_root()
+        good = self.running_chat(root, "Good")
+        damaged = self.running_chat(root, "Damaged")
+        with open(os.path.join(root, "chats", damaged, "chat.json"), "w") as handle:
+            handle.write("{ not a record")
+        server = webapp.build_server(root, port=0, quiet=True,
+                                     launcher_config={"launcher": "scripted-stub"})
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        port = server.server_address[1]
+
+        def call(method, path, payload=None):
+            data = json.dumps(payload).encode("utf-8") if payload is not None else None
+            request = Request("http://127.0.0.1:%d%s" % (port, path), data=data,
+                              method=method, headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(request, timeout=30) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        store = ChatStore(root, read_only=True)
+        self.assertEqual(store.list_sessions(good)[0][0]["state"], "unknown",
+                         "the readable chat was not re-attached")
+        self.assertEqual(store.list_sessions(damaged)[0][0]["state"], "running",
+                         "the damaged chat was acted on")
+        status, listed = call("GET", "/api/chats")
+        self.assertEqual(status, 200)
+        self.assertEqual(sorted(c["chat_id"] for c in listed), sorted([good, damaged]))
+        entry = [c for c in listed if c["chat_id"] == damaged][0]
+        self.assertEqual((entry["title"], entry["preview"], entry.get("unreadable")),
+                         (service_module.UNREADABLE_TITLE, "", True))
+        self.assertEqual(call("GET", "/api/chats/" + damaged),
+                         (409, {"error": webapp.UNREADABLE}))
+        self.assertEqual(call("POST", "/api/chats/%s/messages" % damaged, {"text": "x"})[0], 409)
+        self.assertEqual(call("POST", "/api/chats/%s/abandon" % damaged, {})[0], 409)
+        self.assertEqual(call("POST", "/api/chats/%s/abandon" % good, {})[0], 200)
+        status, body = call("POST", "/api/chats/%s/messages" % good, {"text": "again"})
+        self.assertEqual((status, body["messages"][-1]["text"]), (201, "answer to: again"))
+
+    def test_an_archived_chat_is_re_attached_too(self):
+        """M03. An archived chat's live agent is still a live agent."""
+        root = support.scratch_root()
+        chat_id = self.running_chat(root, "Archived with a live agent")
+        ChatStore(root).archive_chat(chat_id)
+        reopened = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+        session_id = reopened.store.list_sessions(chat_id)[0][0]["session_id"]
+        self.assertEqual(reopened.reattach_on_start(), [(session_id, "unknown")])
+        self.assertEqual(reopened.abandon(chat_id), "abandoned")
+        self.assert_store_valid(reopened.store, "archived-chat-reattached")
+
+    def test_a_re_attachment_the_store_refuses_costs_only_that_chat(self):
+        """M22. A store *refusal* while re-attaching one chat -- here the wall
+        clock stepped back past that session's last transition -- leaves that chat
+        as it was, and every other chat is still re-attached."""
+        root = support.scratch_root()
+        refused = self.running_chat(root, "Refused")
+        other = self.running_chat(root, "Other")
+        reopened = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+        real = reopened.store.append_transition
+
+        def clock_behind_for(chat_id, *args, **kwargs):
+            if chat_id == refused:
+                real_now, ids.now = ids.now, lambda: "2000-01-01T00:00:00.000000Z"
+                try:
+                    return real(chat_id, *args, **kwargs)
+                finally:
+                    ids.now = real_now
+            return real(chat_id, *args, **kwargs)
+
+        reopened.store.append_transition = clock_behind_for
+        outcomes = reopened.reattach_on_start()
+        del reopened.store.append_transition
+        other_session = reopened.store.list_sessions(other)[0][0]
+        self.assertEqual(outcomes, [(other_session["session_id"], "unknown")])
+        self.assertEqual(reopened.store.list_sessions(refused)[0][0]["state"], "running")
+        # And the chat it could not re-attach still has the one action as its exit.
+        self.assertEqual(reopened.abandon(refused), "abandoned")
+        self.assert_store_valid(reopened.store, "reattachment-refused-for-one-chat")
+
+
 class TheResumePointIsTheLastStoredSequence(unittest.TestCase, StoreCheck):
     """`events` is resumable by sequence, and the loop now reads its resume point
     from `ChatStore.next_event_sequence` rather than from #87's store. The drain's

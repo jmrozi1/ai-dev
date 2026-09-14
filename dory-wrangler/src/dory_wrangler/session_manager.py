@@ -872,29 +872,35 @@ class SessionManager(object):
         nobody can use. This happens when the harness starts and never on a
         schedule; everything after it is a user action.
 
-        A chat whose turn lock another process holds is being served by that
-        process right now, so it is not a chat this start interrupted and it is
-        left alone -- the lock is released by the kernel when that process dies,
-        so this asks a fact, not a clock. A chat whose records cannot be read, or
-        whose re-attachment the store refuses to record, is left as it is and the
-        next chat is re-attached: one damaged chat must not keep the application
-        from starting for every other one, and every later action on it reads the
-        same records and fails closed (contract D3), so skipping it here makes
-        nothing look sound.
+        A chat whose turn lock is held by another hold is left alone: under
+        decision D1 no other process can serve this store, so that is another
+        chat loop over the same store in this process, serving the chat right
+        now. A chat whose records cannot be read -- **including its own chat
+        record** (review finding R8) -- or whose re-attachment the store refuses
+        to record, or whose launcher misuses the seam while being re-attached, is
+        left as it is and the next chat is re-attached: one damaged chat must not
+        keep the application from starting for every other one, and every later
+        action on it reads the same records and fails closed (contract D3), so
+        skipping it here makes nothing look sound. Archived chats are
+        re-attached too: an archived chat's agent is still an agent.
         """
+        # Decision D1: nothing is re-attached by a process that is not the one
+        # serving this store. Refused here, before the loop, so the refusal is
+        # not mistaken below for one chat that could not be re-attached.
+        self._store.acquire()
         outcomes = []
-        for chat in self._store.list_chats(include_archived=True):
-            chat_id = chat["chat_id"]
-            with self._turns.hold(chat_id, blocking=False) as held:
-                if not held.acquired:
-                    continue
-                try:
+        for chat_id in self._store.chat_ids():
+            try:
+                with self._turns.hold(chat_id, blocking=False) as held:
+                    if not held.acquired:
+                        continue
+                    self._store.read_chat(chat_id)
                     for session, _binding in self._store.list_sessions(chat_id):
                         if session["state"] in self._terminal:
                             continue
                         outcomes.append((session["session_id"], self._reattach(session)))
-                except StoreError:
-                    continue
+            except (StoreError, LaunchBoundaryError):
+                continue
         return outcomes
 
     def _reattach(self, session):

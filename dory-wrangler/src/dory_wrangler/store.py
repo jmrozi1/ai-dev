@@ -378,6 +378,20 @@ class ChatStore(object):
         chats.sort(key=lambda c: (c["updated_at"], c["chat_id"]), reverse=True)
         return chats
 
+    def chat_ids(self):
+        """The name of every chat directory, without reading any chat.
+
+        For callers that must go on past one unreadable chat -- start-up
+        re-attachment and the conversation list (review finding R8). `list_chats`
+        still fails closed for the whole store, because it promises every chat
+        and cannot keep that promise past one it cannot read; a caller of this
+        reads each chat itself and decides what one it cannot read means.
+        """
+        return sorted(
+            name for name in _listdir(self.chats_dir)
+            if not name.startswith(atomic.TEMP_PREFIX)
+            and os.path.isdir(os.path.join(self.chats_dir, name)))
+
     def archive_chat(self, chat_id):
         with self._lock(chat_id):
             chat = self.read_chat(chat_id)
@@ -1493,6 +1507,15 @@ class ChatStore(object):
             raise ValidationRefused(
                 "an acknowledgement is recorded as true or false; %r is not one, and "
                 "null is what an unanswered delivery already says" % (acknowledged,)
+            )
+        # Review finding R9: the delivery is located *within the named session*,
+        # so a session must be named. `read_delivery_requests` treats a missing
+        # session as "every session", which answered a delivery with no session
+        # named at all.
+        if not ids.is_id(session_id, "ses"):
+            raise ValidationRefused(
+                "an acknowledgement names the session its delivery belongs to; %r is "
+                "not a session identifier" % (session_id,)
             )
         with self._lock(chat_id):
             found = None
