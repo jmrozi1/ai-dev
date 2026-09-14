@@ -1,5 +1,10 @@
 # The swappable single-agent launch boundary (#87)
 
+Since #88's convergence (decision 0002) the seam, the chat loop and the
+launchers live in the one package, `src/dory_wrangler/`, and the chat loop writes
+every record through `ChatStore`. Paths below are relative to that package
+unless they say otherwise.
+
 The launch boundary is the only place that knows how an agent is started. It
 exists so that development mechanics never leak into chat or session design, and
 so that the internal VS Code/network bridge launcher can be dropped in later
@@ -14,16 +19,16 @@ it.
 | Path | What it is |
 | --- | --- |
 | `launch_boundary.py` | **the seam**: the contract's section 6 operations, the closed instruction packet, the declared capabilities, and the payload vocabulary. No host, transport, or bridge mechanics. |
-| `session_manager.py` | the chat loop: binding enforcement, the lifecycle, both continuation modes. Imports no launcher. |
-| `store.py` | the durable records and the section 8 queries. Imports no launcher. |
-| `identity.py`, `errors.py` | opaque ids and timestamps; stated refusals. |
-| `app.py` | wiring. `open_harness(config)` is the only place a store and a launcher meet. |
+| `session_manager.py` | the chat loop: binding enforcement, the lifecycle, both continuation modes, the per-chat turn lock. Imports no launcher and writes nothing itself. |
+| `store.py` | `ChatStore`, #86's durable store and the only writer of every record. Imports no launcher. |
+| `ids.py`, `errors.py` | opaque ids and timestamps; stated refusals. |
+| `wiring.py` | `open_harness(config, root)` is the only place a store and a launcher meet. |
 | `launchers/dev_local.py` | the external Linux development launcher. Real operating-system processes, two profiles. |
 | `launchers/dev_agent.py` | the local development agent program `dev_local` starts. Not part of the boundary. |
 | `launchers/scripted_stub.py` | a second, non-production launcher, selected only by configuration. |
 | `launchers/registry.py` | configuration to launcher. Adding the internal bridge is one module and one entry here. |
-| `tests/internal_bridge.py` | **test material, not a launcher this product ships**: a faithful model of the proven internal path, written against the seam alone. Registered nowhere and imported by no product module. |
-| `tests/` | the suite, including `test_adversarial.py` and `test_internal_bridge.py`. |
+| `dory-wrangler/tests/internal_bridge.py` | **test material, not a launcher this product ships**: a faithful model of the proven internal path, written against the seam alone. Registered nowhere and imported by no product module. |
+| `dory-wrangler/tests/` | the one suite, including `test_launch_adversarial.py` and `test_internal_bridge.py`. |
 
 ## Running it
 
@@ -42,12 +47,15 @@ now and live in `tests/test_turn_floor_regression.py`.
 ## Choosing a launcher
 
 ```python
-from app import open_harness
+from dory_wrangler.wiring import open_harness
 
-harness = open_harness({"launcher": "dev-local", "options": {"profile": "one_shot"}})
-harness = open_harness({"launcher": "dev-local", "options": {"profile": "persistent"}})
-harness = open_harness({"launcher": "scripted-stub"})
+harness = open_harness({"launcher": "dev-local", "options": {"profile": "one_shot"}}, root)
+harness = open_harness({"launcher": "dev-local", "options": {"profile": "persistent"}}, root)
+harness = open_harness({"launcher": "scripted-stub"}, root)
 ```
+
+The served shell takes the same choice as `run_shell.py --launcher <id>
+--launcher-options <json>`.
 
 That dictionary is the whole selection. No chat, session, store, or transcript
 code changes, and `open_harness(..., launcher=...)` takes an implementation this
@@ -85,17 +93,21 @@ boundary rather than a degraded one, and that is what makes contract 5.4
 achievable: after a restart the harness holds the handle and nothing else, and
 that has to be enough.
 
-The harness enforces its own half. It refuses to issue an addressing operation,
-or to write a record claiming one happened, for a session that carries no handle
+The harness enforces its own half. It refuses to issue an addressing operation
+for a session that carries no handle, and the store refuses to write a record
+claiming one happened unless the launcher's accepted `launch_result` issued one
 -- a session whose launch outcome was `unknown` never received one, and contract
 6.1 forbids an `unknown` outcome from carrying one at all. `reattach_failed` is
 the one observation kind exempt from that, because the attempt fails without
 being made. The user is not stuck: `abandon` is contract 5.4's exit from exactly
 that state and needs no handle.
 
-`launching` is a separate question and not a fact about the handle, because the
-handle and the `running` transition are two durable writes and a process can die
-between them. At restart the harness finishes the interrupted transition from the
+`launching` is a separate question and not a fact about the handle. In #87's own
+store the handle and the `running` transition were two durable writes and a
+process could die between them; `ChatStore` makes them one, so the shape a crash
+now leaves is `launching` with an accepted `launch_result` and no handle on the
+session, and #87's older shape still resolves. At restart the harness finishes
+the interrupted transition from the
 launcher's own `launch_result`, which contract 5.2 names as the precondition for
 every exit out of `launching` but one, and falls back to `unknown` evidenced by a
 failed re-attachment when no such record survives. Every shape therefore leaves
@@ -173,5 +185,6 @@ the user's Stop cannot reach a turn in flight, so contract 5.2's
 `running -> terminated` is unreachable on the one-shot shape; the agent has no
 memory of the chat; a dead bridge is discoverable only by attempting a turn; and
 a restart with a live session ends in `unknown`, whose only exit is the user's
-`abandon`. Each has a named test in `tests/test_internal_bridge.py`, and each is
-an affordance decision for #86 and #88 rather than something to fix here.
+`abandon`. Each has a named test in `tests/test_internal_bridge.py`. The converged
+shell exposes `abandon` as its one lifecycle action (decision 0003); Stop reaching
+a turn in flight remains the human's decision.

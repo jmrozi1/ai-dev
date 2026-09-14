@@ -52,6 +52,13 @@ class StoreCase(unittest.TestCase):
                 "store violates the contract:\n"
                 + "\n".join("  %s at %s: %s" % v for v in violations)
             )
+        # And keep it, so the runner's second phase hands every store a test
+        # asserted valid to the contract validator as a separate program too,
+        # rather than only to the same function called in-process.
+        import support
+        self._kept = getattr(self, "_kept", 0) + 1
+        support.keep_records(store.export_records(),
+                             "%s-%d" % (self.id().replace(".", "-"), self._kept))
 
 
 def answered_turn(store, chat_id, user_text, agent_text,
