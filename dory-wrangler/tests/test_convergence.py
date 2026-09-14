@@ -73,6 +73,218 @@ def parse(path):
         return ast.parse(handle.read(), filename=path)
 
 
+def dotted(node):
+    """`os.replace`, `self._store.acquire`, `open` -- or '' for anything else."""
+    parts = []
+    while isinstance(node, ast.Attribute):
+        parts.append(node.attr)
+        node = node.value
+    if isinstance(node, ast.Name):
+        parts.append(node.id)
+        return ".".join(reversed(parts))
+    return ""
+
+
+MODULES_THAT_WRITE = ("os", "shutil", "atomic", "io", "pathlib", "tempfile")
+OS_WRITERS = ("open", "fdopen", "write", "replace", "rename", "renames", "link", "symlink",
+              "unlink", "remove", "rmdir", "removedirs", "makedirs", "mkdir", "mkfifo",
+              "mknod", "truncate", "ftruncate", "chmod", "chown", "utime")
+ATOMIC_WRITERS = ("create_exclusive", "replace", "create_tree_exclusive", "sweep_temp_files",
+                  "ChatLock", "own_store", "_write_temp", "_rmtree")
+
+
+def _writer(call, aliases, module_name):
+    """The name a call that can write a file is recorded under, or None."""
+    callee = dotted(call.func)
+    head, _, tail = callee.partition(".")
+    if head in aliases:
+        callee = aliases[head] + ("." + tail if tail else "")
+        head, _, tail = callee.partition(".")
+    if module_name == "atomic" and not tail and head in ATOMIC_WRITERS:
+        callee, head, tail = "atomic." + head, "atomic", head
+    if callee in ("open", "io.open"):
+        mode = call.args[1] if len(call.args) > 1 else None
+        for keyword in call.keywords:
+            if keyword.arg == "mode":
+                mode = keyword.value
+        if mode is None:
+            return None  # the default mode reads
+        if isinstance(mode, ast.Constant) and not (set(str(mode.value)) & set("wax+")):
+            return None
+        return "open"
+    if head == "os" and tail in OS_WRITERS:
+        if tail == "open" and len(call.args) > 1 and dotted(call.args[1]) == "os.O_RDONLY":
+            return None
+        return callee
+    if head == "atomic" and tail in ATOMIC_WRITERS:
+        return callee
+    if head in ("shutil", "tempfile", "pathlib"):
+        return callee
+    if callee in ("exec", "eval", "__import__"):
+        return callee
+    if callee == "getattr" and call.args and dotted(call.args[0]) in MODULES_THAT_WRITE:
+        return "getattr(%s)" % dotted(call.args[0])
+    return None
+
+
+def write_sites():
+    """Every call in the product that can create, change or remove a file, as
+    (file, qualified function, callee); module-level code is `<module>`. An
+    import that brings a writer in under another name is recorded too."""
+    found = set()
+    for path in product_sources():
+        name = relative(path)
+        module_name = os.path.splitext(os.path.basename(path))[0]
+        tree = parse(path)
+        aliases = {}
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                module = (node.module or "").split(".")[-1]
+                for alias in node.names:
+                    if module in MODULES_THAT_WRITE:
+                        aliases[alias.asname or alias.name] = "%s.%s" % (module, alias.name)
+                        found.add((name, "<module>", "import %s.%s" % (module, alias.name)))
+                    elif alias.name in MODULES_THAT_WRITE and alias.asname:
+                        aliases[alias.asname] = alias.name
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.name in MODULES_THAT_WRITE and alias.asname:
+                        aliases[alias.asname] = alias.name
+
+        def visit(node, scope):
+            for child in ast.iter_child_nodes(node):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    visit(child, scope + [child.name])
+                    continue
+                if isinstance(child, ast.Call):
+                    callee = _writer(child, aliases, module_name)
+                    if callee:
+                        found.add((name, ".".join(scope) or "<module>", callee))
+                visit(child, scope)
+
+        visit(tree, [])
+    return found
+
+
+AUDITED_RUN = textwrap.dedent('''
+    import json, os, sys, threading
+    src, product, root = sys.argv[1:4]
+    sys.path.insert(0, src)
+    root = os.path.realpath(root)
+    product = os.path.realpath(product)
+    product_src = os.path.realpath(src)
+    product_programs = [os.path.join(product, "run_shell.py"),
+                        os.path.join(product, "validate_store.py")]
+    WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+    MUTATING = ("os.rename", "os.remove", "os.link", "os.mkdir", "os.rmdir", "os.symlink",
+                "os.truncate", "os.chmod", "os.chown", "os.utime", "shutil.rmtree",
+                "shutil.move", "shutil.copyfile", "shutil.copytree")
+    from dory_wrangler import atomic
+    seen = {"product": [], "controls": []}
+    sink = ["product"]
+    busy = threading.local()
+
+    def hook(event, args):
+        if getattr(busy, "on", False):
+            return
+        if event == "open":
+            path, mode, flags = args
+            if not isinstance(path, str):
+                return
+            if mode is not None:
+                if not set(mode) & set("wax+"):
+                    return
+            elif not (flags or 0) & WRITE_FLAGS:
+                return
+        elif event in MUTATING:
+            path = args[0]
+            if not isinstance(path, str):
+                return
+        else:
+            return
+        busy.on = True
+        try:
+            if not os.path.realpath(path).startswith(root):
+                return
+            frame = sys._getframe(1)
+            while frame is not None and not (
+                    os.path.realpath(frame.f_code.co_filename).startswith(product_src + os.sep)
+                    or os.path.realpath(frame.f_code.co_filename) in product_programs):
+                frame = frame.f_back
+            if frame is None:
+                where = ("<outside the product>", "")
+            else:
+                where = (os.path.relpath(os.path.realpath(frame.f_code.co_filename), product),
+                         frame.f_code.co_name)
+            held = root in atomic._OWNERS
+            seen[sink[0]].append([where[0], where[1], event.split(".")[-1], held])
+        finally:
+            busy.on = False
+
+    sys.addaudithook(hook)
+
+    from dory_wrangler import ids
+    from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
+    from dory_wrangler.webapp import build_server
+    persistent = {"continuation": "persistent", "response_shape": "stream",
+                  "end_of_turn": "turn_complete"}
+
+    server = build_server(root, port=0, quiet=True, launcher=ScriptedStubLauncher(persistent))
+    service = server.service
+    chat = service.create_chat()["chat_id"]
+    service.send_user_message(chat, "a launched turn")
+    service.send_user_message(chat, "a delivered turn")
+    service.abandon(chat)
+    handle_chat = service.create_chat()["chat_id"]
+    service.send_user_message(handle_chat, "left running for the restart")
+    handle = service.store.list_sessions(handle_chat)[0][0]["agent_handle"]
+    server.server_close()
+
+    server = build_server(root, port=0, quiet=True,
+                          launcher=ScriptedStubLauncher({"launch_outcomes": ["unknown"]}))
+    service = server.service
+    unknown = service.create_chat()["chat_id"]
+    service.send_user_message(unknown, "hello")
+    service.abandon(unknown)
+    pending = service.create_chat()["chat_id"]
+    real = service.store.append_transition
+
+    def stepped(*a, **k):
+        real_now, ids.now = ids.now, lambda: "2000-01-01T00:00:00.000000Z"
+        try:
+            return real(*a, **k)
+        finally:
+            ids.now = real_now
+
+    service.store.append_transition = stepped
+    try:
+        service.send_user_message(pending, "stranded")
+    except Exception:
+        pass
+    del service.store.append_transition
+    service.abandon(pending)
+    server.server_close()
+    sink[0] = "setup"
+    seen["setup"] = []
+    os.makedirs(os.path.join(root, "chats", ".tmp-a-staging-tree", "messages"))
+    with open(os.path.join(root, "chats", chat, ".tmp-a-temp-file"), "w") as h:
+        h.write("left by an interrupted write")
+    sink[0] = "product"
+
+    server = build_server(root, port=0, quiet=True,
+                          launcher=ScriptedStubLauncher(dict(persistent, resume_handles=[handle])))
+    server.service.abandon(handle_chat)
+    server.server_close()
+
+    sink[0] = "controls"
+    with open(os.path.join(root, "a-second-writer.json"), "w") as h:
+        h.write("{}")
+    atomic.create_exclusive(os.path.join(root, "chats", chat, "unlocked.json"), b"{}")
+    del seen["setup"]
+    print(json.dumps(seen))
+''')
+
+
 class ExactlyOneStoreAndOneServedApplication(unittest.TestCase):
     """The first acceptance criterion of #88, read off the tree."""
 
@@ -83,20 +295,21 @@ class ExactlyOneStoreAndOneServedApplication(unittest.TestCase):
                 os.path.exists(os.path.join(PRODUCT, "src", "dory_wrangler", gone)), gone)
 
     def test_exactly_one_class_is_a_store(self):
-        """A store is anything that publishes a record: a class whose methods
-        call the atomic publishers. Exactly one such class exists."""
-        publishers = {"create_exclusive", "replace", "create_tree_exclusive"}
-        found = []
-        for path in product_sources():
-            for node in ast.walk(parse(path)):
-                if not isinstance(node, ast.ClassDef):
-                    continue
-                calls = set(
-                    inner.func.attr for inner in ast.walk(node)
-                    if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute))
-                if calls & publishers:
-                    found.append((relative(path), node.name))
-        self.assertEqual(found, [("src/dory_wrangler/store.py", "ChatStore")])
+        """A store is anything that publishes a record: code that calls the atomic
+        publishers. Walked over *every* function, method and module body -- not
+        only classes -- and over imports, so a module-level publisher or an
+        imported alias is seen too. Exactly one class publishes, through its
+        three gated primitives."""
+        found = sorted(set(
+            (file, where) for file, where, callee in write_sites()
+            if callee in ("atomic.create_exclusive", "atomic.replace",
+                          "atomic.create_tree_exclusive")
+            or callee.startswith("import atomic.")))
+        self.assertEqual(found, [
+            ("src/dory_wrangler/store.py", "ChatStore._publish_new"),
+            ("src/dory_wrangler/store.py", "ChatStore._publish_replace"),
+            ("src/dory_wrangler/store.py", "ChatStore._publish_tree"),
+        ])
 
     def test_only_the_store_composes_a_record(self):
         """Every durable record carries `record_type`. A dict literal with that
@@ -111,44 +324,119 @@ class ExactlyOneStoreAndOneServedApplication(unittest.TestCase):
                     found.append(relative(path))
         self.assertEqual(sorted(set(found)), ["src/dory_wrangler/store.py"])
 
-    # Every filesystem write in the product outside the store and its atomic
-    # primitives, with what it writes. Equality, so a new one fails here.
-    WRITES_OUTSIDE_THE_STORE = {
-        ("src/dory_wrangler/serve.py", "open"): "the --port-file the tests read",
-        ("src/dory_wrangler/session_manager.py", "os.open"): "the chat's turn-lock file",
-        ("validate_store.py", "open"): "the --snapshot export, a fixture document",
+    # Review finding R7. The check this replaces compared a set of (file,
+    # call-name) pairs, so a second writer added to a file that already had one
+    # call of that name -- `os.open` in session_manager.py, `atomic.replace`
+    # through a module function in wiring.py -- was invisible; the review planted
+    # exactly those two and every check stayed green. This one is exact at the
+    # granularity of the function: every call in the product that can create,
+    # change or remove a file, with the function it is made from. Equality, so a
+    # new writer anywhere -- a new function, a new call in an old function, an
+    # import that renames a publisher, an indirection through getattr/exec --
+    # fails here and has to be added deliberately.
+    WRITE_SITES = {
+        # atomic.py: the primitives themselves
+        ("src/dory_wrangler/atomic.py", "_write_temp", "os.open"),
+        ("src/dory_wrangler/atomic.py", "_write_temp", "os.write"),
+        ("src/dory_wrangler/atomic.py", "create_exclusive", "atomic._write_temp"),
+        ("src/dory_wrangler/atomic.py", "replace", "atomic._write_temp"),
+        ("src/dory_wrangler/atomic.py", "create_exclusive", "os.link"),
+        ("src/dory_wrangler/atomic.py", "create_exclusive", "os.unlink"),
+        ("src/dory_wrangler/atomic.py", "replace", "os.replace"),
+        ("src/dory_wrangler/atomic.py", "create_tree_exclusive", "os.mkdir"),
+        ("src/dory_wrangler/atomic.py", "create_tree_exclusive", "os.rename"),
+        ("src/dory_wrangler/atomic.py", "sweep_temp_files", "os.unlink"),
+        ("src/dory_wrangler/atomic.py", "_rmtree", "os.unlink"),
+        ("src/dory_wrangler/atomic.py", "_rmtree", "os.rmdir"),
+        ("src/dory_wrangler/atomic.py", "sweep_temp_files", "atomic._rmtree"),
+        ("src/dory_wrangler/atomic.py", "ChatLock.__enter__", "os.open"),
+        ("src/dory_wrangler/atomic.py", "own_store", "os.makedirs"),
+        ("src/dory_wrangler/atomic.py", "own_store", "os.open"),
+        # store.py: every write behind the store-level lock (decision D1)
+        ("src/dory_wrangler/store.py", "ChatStore.acquire", "atomic.own_store"),
+        ("src/dory_wrangler/store.py", "ChatStore.acquire", "os.makedirs"),
+        ("src/dory_wrangler/store.py", "ChatStore.acquire", "atomic.sweep_temp_files"),
+        ("src/dory_wrangler/store.py", "ChatStore._publish_new", "atomic.create_exclusive"),
+        ("src/dory_wrangler/store.py", "ChatStore._publish_replace", "atomic.replace"),
+        ("src/dory_wrangler/store.py", "ChatStore._publish_tree",
+         "atomic.create_tree_exclusive"),
+        ("src/dory_wrangler/store.py", "ChatStore._make_dirs", "os.makedirs"),
+        ("src/dory_wrangler/store.py", "ChatStore._lock", "atomic.ChatLock"),
+        ("src/dory_wrangler/store.py", "ChatStore.create_chat.build", "os.mkdir"),
+        ("src/dory_wrangler/store.py", "ChatStore.create_chat.build", "open"),
+        # outside the store: the chat's turn-lock file, and two command-line outputs
+        ("src/dory_wrangler/session_manager.py", "_Held.__enter__", "os.open"),
+        ("src/dory_wrangler/serve.py", "main", "open"),
+        ("validate_store.py", "main", "open"),
     }
 
     def test_no_record_has_a_second_writer(self):
-        writers = {"open", "os.open", "os.replace", "os.rename", "os.link", "os.unlink",
-                   "os.remove", "os.makedirs", "os.mkdir", "shutil.copy", "shutil.move",
-                   "shutil.rmtree", "shutil.copytree"}
-        found = set()
-        for path in product_sources():
-            name = relative(path)
-            if name in ("src/dory_wrangler/store.py", "src/dory_wrangler/atomic.py"):
-                continue
-            for node in ast.walk(parse(path)):
-                if not isinstance(node, ast.Call):
-                    continue
-                func = node.func
-                if isinstance(func, ast.Name):
-                    called = func.id
-                elif isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
-                    called = "%s.%s" % (func.value.id, func.attr)
-                else:
-                    continue
-                if called not in writers:
-                    continue
-                if called == "open":
-                    mode = node.args[1] if len(node.args) > 1 else None
-                    for keyword in node.keywords:
-                        if keyword.arg == "mode":
-                            mode = keyword.value
-                    if not (isinstance(mode, ast.Constant) and set(mode.value) & set("wax+")):
-                        continue
-                found.add((name, called))
-        self.assertEqual(found, set(self.WRITES_OUTSIDE_THE_STORE))
+        self.assertEqual(sorted(write_sites()), sorted(self.WRITE_SITES))
+
+    def test_every_store_write_takes_the_store_lock_first(self):
+        """Decision D1, read off store.py: each gated primitive calls
+        `self.acquire()` before the call that writes, and the chat-creation
+        builder is only ever handed to `_publish_tree`."""
+        tree = parse(os.path.join(PRODUCT, "src", "dory_wrangler", "store.py"))
+        store = [n for n in tree.body
+                 if isinstance(n, ast.ClassDef) and n.name == "ChatStore"][0]
+        methods = dict((n.name, n) for n in store.body if isinstance(n, ast.FunctionDef))
+        for name in ("_publish_new", "_publish_replace", "_publish_tree", "_make_dirs",
+                     "_lock"):
+            calls = sorted((c.lineno, c.col_offset, dotted(c.func))
+                           for c in ast.walk(methods[name]) if isinstance(c, ast.Call))
+            order = [callee for _line, _col, callee in calls]
+            self.assertIn("self.acquire", order, name)
+            writer = [callee for callee in order
+                      if callee.startswith("atomic.") or callee == "os.makedirs"][0]
+            self.assertLess(order.index("self.acquire"), order.index(writer), name)
+        builder_uses = [dotted(c.func) for c in ast.walk(methods["create_chat"])
+                        if isinstance(c, ast.Call)
+                        and any(isinstance(a, ast.Name) and a.id == "build" for a in c.args)]
+        self.assertEqual(builder_uses, ["self._publish_tree"])
+
+    def test_every_write_the_running_product_makes_is_a_listed_site_under_the_lock(self):
+        """The same claim made of the running product rather than its source.
+
+        A child process installs an audit hook that sees every file the
+        interpreter opens for writing, renames, links, removes or makes a
+        directory for, then drives the product end to end: the served
+        application's start-up, a launched and a delivered turn with its
+        acknowledgement, the one action from `running`, `unknown` and `pending`,
+        a restart that sweeps and re-attaches, and the first-turn title. Every
+        write under the store root must come from a function listed above and,
+        except the lock's own file, be made while the store-level lock is held.
+        Two controls in the same child must be caught: a write from outside the
+        product, and a primitive called without the lock."""
+        root = support.scratch_root()
+        completed = subprocess.run(
+            [sys.executable, "-c", AUDITED_RUN, support.SRC, PRODUCT, root],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, universal_newlines=True,
+            timeout=300)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        report = json.loads(completed.stdout.strip().splitlines()[-1])
+        allowed = set((file, where.split(".")[-1]) for file, where, _ in self.WRITE_SITES)
+        self.assertGreater(len(report["product"]), 50)
+        for file, function, event, held in report["product"]:
+            self.assertIn((file, function), allowed, (file, function, event))
+            if (file, function) != ("src/dory_wrangler/atomic.py", "own_store"):
+                self.assertTrue(held, "%s:%s wrote (%s) without the store lock"
+                                % (file, function, event))
+        # Every site that makes a filesystem call itself -- rather than handing
+        # the write to an atomic primitive, where the hook sees it -- was reached.
+        exercised = set((file, function) for file, function, _e, _h in report["product"])
+        direct = set((file, where.split(".")[-1]) for file, where, callee in self.WRITE_SITES
+                     if not callee.startswith("atomic."))
+        self.assertEqual(
+            direct - exercised - {("src/dory_wrangler/serve.py", "main"),
+                                  ("validate_store.py", "main")},
+            set(), "a listed write site was never exercised, so this run cannot vouch for it")
+        controls = [tuple(c) for c in report["controls"]]
+        self.assertIn("<outside the product>", [c[0] for c in controls],
+                      "a write from outside the product was not seen")
+        self.assertTrue(
+            [c for c in controls if c[0] == "src/dory_wrangler/atomic.py" and c[3] is False],
+            "a primitive called without the store lock was not seen as unlocked")
 
     def test_exactly_one_served_application(self):
         """One HTTP server class, one handler class, one place that serves."""
