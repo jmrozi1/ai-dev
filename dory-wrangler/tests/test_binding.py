@@ -115,7 +115,17 @@ class ASecondConcurrentLaunchIsRefused(unittest.TestCase, StoreCheck):
 
         harness = support.harness({'launcher': 'scripted-stub', 'options': {'on_launch': on_launch}})
         chat_id = harness.create_chat("Re-entrancy")
-        harness.send_turn(chat_id, "first")
+        # The converged loop holds a per-chat turn lock across the launch, and
+        # the re-entrant call must meet the one-agent rule, not the lock: a lock
+        # that is not re-entrant within a thread deadlocks here. Run in a
+        # daemon thread so that shows as a failure rather than a hung suite;
+        # the correct loop finishes in milliseconds.
+        turn = threading.Thread(target=harness.send_turn, args=(chat_id, "first"),
+                                daemon=True)
+        turn.start()
+        turn.join(30)
+        self.assertFalse(turn.is_alive(),
+                         "the re-entrant send deadlocked on the chat's turn lock")
 
         self.assertIn("refused", results, "the re-entrant launch was permitted")
         self.assertEqual(len(support.view(harness).sessions_of(chat_id)), 1)

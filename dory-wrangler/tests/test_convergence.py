@@ -318,6 +318,121 @@ class TheTurnLockHoldsAcrossProcesses(unittest.TestCase, StoreCheck):
         self.assertEqual(first.store.export_records(), before)
 
 
+class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):
+    """The same lock, between threads, at the two points a race would bite.
+
+    Each test lets a second action start while the first is parked at the exact
+    point the lock exists to protect, then releases the first. With the lock the
+    second always waits, so the outcome below is certain; without it the second
+    runs into the window and the outcome differs. Nothing here depends on how
+    long anything takes when the lock is present.
+    """
+
+    def test_a_second_send_cannot_interleave_between_the_check_and_the_record(self):
+        import threading
+        parked, release, entered_twice = threading.Event(), threading.Event(), threading.Event()
+        calls = []
+
+        def compose(chat_id, text, store):
+            calls.append(text)
+            if len(calls) == 1:
+                parked.set()
+                release.wait(10)
+            else:
+                entered_twice.set()
+            return text
+
+        harness = support.harness({"launcher": "scripted-stub"}, compose=compose)
+        chat_id = harness.create_chat("Two sends at once")
+        errors = []
+
+        def send(text):
+            try:
+                harness.send_turn(chat_id, text)
+            except Exception as exc:  # noqa: BLE001 - recorded and asserted on
+                errors.append(exc)
+
+        first = threading.Thread(target=send, args=("first",))
+        first.start()
+        self.assertTrue(parked.wait(10))
+        second = threading.Thread(target=send, args=("second",))
+        second.start()
+        entered_twice.wait(1.0)  # with the lock this never happens before release
+        release.set()
+        first.join(10)
+        second.join(10)
+        self.assertEqual(errors, [])
+        self.assertEqual([t for _, _, t in harness.transcript(chat_id)],
+                         ["first", "answer to: first", "second", "answer to: second"])
+        self.assert_store_valid(harness.store, "two-threads-send-serialised")
+
+    def test_abandon_waits_for_the_turn_in_flight(self):
+        import threading
+        parked, release = threading.Event(), threading.Event()
+
+        class Parks(ScriptedStubLauncher):
+            def launch(self, instruction):
+                parked.set()
+                release.wait(10)
+                return ScriptedStubLauncher.launch(self, instruction)
+
+        harness = support.harness({}, launcher=Parks({"launch_outcomes": ["unknown"]}))
+        chat_id = harness.create_chat("Abandon during a launch")
+        outcome = {}
+        turn = threading.Thread(target=lambda: harness.send_turn(chat_id, "hello"))
+        turn.start()
+        self.assertTrue(parked.wait(10))
+
+        def abandon():
+            try:
+                outcome["state"] = harness.abandon(chat_id)
+            except Exception as exc:  # noqa: BLE001
+                outcome["error"] = exc
+
+        user = threading.Thread(target=abandon)
+        user.start()
+        user.join(1.0)  # with the lock it is still waiting here
+        release.set()
+        turn.join(10)
+        user.join(10)
+        self.assertEqual(outcome, {"state": "abandoned"},
+                         "abandon acted on a launch still in flight instead of waiting "
+                         "for the outcome it abandons")
+        self.assert_store_valid(harness.store, "abandon-waits-for-the-turn")
+
+
+class TheResumePointIsTheLastStoredSequence(unittest.TestCase, StoreCheck):
+    """`events` is resumable by sequence, and the loop now reads its resume point
+    from `ChatStore.next_event_sequence` rather than from #87's store. The drain's
+    value is pinned by every multi-page turn; re-attachment discards its page, so
+    its value is pinned here, by the argument the launcher was actually handed."""
+
+    def test_re_attachment_resumes_after_the_last_preserved_event(self):
+        seen = []
+
+        class Records(ScriptedStubLauncher):
+            def events(self, agent_handle, after_sequence):
+                seen.append(after_sequence)
+                return ScriptedStubLauncher.events(self, agent_handle, after_sequence)
+
+        options = {"continuation": "persistent", "response_shape": "stream",
+                   "end_of_turn": "turn_complete"}
+        root = support.scratch_root()
+        first = support.harness({}, store_path=root, launcher=ScriptedStubLauncher(options))
+        chat_id = first.create_chat("Resume point")
+        first.send_turn(chat_id, "hello")
+        session = support.view(first).sessions_of(chat_id)[0]
+        stored = len(support.view(first).events_of(session["session_id"]))
+        self.assertEqual(stored, 2)
+        reopened = support.harness(
+            {}, store_path=root,
+            launcher=Records(dict(options, resume_handles=[session["agent_handle"]])))
+        self.assertEqual(reopened.reattach_on_start(), [(session["session_id"], "running")])
+        self.assertEqual(seen, [stored])
+        support.end_chat(reopened, chat_id)
+        self.assert_store_valid(reopened.store, "reattach-resume-point")
+
+
 class TheGuardsConvergenceAddedHaveExits(unittest.TestCase, StoreCheck):
     """Each added guard: the input it refuses, and where that input goes."""
 
@@ -411,6 +526,37 @@ class TheGuardsConvergenceAddedHaveExits(unittest.TestCase, StoreCheck):
                     self.assertEqual(users, ["one", "two"],
                                      "the control must show the pre-flight is what "
                                      "keeps the unoffered turn out")
+
+
+class TheServiceLayerAroundTheLoop(unittest.TestCase, StoreCheck):
+    """`ChatService` now calls the loop instead of writing a turn itself; the two
+    things it still does around that call are pinned here."""
+
+    def service(self, options):
+        from dory_wrangler.service import ChatService
+        return ChatService(support.harness({"launcher": "scripted-stub", "options": options}))
+
+    def test_a_first_turn_names_the_chat_even_when_what_follows_it_fails(self):
+        service = self.service({"continuation": "fresh_binding", "response_shape": "one_shot",
+                                "end_of_turn": "stream_end"})
+        chat_id = service.create_chat()["chat_id"]
+        with self.assertRaises(lb.LaunchBoundaryError):
+            service.send_user_message(chat_id, "Name me anyway")
+        self.assertEqual(service.store.read_chat(chat_id)["title"], "Name me anyway",
+                         "the turn is in the chat, so the chat takes its name from it")
+
+    def test_abandon_fails_closed_on_a_chat_whose_record_cannot_be_read(self):
+        service = self.service({"launch_outcomes": ["unknown"]})
+        chat_id = service.create_chat("Damaged")["chat_id"]
+        service.send_user_message(chat_id, "hello")
+        path = os.path.join(service.store.chats_dir, chat_id, "chat.json")
+        with open(path, "w") as handle:
+            handle.write("{ not a record")
+        before = [s["state"] for s, _ in service.store.list_sessions(chat_id)]
+        from dory_wrangler.errors import StoreCorrupt
+        with self.assertRaises(StoreCorrupt):
+            service.abandon(chat_id)
+        self.assertEqual([s["state"] for s, _ in service.store.list_sessions(chat_id)], before)
 
 
 class ARunningSessionTheShellCannotDrain(unittest.TestCase, StoreCheck):
