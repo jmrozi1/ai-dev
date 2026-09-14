@@ -1,0 +1,7 @@
+# Image-selection example, NOT a complete offline deployment configuration.
+# Apply a separate lab values file after this file for storage, access and plugins.
+controller:
+  image:
+    registry: containeryard.evoforge.org
+    repository: jenkins/jenkins
+    tag: "2.516.2-jdk21"
