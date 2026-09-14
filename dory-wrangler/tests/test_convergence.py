@@ -1094,6 +1094,234 @@ class StartUpGoesOnPastOneChatItCannotReAttach(unittest.TestCase, StoreCheck):
         self.assert_store_valid(reopened.store, "reattachment-refused-for-one-chat")
 
 
+HOLDS_THE_STORE = textwrap.dedent('''
+    import os, sys, time
+    sys.path.insert(0, sys.argv[1])
+    from dory_wrangler.store import ChatStore
+    root, holding, release = sys.argv[2:5]
+    store = ChatStore(root)
+    store.acquire()
+    open(holding, "w").close()
+    while not os.path.exists(release):
+        time.sleep(0.01)
+''')
+
+
+class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
+    """Pins for the guards decision D1 added, each against the input that
+    distinguishes it."""
+
+    def other_process_holds(self, root):
+        tag = os.path.join(root, "..", os.path.basename(root) + "-%d" % time.time_ns())
+        script, holding, release = tag + "-holder.py", tag + "-holding", tag + "-release"
+        with open(script, "w") as handle:
+            handle.write(HOLDS_THE_STORE)
+        child = subprocess.Popen([sys.executable, script, support.SRC, root, holding, release])
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        while not os.path.exists(holding):
+            self.assertIsNone(child.poll())
+            time.sleep(0.01)
+
+        def let_go():
+            open(release, "w").close()
+            self.assertEqual(child.wait(), 0)
+        return let_go
+
+    def can_another_process_take(self, root):
+        program = ("import sys; sys.path.insert(0, %r)\n"
+                   "from dory_wrangler.store import ChatStore\n"
+                   "from dory_wrangler.errors import StoreInUse\n"
+                   "try:\n    ChatStore(%r).acquire(); print('took')\n"
+                   "except StoreInUse:\n    print('refused')\n" % (support.SRC, root))
+        return subprocess.check_output([sys.executable, "-c", program],
+                                       universal_newlines=True).strip()
+
+    def test_a_read_only_store_writes_nothing_and_takes_no_lock(self):
+        from dory_wrangler.errors import ReadOnlyStore
+        root = support.scratch_root()
+        writer = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+        chat_id = writer.create_chat("Read only")
+        writer.send_turn(chat_id, "hello")
+        writer.store.close()
+        let_go = self.other_process_holds(root)
+        temp = os.path.join(root, "chats", chat_id, ".tmp-live-write")
+        with open(temp, "wb") as handle:
+            handle.write(b"x")
+        reader = ChatStore(root, read_only=True)
+        before = reader.export_records()
+        for write in (lambda: reader.acquire(),
+                      lambda: reader.create_chat("no"),
+                      lambda: reader.append_user_message(chat_id, "no"),
+                      lambda: reader.set_title(chat_id, "no"),
+                      lambda: reader.archive_chat(chat_id)):
+            with self.assertRaises(ReadOnlyStore):
+                write()
+        self.assertFalse(reader.held)
+        self.assertEqual(reader.export_records(), before)
+        self.assertTrue(os.path.exists(temp))
+        empty = ChatStore(support.scratch_root(), read_only=True)
+        self.assertEqual((empty.list_chats(), empty.export_records(), empty.chat_ids()),
+                         ([], [], []))
+        let_go()
+
+    def test_a_refused_process_creates_no_turn_lock_file(self):
+        root = support.scratch_root()
+        store = ChatStore(root)
+        chat_id = store.create_chat("Never acted on")["chat_id"]
+        store.close()
+        let_go = self.other_process_holds(root)
+        from dory_wrangler.errors import StoreInUse
+        from dory_wrangler.session_manager import TURN_LOCK_NAME
+        here = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+        for action in (lambda: here.send_turn(chat_id, "hello"), lambda: here.abandon(chat_id),
+                       lambda: here.stop_agent(chat_id, "stop")):
+            with self.assertRaises(StoreInUse):
+                action()
+        self.assertFalse(os.path.exists(os.path.join(root, "chats", chat_id, TURN_LOCK_NAME)))
+        let_go()
+
+    def test_a_second_holder_in_the_same_process_does_not_sweep(self):
+        root = support.scratch_root()
+        first = ChatStore(root)
+        chat_id = first.create_chat("Held")["chat_id"]
+        temp = os.path.join(root, "chats", chat_id, ".tmp-in-flight-in-this-process")
+        with open(temp, "wb") as handle:
+            handle.write(b"a write another thread has not published yet")
+        second = ChatStore(root)
+        second.acquire()
+        self.assertTrue(os.path.exists(temp), "a second holder swept a live write")
+        first.close()
+        second.close()
+        third = ChatStore(root)
+        third.acquire()
+        self.assertFalse(os.path.exists(temp), "taking the lock did not sweep")
+
+    def test_the_lock_is_released_only_by_the_last_holder_in_the_process(self):
+        root = support.scratch_root()
+        first, second = ChatStore(root), ChatStore(root)
+        first.acquire()
+        second.acquire()
+        first.close()
+        self.assertEqual(self.can_another_process_take(root), "refused")
+        second.close()
+        self.assertEqual(self.can_another_process_take(root), "took")
+
+    def test_closing_the_served_application_gives_the_store_back(self):
+        from dory_wrangler.webapp import build_server
+        root = support.scratch_root()
+        server = build_server(root, port=0, quiet=True,
+                              launcher_config={"launcher": "scripted-stub"})
+        self.assertEqual(self.can_another_process_take(root), "refused")
+        server.server_close()
+        self.assertEqual(self.can_another_process_take(root), "took")
+
+    def test_a_shell_refused_its_port_re_attaches_nothing_and_holds_nothing(self):
+        import socket
+        from dory_wrangler.webapp import build_server
+        root = support.scratch_root()
+        harness = SessionManager(ChatStore(root), ScriptedStubLauncher(PERSISTENT))
+        chat_id = harness.create_chat("Live when the port was taken")
+        harness.send_turn(chat_id, "hello")
+        harness.store.close()
+        taken = socket.socket()
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        self.addCleanup(taken.close)
+        before = ChatStore(root, read_only=True).export_records()
+        with self.assertRaises(OSError):
+            build_server(root, port=taken.getsockname()[1], quiet=True,
+                         launcher_config={"launcher": "scripted-stub"})
+        self.assertEqual(ChatStore(root, read_only=True).export_records(), before)
+        self.assertEqual(self.can_another_process_take(root), "took")
+
+    def test_a_launcher_that_misuses_the_seam_during_re_attachment_costs_only_that_chat(self):
+        root = support.scratch_root()
+        broken = SessionManager(ChatStore(root), ScriptedStubLauncher(PERSISTENT))
+        misused = broken.create_chat("Misused at restart")
+        broken.send_turn(misused, "hello")
+        fine = broken.create_chat("Fine")
+        broken._boundary._launch_outcomes = ["unknown"]
+        broken.send_turn(fine, "hello")
+        handle = broken.store.list_sessions(misused)[0][0]["agent_handle"]
+        stored = len(broken.store.read_all_events_of_session(
+            misused, broken.store.list_sessions(misused)[0][0]["session_id"]))
+        broken.store.close()
+
+        class Gaps(ScriptedStubLauncher):
+            def events(self, agent_handle, after_sequence):
+                return lb.EventsPage([lb.EventPayload(after_sequence + 5, "agent",
+                                                      "unrecognized", b"past a gap")])
+
+        reopened = SessionManager(ChatStore(root),
+                                  Gaps(dict(PERSISTENT, resume_handles=[handle])))
+        outcomes = dict(reopened.reattach_on_start())
+        fine_session = reopened.store.list_sessions(fine)[0][0]
+        self.assertEqual(outcomes, {fine_session["session_id"]: "unknown"})
+        self.assertEqual(reopened.abandon(misused), "terminated")
+        self.assertEqual(reopened.abandon(fine), "abandoned")
+        self.assertEqual(stored, len(reopened.store.read_all_events_of_session(
+            misused, reopened.store.list_sessions(misused)[0][0]["session_id"])))
+
+    def test_a_stop_answer_that_is_not_a_usable_confirmation_is_unconfirmed(self):
+        cases = {
+            "not a StopAck": lambda ack: "stopped, honestly",
+            "confirmed mutated to a truthy non-boolean": lambda ack: setattr(
+                ack, "confirmed", "yes") or ack,
+            "detail mutated to a non-string": lambda ack: setattr(ack, "detail", 7) or ack,
+        }
+        for name, spoil in cases.items():
+            with self.subTest(name):
+                class Spoils(ScriptedStubLauncher):
+                    def stop(self, agent_handle, reason):
+                        return spoil(ScriptedStubLauncher.stop(self, agent_handle, reason))
+
+                harness = SessionManager(ChatStore(support.scratch_root()), Spoils(PERSISTENT))
+                chat_id = harness.create_chat(name)
+                harness.send_turn(chat_id, "hello")
+                final = harness.abandon(chat_id)
+                kinds = [o["kind"] for o in harness.store.read_session_observations(chat_id)]
+                if name.startswith("detail"):
+                    self.assertEqual((final, kinds), ("terminated", ["stop_confirmed"]))
+                else:
+                    self.assertEqual((final, kinds), ("abandoned", ["stop_unconfirmed"]))
+                self.assert_store_valid(harness.store, "spoiled-stop-" + name.replace(" ", "-"))
+
+    def test_the_launcher_id_and_capabilities_written_are_the_ones_checked(self):
+        class Changes(ScriptedStubLauncher):
+            reads = 0
+
+            @property
+            def launcher_id(self):
+                Changes.reads += 1
+                return "scripted-stub" if Changes.reads == 1 else "Not A Launcher Id!"
+
+        harness = SessionManager(ChatStore(support.scratch_root()), Changes({}))
+        chat_id = harness.create_chat("Changes between reads")
+        self.assertEqual(harness.send_turn(chat_id, "hello").session_state, "completed")
+        self.assertEqual(Changes.reads, 1)
+
+    def test_a_re_attachment_page_that_ends_the_stream_carries_the_session_to_unknown(self):
+        root = support.scratch_root()
+        first = support.harness({"launcher": "scripted-stub", "options": PERSISTENT},
+                                store_path=root)
+        chat_id = first.create_chat("Stream ended while the harness was down")
+        first.send_turn(chat_id, "one")
+        session = first.store.list_sessions(chat_id)[0][0]
+        stored = len(first.store.read_all_events_of_session(chat_id, session["session_id"]))
+        first.store.close()
+        resuming = ScriptedStubLauncher(dict(PERSISTENT, resume_handles=[session["agent_handle"]]))
+        agent = resuming._sessions[session["agent_handle"]]
+        agent.next_sequence = stored + 1
+        resuming._emit(agent, "launcher", "recognized", json.dumps({"type": "stream_end"}),
+                       interpreted_type="stream_end")
+        reopened = support.harness({}, store_path=root, launcher=resuming)
+        self.assertEqual(reopened.reattach_on_start(), [(session["session_id"], "unknown")])
+        last = reopened.store.read_session(chat_id, session["session_id"])["transitions"][-1]
+        self.assertEqual((last["to"], last["evidence"]["kind"]), ("unknown", "stream_end"))
+        self.assertEqual(reopened.abandon(chat_id), "abandoned")
+        self.assert_store_valid(reopened.store, "reattachment-page-stream-end")
+
+
 class TheResumePointIsTheLastStoredSequence(unittest.TestCase, StoreCheck):
     """`events` is resumable by sequence, and the loop now reads its resume point
     from `ChatStore.next_event_sequence` rather than from #87's store. The drain's
