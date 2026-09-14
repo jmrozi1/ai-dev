@@ -1490,6 +1490,9 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
         "next_event_sequence", "read_diagnostic_event", "read_diagnostic_events",
         "read_all_events_of_session", "export_records", "snapshot", "verify",
         "rejected_content_types", "root", "chats_dir", "diagnostics_dir",
+        # Review finding R4: the pre-flights compose would-be records and put
+        # them to the write's own checks, and write nothing.
+        "preflight_launch", "preflight_delivery",
     ))
 
     # Decision 0002, D1: the store-level lock. These write no record -- `acquire`
@@ -3163,8 +3166,19 @@ class EveryCodeIsAccountedFor(CodeClosureCase):
             if not calls & set(publishers):
                 continue
             publishing.append(node.name)
-            if "_check_record" not in calls:
+            # `_check_packet` is the packet form of the check (review finding
+            # R4 put the pre-flight and the write through one function), and it
+            # is itself held to calling `_check_record` below.
+            if not calls & {"_check_record", "_check_packet"}:
                 unchecked.append(node.name)
+            if node.name == "_append_packet":
+                self.assertIn("_check_packet", calls)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == "_check_packet":
+                first = node.body[1].value.func.attr  # after the docstring
+                self.assertEqual(first, "_check_record",
+                                 "a packet's bound is measured before its text is "
+                                 "known to be UTF-8")
         self.assertEqual(
             [], unchecked,
             "%s publishes a record without putting it to the contract first"
@@ -3823,6 +3837,11 @@ class TestTheReadOnlySurfaceIsDerivedNotDeclared(CodeClosureCase):
             "message_id": message_id, "name": "probe", "sequence": 1,
             "expect": "accept", "description": None, "include_archived": True,
             "sequence_from": None, "sequence_to": None, "limit": None,
+            # The pre-flights (review finding R4) compose would-be records.
+            "user_text": "probe text", "instruction_text": "probe text",
+            "launcher_id": "dev-local",
+            "capabilities": {"continuation": "persistent", "response_shape": "stream",
+                             "instruction_bound_bytes": None},
         }
         supplied = []
         for parameter in list(inspect.signature(method).parameters.values()):

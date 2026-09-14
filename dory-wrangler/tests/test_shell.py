@@ -367,9 +367,215 @@ class TestShellFailsClosed(ShellCase):
             status = exc.code
             body = json.loads(exc.read().decode("utf-8"))
         self.assertEqual(status, 409)
-        self.assertIn("sequence jumps", body["error"])
+        # Review finding R3: the body is the shell's fixed words, not the
+        # store's refusal text (which named the gap, "sequence jumps").
+        self.assertEqual(body, {"error": webapp.UNREADABLE})
         # It refused; it did not return the two messages it could still read.
         self.assertNotIn("turn 0", json.dumps(body))
+
+
+
+class TestEveryErrorBodyIsFixedWords(unittest.TestCase):
+    """Review finding R3, over the bodies actually served, on every error path.
+
+    Since convergence every session, packet, event and transition write runs
+    inside a request, so every refusal those writes make can reach a handler.
+    This drives one instance of each error a route can answer -- including a
+    store refusal through each POST route, a launcher misuse, and an exception no
+    route anticipated -- against a served application whose store really holds
+    sessions, handles, launcher ids and preserved raw output, and requires of
+    every error body that
+
+    * its `error` is one of the shell's own fixed sentences (`webapp.ERROR_WORDS`);
+    * it carries no value the stores hold: every id, handle, launcher id and raw
+      body is read back from the stores after the run, not listed in advance.
+    """
+
+    PERSISTENT = {"continuation": "persistent", "response_shape": "stream",
+                  "end_of_turn": "turn_complete"}
+
+    def serve(self, launcher):
+        import threading
+        root = tempfile.mkdtemp(prefix="dory-errors-")
+        self.addCleanup(shutil.rmtree, root, True)
+        server = webapp.build_server(root, port=0, quiet=True, launcher=launcher)
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.05})
+        thread.daemon = True
+        thread.start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.roots.append(root)
+        return server.server_address[1], server
+
+    def call(self, port, method, path, payload=None, raw=None, headers=None):
+        from urllib.request import Request, urlopen
+        data = raw if raw is not None else (
+            json.dumps(payload).encode("utf-8") if payload is not None else None)
+        request = Request("http://127.0.0.1:%d%s" % (port, path), data=data, method=method,
+                          headers=headers or ({"Content-Type": "application/json"}
+                                              if data else {}))
+        try:
+            with urlopen(request, timeout=30) as response:
+                return response.status, response.read().decode("utf-8")
+        except HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8")
+
+    def error(self, where, expected_status, port, method, path, **kwargs):
+        status, body = self.call(port, method, path, **kwargs)
+        self.assertEqual(status, expected_status, "%s answered %s: %s" % (where, status, body))
+        self.served.append((where, body))
+        return body
+
+    def chat(self, port, first_turn=None):
+        _status, body = self.call(port, "POST", "/api/chats", {})
+        chat_id = json.loads(body)["chat_id"]
+        if first_turn is not None:
+            status, body = self.call(port, "POST", "/api/chats/%s/messages" % chat_id,
+                                     {"text": first_turn})
+            self.assertEqual(status, 201, body)
+        return chat_id
+
+    def test_every_error_body_is_fixed_words_carrying_nothing_the_store_holds(self):
+        from dory_wrangler import ids, launch_boundary as lb
+        from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
+        self.roots, self.served = [], []
+
+        # -- one store holding a live persistent agent, preserved output, a
+        #    finished session: the values that must not leak exist ------------
+        port, server = self.serve(ScriptedStubLauncher(dict(self.PERSISTENT,
+                                                            instruction_bound_bytes=64)))
+        live = self.chat(port, "one")
+        messages = "/api/chats/%s/messages" % live
+
+        self.error("GET unknown route", 404, port, "GET", "/api/sessions")
+        self.error("GET nested route", 404, port, "GET", "/api/chats/%s/x" % live)
+        self.error("GET bad chat id", 404, port, "GET", "/api/chats/not-an-id")
+        self.error("GET unknown chat", 404, port, "GET", "/api/chats/cht_nothinghere000")
+        self.error("POST unknown route", 404, port, "POST", "/api/sessions", payload={})
+        self.error("POST not JSON", 400, port, "POST", messages, raw=b"{nope",
+                   headers={"Content-Type": "application/json"})
+        self.error("POST not an object", 400, port, "POST", messages, raw=b"[1]",
+                   headers={"Content-Type": "application/json"})
+        self.error("POST bad length", 400, port, "POST", messages, raw=b"{}",
+                   headers={"Content-Type": "application/json", "Content-Length": "x"})
+        self.error("POST too large", 400, port, "POST", messages, raw=b"{}",
+                   headers={"Content-Type": "application/json",
+                            "Content-Length": str(webapp.MAX_BODY_BYTES + 1)})
+        self.error("POST no text", 400, port, "POST", messages, payload={"text": "  "})
+        self.error("POST messages, unknown chat", 404, port, "POST",
+                   "/api/chats/cht_nothinghere000/messages", payload={"text": "hi"})
+        self.error("POST abandon, unknown chat", 404, port, "POST",
+                   "/api/chats/cht_nothinghere000/abandon", payload={})
+        self.error("POST chats, title the store refuses", 409, port, "POST", "/api/chats",
+                   payload={"title": "t" * 500})
+        self.error("POST messages, over the declared bound", 409, port, "POST", messages,
+                   payload={"text": "x" * 200})
+        # A store refusal through the send route: the wall clock stepped back
+        # past the second the handle was issued in.
+        real_now = ids.now
+        ids.now = lambda: "2000-01-01T00:00:00.000000Z"
+        try:
+            self.error("POST messages, store refuses (clock)", 409, port, "POST", messages,
+                       payload={"text": "two"})
+        finally:
+            ids.now = real_now
+        self.error("POST messages, lone surrogate", 409, port, "POST", messages,
+                   raw=b'{"text": "two \\ud800"}', headers={"Content-Type": "application/json"})
+        finished = self.chat(port)
+        self.error("POST abandon, nothing to abandon", 409, port, "POST",
+                   "/api/chats/%s/abandon" % finished, payload={})
+        # An exception no route anticipated, carrying worker internals in its text.
+        session = server.service.store.list_sessions(live)[0][0]
+        real_open = server.service.open_chat
+
+        def explodes(chat_id):
+            raise RuntimeError("%s %s" % (session["session_id"], session["agent_handle"]))
+
+        server.service.open_chat = explodes
+        try:
+            self.error("GET unanticipated exception", 500, port, "GET", "/api/chats/" + live)
+            self.error("POST unanticipated exception", 500, port, "POST", "/api/chats",
+                       payload={})
+        finally:
+            server.service.open_chat = real_open
+        # A damaged chat record, through GET and through both POST routes.
+        damaged = self.chat(port, "doomed")
+        with open(os.path.join(self.roots[-1], "chats", damaged, "chat.json"), "w") as handle:
+            handle.write('{"session": "%s"' % session["session_id"])
+        self.error("GET damaged chat", 409, port, "GET", "/api/chats/" + damaged)
+        self.error("POST messages, damaged chat", 409, port, "POST",
+                   "/api/chats/%s/messages" % damaged, payload={"text": "hi"})
+        self.error("POST abandon, damaged chat", 409, port, "POST",
+                   "/api/chats/%s/abandon" % damaged, payload={})
+
+        # -- a launcher that contradicts what is stored: StoreCorrupt mid-turn --
+        class Contradicts(ScriptedStubLauncher):
+            def events(self, agent_handle, after_sequence):
+                page = ScriptedStubLauncher.events(self, agent_handle, after_sequence)
+                if after_sequence == 0:
+                    return page
+                forged = lb.EventPayload(1, "agent", "unrecognized",
+                                         b"raw bytes that contradict sequence one")
+                return lb.EventsPage([forged] + page.payloads)
+
+        port, _server = self.serve(Contradicts(self.PERSISTENT))
+        chat_id = self.chat(port, "one")
+        self.error("POST messages, store refuses (contradicting replay)", 409, port, "POST",
+                   "/api/chats/%s/messages" % chat_id, payload={"text": "two"})
+
+        # -- a launcher that misuses the seam: 502; then the busy refusal ------
+        port, _server = self.serve(ScriptedStubLauncher(
+            {"continuation": "fresh_binding", "response_shape": "one_shot",
+             "end_of_turn": "stream_end"}))
+        chat_id = self.chat(port)
+        self.error("POST messages, launcher misuse", 502, port, "POST",
+                   "/api/chats/%s/messages" % chat_id, payload={"text": "hello"})
+        port, _server = self.serve(ScriptedStubLauncher({"launch_outcomes": ["unknown"]}))
+        chat_id = self.chat(port, "hello")
+        self.error("POST messages, busy", 409, port, "POST",
+                   "/api/chats/%s/messages" % chat_id, payload={"text": "again"})
+
+        # -- what the stores hold, read back after the run ---------------------
+        secrets = set()
+        for root in self.roots:
+            store = ChatStore(root, read_only=True)
+            for chat_dir in sorted(os.listdir(store.chats_dir)):
+                try:
+                    store.read_chat(chat_dir)
+                except Exception:  # noqa: BLE001 - the damaged chat; its sessions still count
+                    pass
+                for pair in store.list_sessions(chat_dir):
+                    for record in pair:
+                        secrets.update(v for k, v in record.items()
+                                       if isinstance(v, str) and (k.endswith("_id") or k in (
+                                           "agent_handle", "launcher_id")))
+                    for event in store.read_all_events_of_session(
+                            chat_dir, pair[0]["session_id"]):
+                        secrets.update((event["event_id"], event["raw"]["body"]))
+                for kind in ("launch_request", "launch_result", "delivery_request",
+                             "session_observation"):
+                    for record in store._read_packets(chat_dir, kind):
+                        secrets.update(v for k, v in record.items()
+                                       if isinstance(v, str) and k.endswith("_id"))
+                for message in store.read_messages(chat_dir):
+                    if message["session_id"]:
+                        secrets.update((message["message_id"], message["session_id"],
+                                        message["source_event_id"]))
+        chat_ids = set(n for root in self.roots for n in os.listdir(os.path.join(root, "chats")))
+        self.assertTrue(any(s.startswith("ses_") for s in secrets))
+        self.assertTrue(any(s.startswith("evt_") for s in secrets))
+        self.assertIn("scripted-stub", secrets)
+        self.assertTrue(any(s.startswith("stub-agent-") for s in secrets))
+        self.assertEqual(len(set(where for where, _ in self.served)), 25)
+        for where, body in self.served:
+            decoded = json.loads(body)
+            self.assertIn(decoded.get("error"), webapp.ERROR_WORDS, where)
+            self.assertLessEqual(set(decoded), {"error", "refused"}, where)
+            for secret in secrets - chat_ids:
+                self.assertNotIn(secret, body, "%s served %r" % (where, secret))
+            for word in ("session", "handle", "sequence", "launch", "transition",
+                         "unknown", "running", "evidence", "StoreCorrupt", "Traceback"):
+                self.assertNotIn(word, body, "%s carries %r" % (where, word))
 
 
 if __name__ == "__main__":

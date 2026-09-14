@@ -312,11 +312,15 @@ class SessionManager(object):
 
     # -- launching ---------------------------------------------------------
 
-    def _check_declared_bound(self, instruction_text):
-        bound = self._boundary.capabilities.instruction_bound_bytes
+    def _check_declared_bound(self, instruction_text, bound):
         if bound is None:
             return  # nobody has measured one; this package asserts none
-        size = len(instruction_text.encode("utf-8"))
+        try:
+            size = len(instruction_text.encode("utf-8"))
+        except (AttributeError, UnicodeEncodeError):
+            # Not text the contract accepts at all. The store's pre-flight,
+            # which runs next, refuses it before anything is written.
+            return
         if size > bound:
             raise InstructionTooLarge(
                 "instruction is %d bytes and this launcher declares a measured bound of "
@@ -348,9 +352,20 @@ class SessionManager(object):
         if existing is not None:
             self._refuse_concurrent_turn(chat_id, existing, text)
         instruction_text = self._compose(chat_id, text, self._store)
-        # Pre-flight, before anything durable is written. A refused packet leaves
-        # no session, no launch_request and no user message: nothing happened.
-        self._check_declared_bound(instruction_text)
+        # Read once. The values the pre-flight checks are the values written:
+        # a launcher's attributes are its own and can change between two reads.
+        launcher_id = self._boundary.launcher_id
+        capabilities = self._boundary.capabilities.as_record()
+        # Pre-flight, before anything durable is written (review finding R4). A
+        # user turn is recorded only if the session and packet it opens would
+        # themselves be accepted, so a refusal here leaves no user message, no
+        # session and no launch_request: nothing happened.
+        self._check_declared_bound(
+            instruction_text,
+            capabilities.get("instruction_bound_bytes") if isinstance(capabilities, dict)
+            else None)
+        self._store.preflight_launch(chat_id, text, launcher_id, capabilities,
+                                     instruction_text)
 
         user_message = self._store.append_user_message(chat_id, text)
         user_message_id = user_message["message_id"]
@@ -359,8 +374,7 @@ class SessionManager(object):
         # (contract 4.3), and a launcher that re-enters `send_turn` during
         # `launch` must find the chat already claimed.
         session, _binding = self._store.create_session(
-            chat_id, user_message_id, self._boundary.launcher_id,
-            self._boundary.capabilities.as_record())
+            chat_id, user_message_id, launcher_id, capabilities)
         session_id = session["session_id"]
 
         try:
@@ -466,13 +480,14 @@ class SessionManager(object):
         # record that the harness addressed the agent, and it may not exist on a
         # session with no handle (contract 4.3, ADDRESSED_WITHOUT_HANDLE).
         agent_handle = self._agent_handle(session)
-        self._check_declared_bound(text)
-        # The store's own delivery preconditions, asked before the user's turn is
-        # recorded rather than discovered after it. Read-only: it writes nothing
-        # and is the same function `append_delivery_request` calls, so the set
-        # of turns refused here is the set the store would refuse below, and a
-        # turn the store would not deliver is never left in the chat unoffered.
-        self._store._require_deliverable(chat_id, session_id)
+        self._check_declared_bound(text, self._boundary.capabilities.instruction_bound_bytes)
+        # The store's own pre-flight of the would-be message and delivery packet,
+        # asked before the user's turn is recorded rather than discovered after
+        # it (review finding R4). It reads and writes nothing, and it runs the
+        # same delivery preconditions (`_require_deliverable`), record check and
+        # session-recorded bound that `append_delivery_request` runs, so a turn
+        # the store would not deliver is never left in the chat unoffered.
+        self._store.preflight_delivery(chat_id, session_id, text, text)
         user_message_id = self._store.append_user_message(chat_id, text)["message_id"]
 
         # Recorded before the call, with `acknowledged: null`. A turn the harness

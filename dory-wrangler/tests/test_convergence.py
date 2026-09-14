@@ -642,18 +642,11 @@ class TheGuardsConvergenceAddedHaveExits(unittest.TestCase, StoreCheck):
                 chat_id = harness.create_chat("Clock stepped back")
                 harness.send_turn(chat_id, "one")
                 if not preflight:
-                    # Only the loop's pre-flight is skipped: the store's own call
-                    # inside `append_delivery_request` still runs.
-                    real = harness._store._require_deliverable
-                    calls = []
-
-                    def skip_the_preflight(chat, sid):
-                        calls.append(sid)
-                        if len(calls) == 1:
-                            return None
-                        return real(chat, sid)
-
-                    harness._store._require_deliverable = skip_the_preflight
+                    # Only the loop's pre-flight is skipped: the store's own
+                    # checks inside `append_delivery_request` still run. (Since
+                    # review finding R4 the loop's pre-flight is the store's
+                    # `preflight_delivery`, which runs `_require_deliverable`.)
+                    harness._store.preflight_delivery = lambda *args: None
                 real_now = ids.now
                 ids.now = lambda: "2000-01-01T00:00:00.000000Z"
                 try:
@@ -672,6 +665,130 @@ class TheGuardsConvergenceAddedHaveExits(unittest.TestCase, StoreCheck):
                     self.assertEqual(users, ["one", "two"],
                                      "the control must show the pre-flight is what "
                                      "keeps the unoffered turn out")
+
+
+class ATurnIsRecordedOnlyIfWhatItOpensIsAcceptable(unittest.TestCase, StoreCheck):
+    """Review finding R4 (#87 F3, widened): decision 0003's invariant, as ordering.
+
+    A user turn is written only after the session and packet it would open have
+    been composed by the store's own composers and put to the store's own
+    checks (`ChatStore.preflight_launch`, `preflight_delivery`). The cases below
+    are not special cases in the product -- there is no clause for any of them
+    -- they are instances of one rule: each would have been refused by a write
+    *after* the turn was recorded, and each is now refused with nothing written,
+    after which the same chat takes a well-formed turn.
+    """
+
+    PERSISTENT = {"continuation": "persistent", "response_shape": "stream",
+                  "end_of_turn": "turn_complete"}
+
+    def refused_with_nothing_written(self, harness, chat_id, text, name):
+        before = harness.store.export_records()
+        with self.assertRaises(ValidationRefused) as caught:
+            harness.send_turn(chat_id, text)
+        self.assertEqual(harness.store.export_records(), before,
+                         "%s: a turn was recorded though what it opens is refused" % name)
+        return caught.exception
+
+    def exit_through_a_good_turn(self, root, chat_id, name, options=None):
+        good = SessionManager(ChatStore(root), ScriptedStubLauncher(options or {}))
+        outcome = good.send_turn(chat_id, "a well-formed turn")
+        self.assertIn(outcome.session_state, ("completed", "running"))
+        support.end_chat(good, chat_id)
+        self.assert_store_valid(good.store, name)
+
+    def test_a_malformed_launcher_id(self):
+        for name, value in (("pattern", "Not A Launcher Id!"), ("type", 42)):
+            class BadId(ScriptedStubLauncher):
+                launcher_id = value
+            root = support.scratch_root()
+            harness = SessionManager(ChatStore(root), BadId({}))
+            chat_id = harness.create_chat("Malformed launcher_id")
+            self.refused_with_nothing_written(harness, chat_id, "hello", name)
+            harness.store.close()
+            self.exit_through_a_good_turn(root, chat_id, "preflight-launcher-id-" + name)
+
+    def test_capabilities_changed_after_construction(self):
+        root = support.scratch_root()
+        launcher = ScriptedStubLauncher({})
+        launcher._capabilities.continuation = "bogus"
+        harness = SessionManager(ChatStore(root), launcher)
+        chat_id = harness.create_chat("Mutated capabilities")
+        self.refused_with_nothing_written(harness, chat_id, "hello", "capabilities")
+        harness.store.close()
+        self.exit_through_a_good_turn(root, chat_id, "preflight-mutated-capabilities")
+
+    def test_a_lone_surrogate_on_the_launch_path_and_on_the_delivery_path(self):
+        root = support.scratch_root()
+        harness = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+        chat_id = harness.create_chat("Surrogate, launch")
+        self.refused_with_nothing_written(harness, chat_id, "two \ud800", "launch")
+        self.assertEqual(harness.send_turn(chat_id, "two").session_state, "completed")
+
+        for bound in (None, 64):
+            harness = SessionManager(ChatStore(support.scratch_root()), ScriptedStubLauncher(
+                dict(self.PERSISTENT, instruction_bound_bytes=bound)))
+            chat_id = harness.create_chat("Surrogate, delivery")
+            harness.send_turn(chat_id, "one")
+            self.refused_with_nothing_written(harness, chat_id, "two \ud800", "delivery")
+            self.assertTrue(harness.send_turn(chat_id, "two").delivered)
+            support.end_chat(harness, chat_id)
+            self.assert_store_valid(harness.store, "preflight-surrogate-delivery-%s" % bound)
+
+    def test_a_lone_surrogate_over_http(self):
+        import threading
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        from dory_wrangler.webapp import build_server, STORE_REFUSED
+        for options, first in (({}, None), (self.PERSISTENT, "one")):
+            root = support.scratch_root()
+            server = build_server(root, port=0, quiet=True,
+                                  launcher=ScriptedStubLauncher(options))
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.server_close)
+            self.addCleanup(server.shutdown)
+            port = server.server_address[1]
+            chat_id = server.service.create_chat()["chat_id"]
+            if first:
+                server.service.send_user_message(chat_id, first)
+            before = ChatStore(root, read_only=True).export_records()
+            request = Request("http://127.0.0.1:%d/api/chats/%s/messages" % (port, chat_id),
+                              data=b'{"text": "two \\ud800"}', method="POST",
+                              headers={"Content-Type": "application/json"})
+            with self.assertRaises(HTTPError) as caught:
+                urlopen(request, timeout=30)
+            self.assertEqual(caught.exception.code, 409)
+            self.assertEqual(json.loads(caught.exception.read().decode("utf-8")),
+                             {"error": STORE_REFUSED})
+            self.assertEqual(ChatStore(root, read_only=True).export_records(), before)
+
+    def test_an_instruction_bound_the_session_recorded_differs_from_the_launchers(self):
+        """The session declared 10 bytes; after a restart the resuming launcher
+        declares none. The loop's check reads the launcher and passes; the
+        store's reads the session, and now runs before the turn is written."""
+        root = support.scratch_root()
+        first = support.harness({"launcher": "scripted-stub",
+                                 "options": dict(self.PERSISTENT, instruction_bound_bytes=10)},
+                                store_path=root)
+        chat_id = first.create_chat("Bound recorded on the session")
+        first.send_turn(chat_id, "short")
+        handle = support.view(first).sessions_of(chat_id)[0]["agent_handle"]
+        first.store.close()
+        reopened = support.harness(
+            {"launcher": "scripted-stub",
+             "options": dict(self.PERSISTENT, resume_handles=[handle])}, store_path=root)
+        reopened.reattach_on_start()
+        self.refused_with_nothing_written(reopened, chat_id, "x" * 40, "bound")
+        self.assertTrue(reopened.send_turn(chat_id, "x" * 10).delivered)
+        support.end_chat(reopened, chat_id)
+        self.assert_store_valid(reopened.store, "preflight-session-bound")
+
+    def test_an_unformable_packet(self):
+        root = support.scratch_root()
+        harness = SessionManager(ChatStore(root), ScriptedStubLauncher({}),
+                                 compose=lambda chat_id, text, store: "")
+        chat_id = harness.create_chat("Empty packet")
+        self.refused_with_nothing_written(harness, chat_id, "hello", "empty packet")
 
 
 class TheServiceLayerAroundTheLoop(unittest.TestCase, StoreCheck):

@@ -29,6 +29,8 @@ vocabulary: the shell still shows one assistant conversation and no status.
 """
 
 import json
+import sys
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -55,9 +57,35 @@ REFUSED_BUSY = (
 REFUSED_TOO_LARGE = "This message is larger than the agent here accepts; it was not sent."
 REFUSED_OTHER = "That is not possible for this chat right now; nothing was changed."
 INTEGRATION_FAILED = (
-    "The agent integration returned something this build cannot use. Your message "
-    "is in the chat; nothing after it was shown."
+    "The agent integration returned something this build cannot use. Reload the "
+    "chat to see what it holds now."
 )
+
+# What the browser is told on every other error path. Fixed words, and the only
+# words any error body carries (review finding R3): the store's refusals and
+# the chat loop's exceptions name sessions, handles, sequences and states, and
+# since convergence every one of those writes can raise into a request handler.
+# Nothing an exception says is ever copied into a body.
+NO_SUCH_ROUTE = "no such route"
+NOT_FOUND = "There is no such chat."
+UNREADABLE = "This chat could not be read, so nothing from it is shown; nothing was changed."
+STORE_REFUSED = (
+    "This could not be recorded as asked. Reload the chat to see what it holds now."
+)
+FAILED = "Something went wrong in the shell. Reload the chat to see what it holds now."
+BAD_LENGTH = "Content-Length is not a number"
+TOO_LARGE = "request body is too large"
+NOT_JSON = "request body is not JSON"
+NOT_AN_OBJECT = "request body must be a JSON object"
+NEEDS_TEXT = "a message needs text"
+
+# Every sentence an error body may carry. A test holds every served error body
+# to this set, so adding a path that answers with anything else fails there.
+ERROR_WORDS = frozenset((
+    REFUSED_BUSY, REFUSED_TOO_LARGE, REFUSED_OTHER, INTEGRATION_FAILED, NO_SUCH_ROUTE,
+    NOT_FOUND, UNREADABLE, STORE_REFUSED, FAILED, BAD_LENGTH, TOO_LARGE, NOT_JSON,
+    NOT_AN_OBJECT, NEEDS_TEXT,
+))
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -423,19 +451,25 @@ class ShellHandler(BaseHTTPRequestHandler):
         try:
             length = int(length)
         except ValueError:
-            raise ValueError("Content-Length is not a number")
+            raise _BadRequest(BAD_LENGTH)
         if length > MAX_BODY_BYTES:
-            raise ValueError("request body is too large")
+            raise _BadRequest(TOO_LARGE)
         raw = self.rfile.read(length)
         if not raw:
             return {}
         try:
             body = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
-            raise ValueError("request body is not JSON")
+            raise _BadRequest(NOT_JSON)
         if not isinstance(body, dict):
-            raise ValueError("request body must be a JSON object")
+            raise _BadRequest(NOT_AN_OBJECT)
         return body
+
+    def _failed(self):
+        """An exception no route anticipated: 500, fixed words, detail to stderr."""
+        if not self.server.quiet:
+            traceback.print_exc(file=sys.stderr)
+        return self._respond(500, {"error": FAILED})
 
     # -- routes ---------------------------------------------------------
 
@@ -452,22 +486,24 @@ class ShellHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/chats/"):
                 chat_id = path[len("/api/chats/"):]
                 if "/" in chat_id:
-                    return self._respond(404, {"error": "no such route"})
+                    return self._respond(404, {"error": NO_SUCH_ROUTE})
                 return self._respond(200, self.service.open_chat(chat_id))
-            return self._respond(404, {"error": "no such route"})
-        except NotFound as exc:
-            return self._respond(404, {"error": str(exc)})
-        except StoreError as exc:
+            return self._respond(404, {"error": NO_SUCH_ROUTE})
+        except NotFound:
+            return self._respond(404, {"error": NOT_FOUND})
+        except StoreError:
             # Fail closed, and say so. Nothing partial is rendered and nothing
             # is repaired on the way out.
-            return self._respond(409, {"error": str(exc)})
+            return self._respond(409, {"error": UNREADABLE})
+        except Exception:  # noqa: BLE001 - answered with fixed words, never its text
+            return self._failed()
 
     def do_POST(self):  # noqa: N802
         path = urlparse(self.path).path
         try:
             body = self._read_json()
-        except ValueError as exc:
-            return self._respond(400, {"error": str(exc)})
+        except _BadRequest as exc:
+            return self._respond(400, {"error": exc.words})
         try:
             if path == "/api/chats":
                 title = body.get("title")
@@ -476,25 +512,35 @@ class ShellHandler(BaseHTTPRequestHandler):
             if path.startswith("/api/chats/") and path.endswith("/messages"):
                 chat_id = path[len("/api/chats/"):-len("/messages")]
                 if "/" in chat_id:
-                    return self._respond(404, {"error": "no such route"})
+                    return self._respond(404, {"error": NO_SUCH_ROUTE})
                 text = body.get("text")
                 if not isinstance(text, str) or not text.strip():
-                    return self._respond(400, {"error": "a message needs text"})
+                    return self._respond(400, {"error": NEEDS_TEXT})
                 return self._respond(201, self.service.send_user_message(chat_id, text.strip()))
             if path.startswith("/api/chats/") and path.endswith("/abandon"):
                 chat_id = path[len("/api/chats/"):-len("/abandon")]
                 if "/" in chat_id:
-                    return self._respond(404, {"error": "no such route"})
+                    return self._respond(404, {"error": NO_SUCH_ROUTE})
                 return self._respond(200, self.service.abandon(chat_id))
-            return self._respond(404, {"error": "no such route"})
-        except NotFound as exc:
-            return self._respond(404, {"error": str(exc)})
-        except StoreError as exc:
-            return self._respond(409, {"error": str(exc)})
+            return self._respond(404, {"error": NO_SUCH_ROUTE})
+        except NotFound:
+            return self._respond(404, {"error": NOT_FOUND})
+        except StoreError:
+            return self._respond(409, {"error": STORE_REFUSED})
         except HarnessError as exc:
             return self._respond(409, {"error": _refusal_words(exc), "refused": True})
         except LaunchBoundaryError:
             return self._respond(502, {"error": INTEGRATION_FAILED})
+        except Exception:  # noqa: BLE001 - answered with fixed words, never its text
+            return self._failed()
+
+
+class _BadRequest(Exception):
+    """A request the shell cannot parse. Carries one of the fixed sentences above."""
+
+    def __init__(self, words):
+        Exception.__init__(self, words)
+        self.words = words
 
 
 def _refusal_words(exc):

@@ -760,7 +760,18 @@ class TheHarnessRefusesToWriteAnUnreadableHistory(unittest.TestCase, StoreCheck)
     def test_probe_a_packet_the_seam_refuses_still_leaves_a_durable_record(self):
         """Contract 4.3: a launch failure must be attributable to a durable
         record rather than being lost -- including when nothing was ever sent.
-        The user's turn is real; the packet composed from it is not formable."""
+
+        **Expectation changed by review finding R4** (decision 0003's invariant,
+        widened). This probe used to compose an empty packet and expect the
+        user's turn to be recorded and its session carried to `launch_failed`.
+        The loop now puts the would-be session and packet to the store's own
+        checks *before* the turn is written, so an unformable packet is refused
+        with nothing recorded at all: no turn that was never offered, and no
+        launch to attribute. The durable-record half of the probe is kept for the
+        one route that still reaches it -- a packet refused *after* the turn and
+        its session were written, which a clock step or an I/O error can cause --
+        by injecting that refusal."""
+        from dory_wrangler.errors import ValidationRefused
 
         def composes_nothing(chat_id, user_text, store):
             return ""
@@ -768,8 +779,22 @@ class TheHarnessRefusesToWriteAnUnreadableHistory(unittest.TestCase, StoreCheck)
         harness = support.harness({}, launcher=ScriptedStubLauncher({}),
                                compose=composes_nothing)
         chat_id = harness.create_chat("Unformable packet")
+        before = harness.store.export_records()
+        with self.assertRaises(ValidationRefused):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(harness.store.export_records(), before,
+                         "a turn whose packet cannot be formed was recorded")
+
+        harness = support.harness({}, launcher=ScriptedStubLauncher({}))
+        chat_id = harness.create_chat("Packet refused after the turn was written")
+
+        def refuses(*_args, **_kwargs):
+            raise ValidationRefused("the packet write was refused")
+
+        harness.store.append_launch_request = refuses
         with self.assertRaises(NotPermitted):
             harness.send_turn(chat_id, "hello")
+        del harness.store.append_launch_request
         session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "launch_failed")
         self.assertEqual(session["transitions"][-1]["owner"], "harness",

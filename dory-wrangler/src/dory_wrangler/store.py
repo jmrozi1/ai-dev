@@ -482,6 +482,22 @@ class ChatStore(object):
                 highest = max(highest, int(match.group(1)))
         return highest + 1
 
+    @staticmethod
+    def _message_record(chat_id, author, text, session_id, source_event_id, sequence, stamp):
+        """The one composition of a `message` record: the write and its pre-flight."""
+        return {
+            "record_type": "message",
+            "record_version": RECORD_VERSION,
+            "message_id": ids.new_id("msg"),
+            "chat_id": chat_id,
+            "sequence": sequence,
+            "author": author,
+            "created_at": stamp,
+            "content": {"content_type": "text/plain", "text": text},
+            "session_id": session_id,
+            "source_event_id": source_event_id,
+        }
+
     def _append_message(self, chat_id, author, text, session_id, source_event_id,
                         content_type="text/plain"):
         if content_type != "text/plain":
@@ -501,20 +517,9 @@ class ChatStore(object):
         last_error = None
         for _ in range(_MAX_SEQUENCE_RETRIES):
             sequence = self._next_sequence(directory)
-            stamp = ids.now()
             record = self._check_record(
-                {
-                    "record_type": "message",
-                    "record_version": RECORD_VERSION,
-                    "message_id": ids.new_id("msg"),
-                    "chat_id": chat_id,
-                    "sequence": sequence,
-                    "author": author,
-                    "created_at": stamp,
-                    "content": {"content_type": "text/plain", "text": text},
-                    "session_id": session_id,
-                    "source_event_id": source_event_id,
-                },
+                self._message_record(chat_id, author, text, session_id, source_event_id,
+                                     sequence, ids.now()),
                 "new message",
             )
             try:
@@ -527,7 +532,7 @@ class ChatStore(object):
                 last_error = exc
                 continue
             atomic.fault("post_message_pre_chat_update")
-            self._touch_chat(chat_id, stamp)
+            self._touch_chat(chat_id, record["created_at"])
             return record
         raise ConcurrencyRefused(
             "could not claim a message sequence in chat %s after %d attempts (%s)"
@@ -763,40 +768,102 @@ class ChatStore(object):
                         "agent is opened by a later user turn"
                         % (opening_message_id, served["session_id"])
                     )
-            stamp = ids.now()
-            session_id = ids.new_id("ses")
-            session = {
-                "record_type": "agent_session",
-                "record_version": RECORD_VERSION,
-                "session_id": session_id,
-                "chat_id": chat_id,
-                "created_at": stamp,
-                "launcher_id": launcher_id,
-                "launcher_capabilities": dict(capabilities),
-                "state": "pending",
-                "transitions": [
-                    {
-                        "from": None,
-                        "to": "pending",
-                        "owner": "user",
-                        "at": stamp,
-                        "evidence": {"kind": "user_action", "ref": opening_message_id},
-                    }
-                ],
-            }
-            binding = {
-                "record_type": "agent_binding",
-                "record_version": RECORD_VERSION,
-                "binding_id": ids.new_id("bnd"),
-                "chat_id": chat_id,
-                "session_id": session_id,
-                "bound_at": stamp,
-                "released_at": None,
-            }
+            session, binding = self._session_records(
+                chat_id, opening_message_id, launcher_id, capabilities, ids.now())
             self._require_precondition(
                 chat_id, session, session["transitions"][0], error=ValidationRefused)
             self._write_session_file(chat_id, session, binding, create=True)
         return session, binding
+
+    @staticmethod
+    def _session_records(chat_id, opening_message_id, launcher_id, capabilities, stamp):
+        """The one composition of a new session and its binding: the write and its pre-flight."""
+        session_id = ids.new_id("ses")
+        session = {
+            "record_type": "agent_session",
+            "record_version": RECORD_VERSION,
+            "session_id": session_id,
+            "chat_id": chat_id,
+            "created_at": stamp,
+            "launcher_id": launcher_id,
+            "launcher_capabilities": (dict(capabilities) if isinstance(capabilities, dict)
+                                      else capabilities),
+            "state": "pending",
+            "transitions": [
+                {
+                    "from": None,
+                    "to": "pending",
+                    "owner": "user",
+                    "at": stamp,
+                    "evidence": {"kind": "user_action", "ref": opening_message_id},
+                }
+            ],
+        }
+        binding = {
+            "record_type": "agent_binding",
+            "record_version": RECORD_VERSION,
+            "binding_id": ids.new_id("bnd"),
+            "chat_id": chat_id,
+            "session_id": session_id,
+            "bound_at": stamp,
+            "released_at": None,
+        }
+        return session, binding
+
+    # -- pre-flight: a user turn is recorded only if what it opens is acceptable --
+
+    def preflight_launch(self, chat_id, user_text, launcher_id, capabilities,
+                         instruction_text):
+        """Refuse, having written nothing, a turn whose records the store would refuse.
+
+        Review finding R4 (decision 0003's invariant): a user turn is recorded
+        only if the session and packet it would open would themselves be
+        accepted. `_launch_turn` used to write the user's message and only then
+        discover that `create_session` or `append_launch_request` refused --
+        a malformed `launcher_id`, capabilities changed after construction, a
+        lone surrogate -- leaving a turn in the chat that was never offered to an
+        agent. This composes the would-be message, session, binding and launch
+        packet with the **same functions the writes use**, and puts each to the
+        same checks the writes make: the contract's record check, contract 5.2's
+        precondition for the creation transition (with the would-be message as
+        its evidence), and the instruction bound the would-be session records.
+        It reads; it writes nothing.
+        """
+        self.read_chat(chat_id)
+        stamp = ids.now()
+        message = self._check_record(
+            self._message_record(chat_id, "user", user_text, None, None,
+                                 self._next_sequence(self._messages_dir(chat_id)), stamp),
+            "new message")
+        session, binding = self._session_records(
+            chat_id, message["message_id"], launcher_id, capabilities, stamp)
+        self._check_record(session, "agent session")
+        self._check_record(binding, "agent binding")
+        self._require_precondition(chat_id, session, session["transitions"][0],
+                                   error=ValidationRefused, would_be=message)
+        request = self._launch_request_record(chat_id, session["session_id"],
+                                              instruction_text, stamp)
+        self._check_packet(chat_id, request, session=session)
+
+    def preflight_delivery(self, chat_id, session_id, user_text, instruction_text):
+        """The delivery path's pre-flight: the would-be message and delivery packet.
+
+        `_require_deliverable` is the store's own delivery precondition, and the
+        bound is the one the *session* recorded -- not the current launcher's,
+        which after a restart may declare a different one (review finding R4).
+        """
+        self.read_chat(chat_id)
+        message = self._check_record(
+            self._message_record(chat_id, "user", user_text, None, None,
+                                 self._next_sequence(self._messages_dir(chat_id)), ids.now()),
+            "new message")
+        session, stamp = self._require_deliverable(chat_id, session_id)
+        existing = self._read_packets(chat_id, "delivery_request", session_id)
+        packet = self._delivery_request_record(
+            chat_id, session_id, max([d["sequence"] for d in existing] or [0]) + 1,
+            instruction_text, stamp)
+        self._check_packet(chat_id, packet, session=session)
+        return message
 
     def _sessions_opened_by(self, chat_id, message_id):
         """Sessions whose creation transition cites this user message.
@@ -1026,7 +1093,7 @@ class ChatStore(object):
                 return event
         return None
 
-    def _evidence_tables(self, chat_id, ref):
+    def _evidence_tables(self, chat_id, ref, would_be=None):
         """The records contract 5.2's precondition column resolves `ref` against.
 
         The contract supplies the rule and the store supplies the records. Only
@@ -1047,6 +1114,9 @@ class ChatStore(object):
             for message in self.read_messages(chat_id):
                 if message["message_id"] == ref:
                     tables["messages"][ref] = message
+            # A pre-flight asks about a message it has composed and not written.
+            if would_be is not None and would_be.get("message_id") == ref:
+                tables["messages"][ref] = would_be
         elif ref.startswith("evt_"):
             event = self._find_event_in_chat(chat_id, ref)
             if event is not None:
@@ -1066,7 +1136,7 @@ class ChatStore(object):
         return tables
 
     def _require_precondition(self, chat_id, session, transition,
-                              error=TransitionRefused):
+                              error=TransitionRefused, would_be=None):
         """Refuse a transition contract 5.2's *precondition* column rejects.
 
         `AUTHORIZED_TRANSITIONS` and `TRANSITION_PRECONDITIONS` are the two
@@ -1093,7 +1163,7 @@ class ChatStore(object):
         evidence = transition.get("evidence")
         ref = evidence.get("ref") if isinstance(evidence, dict) else None
         violations = contract.transition_precondition_violations(
-            probe, self._evidence_tables(chat_id, ref)
+            probe, self._evidence_tables(chat_id, ref, would_be=would_be)
         )
         if violations:
             detail = "; ".join("%s: %s" % (code, text) for code, _, text in violations)
@@ -1196,9 +1266,20 @@ class ChatStore(object):
     def _packets_dir(self, chat_id):
         return os.path.join(self._require_chat_dir(chat_id), "packets")
 
-    def _append_packet(self, chat_id, record, name):
-        self._require_within_instruction_bound(chat_id, record)
+    def _check_packet(self, chat_id, record, session=None):
+        """The checks every packet is put to before it is written, in this order.
+
+        The contract's record check comes first: it refuses text that is not
+        UTF-8 (`INSTRUCTION_TEXT_NOT_UTF8`) before the bound check measures that
+        text in UTF-8 bytes, which would otherwise raise out of the store as a
+        `UnicodeEncodeError` rather than as a refusal.
+        """
         self._check_record(record, record["record_type"])
+        self._require_within_instruction_bound(chat_id, record, session=session)
+        return record
+
+    def _append_packet(self, chat_id, record, name):
+        self._check_packet(chat_id, record)
         try:
             self._publish_new(
                 _under(self._packets_dir(chat_id), name + ".json"), _dumps(record)
@@ -1213,7 +1294,7 @@ class ChatStore(object):
             )
         return record
 
-    def _require_within_instruction_bound(self, chat_id, record):
+    def _require_within_instruction_bound(self, chat_id, record, session=None):
         """Refuse a packet larger than the bound its session declared.
 
         Contract 6.3: this contract asserts no instruction bound of its own. The
@@ -1233,7 +1314,8 @@ class ChatStore(object):
             # `_check_record` reports as BAD_FIELD_TYPE a line later. A separate
             # "has the field at all" test would be a clause nothing could fail.
             return
-        session = self.read_session(chat_id, record["session_id"])
+        if session is None:
+            session = self.read_session(chat_id, record["session_id"])
         capabilities = session.get("launcher_capabilities")
         bound = (capabilities.get("instruction_bound_bytes")
                  if isinstance(capabilities, dict) else None)
@@ -1268,17 +1350,38 @@ class ChatStore(object):
                 "session, one run identity" % session_id
             )
         self.read_session(chat_id, session_id)
-        record = {
+        record = self._launch_request_record(chat_id, session_id, instruction_text, ids.now())
+        return self._append_packet(chat_id, record, "launch_request-" + record["request_id"])
+
+    @staticmethod
+    def _launch_request_record(chat_id, session_id, instruction_text, stamp):
+        """The one composition of a `launch_request`: the write and its pre-flight."""
+        return {
             "record_type": "launch_request",
             "record_version": RECORD_VERSION,
             "request_id": ids.new_id("req"),
             "chat_id": chat_id,
             "session_id": session_id,
-            "created_at": ids.now(),
+            "created_at": stamp,
             "instruction_encoding": "utf-8",
             "instruction_text": instruction_text,
         }
-        return self._append_packet(chat_id, record, "launch_request-" + record["request_id"])
+
+    @staticmethod
+    def _delivery_request_record(chat_id, session_id, sequence, instruction_text, stamp):
+        """The one composition of a `delivery_request`: the write and its pre-flight."""
+        return {
+            "record_type": "delivery_request",
+            "record_version": RECORD_VERSION,
+            "delivery_id": ids.new_id("dlv"),
+            "chat_id": chat_id,
+            "session_id": session_id,
+            "sequence": sequence,
+            "created_at": stamp,
+            "instruction_encoding": "utf-8",
+            "instruction_text": instruction_text,
+            "acknowledged": None,
+        }
 
     def append_launch_result(self, chat_id, request_id, session_id, outcome,
                              agent_handle=None, failure_category=None, detail=None):
@@ -1353,18 +1456,8 @@ class ChatStore(object):
         for _ in range(_MAX_SEQUENCE_RETRIES):
             existing = self._read_packets(chat_id, "delivery_request", session_id)
             sequence = max([d["sequence"] for d in existing] or [0]) + 1
-            record = {
-                "record_type": "delivery_request",
-                "record_version": RECORD_VERSION,
-                "delivery_id": ids.new_id("dlv"),
-                "chat_id": chat_id,
-                "session_id": session_id,
-                "sequence": sequence,
-                "created_at": stamp,
-                "instruction_encoding": "utf-8",
-                "instruction_text": instruction_text,
-                "acknowledged": None,
-            }
+            record = self._delivery_request_record(chat_id, session_id, sequence,
+                                                   instruction_text, stamp)
             try:
                 return self._append_packet(
                     chat_id, record,
