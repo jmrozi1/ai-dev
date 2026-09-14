@@ -1492,6 +1492,12 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
         "rejected_content_types", "root", "chats_dir", "diagnostics_dir",
     ))
 
+    # Decision 0002, D1: the store-level lock. These write no record -- `acquire`
+    # takes the lock, creates the two top-level directories and sweeps temp
+    # files; `close` gives the lock back -- so there is nothing for the cross to
+    # drive, and they are classified here rather than hidden from the check.
+    STORE_LOCK = frozenset(("acquire", "close", "held", "read_only"))
+
     def _agent_answer(self, store, chat_id, sid):
         event, _created = store.append_diagnostic_event(
             chat_id, sid, store.next_event_sequence(chat_id, sid),
@@ -1636,7 +1642,7 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
         finally:
             shutil.rmtree(work, True)
         driven = set(name.split(":")[0] for name, _op in self.operations())
-        unaccounted = public - self.READ_ONLY - driven
+        unaccounted = public - self.READ_ONLY - self.STORE_LOCK - driven
         self.assertEqual(
             set(), unaccounted,
             "ChatStore gained public method(s) %s that this enumeration neither "
@@ -3132,12 +3138,19 @@ class EveryCodeIsAccountedFor(CodeClosureCase):
         day it gains it -- but only while this stays true, which is what the walk
         below checks. A publishing function added without the check fails here.
         """
-        publishers = ("create_exclusive", "replace", "create_tree_exclusive")
+        # Decision 0002, D1: every publish goes through one of the store's
+        # three gated primitives, which take the store-level lock and then call
+        # the atomic publisher. So a record is published by a function that
+        # calls a gated primitive, and the atomic publishers themselves are
+        # called from those three primitives and from nowhere else.
+        primitives = ("create_exclusive", "replace", "create_tree_exclusive")
+        publishers = ("_publish_new", "_publish_replace", "_publish_tree")
         with open(os.path.join(os.path.dirname(TESTS_DIR), "src", "dory_wrangler",
                                "store.py")) as handle:
             tree = ast.parse(handle.read())
         unchecked = []
         publishing = []
+        calling_a_primitive = []
         for node in ast.walk(tree):
             if not isinstance(node, ast.FunctionDef):
                 continue
@@ -3145,6 +3158,8 @@ class EveryCodeIsAccountedFor(CodeClosureCase):
             for inner in ast.walk(node):
                 if isinstance(inner, ast.Call) and isinstance(inner.func, ast.Attribute):
                     calls.add(inner.func.attr)
+            if calls & set(primitives):
+                calling_a_primitive.append(node.name)
             if not calls & set(publishers):
                 continue
             publishing.append(node.name)
@@ -3161,6 +3176,8 @@ class EveryCodeIsAccountedFor(CodeClosureCase):
             sorted(set(publishing)),
             "the set of functions that publish a record changed; each has to be "
             "re-read rather than only re-counted")
+        self.assertEqual(sorted(publishers), sorted(calling_a_primitive),
+                         "an atomic publisher is called outside the gated primitives")
 
     def test_the_snapshot_this_store_produces_is_a_fixture(self):
         """The `FIXTURE` class: those two codes are about a document, not a record.

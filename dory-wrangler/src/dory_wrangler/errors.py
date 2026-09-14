@@ -58,6 +58,24 @@ class ValidationRefused(StoreError):
     """A record failed the executable contract before it was written."""
 
 
+class StoreInUse(StoreError):
+    """Another process is serving this store (decision 0002, D1).
+
+    v0.1 has exactly one serving process per store. The store-level lock is
+    taken before anything is swept, re-attached or written, so a process that
+    meets this refusal has changed nothing.
+    """
+
+
+class ReadOnlyStore(StoreError):
+    """A write was attempted through a store opened for reading only.
+
+    Read-only tooling -- `validate_store.py`, an offline reader -- may open a
+    store another process is serving. It takes no lock, sweeps nothing and
+    writes nothing, and this is what it meets if it tries.
+    """
+
+
 # -- refusals of the chat loop and lifecycle (#87's harness) -------------
 #
 # Stated refusals of an action a user or launcher asked for. Deliberately not

@@ -33,6 +33,9 @@ import errno
 import fcntl
 import os
 import sys
+import threading
+
+from .errors import StoreInUse
 
 FAULT_ENV = "DORY_WRANGLER_FAULT"
 
@@ -219,6 +222,76 @@ class ChatLock(object):
             os.close(self._fd)
             self._fd = None
         return False
+
+
+# -- the store-level lock (decision 0002, D1) --------------------------------
+
+STORE_LOCK_NAME = ".store-lock"
+
+_OWNERS_GUARD = threading.Lock()
+# realpath of a store root -> [descriptor, holders, pid]. One `flock` per store
+# per process: two descriptors on the same file in one process would refuse each
+# other, and v0.1's rule is about processes, not about objects inside one.
+_OWNERS = {}
+
+
+def own_store(root):
+    """Take the store at `root` for this process, or raise `StoreInUse`.
+
+    Exactly one process may sweep, re-attach or write a store at a time
+    (decision 0002, D1). The lock is an exclusive, non-blocking `flock` on
+    `<root>/.store-lock`, held by an open file description the kernel releases
+    when the process dies, so a killed server leaves no stale lock and nothing
+    here measures time. Within one process the hold is shared and counted.
+
+    Returns `(key, first)`. `first` is true only when this call took the lock
+    rather than joining a hold this process already had: the one moment at which
+    nothing can be mid-write, and so the one moment a sweep is safe.
+
+    A refusal leaves the store as it found it. The only things this can create
+    are the root directory and its lock file, and a store another process holds
+    already has both.
+    """
+    key = os.path.realpath(root)
+    with _OWNERS_GUARD:
+        entry = _OWNERS.get(key)
+        if entry is not None and entry[2] == os.getpid():
+            entry[1] += 1
+            return key, False
+        if entry is not None:
+            # Inherited across a fork that did not exec: the lock is the
+            # parent's open file description, not this process's.
+            raise StoreInUse("the store at %s is held by another process" % key)
+        os.makedirs(key, exist_ok=True)
+        fd = os.open(os.path.join(key, STORE_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise StoreInUse(
+                "another process is serving the store at %s; v0.1 has one serving "
+                "process per store, and this one changed nothing" % key)
+        except BaseException:
+            os.close(fd)
+            raise
+        _OWNERS[key] = [fd, 1, os.getpid()]
+        return key, True
+
+
+def disown_store(key):
+    """Give back one hold taken by `own_store`; the last one releases the lock."""
+    with _OWNERS_GUARD:
+        entry = _OWNERS.get(key)
+        if entry is None or entry[2] != os.getpid():
+            return
+        entry[1] -= 1
+        if entry[1] > 0:
+            return
+        del _OWNERS[key]
+        try:
+            fcntl.flock(entry[0], fcntl.LOCK_UN)
+        finally:
+            os.close(entry[0])
 
 
 def describe_environment():

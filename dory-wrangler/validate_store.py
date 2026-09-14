@@ -40,7 +40,9 @@ def main(argv=None):
         sys.stderr.write("error: %s is not a directory\n" % args.root)
         return 2
 
-    store = ChatStore(args.root, sweep=False)
+    # Read-only (decision 0002, D1): this may run while a shell serves the
+    # store, so it takes no lock, sweeps nothing and writes nothing.
+    store = ChatStore(args.root, read_only=True)
     try:
         records = store.export_records()
         violations = store.verify()

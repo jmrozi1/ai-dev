@@ -30,6 +30,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 
 import pagemodel
@@ -557,15 +558,21 @@ class TestAtomicityProbes(ProbeCase):
         sid = session["session_id"]
         env = dict(os.environ)
         env[atomic.FAULT_ENV] = "pre_publish"
-        subprocess.run(
+        # Decision 0002, D1: the crashing child is the process writing the
+        # store, so this one gives the store-level lock back first -- and the
+        # probe now requires the child to have died at the fault point, so a
+        # child refused the store cannot pass it by writing nothing.
+        self.store.close()
+        completed = subprocess.run(
             [sys.executable, os.path.join(TESTS_DIR, "_crashwriter.py"),
              self.root, "transition", chat_id, sid],
             env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        fresh = ChatStore(self.root, sweep=False)
+        fresh = ChatStore(self.root, read_only=True)
         state = fresh.read_session(chat_id, sid)["state"]
         released = fresh.read_binding(chat_id, sid)["released_at"]
-        held = (state == "pending" and released is None) and not fresh.verify()
+        held = (completed.returncode == atomic.FAULT_EXIT_CODE
+                and state == "pending" and released is None) and not fresh.verify()
         self.record("C4-session-and-binding-cannot-split",
                     "kill the process between a terminal transition and its binding release",
                     held, "state=%s released_at=%s" % (state, released))
@@ -687,37 +694,70 @@ class TestOneAgentPerChat(ProbeCase):
                     "write a second non-terminal session and binding straight to disk",
                     held, "violations: %s" % sorted(codes))
 
-    def test_e3_two_processes_opening_a_session_at_once(self):
+    def test_e3_six_writers_opening_a_session_at_once(self):
+        """Six store objects in six threads call `create_session` on one chat.
+
+        Decision 0002, D1 changed this probe. It raced six *processes*, which
+        asserted that several processes may write one store; v0.1 now refuses
+        every writing process but the one serving the store, and that refusal is
+        E3b below. The property E3 exists for -- the per-chat lock lets exactly
+        one concurrent opener through -- is a property of `ChatLock`, an `flock`
+        on a descriptor each store object opens for itself, so six store
+        objects released together by a barrier race for it exactly as six
+        processes did.
+        """
         chat_id = self.store.create_chat("Race for the agent")["chat_id"]
         user = self.store.append_user_message(chat_id, "one")
+        start = threading.Barrier(6)
+        outcomes = []
+
+        def open_session():
+            store = ChatStore(self.root, sweep=False)
+            start.wait(10)
+            try:
+                store.create_session(chat_id, user["message_id"], "dev-local", ONE_SHOT)
+                outcomes.append("opened")
+            except StoreError:
+                outcomes.append("refused")
+
+        threads = [threading.Thread(target=open_session) for _ in range(6)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        opened = outcomes.count("opened")
+        codes = set(code for code, _w, _d in self.store.verify())
+        held = opened == 1 and len(outcomes) == 6 and not codes
+        self.record("E3-race-to-open-an-agent",
+                    "six writers call create_session on one chat at the same moment",
+                    held, "%d opened, %d refused, violations: %s"
+                    % (opened, len(outcomes) - opened, sorted(codes) or "none"))
+
+    def test_e3b_a_second_process_cannot_open_a_session_on_a_served_store(self):
+        chat_id = self.store.create_chat("Held by this process")["chat_id"]
+        user = self.store.append_user_message(chat_id, "one")
+        before = self.store.export_records()
         script = (
             "import sys;sys.path.insert(0,%r);"
             "from dory_wrangler.store import ChatStore;"
-            "from dory_wrangler.errors import StoreError;"
+            "from dory_wrangler.errors import StoreInUse;"
             "s=ChatStore(%r, sweep=False)\n"
             "try:\n"
             "    s.create_session(%r, %r, 'dev-local', "
             "{'continuation':'fresh_binding','response_shape':'one_shot',"
             "'instruction_bound_bytes':None});print('opened')\n"
-            "except StoreError as e:\n"
+            "except StoreInUse as e:\n"
             "    print('refused')\n"
             % (os.path.join(os.path.dirname(TESTS_DIR), "src"), self.root,
                chat_id, user["message_id"])
         )
-        children = [subprocess.Popen([sys.executable, "-c", script],
-                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    for _ in range(6)]
-        outcomes = []
-        for child in children:
-            out, err = child.communicate()
-            outcomes.append(out.decode("utf-8").strip() or err.decode("utf-8").strip())
-        opened = outcomes.count("opened")
-        codes = set(code for code, _w, _d in self.store.verify())
-        held = opened == 1 and not codes
-        self.record("E3-race-to-open-an-agent",
-                    "six processes call create_session on one chat at the same moment",
-                    held, "%d opened, %d refused, violations: %s"
-                    % (opened, len(outcomes) - opened, sorted(codes) or "none"))
+        completed = subprocess.run([sys.executable, "-c", script],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        out = completed.stdout.decode("utf-8").strip()
+        held = out == "refused" and self.store.export_records() == before
+        self.record("E3b-second-process-refused",
+                    "a second process calls create_session on a store this one serves",
+                    held, out or completed.stderr.decode("utf-8")[-200:])
 
 
 # ---------------------------------------------------------------------------

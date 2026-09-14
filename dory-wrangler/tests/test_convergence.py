@@ -6,8 +6,8 @@ Four claims, each stated over a fact rather than a narrative:
    record has two writers -- read off the product's own sources;
 2. the concurrent-turn policy is one point, its default refuses before
    recording, and the alternative is contract-valid;
-3. the turn lock holds across processes, and re-attachment at start leaves a
-   chat another live process is serving alone;
+3. one serving process per store (decision 0002, D1): a second process is
+   refused before it sweeps, re-attaches or writes, and changes nothing;
 4. every guard convergence *added* to the chat loop has an input it refuses and
    a legal exit for that input -- and the one exit convergence did not provide
    (a `running` session the shell cannot drain) is pinned as measured, so it
@@ -255,19 +255,28 @@ LOCK_HOLDER = textwrap.dedent('''
 ''')
 
 
-class TheTurnLockHoldsAcrossProcesses(unittest.TestCase, StoreCheck):
-    """Two processes serving one store: #86's store was built for it, so the
-    refuse-before-recording rule has to hold across them too."""
+class OneServingProcessPerStore(unittest.TestCase, StoreCheck):
+    """Decision 0002, D1: exactly one serving process per store, enforced.
 
-    def test_a_turn_in_flight_in_another_process_holds_the_chat(self):
+    These two tests replace convergence's `TheTurnLockHoldsAcrossProcesses`,
+    which asserted that two processes could serve one store and that the turn
+    lock serialised them. The review showed a store shared that way is not safe
+    (a second opener swept the first's in-flight writes and re-attached its live
+    agents), and v0.1 never required it. Their expectation changed deliberately:
+    a second process is now refused, before it has swept, re-attached or written
+    anything, and the process serving the store is unaffected.
+    """
+
+    def test_a_second_process_is_refused_the_store_another_is_serving(self):
         root = support.scratch_root()
         store = ChatStore(root)
         chat_id = store.create_chat("Shared")["chat_id"]
-        script = os.path.join(root, "holder.py")
+        store.close()  # this process gives the store to the one that will serve it
+        script = os.path.join(root, "..", os.path.basename(root) + "-holder.py")
         with open(script, "w") as handle:
             handle.write(LOCK_HOLDER)
-        marker = os.path.join(root, "launch-entered")
-        release = os.path.join(root, "release")
+        marker = os.path.join(root, "..", os.path.basename(root) + "-entered")
+        release = os.path.join(root, "..", os.path.basename(root) + "-release")
         child = subprocess.Popen([sys.executable, script, support.SRC, root, chat_id,
                                   marker, release])
         self.addCleanup(lambda: child.poll() is None and child.kill())
@@ -275,16 +284,32 @@ class TheTurnLockHoldsAcrossProcesses(unittest.TestCase, StoreCheck):
             self.assertIsNone(child.poll(), "the other process died before launching")
             time.sleep(0.02)
 
+        reader = ChatStore(root, read_only=True)
+        before = reader.export_records()
+        temp = os.path.join(root, "chats", chat_id, ".tmp-an-unpublished-write")
+        with open(temp, "wb") as handle:
+            handle.write(b"another process's write in flight")
+
         here = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
-        # A fact about the lock, not a timing: it is held by a live process.
-        with here._turns.hold(chat_id, blocking=False) as held:
-            self.assertFalse(held.acquired)
-        # And re-attachment at start leaves that chat alone rather than
-        # resolving a launch another process is in the middle of.
-        self.assertEqual(here.reattach_on_start(), [])
-        session = store.list_sessions(chat_id)[0][0]
-        self.assertEqual(session["state"], "launching")
-        self.assertEqual(store.read_session_observations(chat_id), [])
+        from dory_wrangler.errors import StoreInUse
+        from dory_wrangler.webapp import build_server
+        with self.assertRaises(StoreInUse):
+            here.send_turn(chat_id, "from this process")
+        with self.assertRaises(StoreInUse):
+            here.reattach_on_start()
+        with self.assertRaises(StoreInUse):
+            build_server(root, port=0, quiet=True,
+                         launcher_config={"launcher": "scripted-stub"})
+        # Changed nothing: no record, no transition, no sweep.
+        self.assertEqual(reader.export_records(), before)
+        self.assertTrue(os.path.exists(temp), "a refused process swept a live write")
+        self.assertEqual(reader.list_sessions(chat_id)[0][0]["state"], "launching")
+        # Read-only tooling still works while the store is served.
+        tool = subprocess.run([sys.executable, os.path.join(PRODUCT, "validate_store.py"), root],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.assertIn(tool.returncode, (0, 1), tool.stderr)
+        self.assertEqual(reader.export_records(), before)
+        os.unlink(temp)
 
         open(release, "w").close()
         self.assertEqual(child.wait(), 0)
@@ -293,9 +318,9 @@ class TheTurnLockHoldsAcrossProcesses(unittest.TestCase, StoreCheck):
         self.assertEqual([t for _, _, t in here.transcript(chat_id)], [
             "from the other process", "answer to: from the other process",
             "from this process", "answer to: from this process"])
-        self.assert_store_valid(here.store, "two-processes-one-chat")
+        self.assert_store_valid(here.store, "second-process-refused-then-serves")
 
-    def test_a_turn_refused_across_processes_leaves_nothing(self):
+    def test_a_turn_sent_by_a_second_process_is_refused_and_leaves_nothing(self):
         root = support.scratch_root()
         first = SessionManager(ChatStore(root),
                                ScriptedStubLauncher({"launch_outcomes": ["unknown"]}))
@@ -306,16 +331,137 @@ class TheTurnLockHoldsAcrossProcesses(unittest.TestCase, StoreCheck):
             "from dory_wrangler.store import ChatStore;"
             "from dory_wrangler.session_manager import SessionManager;"
             "from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher;"
-            "from dory_wrangler.errors import ConcurrentLaunchRefused;"
+            "from dory_wrangler.errors import StoreInUse;"
             "m = SessionManager(ChatStore(%r), ScriptedStubLauncher({}));"
             "\ntry:\n    m.send_turn(%r, 'second')\n"
-            "except ConcurrentLaunchRefused:\n    print('refused')\n"
+            "except StoreInUse:\n    print('refused')\n"
             % (support.SRC, root, chat_id))
         before = first.store.export_records()
         out = subprocess.check_output([sys.executable, "-c", program],
                                       universal_newlines=True)
         self.assertEqual(out.strip(), "refused")
         self.assertEqual(first.store.export_records(), before)
+
+
+SERVES_FORTY_TURNS = textwrap.dedent('''
+    import os, sys, collections, time
+    sys.path.insert(0, sys.argv[1])
+    from dory_wrangler.store import ChatStore
+    from dory_wrangler.session_manager import SessionManager
+    from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
+    root, started, finished, release = sys.argv[2:6]
+    manager = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+    manager.store.acquire()
+    open(started, "w").close()
+    failures = collections.Counter()
+    for i in range(40):
+        try:
+            chat_id = manager.create_chat("turn %d" % i)
+            manager.send_turn(chat_id, "hello %d" % i)
+        except BaseException as exc:
+            failures[type(exc).__name__] += 1
+    print(sum(failures.values()), dict(failures))
+    sys.stdout.flush()
+    open(finished, "w").close()
+    while not os.path.exists(release):
+        time.sleep(0.01)
+''')
+
+
+class ASecondShellAgainstALiveOneChangesNothing(unittest.TestCase, StoreCheck):
+    """Review finding R1, as the review reproduced it, closed (decision 0002, D1)."""
+
+    def test_a_real_second_shell_against_a_live_dev_local_one(self):
+        """A live shell with the real `dev-local` launcher holds a running, idle,
+        real agent process. A second `run_shell.py` on the same store -- on the
+        same port, as the review ran it, and on a free one -- is refused and
+        exits having changed nothing: no transition, no observation, no swept
+        temp file, and no second agent."""
+        from shellproc import ShellProcess, children_of, is_alive
+        root = support.scratch_root()
+        first = ShellProcess(root, launcher="dev-local",
+                             launcher_options={"profile": "persistent"})
+        self.addCleanup(first.kill)
+        first.start()
+        agents = lambda: [c for c in children_of(first.process.pid) if is_alive(c)]
+        self.addCleanup(lambda: [os.kill(c, 9) for c in agents()] if first.process else None)
+        _status, chat = first.post("/api/chats", {})
+        path = "/api/chats/%s" % chat["chat_id"]
+        self.assertEqual(first.raw("POST", path + "/messages", {"text": "hello"})[0], 201)
+        self.assertEqual(len(agents()), 1)
+        reader = ChatStore(root, read_only=True)
+        temp = os.path.join(root, "chats", chat["chat_id"], ".tmp-an-unpublished-write")
+        for port in (str(first.port), "0"):
+            with open(temp, "wb") as handle:
+                handle.write(b"a write the live shell has not published yet")
+            before = reader.export_records()
+            second = subprocess.run(
+                [sys.executable, os.path.join(PRODUCT, "run_shell.py"), "--root", root,
+                 "--port", port, "--quiet", "--launcher", "dev-local",
+                 "--launcher-options", json.dumps({"profile": "persistent"})],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+            self.assertEqual(second.returncode, 3, second.stderr)
+            self.assertIn(b"another shell is already serving", second.stderr)
+            self.assertEqual(reader.export_records(), before, "the second shell wrote")
+            self.assertTrue(os.path.exists(temp), "the second shell swept a live write")
+            self.assertEqual(reader.list_sessions(chat["chat_id"])[0][0]["state"], "running")
+            self.assertEqual(reader.read_session_observations(chat["chat_id"]), [])
+        os.unlink(temp)
+        # The first shell's agent is untouched: its next turn is delivered to it.
+        self.assertEqual(first.raw("POST", path + "/messages", {"text": "still there?"})[0], 201)
+        self.assertEqual(len(agents()), 1, "a second agent was started for the chat")
+        self.assertEqual(len(reader.list_sessions(chat["chat_id"])), 1)
+        self.assertEqual(reader.verify(), [])
+
+    def test_forty_turns_served_while_another_process_keeps_trying_to_serve(self):
+        """The review's 40-turn run: one process serves 40 turns while another
+        opens the store the way a serving process does, as fast as it can. Every
+        attempt is refused, and every turn is served whole."""
+        from dory_wrangler.errors import StoreInUse
+        from dory_wrangler.webapp import build_server
+        root = support.scratch_root()
+        script = os.path.join(root, "..", os.path.basename(root) + "-forty.py")
+        started, finished, release = (
+            os.path.join(root, "..", os.path.basename(root) + suffix)
+            for suffix in ("-started", "-finished", "-release"))
+        with open(script, "w") as handle:
+            handle.write(SERVES_FORTY_TURNS)
+        child = subprocess.Popen([sys.executable, script, support.SRC, root, started,
+                                  finished, release],
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                 universal_newlines=True)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        while not os.path.exists(started):
+            self.assertIsNone(child.poll(), child.stderr.read() if child.poll() else "")
+            time.sleep(0.01)
+        refused, opened = 0, 0
+        # Until the serving process says it has finished -- it then waits, still
+        # holding the store, so no attempt below can land after it exits.
+        while not os.path.exists(finished):
+            self.assertIsNone(child.poll())
+            try:
+                build_server(root, port=0, quiet=True,
+                             launcher_config={"launcher": "scripted-stub"}).server_close()
+                opened += 1
+            except StoreInUse:
+                refused += 1
+        open(release, "w").close()
+        out, err = child.communicate()
+        self.assertEqual(out.strip(), "0 {}", err)
+        self.assertEqual(opened, 0)
+        self.assertGreater(refused, 0)
+        store = ChatStore(root, read_only=True)
+        chats = store.list_chats()
+        self.assertEqual(len(chats), 40)
+        for chat in chats:
+            self.assertEqual([s["state"] for s, _ in store.list_sessions(chat["chat_id"])],
+                             ["completed"])
+            self.assertEqual([m["author"] for m in store.read_messages(chat["chat_id"])],
+                             ["user", "agent"])
+        self.assertEqual(store.verify(), [])
+        # And once the serving process is gone, the application starts.
+        build_server(root, port=0, quiet=True,
+                     launcher_config={"launcher": "scripted-stub"}).server_close()
 
 
 class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):

@@ -514,15 +514,39 @@ class ShellServer(ThreadingHTTPServer):
         self.quiet = quiet
         ThreadingHTTPServer.__init__(self, address, ShellHandler)
 
+    def server_close(self):
+        try:
+            ThreadingHTTPServer.server_close(self)
+        finally:
+            # The server was the store's one serving process; closing it gives
+            # the store-level lock back (decision 0002, D1).
+            self.service.store.close()
+
 
 def build_server(root, host="127.0.0.1", port=8765, quiet=False, launcher_config=None,
                  launcher=None):
     """The one served application: the shell, over the chat loop, over the store.
 
-    Re-attachment happens here, once, before the first request is served
-    (contract 5.4), so a chat a restart interrupted has already been carried to
-    a state its user can act on by the time anyone opens it.
+    In this order, and the order is the point (decision 0002, D1):
+
+    1. **take the store.** The store-level lock is taken before anything is
+       swept, re-attached or written. A second shell on a store another process
+       serves is refused here, with `StoreInUse`, having changed nothing;
+    2. **bind.** A shell that cannot serve does not re-attach anyone's agents;
+    3. **re-attach**, once, before the first request is served (contract 5.4),
+       so a chat a restart interrupted has already been carried to a state its
+       user can act on by the time anyone opens it.
     """
     service = ChatService.open(root, launcher_config=launcher_config, launcher=launcher)
-    service.sessions.reattach_on_start()
-    return ShellServer((host, port), service, quiet=quiet)
+    try:
+        service.store.acquire()
+        server = ShellServer((host, port), service, quiet=quiet)
+    except BaseException:
+        service.store.close()
+        raise
+    try:
+        service.sessions.reattach_on_start()
+    except BaseException:
+        server.server_close()
+        raise
+    return server

@@ -13,8 +13,12 @@ import json
 import os
 import sys
 
+from .errors import StoreInUse
 from .service import DEFAULT_LAUNCHER
 from .webapp import build_server
+
+# A second shell on a store another process is serving.
+EXIT_STORE_IN_USE = 3
 
 
 def main(argv=None):
@@ -40,8 +44,18 @@ def main(argv=None):
     else:
         options = {}
     config = {"launcher": args.launcher, "options": options}
-    server = build_server(args.root, host=args.host, port=args.port, quiet=args.quiet,
-                          launcher_config=config)
+    try:
+        server = build_server(args.root, host=args.host, port=args.port, quiet=args.quiet,
+                              launcher_config=config)
+    except StoreInUse:
+        # Decision 0002, D1: one serving process per store. Refused before
+        # anything was swept, re-attached or written, so there is nothing to
+        # undo and nothing to report but the refusal itself.
+        sys.stderr.write(
+            "dory-wrangler: another shell is already serving the store at %s; "
+            "this one changed nothing and is exiting\n" % os.path.abspath(args.root))
+        sys.stderr.flush()
+        return EXIT_STORE_IN_USE
     bound = server.server_address[1]
     if args.port_file:
         with open(args.port_file, "w") as handle:

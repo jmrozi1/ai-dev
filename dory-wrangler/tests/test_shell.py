@@ -5,6 +5,7 @@ product a user touches rather than about a Python object.
 """
 
 import ast
+import contextlib
 import inspect
 import json
 import os
@@ -26,6 +27,23 @@ class ShellCase(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         self.shell = ShellProcess(self.root).start()
         self.addCleanup(self.shell.kill)
+
+    @contextlib.contextmanager
+    def stopped_shell_store(self):
+        """Write into the store while no shell serves it, then serve it again.
+
+        Decision 0002, D1: one serving process per store. These tests used to
+        write records behind a live shell's back from the test process, which is
+        a second writer on a served store; they now stop the shell, write, give
+        the store back, and restart it, so the shell serves what is on disk.
+        """
+        self.shell.kill()
+        store = ChatStore(self.root)
+        try:
+            yield store
+        finally:
+            store.close()
+            self.shell.start()
 
 
 class TestShellFlows(ShellCase):
@@ -163,9 +181,9 @@ class TestShellBoundaries(ShellCase):
         # The inventory is of the code; this is the same claim made of the
         # running process. Every intended route answers, and a sample of the
         # worker-internal shapes somebody would reach for does not.
-        store = ChatStore(self.root)
-        chat_id = store.create_chat("Bounded")["chat_id"]
-        session, event, _message = answered_turn(store, chat_id, "q", "the answer")
+        with self.stopped_shell_store() as store:
+            chat_id = store.create_chat("Bounded")["chat_id"]
+            session, event, _message = answered_turn(store, chat_id, "q", "the answer")
 
         for method, path in (
             ("GET", "/"), ("GET", "/index.html"), ("GET", "/healthz"),
@@ -204,9 +222,10 @@ class TestShellBoundaries(ShellCase):
         launch packet and preserved agent output, and requires that none of
         those reach the browser through any of them.
         """
-        store = ChatStore(self.root)
-        chat_id = store.create_chat("Bounded")["chat_id"]
-        session, event, _message = answered_turn(store, chat_id, "q", "the answer")
+        with self.stopped_shell_store() as store:
+            chat_id = store.create_chat("Bounded")["chat_id"]
+            session, event, _message = answered_turn(store, chat_id, "q", "the answer")
+        store = ChatStore(self.root, read_only=True)
         preserved = store.read_diagnostic_events(
             chat_id, session_id=session["session_id"]
         )
@@ -244,7 +263,7 @@ class TestShellBoundaries(ShellCase):
         status, abandoned = live.raw("POST", "/api/chats/%s/abandon" % stuck["chat_id"], {})
         self.assertEqual(status, 200)
         served.append(("POST /api/chats/<id>/abandon", abandoned))
-        unknown_store = ChatStore(live.root)
+        unknown_store = ChatStore(live.root, read_only=True)
         unknown_session = unknown_store.list_sessions(stuck["chat_id"])[0][0]
         secrets_elsewhere = [unknown_session["session_id"], "abandoned", "unknown"]
         for where, body in served[-3:]:
@@ -279,9 +298,9 @@ class TestShellBoundaries(ShellCase):
                 )
 
     def test_the_transcript_payload_carries_no_worker_internals(self):
-        store = ChatStore(self.root)
-        chat_id = store.create_chat("Bounded")["chat_id"]
-        session, event, _message = answered_turn(store, chat_id, "q", "the answer")
+        with self.stopped_shell_store() as store:
+            chat_id = store.create_chat("Bounded")["chat_id"]
+            session, event, _message = answered_turn(store, chat_id, "q", "the answer")
 
         _status, opened = self.shell.get("/api/chats/" + chat_id)
         blob = json.dumps(opened)
@@ -336,11 +355,11 @@ class TestShellRejectsBadAddressing(ShellCase):
 
 class TestShellFailsClosed(ShellCase):
     def test_a_corrupt_history_is_refused_rather_than_partially_rendered(self):
-        store = ChatStore(self.root)
-        chat_id = store.create_chat("Broken")["chat_id"]
-        for i in range(3):
-            store.append_user_message(chat_id, "turn %d" % i)
-        os.unlink(os.path.join(self.root, "chats", chat_id, "messages", "00000002.json"))
+        with self.stopped_shell_store() as store:
+            chat_id = store.create_chat("Broken")["chat_id"]
+            for i in range(3):
+                store.append_user_message(chat_id, "turn %d" % i)
+            os.unlink(os.path.join(self.root, "chats", chat_id, "messages", "00000002.json"))
 
         try:
             status, body = self.shell.get("/api/chats/" + chat_id)

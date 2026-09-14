@@ -51,10 +51,13 @@ class TestInterruptedWrites(StoreCase):
         self.store.append_user_message(self.chat_id, "turn one")
         self.store.append_user_message(self.chat_id, "turn two")
         self.before = self.store.read_messages(self.chat_id)
+        # Decision 0002, D1: the crashing child is the one process writing the
+        # store, so this process gives the store-level lock back before it runs.
+        self.store.close()
 
     def read_fresh(self):
         """Read the store as a process that has never seen a write would."""
-        return ChatStore(self.root, sweep=False)
+        return ChatStore(self.root, read_only=True)
 
     def test_every_fault_point_leaves_a_whole_store(self):
         exercised = []
@@ -148,9 +151,10 @@ class TestInterruptedWrites(StoreCase):
         self.assertLess(chat["updated_at"], messages[-1]["created_at"])
         self.assertEqual(fresh.verify(), [])
         # And the next successful append brings it forward again.
-        fresh.append_user_message(self.chat_id, "the next turn")
+        writer = ChatStore(self.root)
+        writer.append_user_message(self.chat_id, "the next turn")
         self.assertGreater(
-            fresh.read_chat(self.chat_id)["updated_at"], before_chat["updated_at"]
+            writer.read_chat(self.chat_id)["updated_at"], before_chat["updated_at"]
         )
 
     def test_an_interrupted_chat_creation_leaves_no_half_chat(self):
@@ -191,6 +195,7 @@ class TestInterruptedWrites(StoreCase):
              "instruction_bound_bytes": None},
         )
         sid = session["session_id"]
+        self.store.close()
         reached = []
         for point in atomic.FAULT_POINTS:
             code, _ = crash_write(self.root, point, "transition", chat_id, sid)
@@ -259,8 +264,17 @@ class TestConcurrentSenders(StoreCase):
         )
         self.assertStoreValid()
 
-    def test_two_processes_racing_for_a_sequence_lose_nothing(self):
+    def test_a_second_writing_process_is_refused_and_writes_nothing(self):
+        """Decision 0002, D1 -- this replaces `test_two_processes_racing_for_a_
+        sequence_lose_nothing`, which asserted that eight processes could write
+        one store at once. v0.1 has one serving process per store, so the
+        expectation changed deliberately: while this process holds the store,
+        every other writing process is refused before it writes anything.
+        Sequence allocation between concurrent writers is still proven, between
+        threads, by `test_threads_racing_for_a_sequence_lose_nothing`."""
         chat_id = self.store.create_chat("Race")["chat_id"]
+        self.assertTrue(self.store.held)
+        before = self.store.export_records()
         children = [
             subprocess.Popen(
                 [sys.executable, CRASH_WRITER, self.root, "message", chat_id, "racer %d" % i],
@@ -270,14 +284,10 @@ class TestConcurrentSenders(StoreCase):
         ]
         for child in children:
             _out, err = child.communicate()
-            self.assertEqual(child.returncode, 0, err.decode())
-        messages = self.store.read_messages(chat_id)
-        self.assertEqual([m["sequence"] for m in messages], list(range(1, 9)))
-        self.assertEqual(
-            sorted(m["content"]["text"] for m in messages),
-            sorted("racer %d" % i for i in range(8)),
-        )
-        self.assertStoreValid()
+            self.assertNotEqual(child.returncode, 0)
+            self.assertIn(b"StoreInUse", err)
+        self.assertEqual(self.store.export_records(), before)
+        self.assertEqual(self.store.read_messages(chat_id), [])
 
     def test_the_second_writer_of_a_name_is_refused(self):
         """The primitive itself: exclusive creation, not last-writer-wins."""

@@ -118,11 +118,14 @@ a public `ChatStore` method, so no record has two writers. Consequences:
   deliver is never left in the chat unoffered; a launcher-mutated `DeliveryAck`
   records nothing; re-attachment at start skips a chat whose turn lock another
   live process holds, and a chat whose records cannot be read.
-* **A turn lock that crosses processes.** #87 held a per-chat in-process lock for
-  a whole turn; #86's store is shared safely by more than one process. The loop
-  now holds an `flock` on `chats/<id>/.turn-lock` for each user action,
-  re-entrant within a thread. A process that dies releases it; nothing measures
-  time.
+* **A per-chat turn lock.** #87 held a per-chat in-process lock for a whole
+  turn. The loop now holds an `flock` on `chats/<id>/.turn-lock` for each user
+  action, re-entrant within a thread, so threads of the one serving process are
+  serialised per chat and a launcher that calls back into the loop is refused
+  rather than deadlocked. A process that dies releases it; nothing measures
+  time. *Corrected in place:* this bullet used to say "#86's store is shared
+  safely by more than one process" and presented the lock as what made that
+  safe. That was false; see section 5.
 * **Ids and clock are the store's.** #87 injected an id factory and a clock so
   its stores were byte-comparable run to run; the store mints both, so those
   parameters are gone rather than accepted and ignored. Nothing asserted
@@ -162,11 +165,71 @@ durable; `POST /api/chats/<id>/abandon` is new (decision 0003); the chat loop's
 refusals reach the browser as fixed sentences with no identifier, state name or
 lifecycle word in them, flagged `"refused": true`; a launcher that misuses the
 seam answers 502; `serve.py` takes `--launcher` and `--launcher-options`; and
-re-attachment runs once when the server is built, before the first request.
+re-attachment runs once when the server is built, before the first request --
+after the store-level lock is taken and the port is bound (section 5), so a
+shell that cannot serve re-attaches nothing.
 
 The default launcher is `dev-local` with profile `one_shot`, the shape of the
 one proven internal path. The test shell runs `scripted-stub`, so no test starts
 an operating-system process through the shell.
+
+## 5. One serving process per store (corrected in place: decision D1)
+
+**The claim that was here, and why it was false.** This decision said that
+#86's store "is shared safely by more than one process", and convergence's
+`TheTurnLockHoldsAcrossProcesses` tests were offered as the evidence. The
+independent review of convergence (finding R1) showed otherwise, on the
+product, with real processes:
+
+* a second `run_shell.py` started on the same store re-attached before it bound
+  its port, so it turned the first server's live, idle `running` agents
+  `unknown` and then exited on "address already in use"; with the real
+  `dev-local` launcher the user's Abandon then orphaned the first agent process
+  and the next turn started a second agent for the same chat;
+* opening a `ChatStore` swept `.tmp-` files across the whole root, deleting
+  another live process's writes in flight: in one 40-turn run 33 turns failed,
+  sessions were stranded in `running`, `launching` and `pending`, and one chat
+  directory lost its chat record, after which the application would not start.
+
+The per-chat turn lock serialised *turns*; it never covered a second process's
+start-up, its sweep, or an idle live agent. The two-process tests were green
+because they opened the second store while the first was parked with no write
+in flight. v0.1 never required a multi-writer store -- the release is one user
+and one shell -- so the truthful fix is to enforce that the store is not
+shared, not to build the property the sentence claimed.
+
+**The rule that replaces it.**
+
+* **Exactly one process serves a store.** It holds an exclusive, non-blocking
+  `flock` on `<root>/.store-lock` (`atomic.own_store`), taken **before** anything
+  is swept, re-attached or written, and held for the life of the server. The
+  kernel releases it when the process dies, so a killed server leaves no stale
+  lock and nothing measures time.
+* **Nothing sweeps or writes without it.** Every write `ChatStore` makes goes
+  through five gated primitives (`_publish_new`, `_publish_replace`,
+  `_publish_tree`, `_make_dirs`, `_lock`), each of which takes the store-level
+  lock first; the chat loop's turn-lock file is created only after the same
+  check. Temp files are swept when a process *takes* the lock, which is the one
+  moment no write can be in flight. A second process that tries to serve or
+  write fails closed with `StoreInUse` having changed nothing; `run_shell.py`
+  exits with status 3 and says so.
+* **The served application takes the store, binds, then re-attaches**
+  (`build_server`), so a shell refused the store or the port changes nothing.
+* **Read-only tooling still works.** `ChatStore(root, read_only=True)` takes no
+  lock, sweeps nothing, creates nothing and refuses every write with
+  `ReadOnlyStore`; `validate_store.py` opens the store that way and runs against
+  a live server.
+* **Within the one process** the store-level hold is shared by every
+  `ChatStore` over that root and counted, and the per-chat turn lock remains,
+  for threads and for a launcher that re-enters the loop.
+* Decision 0001's remark that `os.link` makes message-sequence allocation safe
+  "between processes with no lock" remains true of the primitive; the product
+  no longer relies on it across processes, and it is proven between threads.
+
+Tests whose expectation changed with this rule, each deliberately and not as a
+weakening, are listed in the rail handoff `issue-88-convergence-remediation`.
+The rule is surfaced to the human as overridable: making the store genuinely
+multi-writer would be new architecture for a property v0.1 does not require.
 
 ## Not decided here
 

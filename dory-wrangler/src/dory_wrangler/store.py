@@ -5,6 +5,7 @@ about history is a guarantee about this module.
 
 ## Layout
 
+    <root>/.store-lock                         held by the one serving process (D1)
     <root>/chats/<chat_id>/chat.json
     <root>/chats/<chat_id>/.lock
     <root>/chats/<chat_id>/messages/00000001.json
@@ -43,6 +44,7 @@ trusted. No read path repairs anything.
 import json
 import os
 import re
+import weakref
 
 from . import atomic
 from . import contract
@@ -51,6 +53,7 @@ from .errors import (
     ConcurrencyRefused,
     NotFound,
     ProvenanceRefused,
+    ReadOnlyStore,
     StoreCorrupt,
     TransitionRefused,
     UnsupportedContentType,
@@ -153,6 +156,18 @@ def _under(base, *components):
     return os.path.join(base, *checked)
 
 
+def _listdir(directory):
+    """Names in a directory that may not exist yet.
+
+    A store is created by its first write, and a reader that opens it before
+    then -- read-only tooling does not create anything -- sees an empty store
+    rather than an error.
+    """
+    if not os.path.isdir(directory):
+        return []
+    return os.listdir(directory)
+
+
 def _json_names(directory):
     """Record file names in a directory, temp files excluded by construction."""
     if not os.path.isdir(directory):
@@ -167,19 +182,82 @@ def _json_names(directory):
 
 
 class ChatStore(object):
-    """Durable storage for contract v0.1 records."""
+    """Durable storage for contract v0.1 records.
 
-    def __init__(self, root, sweep=True):
+    ## One serving process per store (decision 0002, D1)
+
+    Nothing sweeps, creates, publishes or locks anything in a store without
+    first holding the store-level lock (`atomic.own_store`). Every write in this
+    class goes through one of the gated primitives below -- `_publish_new`,
+    `_publish_replace`, `_publish_tree`, `_make_dirs`, `_lock` -- and each takes
+    the lock before it touches the filesystem, so a second process that tries to
+    write is refused with `StoreInUse` before it has changed anything. The lock
+    is taken on the first write (or by `acquire`, which the served application
+    calls before re-attaching), held for the life of this object, and released
+    by `close` or when the object is collected.
+
+    Temp files are swept when this process takes the lock, not when an object
+    is constructed: that is the only moment at which no write of this process
+    can be in flight, and the lock means no other process has one either.
+
+    `read_only=True` is for tooling that must work while a server runs
+    (`validate_store.py`): it takes no lock, sweeps nothing, creates nothing,
+    and refuses every write with `ReadOnlyStore`.
+    """
+
+    def __init__(self, root, sweep=True, read_only=False):
         self.root = os.path.abspath(root)
         self.chats_dir = os.path.join(self.root, "chats")
         self.diagnostics_dir = os.path.join(self.root, "diagnostics")
-        os.makedirs(self.chats_dir, exist_ok=True)
-        os.makedirs(self.diagnostics_dir, exist_ok=True)
+        self.read_only = bool(read_only)
         # Contract 4.2: richer content fails closed and is *counted* rather than
         # silently downgraded. This is that count.
         self.rejected_content_types = {}
-        if sweep:
+        self._sweep = sweep
+        self._release = None
+
+    # -- the store-level lock (D1) --------------------------------------
+
+    def acquire(self):
+        """Hold this store for writing, or raise `StoreInUse` having changed nothing."""
+        if self.read_only:
+            raise ReadOnlyStore(
+                "this store was opened for reading only; it takes no lock and writes "
+                "nothing")
+        if self._release is not None and self._release.alive:
+            return
+        key, first = atomic.own_store(self.root)
+        self._release = weakref.finalize(self, atomic.disown_store, key)
+        os.makedirs(self.chats_dir, exist_ok=True)
+        os.makedirs(self.diagnostics_dir, exist_ok=True)
+        if first and self._sweep:
             atomic.sweep_temp_files(self.root)
+
+    def close(self):
+        """Give the store-level lock back. A later write takes it again."""
+        if self._release is not None:
+            self._release()
+            self._release = None
+
+    @property
+    def held(self):
+        return self._release is not None and self._release.alive
+
+    def _publish_new(self, path, data):
+        self.acquire()
+        atomic.create_exclusive(path, data)
+
+    def _publish_replace(self, path, data):
+        self.acquire()
+        atomic.replace(path, data)
+
+    def _publish_tree(self, parent, final_name, builder):
+        self.acquire()
+        atomic.create_tree_exclusive(parent, final_name, builder)
+
+    def _make_dirs(self, path):
+        self.acquire()
+        os.makedirs(path, exist_ok=True)
 
     # -- paths ---------------------------------------------------------
 
@@ -195,7 +273,9 @@ class ChatStore(object):
         return path
 
     def _lock(self, chat_id):
-        return atomic.ChatLock(os.path.join(self._require_chat_dir(chat_id), ".lock"))
+        path = os.path.join(self._require_chat_dir(chat_id), ".lock")
+        self.acquire()
+        return atomic.ChatLock(path)
 
     # -- record validation ---------------------------------------------
 
@@ -249,7 +329,7 @@ class ChatStore(object):
                 handle.write(_dumps(record))
 
         try:
-            atomic.create_tree_exclusive(self.chats_dir, chat_id, build)
+            self._publish_tree(self.chats_dir, chat_id, build)
         except FileExistsError:
             raise ConcurrencyRefused("chat %s already exists" % chat_id)
         return record
@@ -276,7 +356,7 @@ class ChatStore(object):
         identifier to produce it.
         """
         chats = []
-        for name in sorted(os.listdir(self.chats_dir)):
+        for name in sorted(_listdir(self.chats_dir)):
             if name.startswith(atomic.TEMP_PREFIX):
                 continue
             if not os.path.isdir(os.path.join(self.chats_dir, name)):
@@ -304,7 +384,7 @@ class ChatStore(object):
             chat["state"] = "archived"
             chat["updated_at"] = ids.now()
             self._check_record(chat, "archived chat")
-            atomic.replace(
+            self._publish_replace(
                 os.path.join(self._chat_dir(chat_id), "chat.json"), _dumps(chat)
             )
         return chat
@@ -325,7 +405,7 @@ class ChatStore(object):
             chat["title"] = title
             chat["updated_at"] = ids.now()
             self._check_record(chat, "renamed chat")
-            atomic.replace(
+            self._publish_replace(
                 os.path.join(self._chat_dir(chat_id), "chat.json"), _dumps(chat)
             )
         return chat
@@ -336,7 +416,7 @@ class ChatStore(object):
             if chat["updated_at"] < stamp:
                 chat["updated_at"] = stamp
                 self._check_record(chat, "chat")
-                atomic.replace(
+                self._publish_replace(
                     os.path.join(self._chat_dir(chat_id), "chat.json"), _dumps(chat)
                 )
 
@@ -438,7 +518,7 @@ class ChatStore(object):
                 "new message",
             )
             try:
-                atomic.create_exclusive(
+                self._publish_new(
                     os.path.join(directory, _seq_name(sequence)), _dumps(record)
                 )
             except FileExistsError as exc:
@@ -590,9 +670,9 @@ class ChatStore(object):
         path = self._session_path(chat_id, session["session_id"])
         data = _dumps({"session": session, "binding": binding})
         if create:
-            atomic.create_exclusive(path, data)
+            self._publish_new(path, data)
         else:
-            atomic.replace(path, data)
+            self._publish_replace(path, data)
 
     def read_session(self, chat_id, session_id):
         path = self._session_path(chat_id, session_id)
@@ -657,9 +737,7 @@ class ChatStore(object):
         the same "a repair can leave a guard nothing can prove" shape the last
         rail reported one function over.
         """
-        chat_dir = self._require_chat_dir(chat_id)
-
-        with atomic.ChatLock(os.path.join(chat_dir, ".lock")):
+        with self._lock(chat_id):
             status = self.chat_agent_status(chat_id)
             if status["open_bindings"]:
                 raise ConcurrencyRefused(
@@ -1122,7 +1200,7 @@ class ChatStore(object):
         self._require_within_instruction_bound(chat_id, record)
         self._check_record(record, record["record_type"])
         try:
-            atomic.create_exclusive(
+            self._publish_new(
                 _under(self._packets_dir(chat_id), name + ".json"), _dumps(record)
             )
         except FileExistsError as exc:
@@ -1354,7 +1432,7 @@ class ChatStore(object):
                     "delivery %s is not stored under the name its session and "
                     "sequence give it" % delivery_id
                 )
-            atomic.replace(path, _dumps(updated))
+            self._publish_replace(path, _dumps(updated))
         return updated
 
     def append_session_observation(self, chat_id, session_id, kind, detail=None):
@@ -1464,7 +1542,7 @@ class ChatStore(object):
                 "to have observed" % session_id
             )
         directory = self._events_dir(chat_id, session_id)
-        os.makedirs(directory, exist_ok=True)
+        self._make_dirs(directory)
         # Contract P3: event `sequence` is contiguous from 1 within its session,
         # and "a gap means a turn was lost; it is never closed silently". A
         # caller naming a sequence beyond the next one writes that gap, and the
@@ -1496,7 +1574,7 @@ class ChatStore(object):
         )
         path = _under(directory, _seq_name(sequence))
         try:
-            atomic.create_exclusive(path, _dumps(record))
+            self._publish_new(path, _dumps(record))
         except FileExistsError:
             existing = self._check_read(_loads(path), path)
             if existing["raw"] != record["raw"] or existing["source"] != record["source"]:
@@ -1614,7 +1692,7 @@ class ChatStore(object):
         what the exporter chose to emit rather than about what is on disk.
         """
         records = []
-        for name in sorted(os.listdir(self.chats_dir)):
+        for name in sorted(_listdir(self.chats_dir)):
             if name.startswith(atomic.TEMP_PREFIX):
                 continue
             chat_dir = _under(self.chats_dir, name)
@@ -1638,7 +1716,7 @@ class ChatStore(object):
             (r["session_id"], r["sequence"]) for r in records
             if r.get("record_type") == "diagnostic_event"
         )
-        for chat_id in sorted(os.listdir(self.diagnostics_dir)):
+        for chat_id in sorted(_listdir(self.diagnostics_dir)):
             if chat_id.startswith(atomic.TEMP_PREFIX):
                 continue
             base = _under(self.diagnostics_dir, chat_id)

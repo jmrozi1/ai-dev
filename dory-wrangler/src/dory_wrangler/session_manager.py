@@ -126,6 +126,9 @@ class _Held(object):
     def __enter__(self):
         path = os.path.join(self._turns.store._require_chat_dir(self._chat_id),
                             TURN_LOCK_NAME)
+        # The turn-lock file is created in the store, so it is a write, and no
+        # write happens without the store-level lock (decision 0002, D1).
+        self._turns.store.acquire()
         with self._turns.guard:
             turn = self._turns.table.setdefault(self._chat_id, _ChatTurn())
         if not turn.rlock.acquire(self._blocking):
