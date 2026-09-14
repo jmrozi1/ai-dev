@@ -17,12 +17,12 @@ Release intent and the checkpoint roadmap are `jmrozi1/ai-dev` #81.
 | `fixtures/v0.1/valid/` | store snapshots the contract must accept, including both continuation modes and both restart outcomes |
 | `fixtures/v0.1/invalid/` | store snapshots the contract must reject, each naming the rule it violates |
 | `validator/validate_contract.py` | the executable form of the contract |
-| `harness/` | the swappable single-agent launch boundary (#87), its two launcher implementations, and its tests |
+| `launch-boundary.md` | the swappable single-agent launch boundary (#87): the seam, the launchers, and the launcher-author obligations |
 | `decisions/0001-runtime-and-storage.md` | the recorded runtime and storage choice, and its Rocky Linux 9 risks as claims to settle |
-| `src/dory_wrangler/` | the chat shell and its durable store |
+| `src/dory_wrangler/` | the chat shell, its durable store, the launch seam (`launch_boundary.py`), the chat loop (`session_manager.py`), and the launchers (`launchers/`) |
 | `run_shell.py` | run the shell |
 | `validate_store.py` | check a live store against the contract |
-| `tests/` | the test suite, including the adversarial probes |
+| `tests/` | the one test suite for all of it, including both sides' adversarial probes |
 
 ## Running the shell
 

@@ -25,12 +25,12 @@ import unittest
 import support
 from support import StoreCheck, end_chat, expected_transcript, run_three_turns
 
-import launch_boundary as lb
-import session_manager
-from app import open_harness
-from errors import ConcurrentLaunchRefused, NotPermitted
+from dory_wrangler import launch_boundary as lb
+from dory_wrangler import session_manager
+from dory_wrangler.wiring import open_harness
+from dory_wrangler.errors import ConcurrentLaunchRefused, NotPermitted
 from internal_bridge import InternalBridgeLauncher
-from launchers.registry import UnknownLauncher, build_launcher
+from dory_wrangler.launchers.registry import UnknownLauncher, build_launcher
 
 
 class TheSeamHostsTheModelledInternalPath(unittest.TestCase, StoreCheck):

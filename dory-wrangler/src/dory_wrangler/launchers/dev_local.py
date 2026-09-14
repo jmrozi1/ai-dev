@@ -33,7 +33,7 @@ import subprocess
 import sys
 import threading
 
-from launch_boundary import (
+from ..launch_boundary import (
     DeliveryAck,
     EventPayload,
     EventsPage,

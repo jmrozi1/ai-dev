@@ -14,7 +14,7 @@ import unittest
 import support
 from support import StoreCheck
 
-from errors import ConcurrentLaunchRefused, NotPermitted
+from dory_wrangler.errors import ConcurrentLaunchRefused, NotPermitted
 
 
 def live_agent_harness(salt="b", continuation="fresh_binding"):

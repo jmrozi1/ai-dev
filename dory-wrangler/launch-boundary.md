@@ -28,7 +28,7 @@ it.
 ## Running it
 
 ```
-python3 dory-wrangler/harness/tests/run_tests.py
+python3 dory-wrangler/tests/run_tests.py
 ```
 
 Python 3 standard library only; no test framework beyond `unittest`. Three

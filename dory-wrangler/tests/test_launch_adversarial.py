@@ -25,15 +25,15 @@ import unittest
 import support
 from support import StoreCheck, codes, run_three_turns
 
-import identity
-import launch_boundary as lb
-import launchers.dev_local as dev_local
-import launchers.scripted_stub as scripted_stub
-import session_manager
-import store as store_module
-from app import open_harness
-from errors import ConcurrentLaunchRefused, InstructionTooLarge, NotPermitted
-from launchers.scripted_stub import ScriptedStubLauncher
+from dory_wrangler import identity
+from dory_wrangler import launch_boundary as lb
+from dory_wrangler.launchers import dev_local
+from dory_wrangler.launchers import scripted_stub
+from dory_wrangler import session_manager
+from dory_wrangler import harness_store as store_module
+from dory_wrangler.wiring import open_harness
+from dory_wrangler.errors import ConcurrentLaunchRefused, InstructionTooLarge, NotPermitted
+from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 
 
 def stub_harness(salt="a", **options):

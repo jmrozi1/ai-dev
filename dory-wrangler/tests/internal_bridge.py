@@ -65,7 +65,7 @@ from __future__ import annotations
 import json
 import uuid
 
-import launch_boundary as lb
+from dory_wrangler import launch_boundary as lb
 
 
 def _default_script(instruction_text):

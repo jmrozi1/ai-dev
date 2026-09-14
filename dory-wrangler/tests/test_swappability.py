@@ -8,6 +8,7 @@ chat and session layers never load, name, or branch on a launcher.
 
 from __future__ import annotations
 
+import importlib
 import inspect
 import re
 import subprocess
@@ -17,11 +18,11 @@ import unittest
 import support
 from support import StoreCheck, expected_transcript, run_three_turns
 
-import launch_boundary as lb
-import session_manager
-import store as store_module
-from app import open_harness
-from launchers.registry import UnknownLauncher, build_launcher
+from dory_wrangler import launch_boundary as lb
+from dory_wrangler import session_manager
+from dory_wrangler import harness_store as store_module
+from dory_wrangler.wiring import open_harness
+from dory_wrangler.launchers.registry import UnknownLauncher, build_launcher
 
 
 class OutOfTreeLauncher(lb.LaunchBoundary):
@@ -129,15 +130,17 @@ class SelectionIsConfigurationOnly(unittest.TestCase, StoreCheck):
 class NothingAboveTheSeamKnowsALauncher(unittest.TestCase):
     """Facts, not naming conventions."""
 
-    CORE = ("launch_boundary", "session_manager", "store", "identity", "errors")
+    CORE = ("launch_boundary", "session_manager", "store", "harness_store", "identity",
+            "errors")
 
     def test_importing_the_core_loads_no_launcher_and_no_subprocess(self):
         program = (
             "import sys; sys.path.insert(0, %r);"
-            "import session_manager, store, launch_boundary;"
-            "bad=[m for m in sys.modules if m.startswith('launchers') "
+            "import dory_wrangler.session_manager, dory_wrangler.store, "
+            "dory_wrangler.launch_boundary;"
+            "bad=[m for m in sys.modules if m.startswith('dory_wrangler.launchers') "
             "or m in ('subprocess','socket','shutil')];"
-            "print(sorted(bad))" % support.HARNESS
+            "print(sorted(bad))" % support.SRC
         )
         out = subprocess.check_output([sys.executable, "-c", program],
                                       universal_newlines=True).strip()
@@ -149,7 +152,7 @@ class NothingAboveTheSeamKnowsALauncher(unittest.TestCase):
                  "DevLocal", "ScriptedStub", "launch_agent.sh", "vscode", "subprocess",
                  "Popen", "argv", "os.environ")
         for module_name in self.CORE:
-            module = __import__(module_name)
+            module = importlib.import_module("dory_wrangler." + module_name)
             source = inspect.getsource(module)
             # The seam's denylist legitimately *enumerates* mechanics names in
             # order to refuse them. Excluding that one literal is not excusing an

@@ -14,9 +14,9 @@ import unittest
 
 import support  # noqa: F401  (puts the harness on sys.path)
 
-import launch_boundary as lb
-import session_manager
-import store as store_module
+from dory_wrangler import launch_boundary as lb
+from dory_wrangler import session_manager
+from dory_wrangler import harness_store as store_module
 from support import VALIDATOR
 
 

@@ -29,11 +29,11 @@ import support
 from support import StoreCheck, VALIDATOR, codes, end_chat, expected_transcript, \
     run_three_turns
 
-import launch_boundary as lb
-import session_manager
-from app import open_harness
-from errors import ConcurrentLaunchRefused, NotPermitted
-from launchers.scripted_stub import ScriptedStubLauncher
+from dory_wrangler import launch_boundary as lb
+from dory_wrangler import session_manager
+from dory_wrangler.wiring import open_harness
+from dory_wrangler.errors import ConcurrentLaunchRefused, NotPermitted
+from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 
 
 class TheSignatureTakesTheHandle(unittest.TestCase):

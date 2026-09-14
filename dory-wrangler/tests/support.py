@@ -13,24 +13,24 @@ import sys
 import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-HARNESS = os.path.dirname(HERE)
-DORY = os.path.dirname(HARNESS)
+DORY = os.path.dirname(HERE)
+SRC = os.path.join(DORY, "src")
 REPO = os.path.dirname(DORY)
 VALIDATOR_PATH = os.path.join(DORY, "validator", "validate_contract.py")
 # Produced stores are written outside the repository on purpose: they are test
-# output, not source, and #87 adds nothing outside `dory-wrangler/`.
+# output, not source, and nothing is added outside `dory-wrangler/`.
 FIXTURE_OUT = os.environ.get(
     "DORY_TEST_STORE_DIR",
-    os.path.join(tempfile.gettempdir(), "dory-wrangler-issue-87-stores"))
-SCRATCH = os.path.join(tempfile.gettempdir(), "dory-wrangler-issue-87-scratch")
+    os.path.join(tempfile.gettempdir(), "dory-wrangler-stores"))
+SCRATCH = os.path.join(tempfile.gettempdir(), "dory-wrangler-scratch")
 # There is no separate divergence directory any more. #85 corrected the
 # turn-instruction floor at `4ff8b63`, so the stores that used to be exported
 # there as `expect: accept` regression material are now ordinary stores in
 # phase 2 -- see `test_turn_floor_regression.py`. Keeping a second directory
 # would have been the workaround, not the fix.
 
-if HARNESS not in sys.path:
-    sys.path.insert(0, HARNESS)
+if SRC not in sys.path:
+    sys.path.insert(0, SRC)
 
 
 def load_validator():
@@ -115,7 +115,7 @@ def run_three_turns(harness, title="Continuation"):
 
 def end_chat(harness, chat_id, reason="the user is done"):
     """Release whatever the chat still holds, the way a user would."""
-    from errors import NotPermitted
+    from dory_wrangler.errors import NotPermitted
     try:
         harness.stop_agent(chat_id, reason)
     except NotPermitted:
@@ -164,8 +164,8 @@ def deterministic(config, salt, store_path=None, start=None, **kwargs):
     store needs: a real restart's clock has advanced, and a fixture clock that
     silently rewound would manufacture a TIME_REGRESSION the product never has.
     """
-    from app import open_harness
-    from identity import FixedClock, SequentialIdFactory
+    from dory_wrangler.wiring import open_harness
+    from dory_wrangler.identity import FixedClock, SequentialIdFactory
     clock = FixedClock(start) if start else FixedClock()
     return open_harness(config, store_path=store_path,
                         ids=SequentialIdFactory(salt), clock=clock, **kwargs)

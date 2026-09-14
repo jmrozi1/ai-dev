@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import base64
 
-from errors import ConcurrentLaunchRefused, InstructionTooLarge, NotPermitted
-from identity import Clock, IdFactory
-from launch_boundary import (
+from .errors import ConcurrentLaunchRefused, InstructionTooLarge, NotPermitted
+from .identity import Clock, IdFactory
+from .launch_boundary import (
     DeliveryAck,
     DeliveryInstruction,
     EventsPage,
@@ -40,7 +40,7 @@ from launch_boundary import (
     SOURCE_AGENT,
     SOURCE_LAUNCHER,
 )
-from store import TERMINAL_SESSION_STATES, Store
+from .harness_store import TERMINAL_SESSION_STATES, Store
 
 # Contract 5.2's owner table. It is repeated here because this module must fail
 # closed before writing an unauthorized transition rather than rely on a

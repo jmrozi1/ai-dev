@@ -43,10 +43,10 @@ import unittest
 import support
 from support import CONFIGURATIONS, StoreCheck, expected_transcript, run_three_turns
 
-import launch_boundary as lb
-from app import open_harness
-from launchers.registry import build_launcher
-from launchers.scripted_stub import ScriptedStubLauncher
+from dory_wrangler import launch_boundary as lb
+from dory_wrangler.wiring import open_harness
+from dory_wrangler.launchers.registry import build_launcher
+from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 
 
 class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreCheck):

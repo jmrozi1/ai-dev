@@ -10,9 +10,9 @@ evidence for.
 
 from __future__ import annotations
 
-from launchers.registry import build_launcher
-from session_manager import SessionManager
-from store import Store
+from .launchers.registry import build_launcher
+from .session_manager import SessionManager
+from .harness_store import Store
 
 
 def open_harness(config, store_path=None, ids=None, clock=None, compose=None,

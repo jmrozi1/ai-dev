@@ -19,7 +19,7 @@ from __future__ import annotations
 import json
 import threading
 
-from launch_boundary import (
+from ..launch_boundary import (
     DeliveryAck,
     EventPayload,
     EventsPage,

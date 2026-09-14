@@ -14,9 +14,9 @@ from __future__ import annotations
 
 import re
 
-from launch_boundary import LAUNCHER_ID_PATTERN, LaunchBoundary
-from launchers.dev_local import DevLocalLauncher
-from launchers.scripted_stub import ScriptedStubLauncher
+from ..launch_boundary import LAUNCHER_ID_PATTERN, LaunchBoundary
+from .dev_local import DevLocalLauncher
+from .scripted_stub import ScriptedStubLauncher
 
 BUILDERS = {
     DevLocalLauncher.launcher_id: DevLocalLauncher.from_options,

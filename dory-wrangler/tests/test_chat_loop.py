@@ -15,7 +15,7 @@ import unittest
 import support
 from support import CONFIGURATIONS, StoreCheck, end_chat, expected_transcript, run_three_turns
 
-from errors import NotPermitted
+from dory_wrangler.errors import NotPermitted
 
 
 class FullLoopAgainstEveryLauncher(unittest.TestCase, StoreCheck):
@@ -192,7 +192,7 @@ class DiagnosticsStayOutOfTheChat(unittest.TestCase, StoreCheck):
                          "command": None}}, "n")
         # Reconfigure the real agent to emit both kinds of unusable output.
         import sys
-        from launchers.dev_local import DEV_AGENT
+        from dory_wrangler.launchers.dev_local import DEV_AGENT
         self.addCleanup(support.release, harness)
         harness._boundary._command = [sys.executable, DEV_AGENT, "--profile",
                                       "one_shot", "--garbage", "--unknown-type"]

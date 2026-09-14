@@ -14,11 +14,11 @@ import unittest
 import support
 from support import StoreCheck
 
-import launch_boundary as lb
-import session_manager
-from app import open_harness
-from errors import NotPermitted
-from launchers.dev_local import DEV_AGENT
+from dory_wrangler import launch_boundary as lb
+from dory_wrangler import session_manager
+from dory_wrangler.wiring import open_harness
+from dory_wrangler.errors import NotPermitted
+from dory_wrangler.launchers.dev_local import DEV_AGENT
 
 
 def stub(salt, **options):
