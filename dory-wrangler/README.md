@@ -17,6 +17,7 @@ Release intent and the checkpoint roadmap are `jmrozi1/ai-dev` #81.
 | `fixtures/v0.1/valid/` | store snapshots the contract must accept, including both continuation modes and both restart outcomes |
 | `fixtures/v0.1/invalid/` | store snapshots the contract must reject, each naming the rule it violates |
 | `validator/validate_contract.py` | the executable form of the contract |
+| `harness/` | the swappable single-agent launch boundary (#87), its two launcher implementations, and its tests |
 | `decisions/0001-runtime-and-storage.md` | the recorded runtime and storage choice, and its Rocky Linux 9 risks as claims to settle |
 | `src/dory_wrangler/` | the chat shell and its durable store |
 | `run_shell.py` | run the shell |
@@ -68,7 +69,8 @@ made on it, and what the attack found.
 
 ## Status
 
-v0.1 has its contract (#85) and its chat shell and durable persistence (#86). It
-does not implement the launcher (#87) or the event pipeline (#88). No
+v0.1 has its contract (#85), its chat shell and durable persistence (#86), and
+the launch boundary with its launchers (#87), built independently and not yet
+converged (#88). It does not implement the event pipeline (#88). No
 observability (#82), supervision (#83), or multi-agent (#84) behavior is in
 scope.
