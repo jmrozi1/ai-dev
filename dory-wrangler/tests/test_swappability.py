@@ -20,7 +20,7 @@ from support import StoreCheck, expected_transcript, run_three_turns
 
 from dory_wrangler import launch_boundary as lb
 from dory_wrangler import session_manager
-from dory_wrangler import harness_store as store_module
+from dory_wrangler.store import ChatStore
 from dory_wrangler.wiring import open_harness
 from dory_wrangler.launchers.registry import UnknownLauncher, build_launcher
 
@@ -112,7 +112,7 @@ class SelectionIsConfigurationOnly(unittest.TestCase, StoreCheck):
         for continuation, shape in (("fresh_binding", "one_shot"),
                                     ("persistent", "stream")):
             with self.subTest(continuation=continuation, response_shape=shape):
-                harness = open_harness({}, launcher=OutOfTreeLauncher(continuation, shape))
+                harness = support.harness({}, launcher=OutOfTreeLauncher(continuation, shape))
                 chat_id = run_three_turns(harness, "Out of tree")
                 self.assertEqual(harness.transcript(chat_id), expected_transcript())
                 support.end_chat(harness, chat_id)
@@ -121,7 +121,7 @@ class SelectionIsConfigurationOnly(unittest.TestCase, StoreCheck):
                     "The full loop against a launcher the package does not know.")
 
     def test_a_second_registry_can_replace_the_table_entirely(self):
-        harness = open_harness({"launcher": "anything-at-all"},
+        harness = support.harness({"launcher": "anything-at-all"},
                                builders={"anything-at-all": lambda o: OutOfTreeLauncher()})
         chat_id = run_three_turns(harness, "Replaced registry")
         self.assertEqual(harness.transcript(chat_id), expected_transcript())
@@ -130,7 +130,7 @@ class SelectionIsConfigurationOnly(unittest.TestCase, StoreCheck):
 class NothingAboveTheSeamKnowsALauncher(unittest.TestCase):
     """Facts, not naming conventions."""
 
-    CORE = ("launch_boundary", "session_manager", "store", "harness_store", "identity",
+    CORE = ("launch_boundary", "session_manager", "store", "atomic", "contract", "ids",
             "errors")
 
     def test_importing_the_core_loads_no_launcher_and_no_subprocess(self):
@@ -160,11 +160,44 @@ class NothingAboveTheSeamKnowsALauncher(unittest.TestCase):
             # closed schema -- not the denylist -- is what the seam relies on.
             source = re.sub(r"_MECHANICS_FIELD_NAMES = frozenset\((?:.|\n)*?\n\)",
                             "", source)
+            # The one store brought two environment reads into the core with it,
+            # and neither is launcher configuration: #86's fault-injection hook
+            # (inert unless a test sets it, unreachable over HTTP) and the path
+            # override for the contract validator. Each is removed only when it
+            # is exactly that read of exactly that variable, so any other use of
+            # the environment in these modules -- a launcher option read from it
+            # included -- still fails here, and `test_the_core_reads_no_other_
+            # environment_variable` holds the list itself shut.
+            for allowed in self.CORE_ENVIRONMENT_READS:
+                source = source.replace(allowed, "")
             for name in names:
                 self.assertFalse(
                     name in source,
                     "%s names %r, so the chat and session layers are not "
                     "launcher-independent" % (module_name, name))
+
+    CORE_ENVIRONMENT_READS = (
+        'os.environ.get(FAULT_ENV)',                     # atomic: fault injection
+        'os.environ.get("DORY_WRANGLER_VALIDATOR")',     # contract: validator path
+    )
+
+    def test_the_core_reads_no_other_environment_variable(self):
+        """What the exemption above admits, stated as a closed set of reads."""
+        import ast
+        from dory_wrangler import atomic
+        self.assertEqual(atomic.FAULT_ENV, "DORY_WRANGLER_FAULT")
+        found = []
+        for module_name in self.CORE:
+            module = importlib.import_module("dory_wrangler." + module_name)
+            for node in ast.walk(ast.parse(inspect.getsource(module))):
+                if (isinstance(node, ast.Attribute) and node.attr == "environ"
+                        and isinstance(node.value, ast.Name) and node.value.id == "os"):
+                    found.append(module_name)
+            self.assertNotIn("getenv", inspect.getsource(module))
+        self.assertEqual(sorted(found), ["atomic", "contract"])
+        for allowed, module_name in zip(self.CORE_ENVIRONMENT_READS, ("atomic", "contract")):
+            module = importlib.import_module("dory_wrangler." + module_name)
+            self.assertEqual(inspect.getsource(module).count(allowed), 1)
 
     # The two arms of the `launcher_id` experiment. They differ in the id and in
     # the shape of the handles, and in nothing else.
@@ -175,18 +208,18 @@ class NothingAboveTheSeamKnowsALauncher(unittest.TestCase):
         launcher = OutOfTreeLauncher(handle_prefix=handle_prefix)
         launcher.launcher_id = launcher_id
         if manager is None:
-            harness = open_harness({}, launcher=launcher)
+            harness = support.harness({}, launcher=launcher)
         else:
-            harness = manager(store_module.Store(None), launcher)
+            harness = manager(ChatStore(support.scratch_root()), launcher)
         chat_id = run_three_turns(harness, "Opaque")
-        sessions = harness.store.sessions_of(chat_id)
+        sessions = support.view(harness).sessions_of(chat_id)
         return {
             "transcript": harness.transcript(chat_id),
             "states": [s["state"] for s in sessions],
             "recorded_ids": [s["launcher_id"] for s in sessions],
             "handles": [s["agent_handle"] for s in sessions],
             "packets": [p["instruction_text"]
-                        for p in harness.store.all_of("launch_request")],
+                        for p in support.view(harness).all_of("launch_request")],
         }
 
     def test_no_behaviour_branches_on_a_launcher_id(self):

@@ -8,6 +8,7 @@ contract -- rather than against a local opinion of what the contract says.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import sys
 import tempfile
@@ -54,11 +55,16 @@ def codes(records):
     return sorted(set(code for code, _ in violations(records)))
 
 
+def _records_of(store):
+    """The records of a `ChatStore`, or of a `StoreView` built from one."""
+    return store.snapshot() if isinstance(store, StoreView) else store.export_records()
+
+
 class StoreCheck(object):
     """Mixin: assert a store validates, and keep it for the CLI validator run."""
 
     def assert_store_valid(self, store, name, description=None):
-        found = violations(store.snapshot())
+        found = violations(_records_of(store))
         if found:
             self.fail(
                 "store %r was expected to satisfy the contract but the validator "
@@ -66,7 +72,7 @@ class StoreCheck(object):
         self.keep(store, name, description)
 
     def assert_store_rejected_for(self, store, code, name=None):
-        found = codes(store.snapshot())
+        found = codes(_records_of(store))
         if code not in found:
             self.fail("expected the validator to emit %s; it emitted %s"
                       % (code, ", ".join(found) or "nothing"))
@@ -75,11 +81,189 @@ class StoreCheck(object):
     def keep(self, store, name, description=None):
         """Write the store out in fixture form so the CLI validator can be run
         over every store this suite produced, as independent evidence."""
-        if not os.path.isdir(FIXTURE_OUT):
-            os.makedirs(FIXTURE_OUT)
-        store.write_snapshot_fixture(
-            os.path.join(FIXTURE_OUT, "%s.json" % name), name,
-            expect="accept", description=description)
+        keep_records(_records_of(store), name, description)
+
+
+def keep_records(records, name, description=None):
+    if not os.path.isdir(FIXTURE_OUT):
+        os.makedirs(FIXTURE_OUT)
+    meta = {"name": name, "expect": "accept"}
+    if description:
+        meta["description"] = description
+    path = os.path.join(FIXTURE_OUT, "%s.json" % name)
+    if os.path.exists(path):
+        raise AssertionError("two tests kept a store under the name %r" % name)
+    with open(path + ".partial", "w") as out:
+        json.dump({"fixture": meta, "contract_version": "0.1", "records": records},
+                  out, indent=2)
+        out.write("\n")
+    os.replace(path + ".partial", path)
+
+
+OWN_ID_FIELD = {
+    "chat": "chat_id",
+    "message": "message_id",
+    "agent_session": "session_id",
+    "agent_binding": "binding_id",
+    "launch_request": "request_id",
+    "launch_result": "request_id",
+    "delivery_request": "delivery_id",
+    "session_observation": "observation_id",
+    "diagnostic_event": "event_id",
+}
+
+
+class StoreView(object):
+    """#87's store queries, answered from one snapshot of a `ChatStore`.
+
+    Read-only with respect to the store: it holds the records `export_records`
+    read -- every one of them run through the contract on the way out -- and
+    answers #87's query names over that list, so #87's tests keep asking the
+    questions they asked of #87's store. `put` edits **the snapshot and nothing
+    on disk**. That is exactly what the forging probes need: they take a store
+    the product really wrote, change one record the way an attacker or a bug
+    would, and hand the result to the contract validator. A probe that needs the
+    *product* to meet a planted shape writes it to disk with `plant` instead.
+    """
+
+    def __init__(self, store):
+        self._records = store.export_records()
+
+    def snapshot(self):
+        return json.loads(json.dumps(self._records))
+
+    def put(self, record):
+        record = json.loads(json.dumps(record))
+        key = (record["record_type"], record[OWN_ID_FIELD[record["record_type"]]])
+        for i, existing in enumerate(self._records):
+            if (existing["record_type"],
+                    existing[OWN_ID_FIELD[existing["record_type"]]]) == key:
+                self._records[i] = record
+                return
+        self._records.append(record)
+
+    def remove(self, record_type, record_id):
+        self._records = [
+            r for r in self._records
+            if (r["record_type"], r[OWN_ID_FIELD[r["record_type"]]])
+            != (record_type, record_id)]
+
+    def all_of(self, record_type):
+        return [json.loads(json.dumps(r)) for r in self._records
+                if r["record_type"] == record_type]
+
+    def get(self, record_type, record_id):
+        for r in self.all_of(record_type):
+            if r[OWN_ID_FIELD[record_type]] == record_id:
+                return r
+        return None
+
+    def messages(self, chat_id):
+        return sorted((m for m in self.all_of("message") if m["chat_id"] == chat_id),
+                      key=lambda m: m["sequence"])
+
+    def sessions_of(self, chat_id):
+        return sorted((s for s in self.all_of("agent_session") if s["chat_id"] == chat_id),
+                      key=lambda s: (s["created_at"], s["session_id"]))
+
+    def open_bindings(self, chat_id):
+        return [b for b in self.all_of("agent_binding")
+                if b["chat_id"] == chat_id and b["released_at"] is None]
+
+    def non_terminal_sessions(self, chat_id):
+        terminal = VALIDATOR.TERMINAL_SESSION_STATES
+        return [s for s in self.sessions_of(chat_id) if s["state"] not in terminal]
+
+    def binding_for_session(self, session_id):
+        for b in self.all_of("agent_binding"):
+            if b["session_id"] == session_id:
+                return b
+        return None
+
+    def events_of(self, session_id):
+        return sorted((e for e in self.all_of("diagnostic_event")
+                       if e["session_id"] == session_id), key=lambda e: e["sequence"])
+
+    def last_event_sequence(self, session_id):
+        rows = self.events_of(session_id)
+        return rows[-1]["sequence"] if rows else 0
+
+    def observations_of(self, session_id):
+        return sorted((o for o in self.all_of("session_observation")
+                       if o["session_id"] == session_id),
+                      key=lambda o: (o["observed_at"], o["observation_id"]))
+
+    def launch_request_of(self, session_id):
+        for r in self.all_of("launch_request"):
+            if r["session_id"] == session_id:
+                return r
+        return None
+
+    def launch_result_of(self, session_id):
+        for r in self.all_of("launch_result"):
+            if r["session_id"] == session_id:
+                return r
+        return None
+
+    def deliveries_of(self, session_id):
+        return sorted((d for d in self.all_of("delivery_request")
+                       if d["session_id"] == session_id), key=lambda d: d["sequence"])
+
+
+def view(harness_or_store):
+    """A fresh `StoreView` of a harness's store, or of a `ChatStore`."""
+    store = getattr(harness_or_store, "store", harness_or_store)
+    return StoreView(store)
+
+
+def now():
+    from dory_wrangler import ids
+    return ids.now()
+
+
+def plant(harness_or_store, record, chat_id=None):
+    """Write one record straight onto disk, around the store.
+
+    For the probes whose subject is what the *product* does when it meets a
+    shape its own writer would never produce -- a crash window, a corrupted
+    file, a record from an older writer. Nothing in the product calls this, and
+    every record it writes is written where `ChatStore` itself would look for it,
+    so the product reads it exactly as it reads everything else.
+    """
+    store = getattr(harness_or_store, "store", harness_or_store)
+    rtype = record["record_type"]
+    chat_dir = os.path.join(store.chats_dir, chat_id or record["chat_id"])
+
+    def write(path, document):
+        with open(path, "w") as out:
+            json.dump(document, out, indent=2, sort_keys=True)
+            out.write("\n")
+
+    if rtype == "chat":
+        write(os.path.join(chat_dir, "chat.json"), record)
+    elif rtype == "message":
+        write(os.path.join(chat_dir, "messages", "%08d.json" % record["sequence"]), record)
+    elif rtype in ("agent_session", "agent_binding"):
+        path = os.path.join(chat_dir, "sessions", record["session_id"] + ".json")
+        with open(path) as handle:
+            pair = json.load(handle)
+        pair["session" if rtype == "agent_session" else "binding"] = record
+        write(path, pair)
+    elif rtype == "diagnostic_event":
+        directory = os.path.join(store.diagnostics_dir, record["chat_id"],
+                                 record["session_id"])
+        if not os.path.isdir(directory):
+            os.makedirs(directory)
+        write(os.path.join(directory, "%08d.json" % record["sequence"]), record)
+    else:
+        name = {
+            "launch_request": lambda r: "launch_request-" + r["request_id"],
+            "launch_result": lambda r: "launch_result-" + r["request_id"],
+            "delivery_request": lambda r: "delivery_request-%s-%08d"
+                                          % (r["session_id"], r["sequence"]),
+            "session_observation": lambda r: "session_observation-" + r["observation_id"],
+        }[rtype](record)
+        write(os.path.join(chat_dir, "packets", name + ".json"), record)
 
 
 THREE_TURNS = (
@@ -156,19 +340,22 @@ def expected_transcript():
     return rows
 
 
-def deterministic(config, salt, store_path=None, start=None, **kwargs):
-    """A harness on a deterministic clock and id source, so a produced store is
-    byte-comparable run to run.
+def harness(config, store_path=None, **kwargs):
+    """A harness over a `ChatStore` at `store_path`, or at a fresh scratch root.
 
-    `start` moves the clock forward, which a harness reopened over an existing
-    store needs: a real restart's clock has advanced, and a fixture clock that
-    silently rewound would manufacture a TIME_REGRESSION the product never has.
+    Reopening one over an existing root is how these tests restart: a new
+    `SessionManager`, a new launcher instance, and nothing carried over but what
+    is on disk.
     """
     from dory_wrangler.wiring import open_harness
-    from dory_wrangler.identity import FixedClock, SequentialIdFactory
-    clock = FixedClock(start) if start else FixedClock()
-    return open_harness(config, store_path=store_path,
-                        ids=SequentialIdFactory(salt), clock=clock, **kwargs)
+    if store_path is None:
+        if not os.path.isdir(SCRATCH):
+            os.makedirs(SCRATCH)
+        store_path = tempfile.mkdtemp(prefix="store-", dir=SCRATCH)
+    return open_harness(config, store_path, **kwargs)
 
 
-RESTARTED = "2026-09-12T12:00:00.000000Z"
+def scratch_root(prefix="root-"):
+    if not os.path.isdir(SCRATCH):
+        os.makedirs(SCRATCH)
+    return tempfile.mkdtemp(prefix=prefix, dir=SCRATCH)

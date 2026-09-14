@@ -1,4 +1,4 @@
-"""The chat shell: conversation list, active conversation, new-chat flow.
+"""The chat shell: conversation list, active conversation, new-chat flow, send, abandon.
 
 An HTTP server from the standard library, serving one page with no external
 asset of any kind. Nothing is fetched from a CDN, a package registry, or a font
@@ -16,17 +16,48 @@ even if its markup tried to. The bounded out-of-band diagnostic retrieval
 required by contract 8.5 exists on `ChatStore`, reachable by a program, and is
 not wired to a route.
 
-There is also no agent-launch mechanics here. #86 starts nothing.
+There are no agent-launch mechanics here either. A sent turn goes to the chat
+loop (`session_manager`), which reaches an agent only through the configured
+launcher; this module never names one.
+
+## The one lifecycle action
+
+`POST /api/chats/<id>/abandon` is the user's exit from an agent nobody can reach
+(contract 5.4). It is offered on the page only after a send was refused, and a
+refusal says why in words that carry no identifier, state name, or lifecycle
+vocabulary: the shell still shows one assistant conversation and no status.
 """
 
 import json
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
-from .errors import NotFound, StoreError
+from .errors import (
+    ConcurrentLaunchRefused,
+    HarnessError,
+    InstructionTooLarge,
+    NotFound,
+    StoreError,
+)
+from .launch_boundary import LaunchBoundaryError
 from .service import ChatService
 
 MAX_BODY_BYTES = 1 << 20  # a user turn is text; a megabyte is already generous
+
+# What the browser is told when the chat loop refuses an action. Fixed words,
+# deliberately: the refusal a harness raises names sessions and states, and
+# none of that crosses onto the chat surface (contract P4).
+REFUSED_BUSY = (
+    "This chat's agent has not finished, or whether it has cannot be determined, "
+    "so your message was not sent. If the agent cannot be reached, abandon it and "
+    "send again."
+)
+REFUSED_TOO_LARGE = "This message is larger than the agent here accepts; it was not sent."
+REFUSED_OTHER = "That is not possible for this chat right now; nothing was changed."
+INTEGRATION_FAILED = (
+    "The agent integration returned something this build cannot use. Your message "
+    "is in the chat; nothing after it was shown."
+)
 
 PAGE = r"""<!doctype html>
 <html lang="en">
@@ -170,6 +201,11 @@ PAGE = r"""<!doctype html>
   }
   #send:disabled { opacity: .5; cursor: default; }
   #empty, #problem { max-width: 760px; margin: 60px auto; color: var(--muted); text-align: center; }
+  #refusal { max-width: 760px; margin: 0 auto 10px; color: var(--muted); }
+  #refusal button {
+    margin-left: 8px; padding: 4px 10px; border: 1px solid var(--line); border-radius: 8px;
+    background: var(--bg); color: var(--ink); font: inherit; cursor: pointer;
+  }
   #problem { color: #c0392b; white-space: pre-wrap; text-align: left; }
 </style>
 </head>
@@ -183,6 +219,7 @@ PAGE = r"""<!doctype html>
   <div id="header">Dory-wrangler</div>
   <div id="transcript"><div id="empty">Start a new chat, or pick one on the left.</div></div>
   <div id="composer">
+    <div id="refusal" hidden><span id="refusal-text"></span><button id="abandon" type="button">Abandon the agent</button></div>
     <form id="form">
       <textarea id="text" placeholder="Send a message" autocomplete="off"></textarea>
       <button id="send" type="submit">Send</button>
@@ -204,7 +241,9 @@ function api(method, path, body) {
       try { payload = text ? JSON.parse(text) : null; } catch (e) { payload = null; }
       if (!response.ok) {
         var message = payload && payload.error ? payload.error : (text || response.statusText);
-        throw new Error(message);
+        var failure = new Error(message);
+        failure.refused = !!(payload && payload.refused);
+        throw failure;
       }
       return payload;
     });
@@ -225,6 +264,15 @@ function showProblem(err) {
     "This chat could not be read, and nothing has been changed.\n\n" + err.message);
   panel.id = "problem";
   transcript.appendChild(panel);
+}
+
+function hideRefusal() {
+  document.getElementById("refusal").hidden = true;
+}
+
+function showRefusal(err) {
+  document.getElementById("refusal-text").textContent = err.message;
+  document.getElementById("refusal").hidden = false;
 }
 
 function renderChatList(chats) {
@@ -269,6 +317,7 @@ function refreshList() {
 function openChat(chatId) {
   return api("GET", "/api/chats/" + encodeURIComponent(chatId))
     .then(function (chat) {
+      if (chat.chat_id !== activeChatId) { hideRefusal(); }
       activeChatId = chat.chat_id;
       renderChat(chat);
       return refreshList();
@@ -300,9 +349,25 @@ document.getElementById("form").addEventListener("submit", function (event) {
   var started = activeChatId
     ? send(activeChatId)
     : api("POST", "/api/chats", {}).then(function (chat) { activeChatId = chat.chat_id; return send(chat.chat_id); });
-  started.catch(showProblem).then(function () {
+  hideRefusal();
+  started.catch(function (err) {
+    if (err.refused) { showRefusal(err); } else { showProblem(err); }
+  }).then(function () {
     document.getElementById("send").disabled = false;
   });
+});
+
+document.getElementById("abandon").addEventListener("click", function () {
+  if (!activeChatId) { hideRefusal(); return; }
+  api("POST", "/api/chats/" + encodeURIComponent(activeChatId) + "/abandon", {})
+    .then(function (chat) {
+      hideRefusal();
+      renderChat(chat);
+      return refreshList();
+    })
+    .catch(function (err) {
+      if (err.refused) { showRefusal(err); } else { showProblem(err); }
+    });
 });
 
 document.getElementById("text").addEventListener("keydown", function (event) {
@@ -416,11 +481,28 @@ class ShellHandler(BaseHTTPRequestHandler):
                 if not isinstance(text, str) or not text.strip():
                     return self._respond(400, {"error": "a message needs text"})
                 return self._respond(201, self.service.send_user_message(chat_id, text.strip()))
+            if path.startswith("/api/chats/") and path.endswith("/abandon"):
+                chat_id = path[len("/api/chats/"):-len("/abandon")]
+                if "/" in chat_id:
+                    return self._respond(404, {"error": "no such route"})
+                return self._respond(200, self.service.abandon(chat_id))
             return self._respond(404, {"error": "no such route"})
         except NotFound as exc:
             return self._respond(404, {"error": str(exc)})
         except StoreError as exc:
             return self._respond(409, {"error": str(exc)})
+        except HarnessError as exc:
+            return self._respond(409, {"error": _refusal_words(exc), "refused": True})
+        except LaunchBoundaryError:
+            return self._respond(502, {"error": INTEGRATION_FAILED})
+
+
+def _refusal_words(exc):
+    if isinstance(exc, ConcurrentLaunchRefused):
+        return REFUSED_BUSY
+    if isinstance(exc, InstructionTooLarge):
+        return REFUSED_TOO_LARGE
+    return REFUSED_OTHER
 
 
 class ShellServer(ThreadingHTTPServer):
@@ -433,6 +515,14 @@ class ShellServer(ThreadingHTTPServer):
         ThreadingHTTPServer.__init__(self, address, ShellHandler)
 
 
-def build_server(root, host="127.0.0.1", port=8765, quiet=False, turn_listener=None):
-    service = ChatService.open(root, turn_listener=turn_listener)
+def build_server(root, host="127.0.0.1", port=8765, quiet=False, launcher_config=None,
+                 launcher=None):
+    """The one served application: the shell, over the chat loop, over the store.
+
+    Re-attachment happens here, once, before the first request is served
+    (contract 5.4), so a chat a restart interrupted has already been carried to
+    a state its user can act on by the time anyone opens it.
+    """
+    service = ChatService.open(root, launcher_config=launcher_config, launcher=launcher)
+    service.sessions.reattach_on_start()
     return ShellServer((host, port), service, quiet=quiet)

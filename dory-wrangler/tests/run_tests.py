@@ -45,6 +45,7 @@ def main(argv):
         if not arg.startswith("-"):
             pattern = arg
     shutil.rmtree(support.FIXTURE_OUT, ignore_errors=True)
+    shutil.rmtree(support.SCRATCH, ignore_errors=True)
 
     print("== phase 1: unit suite ==", flush=True)
     suite = unittest.TestLoader().discover(

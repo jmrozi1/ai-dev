@@ -17,8 +17,15 @@ from helpers import RUN_SHELL
 
 
 class ShellProcess(object):
-    def __init__(self, root):
+    # The launcher a shell under test serves turns through unless a test names
+    # another: the in-process stub, so a turn is answered by the real chat loop
+    # and no operating-system process is started on the shell's behalf.
+    LAUNCHER = ("scripted-stub", None)
+
+    def __init__(self, root, launcher=None, launcher_options=None):
         self.root = root
+        self.launcher = launcher or self.LAUNCHER[0]
+        self.launcher_options = launcher_options
         self.port_file = os.path.join(root, ".port")
         self.process = None
         self.port = None
@@ -28,7 +35,10 @@ class ShellProcess(object):
             os.unlink(self.port_file)
         self.process = subprocess.Popen(
             [sys.executable, RUN_SHELL, "--root", self.root,
-             "--port", "0", "--port-file", self.port_file, "--quiet"],
+             "--port", "0", "--port-file", self.port_file, "--quiet",
+             "--launcher", self.launcher]
+            + (["--launcher-options", json.dumps(self.launcher_options)]
+               if self.launcher_options is not None else []),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
         deadline = time.time() + timeout

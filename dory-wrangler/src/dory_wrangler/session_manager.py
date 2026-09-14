@@ -6,6 +6,15 @@ anything else about it: it does not import a launcher, does not read a
 mechanics. Swapping launchers is a change to the object handed to the
 constructor and to nothing else.
 
+**It writes nothing itself.** Every durable record goes through `ChatStore`,
+which is the only writer of every record type (decision 0002). This module
+decides *what* happens to a chat -- which operation the launcher is asked for,
+which transition the lifecycle takes, when a turn is refused -- and the store
+decides whether the record of it may exist, fails closed if not, and publishes
+it atomically. A lifecycle rule this module relies on and the store also
+enforces is therefore stated once, in the store, over the contract's own
+tables; it is not restated here.
+
 What is deliberately **not** here, per contract 1 and 5.3: no timer, no
 inactivity inference, no liveness interrogation, no stall detection, no retry,
 and no automatic recovery. Nothing in this file computes an elapsed duration or
@@ -16,9 +25,18 @@ a harness action, or an explicit launcher observation.
 from __future__ import annotations
 
 import base64
+import fcntl
+import os
+import threading
 
-from .errors import ConcurrentLaunchRefused, InstructionTooLarge, NotPermitted
-from .identity import Clock, IdFactory
+from .contract import terminal_states
+from .errors import (
+    ConcurrentLaunchRefused,
+    InstructionTooLarge,
+    NotPermitted,
+    StoreError,
+    ValidationRefused,
+)
 from .launch_boundary import (
     DeliveryAck,
     DeliveryInstruction,
@@ -27,7 +45,6 @@ from .launch_boundary import (
     LaunchInstruction,
     LaunchResult,
     LauncherError,
-    PAYLOAD_ASSISTANT_TEXT,
     PAYLOAD_SESSION_COMPLETED,
     PAYLOAD_SESSION_FAILED,
     PAYLOAD_STREAM_END,
@@ -37,48 +54,14 @@ from .launch_boundary import (
     OUTCOME_ACCEPTED,
     OUTCOME_FAILED,
     OUTCOME_UNKNOWN,
-    SOURCE_AGENT,
     SOURCE_LAUNCHER,
 )
-from .harness_store import TERMINAL_SESSION_STATES, Store
 
-# Contract 5.2's owner table. It is repeated here because this module must fail
-# closed before writing an unauthorized transition rather than rely on a
-# validator run afterwards. A drift guard in the test suite asserts this is
-# identical to the validator's table, since two copies of one table is exactly
-# the divergence this contract exists to prevent.
-AUTHORIZED_TRANSITIONS = {
-    (None, "pending"): "user",
-    ("pending", "launching"): "harness",
-    ("pending", "launch_failed"): "harness",
-    ("launching", "running"): "launcher",
-    ("launching", "launch_failed"): "launcher",
-    ("launching", "unknown"): "launcher",
-    ("running", "completed"): "launcher",
-    ("running", "failed"): "launcher",
-    ("running", "terminated"): "user",
-    ("running", "unknown"): "launcher",
-    ("unknown", "running"): "launcher",
-    ("unknown", "completed"): "launcher",
-    ("unknown", "failed"): "launcher",
-    ("unknown", "terminated"): "user",
-    ("unknown", "abandoned"): "user",
-}
-
-# Contract 4.3/6.1: observation kinds that can only be produced by an operation
-# which addressed an already-launched agent. `stop`, `events` and `deliver` take
-# the `agent_handle` and nothing else, so the harness cannot honestly record any
-# of these for a session whose handle it never received. Kept here as the
-# harness's own fail-closed rule rather than left to a validator run afterwards,
-# and drift-guarded against the validator's copy in the test suite.
-#
-# `reattach_failed` is deliberately absent, exactly as in the validator: a
-# session interrupted in `launching`, or one whose launch outcome came back
-# `unknown`, never received a handle, so the attempt fails without being made
-# and a failed re-attachment is the honest record of precisely that (5.4).
-ADDRESSING_OBSERVATION_KINDS = frozenset(
-    ("stop_confirmed", "stop_unconfirmed", "reattached", "stream_read_failed")
-)
+# The file, inside a chat's own directory, whose lock is held for the duration
+# of one user action on that chat. Not the store's `.lock`: the store takes that
+# one for each write, and a second descriptor on the same file in one process
+# would wait on itself.
+TURN_LOCK_NAME = ".turn-lock"
 
 
 class TurnOutcome(object):
@@ -112,8 +95,8 @@ def compose_launch_instruction(chat_id, user_text, store):
     facts-and-assumptions U1 leave packet composition open for early internal
     dogfood and say explicitly that it is *not* "the whole prior chat by
     default", because carrying prior history would make an unmeasured payload
-    bound (U2) part of the architecture. #87 does not settle it, and a future
-    composer is a change to this one function.
+    bound (U2) part of the architecture. A future composer is a change to this
+    one function.
 
     `store` is accepted, unused, and named so that the decision is visible: the
     prior chat is available here and is deliberately not read.
@@ -121,15 +104,95 @@ def compose_launch_instruction(chat_id, user_text, store):
     return user_text
 
 
+class _ChatTurn(object):
+    __slots__ = ("rlock", "depth", "fd")
+
+    def __init__(self):
+        self.rlock = threading.RLock()
+        self.depth = 0
+        self.fd = None
+
+
+class _Held(object):
+    """One hold of a chat's turn lock. `acquired` says whether it was obtained."""
+
+    def __init__(self, turns, chat_id, blocking):
+        self._turns = turns
+        self._chat_id = chat_id
+        self._blocking = blocking
+        self._turn = None
+        self.acquired = False
+
+    def __enter__(self):
+        path = os.path.join(self._turns.store._require_chat_dir(self._chat_id),
+                            TURN_LOCK_NAME)
+        with self._turns.guard:
+            turn = self._turns.table.setdefault(self._chat_id, _ChatTurn())
+        if not turn.rlock.acquire(self._blocking):
+            return self
+        if turn.depth == 0:
+            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | (0 if self._blocking else fcntl.LOCK_NB))
+            except BlockingIOError:
+                os.close(fd)
+                turn.rlock.release()
+                return self
+            turn.fd = fd
+        turn.depth += 1
+        self._turn = turn
+        self.acquired = True
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        turn = self._turn
+        if turn is None:
+            return False
+        turn.depth -= 1
+        if turn.depth == 0:
+            try:
+                fcntl.flock(turn.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(turn.fd)
+                turn.fd = None
+        turn.rlock.release()
+        return False
+
+
+class ChatTurnLocks(object):
+    """One user action at a time per chat, across threads *and* processes.
+
+    #87's harness held a per-chat in-process lock for a whole turn; #86's store
+    is written to be shared by more than one process. The refuse-before-recording
+    rule for concurrent turns (decision 0003) is only true if "is this chat
+    already served?" and "record this turn and open its session" cannot be
+    interleaved by another writer, so the lock is an `flock` on a file in the
+    chat's own directory, held for the action, and re-entrant within one thread
+    so a launcher that calls back into the chat loop during `launch` is refused
+    by the rule rather than deadlocked by the lock.
+
+    A process that dies holding it releases it with its descriptor, so there is
+    no stale lock to time out and nothing here measures time.
+    """
+
+    def __init__(self, store):
+        self.store = store
+        self.guard = threading.Lock()
+        self.table = {}
+
+    def hold(self, chat_id, blocking=True):
+        return _Held(self, chat_id, blocking)
+
+
 class SessionManager(object):
     """The chat loop, the lifecycle, and the one-agent-per-chat rule."""
 
-    def __init__(self, store, boundary, ids=None, clock=None, compose=None):
+    def __init__(self, store, boundary, compose=None):
         self._store = store
         self._boundary = boundary
-        self._ids = ids or IdFactory()
-        self._clock = clock or Clock()
         self._compose = compose or compose_launch_instruction
+        self._turns = ChatTurnLocks(store)
+        self._terminal = terminal_states()
 
     # -- properties --------------------------------------------------------
 
@@ -144,25 +207,18 @@ class SessionManager(object):
     # -- chats -------------------------------------------------------------
 
     def create_chat(self, title):
-        now = self._clock.now()
-        chat_id = self._ids("cht")
-        self._store.put({
-            "record_type": "chat", "record_version": 1,
-            "chat_id": chat_id, "title": title,
-            "created_at": now, "updated_at": now, "state": "open",
-        })
-        return chat_id
+        return self._store.create_chat(title)["chat_id"]
 
     def transcript(self, chat_id):
         """The user-visible history, from durable records alone (contract D1, P4).
 
         Messages only. `diagnostic_event` records are never rendered here; they
-        are reachable through `store.retrieve_diagnostics`, which is a bounded
-        out-of-band retrieval that derives nothing.
+        are reachable through `ChatStore.read_diagnostic_events`, which is a
+        bounded out-of-band retrieval that derives nothing.
         """
         return [
             (m["sequence"], m["author"], m["content"]["text"])
-            for m in self._store.messages(chat_id)
+            for m in self._store.read_messages(chat_id)
         ]
 
     # -- the chat loop -----------------------------------------------------
@@ -183,7 +239,7 @@ class SessionManager(object):
                 "a user turn must carry text; an empty turn is refused rather than "
                 "recorded as a turn that happened")
 
-        with self._store.chat_lock(chat_id):
+        with self._turns.hold(chat_id):
             active = self._active_session(chat_id)
             if active is None:
                 return self._launch_turn(chat_id, text)
@@ -195,25 +251,24 @@ class SessionManager(object):
         This asks about **sessions**, not about bindings. A chat with a
         non-terminal session has an agent that may still be alive even if no
         binding holds it, and contract 4.4 is explicit that the rule bites on
-        agents: without this, a released-too-early binding lets a second live
-        agent speak into a chat while the ledger still reads as one-agent-per-
-        chat. Open bindings are checked too, because either one alone leaves a
-        route through.
+        agents. Open bindings are checked too, because either one alone leaves a
+        route through -- and because together they are exactly the two refusals
+        `ChatStore.create_session` makes, which is what lets a concurrent turn be
+        refused *before* it is recorded rather than by the store after.
         """
-        non_terminal = self._store.non_terminal_sessions(chat_id)
-        if non_terminal:
-            return non_terminal[0]
-        open_bindings = self._store.open_bindings(chat_id)
-        if open_bindings:
-            held = self._store.get("agent_session", open_bindings[0]["session_id"])
-            if held is not None:
-                return held
+        pairs = self._store.list_sessions(chat_id)
+        for session, _binding in pairs:
+            if session["state"] not in self._terminal:
+                return session
+        for session, binding in pairs:
+            if binding.get("released_at") is None:
+                return session
         return None
 
     def _refusal_reason(self, session):
         state = session["state"]
         mode = session["launcher_capabilities"]["continuation"]
-        if state in TERMINAL_SESSION_STATES:
+        if state in self._terminal:
             return (
                 "chat %s still holds an open binding on session %s; the binding must be "
                 "released before another agent may be launched"
@@ -234,10 +289,22 @@ class SessionManager(object):
             % (session["chat_id"], session["session_id"], state)
         )
 
+    def _refuse_concurrent_turn(self, chat_id, session, text):
+        """The one place the concurrent-turn policy lives (decision 0003).
+
+        The default, kept from #87: refuse **before** recording, so nothing is in
+        the chat's history as a user turn that was never offered to an agent.
+        `text` is unused by this policy and passed so the alternative -- #86's
+        record-then-refuse -- is a change to this method alone: append
+        `self._store.append_user_message(chat_id, text)` before the raise.
+        Both are contract-valid; the decision record says how each was measured.
+        """
+        raise ConcurrentLaunchRefused(self._refusal_reason(session))
+
     def _continue_turn(self, chat_id, session, text):
         capabilities = session["launcher_capabilities"]
         if capabilities["continuation"] != "persistent" or session["state"] != "running":
-            raise ConcurrentLaunchRefused(self._refusal_reason(session))
+            self._refuse_concurrent_turn(chat_id, session, text)
         return self._deliver_turn(chat_id, session, text)
 
     # -- launching ---------------------------------------------------------
@@ -276,52 +343,47 @@ class SessionManager(object):
     def _launch_turn(self, chat_id, text):
         existing = self._active_session(chat_id)
         if existing is not None:
-            raise ConcurrentLaunchRefused(self._refusal_reason(existing))
+            self._refuse_concurrent_turn(chat_id, existing, text)
         instruction_text = self._compose(chat_id, text, self._store)
         # Pre-flight, before anything durable is written. A refused packet leaves
         # no session, no launch_request and no user message: nothing happened.
         self._check_declared_bound(instruction_text)
 
-        user_message_id = self._append_message(chat_id, "user", text)
-        session = self._open_session(chat_id, user_message_id)
+        user_message = self._store.append_user_message(chat_id, text)
+        user_message_id = user_message["message_id"]
+        # The session and its binding are one write, opened *before* the launch
+        # is attempted: a launch failure must be attributable to a durable record
+        # (contract 4.3), and a launcher that re-enters `send_turn` during
+        # `launch` must find the chat already claimed.
+        session, _binding = self._store.create_session(
+            chat_id, user_message_id, self._boundary.launcher_id,
+            self._boundary.capabilities.as_record())
         session_id = session["session_id"]
 
-        request_id = self._ids("req")
-        now = self._clock.now()
         try:
+            request = self._store.append_launch_request(chat_id, session_id,
+                                                        instruction_text)
             instruction = LaunchInstruction(
-                request_id=request_id,
-                chat_id=chat_id,
-                session_id=session_id,
-                created_at=now,
-                instruction_encoding="utf-8",
-                instruction_text=instruction_text,
-            )
-        except LaunchBoundaryError as exc:
-            # Nothing was launched, and no packet exists to point at.
+                **dict((name, request[name]) for name in LaunchInstruction.FIELDS))
+        except (ValidationRefused, LaunchBoundaryError) as exc:
+            # The packet could not be formed, so nothing was launched. The
+            # session records that the turn was attempted and never reached an
+            # agent, and releases the chat in the same write.
             self._transition(session, "launch_failed", "harness", "harness_action", None)
-            self._release_binding(session_id)
             raise NotPermitted("the instruction packet could not be formed: %s" % exc)
-
-        packet = dict(instruction.as_record())
-        packet.update({"record_type": "launch_request", "record_version": 1})
-        self._store.put(packet)
+        request_id = request["request_id"]
         self._transition(session, "launching", "harness", "harness_action", request_id)
 
         result = self._call_launch(instruction)
-        self._store.put({
-            "record_type": "launch_result", "record_version": 1,
-            "request_id": request_id, "session_id": session_id,
-            "observed_at": self._clock.now(),
-            "outcome": result.outcome,
-            "agent_handle": result.agent_handle,
-            "failure_category": result.failure_category,
-            "detail": result.detail,
-        })
+        self._store.append_launch_result(
+            chat_id, request_id, session_id, result.outcome,
+            agent_handle=result.agent_handle,
+            failure_category=result.failure_category,
+            detail=result.detail)
 
         if result.outcome == OUTCOME_FAILED:
-            self._transition(session, "launch_failed", "launcher", "launch_result", request_id)
-            self._release_binding(session_id)
+            self._transition(session, "launch_failed", "launcher", "launch_result",
+                             request_id)
             return TurnOutcome(chat_id, session_id, user_message_id, [],
                                session["state"], result.outcome, result.failure_category)
 
@@ -333,9 +395,11 @@ class SessionManager(object):
             return TurnOutcome(chat_id, session_id, user_message_id, [],
                                session["state"], result.outcome, None)
 
-        session["agent_handle"] = result.agent_handle
-        self._store.put(session)
-        self._transition(session, "running", "launcher", "launch_result", request_id)
+        # The handle enters the session in the same write as `running`, so no
+        # process death can leave a session that ran without the handle it ran
+        # with (the window #87's N1 lived in).
+        self._transition(session, "running", "launcher", "launch_result", request_id,
+                         agent_handle=result.agent_handle)
         agent_messages = self._drain(session)
         return TurnOutcome(chat_id, session_id, user_message_id, agent_messages,
                            session["state"], result.outcome, None)
@@ -353,10 +417,9 @@ class SessionManager(object):
         the `LaunchResult` that classified a failure could itself raise --
         out of the `except` block, past the caller, leaving the session stuck in
         `launching` with its binding open and no `launch_result` written at all.
-        The one method whose entire purpose is "every failure becomes a durable
-        outcome" checked that at its label. Everything this method does is now
-        inside the guarantee, and the fallback below cannot fail: its category is
-        a module constant and its detail is built by this method.
+        Everything this method does is now inside the guarantee, and the
+        fallback below cannot fail: its category is a module constant and its
+        detail is built by this method.
         """
         try:
             return self._classify_launch(instruction)
@@ -382,7 +445,15 @@ class SessionManager(object):
                 detail="launcher returned %r rather than a LaunchResult"
                        % (type(result).__name__,),
             )
-        return result
+        # Re-stated through the constructor rather than trusted, because the
+        # object is the launcher's and its attributes are writable after it was
+        # built. A result that no longer satisfies its own conditional-field
+        # rules raises here, inside `_call_launch`'s guarantee, and becomes a
+        # classified failure instead of a record the store refuses mid-launch
+        # with the session left in `launching`.
+        return LaunchResult(result.outcome, agent_handle=result.agent_handle,
+                            failure_category=result.failure_category,
+                            detail=result.detail)
 
     # -- delivering (persistent continuation) ------------------------------
 
@@ -393,28 +464,20 @@ class SessionManager(object):
         # session with no handle (contract 4.3, ADDRESSED_WITHOUT_HANDLE).
         agent_handle = self._agent_handle(session)
         self._check_declared_bound(text)
-        user_message_id = self._append_message(chat_id, "user", text)
+        # The store's own delivery preconditions, asked before the user's turn is
+        # recorded rather than discovered after it. Read-only: it writes nothing
+        # and is the same function `append_delivery_request` calls, so the set
+        # of turns refused here is the set the store would refuse below, and a
+        # turn the store would not deliver is never left in the chat unoffered.
+        self._store._require_deliverable(chat_id, session_id)
+        user_message_id = self._store.append_user_message(chat_id, text)["message_id"]
 
-        delivery_id = self._ids("dlv")
-        sequence = len(self._store.deliveries_of(session_id)) + 1
-        instruction = DeliveryInstruction(
-            delivery_id=delivery_id,
-            chat_id=chat_id,
-            session_id=session_id,
-            sequence=sequence,
-            created_at=self._clock.now(),
-            instruction_encoding="utf-8",
-            instruction_text=text,
-        )
         # Recorded before the call, with `acknowledged: null`. A turn the harness
         # sent to an agent and did not record is a turn nobody can investigate,
         # and an acknowledgement we never received is unknown rather than false.
-        packet = dict(instruction.as_record())
-        packet.update({
-            "record_type": "delivery_request", "record_version": 1,
-            "acknowledged": None,
-        })
-        self._store.put(packet)
+        packet = self._store.append_delivery_request(chat_id, session_id, text)
+        instruction = DeliveryInstruction(
+            **dict((name, packet[name]) for name in DeliveryInstruction.FIELDS))
 
         try:
             ack = self._boundary.deliver(agent_handle, instruction)
@@ -423,8 +486,12 @@ class SessionManager(object):
         if not isinstance(ack, DeliveryAck):
             ack = DeliveryAck(None, detail="launcher returned %r rather than a DeliveryAck"
                                            % (type(ack).__name__,))
-        packet["acknowledged"] = ack.acknowledged
-        self._store.put(packet)
+        acknowledged = ack.acknowledged
+        if acknowledged is not None and not isinstance(acknowledged, bool):
+            acknowledged = None  # a launcher-mutated ack says nothing usable
+        if acknowledged is not None:
+            self._store.record_delivery_acknowledgement(
+                chat_id, session_id, packet["delivery_id"], acknowledged)
 
         agent_messages = self._drain(session)
         return TurnOutcome(chat_id, session_id, user_message_id, agent_messages,
@@ -441,13 +508,14 @@ class SessionManager(object):
         that is merely quiet blocks here, which is v0.1's honest behaviour and
         #83's gap rather than something to paper over with a timer.
         """
+        chat_id = session["chat_id"]
         session_id = session["session_id"]
         agent_handle = self._agent_handle(session)
         capabilities = self._boundary.capabilities
         agent_messages = []
 
         while True:
-            after = self._store.last_event_sequence(session_id)
+            after = self._store.next_event_sequence(chat_id, session_id) - 1
             try:
                 page = self._boundary.events(agent_handle, after)
             except LauncherError as exc:
@@ -456,7 +524,7 @@ class SessionManager(object):
                 observation_id = self._record_observation(
                     session, "stream_read_failed",
                     "%s: %s" % (exc.category, exc.detail))
-                if session["state"] in ("running", "launching"):
+                if session["state"] == "running":
                     self._transition(session, "unknown", "launcher", "observation",
                                      observation_id)
                 return agent_messages
@@ -485,9 +553,8 @@ class SessionManager(object):
                 stored_any = True
                 if payload.is_chat_text:
                     agent_messages.append(
-                        self._append_message(session["chat_id"], "agent", payload.text,
-                                             session_id=session_id,
-                                             source_event_id=event_id))
+                        self._store.append_agent_message(
+                            chat_id, session_id, event_id, payload.text)["message_id"])
                 if payload.interpretation != INTERPRETATION_RECOGNIZED:
                     continue
                 if payload.interpreted_type == PAYLOAD_TURN_COMPLETE:
@@ -504,12 +571,13 @@ class SessionManager(object):
                     stream_end_event_id = event_id
 
             if reached_terminal:
-                self._release_binding(session_id)
+                # The binding was released in the same write as the terminal
+                # transition; there is no second write to make here.
                 return agent_messages
             if stream_end_event_id is not None:
                 # The stream closing is an observed fact, unlike silence on an
                 # open stream (contract 5.3 cause 2).
-                if session["state"] in ("running",):
+                if session["state"] == "running":
                     self._transition(session, "unknown", "launcher", "stream_end",
                                      stream_end_event_id)
                 return agent_messages
@@ -522,17 +590,11 @@ class SessionManager(object):
                 # launcher did not honour `after_sequence` and the next call
                 # would ask the same question and get the same answer. Looping
                 # is then unbounded, with the chat lock held and nothing durable
-                # written -- a hung UI at full CPU rather than a stated refusal,
-                # and whether the internal bridge can resume at all is unknown
-                # (facts-and-assumptions C5).
+                # written -- a hung UI at full CPU rather than a stated refusal.
                 #
                 # This is a refusal about a fact the launcher supplied, not an
                 # inference from elapsed time: no duration is measured and no
-                # threshold compared. It is the mirror of the sequence-gap
-                # refusal in `_preserve`, which the earlier revision had and this
-                # one lacked -- the existing replay probe tested replay for
-                # *duplication*, which is a different guarantee from the drain
-                # *terminating*.
+                # threshold compared.
                 raise LaunchBoundaryError(
                     "launcher returned %d payload(s) for session %s after sequence "
                     "%d and every one of them was already stored; `events` is "
@@ -561,7 +623,9 @@ class SessionManager(object):
         Preservation is unconditional and is especially required when
         interpretation failed, because those are the cases v0.1 exists to
         discover. Returns the event id, or None when this `(session_id,
-        sequence)` was already stored -- `events` is at-least-once.
+        sequence)` was already stored with the same evidence -- `events` is
+        at-least-once. A *different* payload at a stored sequence is not a
+        replay, and the store refuses it (`StoreCorrupt`).
         """
         try:
             body = payload.raw.decode("utf-8")
@@ -570,33 +634,24 @@ class SessionManager(object):
             body = base64.b64encode(payload.raw).decode("ascii")
             encoding = "base64"
         # Contiguity is the launcher's to assign and the harness's to refuse.
-        # `events` is resumable by sequence, so a gap means a payload was lost
-        # rather than that one is still coming, and contract 4.5 makes an ordered
-        # history contiguous from 1. Failing closed here keeps a launcher with a
-        # counting bug from writing a store nobody can read back in order.
-        last = self._store.last_event_sequence(session["session_id"])
+        # The store refuses a gap too; this states it as the launcher's misuse
+        # of the seam, before the store is asked, so the refusal a launcher
+        # author sees names the seam rule it broke.
+        chat_id = session["chat_id"]
+        session_id = session["session_id"]
+        last = self._store.next_event_sequence(chat_id, session_id) - 1
         if payload.sequence > last + 1:
             raise LaunchBoundaryError(
                 "launcher returned payload sequence %d for session %s while %d is "
                 "stored; an ordered history must be contiguous, and a gap means a "
                 "payload was lost rather than that one is still coming"
-                % (payload.sequence, session["session_id"], last))
-        event_id = self._ids("evt")
-        record = {
-            "record_type": "diagnostic_event", "record_version": 1,
-            "event_id": event_id,
-            "chat_id": session["chat_id"],
-            "session_id": session["session_id"],
-            "sequence": payload.sequence,
-            "received_at": self._clock.now(),
-            "source": payload.source,
-            "interpretation": payload.interpretation,
-            "interpreted_type": payload.interpreted_type,
-            "raw": {"encoding": encoding, "body": body},
-        }
-        if not self._store.append_event(record):
+                % (payload.sequence, session_id, last))
+        record, created = self._store.append_diagnostic_event(
+            chat_id, session_id, payload.sequence, payload.source,
+            payload.interpretation, payload.interpreted_type, body, encoding=encoding)
+        if not created:
             return None
-        return event_id
+        return record["event_id"]
 
     # -- user actions ------------------------------------------------------
 
@@ -607,7 +662,7 @@ class SessionManager(object):
         observation that leaves liveness undeterminable, which carries the
         session to `unknown`, from which the user can always abandon.
         """
-        with self._store.chat_lock(chat_id):
+        with self._turns.hold(chat_id):
             session = self._active_session(chat_id)
             if session is None:
                 raise NotPermitted("chat %s has no live agent to stop" % chat_id)
@@ -617,14 +672,12 @@ class SessionManager(object):
                     "stopped" % (session["session_id"], session["state"]))
             handle = session.get("agent_handle")
             if not (isinstance(handle, str) and handle):
-                # An `unknown` session whose launch was never accepted -- an
-                # `unknown` launch outcome, or a restart that interrupted the
-                # launch -- never received a handle. `stop` takes the handle and
-                # nothing else (6.1), so there is nothing to address and a stop
-                # observation here would claim an operation that cannot have
-                # happened. The user is not stuck: `abandon` is 5.4's exit from
-                # exactly this state, and it needs no handle because it is the
-                # user's decision rather than an observation of the agent.
+                # An `unknown` session whose launch was never accepted never
+                # received a handle. `stop` takes the handle and nothing else
+                # (6.1), so there is nothing to address and a stop observation
+                # here would claim an operation that cannot have happened. The
+                # user is not stuck: `abandon` is 5.4's exit from exactly this
+                # state, and it needs no handle.
                 raise NotPermitted(
                     "session %s never received an agent_handle, so there is nothing "
                     "to stop; abandon it instead (contract 5.4)"
@@ -642,7 +695,6 @@ class SessionManager(object):
             if confirmed:
                 self._transition(session, "terminated", "user", "observation",
                                  observation_id)
-                self._release_binding(session["session_id"])
             elif session["state"] == "running":
                 self._transition(session, "unknown", "launcher", "observation",
                                  observation_id)
@@ -652,9 +704,10 @@ class SessionManager(object):
         """The user gives up on an `unknown` session (contract 5.1, 5.4).
 
         This is a decision, not an observation, and it is the reason the user is
-        never stuck behind a silent agent. The harness never makes it.
+        never stuck behind a silent agent. The harness never makes it. It is the
+        one lifecycle action the shell exposes (decision 0003).
         """
-        with self._store.chat_lock(chat_id):
+        with self._turns.hold(chat_id):
             session = self._active_session(chat_id)
             if session is None:
                 raise NotPermitted("chat %s has no session to abandon" % chat_id)
@@ -663,7 +716,6 @@ class SessionManager(object):
                     "session %s is in state %r; only an 'unknown' session may be "
                     "abandoned" % (session["session_id"], session["state"]))
             self._transition(session, "abandoned", "user", "user_action", None)
-            self._release_binding(session["session_id"])
             return session["state"]
 
     # -- restart (contract 5.4) -------------------------------------------
@@ -676,39 +728,52 @@ class SessionManager(object):
         survives into a state with no legal exit is not durable, it is a chat
         nobody can use. This happens when the harness starts and never on a
         schedule; everything after it is a user action.
+
+        A chat whose turn lock another process holds is being served by that
+        process right now, so it is not a chat this start interrupted and it is
+        left alone -- the lock is released by the kernel when that process dies,
+        so this asks a fact, not a clock. A chat whose records cannot be read, or
+        whose re-attachment the store refuses to record, is left as it is and the
+        next chat is re-attached: one damaged chat must not keep the application
+        from starting for every other one, and every later action on it reads the
+        same records and fails closed (contract D3), so skipping it here makes
+        nothing look sound.
         """
         outcomes = []
-        for session in self._store.all_of("agent_session"):
-            if session["state"] in TERMINAL_SESSION_STATES:
-                continue
-            outcomes.append((session["session_id"], self._reattach(session)))
+        for chat in self._store.list_chats(include_archived=True):
+            chat_id = chat["chat_id"]
+            with self._turns.hold(chat_id, blocking=False) as held:
+                if not held.acquired:
+                    continue
+                try:
+                    for session, _binding in self._store.list_sessions(chat_id):
+                        if session["state"] in self._terminal:
+                            continue
+                        outcomes.append((session["session_id"], self._reattach(session)))
+                except StoreError:
+                    continue
         return outcomes
 
     def _reattach(self, session):
         state = session["state"]
+        chat_id = session["chat_id"]
         session_id = session["session_id"]
 
         if state == "pending":
             # No launch was ever issued, so there is no agent and nothing to
             # re-attach to. "We never got an agent" is precisely launch_failed.
             self._transition(session, "launch_failed", "harness", "harness_action", None)
-            self._release_binding(session_id)
             return "launch_failed"
 
         if state == "launching":
-            # `launching` is not a fact about the handle, and generalising this
-            # path to the handle alone left this shape in no branch at all
-            # (re-review N1): a `launching` session that *does* carry a handle
-            # passed the guard below and then matched neither outcome gate, so
-            # `return session["state"]` left it `launching` on every restart,
-            # for the life of the store, with stop, abandon and every turn
-            # refused. Resolving it first, from the record that says how the
-            # launch ended, is what puts every shape back in a branch.
+            # `launching` is not a fact about the handle (re-review N1): it means
+            # the launch was issued and its outcome was never written as a state.
+            # Resolving it first, from the record that says how the launch ended,
+            # is what puts every shape in a branch.
             state = self._resolve_interrupted_launch(session)
             if state != "running":
                 # `launch_failed` is terminal and `unknown`'s exit is the user's
-                # `abandon`; neither has a handle to re-attach through, and
-                # nothing below applies to them.
+                # `abandon`; neither has a handle to re-attach through.
                 return state
 
         handle = session.get("agent_handle")
@@ -716,13 +781,8 @@ class SessionManager(object):
             # Contract 5.4's second case, stated over the fact rather than over
             # the state name. `events` takes the handle and nothing else, so a
             # session that never received one has nothing to address and the
-            # attempt fails without being made. The shape that reaches here is a
-            # session whose launch outcome came back `unknown`, which contract
-            # 6.1 forbids from carrying a handle at all; the branch stays keyed
-            # on the fact rather than on that one state name so that any other
-            # handle-less session is refused rather than addressed.
-            # `reattach_failed` is the one observation kind that needs no handle,
-            # for exactly this reason (contract 4.3).
+            # attempt fails without being made. `reattach_failed` is the one
+            # observation kind that needs no handle, for exactly this reason.
             observation_id = self._record_observation(
                 session, "reattach_failed",
                 "session %s carries no agent_handle -- its launch was never accepted, "
@@ -734,7 +794,8 @@ class SessionManager(object):
             return "unknown"
 
         try:
-            self._boundary.events(handle, self._store.last_event_sequence(session_id))
+            self._boundary.events(handle,
+                                  self._store.next_event_sequence(chat_id, session_id) - 1)
         except LauncherError as exc:
             observation_id = self._record_observation(
                 session, "reattach_failed", "%s: %s" % (exc.category, exc.detail))
@@ -753,47 +814,41 @@ class SessionManager(object):
     def _resolve_interrupted_launch(self, session):
         """Finish the launch outcome a restart interrupted, from the record of it.
 
-        `launching` means one thing and it is not a fact about the handle: the
-        launch was issued and its outcome was never written as a state. The two
-        are independent, because `_launch_turn` persists the handle and the
-        `running` transition as separate durable writes, so a process death
-        between them leaves `launching` *with* a handle.
-
-        Contract 5.2's precondition column decides what may resolve it, and for
-        every exit but one it names the launcher's own `launch_result`:
+        Contract 5.2's precondition column decides what may resolve `launching`,
+        and for every exit but one it names the launcher's own `launch_result`:
         `launching -> running` admits `launch_result` reporting `accepted`,
         `launching -> launch_failed` admits `failed`, `launching -> unknown`
         admits `unknown`. D1 makes that record canonical across a restart, so the
         harness finishes the transition it already holds the evidence for. It
-        asks the launcher nothing here: this reads the harness's own records, and
-        the re-attachment proper still happens above, through the handle.
+        asks the launcher nothing here.
 
-        A re-attachment cannot stand in for that evidence. `launching -> running`
-        does not admit an `observation` at all, and an accepted launch whose
-        session never entered `running` is a `LAUNCH_OUTCOME_MISMATCH` however
-        the session is later resolved -- so widening the two outcome gates below
-        to admit `launching` would trade a bricked chat for a store the contract
-        rejects. Measured both ways; see this rail's handoff.
+        On this store the handle is written in the same write as `running`, so
+        the shape a restart meets is `launching` with an accepted result and no
+        handle on the session; the handle that enters `running` is the one the
+        result carries, and the store checks it was issued. A session written by
+        #87's own store could also carry that handle already, and resolves the
+        same way.
 
         When no usable `launch_result` survives, nothing can say how the launch
         ended and nothing ever will: that is `unknown`, evidenced by the failed
         re-attachment, which is the one observation kind that needs no handle.
         """
+        chat_id = session["chat_id"]
         session_id = session["session_id"]
-        request = self._store.launch_request_of(session_id)
-        result = self._store.launch_result_of(session_id)
-        request_id = request["request_id"] if request is not None else None
+        requests = self._store.read_launch_requests(chat_id, session_id)
+        results = self._store.read_launch_results(chat_id, session_id)
+        request_id = requests[0]["request_id"] if requests else None
+        result = results[0] if results else None
 
         if result is not None and request_id is not None:
             outcome = result.get("outcome")
             if outcome == OUTCOME_ACCEPTED and result.get("agent_handle"):
                 self._transition(session, "running", "launcher", "launch_result",
-                                 request_id)
+                                 request_id, agent_handle=result["agent_handle"])
                 return session["state"]
             if outcome == OUTCOME_FAILED:
                 self._transition(session, "launch_failed", "launcher", "launch_result",
                                  request_id)
-                self._release_binding(session_id)
                 return session["state"]
             if outcome == OUTCOME_UNKNOWN:
                 self._transition(session, "unknown", "launcher", "launch_result",
@@ -811,93 +866,26 @@ class SessionManager(object):
 
     # -- record plumbing ---------------------------------------------------
 
-    def _append_message(self, chat_id, author, text, session_id=None, source_event_id=None):
-        message_id = self._ids("msg")
-        now = self._clock.now()
-        self._store.append_message({
-            "record_type": "message", "record_version": 1,
-            "message_id": message_id, "chat_id": chat_id,
-            "sequence": self._store.next_message_sequence(chat_id),
-            "author": author, "created_at": now,
-            "content": {"content_type": "text/plain", "text": text},
-            "session_id": session_id, "source_event_id": source_event_id,
-        })
-        chat = self._store.get("chat", chat_id)
-        if chat is not None:
-            chat["updated_at"] = now
-            self._store.put(chat)
-        return message_id
+    def _transition(self, session, to, owner, evidence_kind, evidence_ref,
+                    agent_handle=None):
+        """Append a transition through the store and carry its result back.
 
-    def _open_session(self, chat_id, opening_message_id):
-        """Create the session and open its binding *before* the launch is attempted.
-
-        Two reasons, and both matter. Contract 4.3: a launch failure must be
-        attributable to a durable record rather than being lost. And the
-        one-agent-per-chat rule is only real if the chat is claimed before the
-        harness calls out: a launcher that re-enters `send_turn` during `launch`
-        finds a non-terminal session already recorded and is refused, which a
-        binding opened after the call would not do.
+        The store compares against the state this caller last read, checks the
+        pair and its owner against contract 5.2's owner table *and* its
+        precondition table, puts a handle into the session only in the write that
+        enters `running`, and releases the binding in the same write as a
+        terminal state. `session` is updated in place so a caller's view is the
+        durable one.
         """
-        existing = self._active_session(chat_id)
-        if existing is not None:
-            raise ConcurrentLaunchRefused(self._refusal_reason(existing))
-
-        now = self._clock.now()
-        session_id = self._ids("ses")
-        session = {
-            "record_type": "agent_session", "record_version": 1,
-            "session_id": session_id, "chat_id": chat_id, "created_at": now,
-            "launcher_id": self._boundary.launcher_id,
-            "launcher_capabilities": self._boundary.capabilities.as_record(),
-            "state": "pending",
-            "transitions": [{
-                "from": None, "to": "pending", "owner": "user", "at": now,
-                "evidence": {"kind": "user_action", "ref": opening_message_id},
-            }],
-        }
-        self._store.put(session)
-        self._store.put({
-            "record_type": "agent_binding", "record_version": 1,
-            "binding_id": self._ids("bnd"), "chat_id": chat_id,
-            "session_id": session_id, "bound_at": now, "released_at": None,
-        })
-        return session
-
-    def _transition(self, session, to, owner, evidence_kind, evidence_ref):
-        frm = session["state"]
-        expected = AUTHORIZED_TRANSITIONS.get((frm, to))
-        if expected is None:
-            raise NotPermitted("%s -> %s is not an authorized transition" % (frm, to))
-        if expected != owner:
-            raise NotPermitted(
-                "%s -> %s is owned by %r, not %r" % (frm, to, expected, owner))
-        session["transitions"].append({
-            "from": frm, "to": to, "owner": owner, "at": self._clock.now(),
-            "evidence": {"kind": evidence_kind, "ref": evidence_ref},
-        })
-        session["state"] = to
-        self._store.put(session)
-
-    def _release_binding(self, session_id):
-        binding = self._store.binding_for_session(session_id)
-        if binding is None or binding["released_at"] is not None:
-            return
-        binding["released_at"] = self._clock.now()
-        self._store.put(binding)
+        updated, _binding = self._store.append_transition(
+            session["chat_id"], session["session_id"], session["state"], to, owner,
+            {"kind": evidence_kind, "ref": evidence_ref}, agent_handle=agent_handle)
+        session.clear()
+        session.update(updated)
 
     def _record_observation(self, session, kind, detail):
-        # The harness's own copy of contract 4.3's rule, applied where the record
-        # is written rather than left to a validator run afterwards. Every kind
-        # here but `reattach_failed` records an operation that took the handle as
-        # its address, so writing one for a session with no handle would be a
-        # record of something that cannot have happened.
-        if kind in ADDRESSING_OBSERVATION_KINDS:
-            self._agent_handle(session)
-        observation_id = self._ids("obs")
-        self._store.put({
-            "record_type": "session_observation", "record_version": 1,
-            "observation_id": observation_id,
-            "chat_id": session["chat_id"], "session_id": session["session_id"],
-            "observed_at": self._clock.now(), "kind": kind, "detail": detail,
-        })
-        return observation_id
+        # Contract 4.3's addressing rule is the store's: it refuses an
+        # observation of an operation that took the handle as its address unless
+        # the launcher issued one for this session.
+        return self._store.append_session_observation(
+            session["chat_id"], session["session_id"], kind, detail)["observation_id"]

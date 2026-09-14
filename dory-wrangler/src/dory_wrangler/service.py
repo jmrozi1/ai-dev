@@ -1,18 +1,20 @@
-"""The chat shell's use cases: create, list, open, send.
+"""The chat shell's use cases: create, list, open, send, abandon.
 
-Thin by design. Every durable decision belongs to `store`, and this layer adds
-only the four things the shell actually does. In particular it holds no cache:
-`open_chat` reads the chat and its messages from disk on every call, so the
-history the shell renders is the durable history and cannot diverge from it.
+Thin by design. Every durable decision belongs to `store`, and every decision
+about an agent belongs to `session_manager`; this layer adds only the things the
+shell actually does. In particular it holds no cache: `open_chat` reads the chat
+and its messages from disk on every call, so the history the shell renders is
+the durable history and cannot diverge from it.
 
-This layer contains no launch mechanics. #86 starts no agent, and the contract's
-section 6 boundary is #87's to implement. `turn_listener` exists so that a later
-ticket can be told a user turn is durable without editing the send path; it is a
-notification with no autonomy of its own -- it is called only because a user
-sent a turn, never on a schedule, and never because time passed.
+A sent turn goes through the chat loop (`SessionManager.send_turn`), which is
+the only path that records a user turn in the served application: the turn is
+recorded when it is offered to an agent and refused before it is recorded when
+the chat is already served (decision 0003). Abandon is the one lifecycle action
+the shell exposes, because a restart that finds an agent nobody can reach must
+leave the user a way out.
 """
 
-from .store import ChatStore
+from .wiring import open_harness
 
 DEFAULT_TITLE = "New chat"
 
@@ -21,15 +23,21 @@ DEFAULT_TITLE = "New chat"
 # nothing is parsed out of an identifier to produce it.
 TITLE_FROM_FIRST_TURN_CHARS = 60
 
+# The launcher the shell uses when none is configured: the external development
+# launcher in the shape of the one internal path that is proven, a one-shot
+# script. Configuration, not code, chooses another (`serve.py --launcher`).
+DEFAULT_LAUNCHER = {"launcher": "dev-local", "options": {"profile": "one_shot"}}
+
 
 class ChatService(object):
-    def __init__(self, store, turn_listener=None):
-        self.store = store
-        self.turn_listener = turn_listener
+    def __init__(self, sessions):
+        self.sessions = sessions
+        self.store = sessions.store
 
     @classmethod
-    def open(cls, root, turn_listener=None):
-        return cls(ChatStore(root), turn_listener=turn_listener)
+    def open(cls, root, launcher_config=None, launcher=None):
+        return cls(open_harness(launcher_config or DEFAULT_LAUNCHER, root,
+                                launcher=launcher))
 
     # -- the new-chat flow ---------------------------------------------
 
@@ -92,18 +100,36 @@ class ChatService(object):
     # -- send ----------------------------------------------------------
 
     def send_user_message(self, chat_id, text):
-        """Append a user turn and return the reloaded chat.
+        """Send a user turn through the chat loop and return the reloaded chat.
 
-        The message is durable before anything else happens. The chat is then
-        re-read from disk rather than patched in memory, so what the shell shows
-        after a send is the same history it would show after a restart.
+        The turn is offered to an agent and the chat is then re-read from disk
+        rather than patched in memory, so what the shell shows after a send is
+        the same history it would show after a restart. A refused turn raises
+        before anything is recorded; a turn that was recorded names the chat even
+        when what followed it failed.
         """
         chat = self.store.read_chat(chat_id)
-        message = self.store.append_user_message(chat_id, text)
-        if chat["title"] == DEFAULT_TITLE and message["sequence"] == 1:
-            title = " ".join(text.split())[:TITLE_FROM_FIRST_TURN_CHARS].strip()
-            if title:
-                self.store.set_title(chat_id, title, only_if_titled=DEFAULT_TITLE)
-        if self.turn_listener is not None:
-            self.turn_listener(chat_id, message["message_id"])
+        try:
+            self.sessions.send_turn(chat_id, text)
+        finally:
+            self._name_from_first_turn(chat)
+        return self.open_chat(chat_id)
+
+    def _name_from_first_turn(self, chat):
+        if chat["title"] != DEFAULT_TITLE:
+            return
+        messages = self.store.read_messages(chat["chat_id"])
+        if not messages or messages[0]["author"] != "user":
+            return
+        text = messages[0]["content"]["text"]
+        title = " ".join(text.split())[:TITLE_FROM_FIRST_TURN_CHARS].strip()
+        if title:
+            self.store.set_title(chat["chat_id"], title, only_if_titled=DEFAULT_TITLE)
+
+    # -- the one lifecycle action --------------------------------------
+
+    def abandon(self, chat_id):
+        """The user abandons the agent holding this chat, then sees the chat."""
+        self.store.read_chat(chat_id)
+        self.sessions.abandon(chat_id)
         return self.open_chat(chat_id)

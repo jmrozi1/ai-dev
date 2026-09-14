@@ -31,7 +31,9 @@ from dory_wrangler.errors import (
     UnsupportedContentType,
     ValidationRefused,
 )
+from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 from dory_wrangler.service import ChatService
+from dory_wrangler.session_manager import SessionManager
 from dory_wrangler.store import ChatStore
 
 
@@ -885,22 +887,40 @@ class TestService(StoreCase):
 
     def setUp(self):
         StoreCase.setUp(self)
-        self.seen = []
-        self.service = ChatService(
-            self.store,
-            turn_listener=lambda chat_id, message_id: self.seen.append((chat_id, message_id)),
-        )
+        self.launcher = ScriptedStubLauncher({})
+        self.service = ChatService(SessionManager(self.store, self.launcher))
 
-    def test_the_turn_listener_sees_a_turn_that_is_already_durable(self):
-        """#87's seam: it is told after the write, and only because a user sent one."""
+    def test_a_sent_turn_is_durable_before_any_agent_is_asked(self):
+        """Replaces `test_the_turn_listener_sees_a_turn_that_is_already_durable`.
+
+        #86's listener was the seam through which #87 was to be told of a turn
+        only after it was durable and only because a user sent one. The chat
+        loop now *is* that path, so the property is asserted over what the
+        launcher saw rather than over a callback: nothing is launched by opening
+        a chat, and at the moment `launch` is called the user's turn is already
+        on disk and is the message the session was opened on.
+        """
+        seen = []
+
+        def on_launch(instruction):
+            durable = ChatStore(self.root).read_messages(instruction.chat_id)
+            session = ChatStore(self.root).read_session(
+                instruction.chat_id, instruction.session_id)
+            seen.append((instruction.instruction_text, durable, session))
+
+        self.launcher = ScriptedStubLauncher({"on_launch": on_launch})
+        self.service = ChatService(SessionManager(self.store, self.launcher))
         chat_id = self.service.create_chat()["chat_id"]
-        self.assertEqual(self.seen, [], "a listener fired without a user turn")
+        self.assertEqual(self.launcher.launch_calls, [],
+                         "an agent was launched without a user turn")
         self.service.send_user_message(chat_id, "a turn")
-        self.assertEqual(len(self.seen), 1)
-        notified_chat, notified_message = self.seen[0]
-        self.assertEqual(notified_chat, chat_id)
-        durable = self.store.read_messages(chat_id)
-        self.assertEqual(durable[0]["message_id"], notified_message)
+        self.assertEqual(len(seen), 1)
+        text, durable, session = seen[0]
+        self.assertEqual(text, "a turn")
+        self.assertEqual([m["content"]["text"] for m in durable], ["a turn"])
+        self.assertEqual(session["transitions"][0]["evidence"]["ref"],
+                         durable[0]["message_id"])
+        self.assertStoreValid()
 
     def test_open_chat_reads_from_disk_every_time(self):
         chat_id = self.service.create_chat("Fresh")["chat_id"]
@@ -908,7 +928,7 @@ class TestService(StoreCase):
         self.store.append_user_message(chat_id, "written by something else")
         self.assertEqual(
             [m["text"] for m in self.service.open_chat(chat_id)["messages"]],
-            ["first", "written by something else"],
+            ["first", "answer to: first", "written by something else"],
         )
 
     def test_the_conversation_list_carries_no_worker_state(self):
@@ -1479,6 +1499,27 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
             '{"type":"assistant_text","text":"hi"}')
         return store.append_agent_message(chat_id, sid, event["event_id"], "hi")
 
+    def _acknowledged(self, store, chat_id, sid, values):
+        """A delivery, then the answers to it, the last of which may be refused.
+
+        A compound operation, so a refusal of its *last* write must not hide the
+        writes before it from the property: the store is verified here before
+        the refusal is passed on, which the cross does not do for a refused op.
+        """
+        delivery = store.append_delivery_request(chat_id, sid, "follow-up")
+        for value in values[:-1]:
+            store.record_delivery_acknowledgement(
+                chat_id, sid, delivery["delivery_id"], value)
+        try:
+            return store.record_delivery_acknowledgement(
+                chat_id, sid, delivery["delivery_id"], values[-1])
+        except StoreError:
+            introduced = set(v[0] for v in store.verify()) - self.TRANSIENT
+            self.assertEqual(set(), introduced,
+                             "a refused acknowledgement left the writes before it "
+                             "in a store the contract rejects")
+            raise
+
     def _second_session(self, store, chat_id, sid):
         user = store.append_user_message(chat_id, "another turn")
         return store.create_session(
@@ -1510,6 +1551,12 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
             ("append_delivery_request",
              lambda store, chat_id, sid:
                  store.append_delivery_request(chat_id, sid, "follow-up")))
+        for variant, values in (("true", (True,)), ("false", (False,)),
+                                ("twice", (True, False)), ("null", (None,))):
+            operations.append(
+                ("record_delivery_acknowledgement:" + variant,
+                 lambda store, chat_id, sid, values=values:
+                     self._acknowledged(store, chat_id, sid, values)))
         operations.append(
             ("set_agent_handle",
              lambda store, chat_id, sid:
@@ -3110,7 +3157,7 @@ class EveryCodeIsAccountedFor(CodeClosureCase):
         self.assertEqual(
             ["_append_message", "_append_packet", "_touch_chat",
              "_write_session_file", "append_diagnostic_event", "archive_chat",
-             "create_chat", "set_title"],
+             "create_chat", "record_delivery_acknowledgement", "set_title"],
             sorted(set(publishing)),
             "the set of functions that publish a record changed; each has to be "
             "re-read rather than only re-counted")
@@ -3824,3 +3871,111 @@ class TestTheReadOnlySurfaceIsDerivedNotDeclared(CodeClosureCase):
         self.assertNotEqual(
             sorted(before), sorted(after),
             "the digest must notice a write, or it notices nothing")
+
+
+class TestTheDeliveryAcknowledgementIsWrittenOnce(CodeClosureCase):
+    """The one write convergence added to the store, and every guard in it.
+
+    #87 recorded a delivery before the call with `acknowledged: null` and
+    rewrote the record with the answer; #86's packets are created once and never
+    replaced, so the answer had nowhere to go. `record_delivery_acknowledgement`
+    is that one field of that one packet type, filled in once.
+    """
+
+    def delivered(self):
+        sid, _request_id, _user = self.running()
+        delivery = self.store.append_delivery_request(self.chat_id, sid, "follow-up")
+        return sid, delivery
+
+    def packet_bytes(self):
+        directory = os.path.join(self.root, "chats", self.chat_id, "packets")
+        return dict((name, open(os.path.join(directory, name), "rb").read())
+                    for name in sorted(os.listdir(directory)))
+
+    def test_the_answer_is_recorded_on_the_delivery_it_answers(self):
+        for value in (True, False):
+            with self.subTest(acknowledged=value):
+                sid, delivery = self.delivered()
+                updated = self.store.record_delivery_acknowledgement(
+                    self.chat_id, sid, delivery["delivery_id"], value)
+                self.assertIs(updated["acknowledged"], value)
+                stored = [d for d in self.store.read_delivery_requests(self.chat_id, sid)
+                          if d["delivery_id"] == delivery["delivery_id"]]
+                self.assertEqual(len(stored), 1)
+                expected = dict(delivery, acknowledged=value)
+                self.assertEqual(stored[0], expected,
+                                 "a field other than `acknowledged` changed")
+                self.assertStoreValid()
+                self.completed(sid)
+
+    def test_null_and_anything_not_a_boolean_is_refused_and_nothing_is_written(self):
+        sid, delivery = self.delivered()
+        before = self.packet_bytes()
+        for value in (None, 1, 0, "true", [], {}):
+            with self.subTest(value=value):
+                with self.assertRaises(ValidationRefused):
+                    self.store.record_delivery_acknowledgement(
+                        self.chat_id, sid, delivery["delivery_id"], value)
+                self.assertEqual(self.packet_bytes(), before)
+
+    def test_an_answer_already_recorded_is_not_rewritten(self):
+        sid, delivery = self.delivered()
+        self.store.record_delivery_acknowledgement(
+            self.chat_id, sid, delivery["delivery_id"], True)
+        before = self.packet_bytes()
+        for value in (False, True):
+            with self.assertRaises(ValidationRefused):
+                self.store.record_delivery_acknowledgement(
+                    self.chat_id, sid, delivery["delivery_id"], value)
+        self.assertEqual(self.packet_bytes(), before)
+
+    def test_only_a_delivery_of_the_named_session_can_be_answered(self):
+        sid, delivery = self.delivered()
+        before = self.packet_bytes()
+        request_id = self.store.read_launch_requests(self.chat_id, sid)[0]["request_id"]
+        for chat_id, session_id, delivery_id, error in (
+                (self.chat_id, sid, "dlv_nosuchdelivery", ValidationRefused),
+                (self.chat_id, sid, request_id, ValidationRefused),
+                (self.chat_id, "ses_nosuchsession0", delivery["delivery_id"], ValidationRefused),
+                (self.store.create_chat("Other")["chat_id"], sid, delivery["delivery_id"],
+                 ValidationRefused),
+                ("cht_nosuchchat000", sid, delivery["delivery_id"], NotFound),
+                ("../" + self.chat_id, sid, delivery["delivery_id"], NotFound)):
+            with self.subTest(chat=chat_id, session=session_id, delivery=delivery_id):
+                with self.assertRaises(error):
+                    self.store.record_delivery_acknowledgement(
+                        chat_id, session_id, delivery_id, True)
+        self.assertEqual(self.packet_bytes(), before)
+
+    def test_the_file_replaced_is_the_one_that_holds_the_record(self):
+        """Located by the record, replaced by the name the record gives it -- and
+        that name must still hold that record, or nothing is written."""
+        sid, first = self.delivered()
+        second = self.store.append_delivery_request(self.chat_id, sid, "again")
+        directory = os.path.join(self.root, "chats", self.chat_id, "packets")
+        names = dict(
+            (json.load(open(os.path.join(directory, n)))["delivery_id"], n)
+            for n in os.listdir(directory) if n.startswith("delivery_request-"))
+        a, b = names[first["delivery_id"]], names[second["delivery_id"]]
+        a_bytes = open(os.path.join(directory, a), "rb").read()
+        b_bytes = open(os.path.join(directory, b), "rb").read()
+        with open(os.path.join(directory, a), "wb") as handle:
+            handle.write(b_bytes)
+        with open(os.path.join(directory, b), "wb") as handle:
+            handle.write(a_bytes)
+        before = self.packet_bytes()
+        with self.assertRaises(StoreCorrupt):
+            self.store.record_delivery_acknowledgement(
+                self.chat_id, sid, first["delivery_id"], True)
+        self.assertEqual(self.packet_bytes(), before)
+
+    def test_an_answer_after_the_agent_exited_is_still_a_true_record(self):
+        """The added-guard direction: no refusal here would be honest. The answer
+        is a fact about a call made while the agent ran, and the contract dates a
+        delivery by when it was sent, not by when it was answered."""
+        sid, delivery = self.delivered()
+        self.completed(sid)
+        self.store.record_delivery_acknowledgement(
+            self.chat_id, sid, delivery["delivery_id"], False)
+        self.assertStoreValid()
+

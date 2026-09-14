@@ -61,10 +61,14 @@ class TestShellFlows(ShellCase):
             _status, body = self.shell.post(
                 "/api/chats/%s/messages" % chat_id, {"text": "turn %d" % i}
             )
-        self.assertEqual([m["sequence"] for m in body["messages"]], [1, 2, 3, 4])
-        self.assertEqual(
-            [m["text"] for m in body["messages"]], ["turn %d" % i for i in range(4)]
-        )
+        # Each turn is answered by the agent through the chat loop before the
+        # send returns, so the history the send renders holds both sides.
+        self.assertEqual([m["sequence"] for m in body["messages"]], list(range(1, 9)))
+        expected = []
+        for i in range(4):
+            expected += ["turn %d" % i, "answer to: turn %d" % i]
+        self.assertEqual([m["text"] for m in body["messages"]], expected)
+        self.assertEqual([m["author"] for m in body["messages"]], ["user", "agent"] * 4)
         # What the shell returned is what is on disk, not what it remembered.
         on_disk = ChatStore(self.root).read_messages(chat_id)
         self.assertEqual(
@@ -95,12 +99,16 @@ class TestShellFlows(ShellCase):
 class TestShellBoundaries(ShellCase):
     """The shell presents a single-assistant conversation and nothing else."""
 
-    # The six routes this release is allowed to answer, as the URL fragments the
+    # The routes this release is allowed to answer, as the URL fragments the
     # handler dispatches on. This is a closed world: the assertion below is
-    # equality, so a seventh route cannot be added without changing this list,
-    # and changing this list is the visible act of widening the release boundary.
+    # equality, so a route cannot be added without changing this list, and
+    # changing this list is the visible act of widening the release boundary.
+    # `/abandon` is that act, made by #88's convergence (decision 0003): the one
+    # lifecycle action a user needs when a restart leaves an agent nobody can
+    # reach, and nothing else.
     INTENDED_ROUTE_FRAGMENTS = {
         "/", "/index.html", "/healthz", "/api/chats", "/api/chats/", "/messages",
+        "/abandon",
     }
     INTENDED_METHODS = {"do_GET", "do_POST"}
 
@@ -162,6 +170,7 @@ class TestShellBoundaries(ShellCase):
         for method, path in (
             ("GET", "/"), ("GET", "/index.html"), ("GET", "/healthz"),
             ("GET", "/api/chats"), ("GET", "/api/chats/%s" % chat_id),
+            ("POST", "/api/chats/%s/abandon" % chat_id),
         ):
             status, _body = self.shell.raw(method, path)
             self.assertNotEqual(
@@ -214,6 +223,34 @@ class TestShellBoundaries(ShellCase):
         served.append(("POST /api/chats", json.dumps(created)))
         served.append(("POST /api/chats/<id>/messages", json.dumps(
             self.shell.post("/api/chats/%s/messages" % chat_id, {"text": "hello"})[1])))
+        # The abandon route's own answers: a refusal (this chat's agent finished)
+        # and a success, each composed by the shell and each held to the boundary.
+        status, refused = self.shell.raw("POST", "/api/chats/%s/abandon" % chat_id, {})
+        self.assertEqual(status, 409)
+        served.append(("POST /api/chats/<id>/abandon (refused)", refused))
+        live = ShellProcess(tempfile.mkdtemp(prefix="dory-shell-unknown-"),
+                            launcher_options={"launch_outcomes": ["unknown"]})
+        self.addCleanup(shutil.rmtree, live.root, True)
+        self.addCleanup(live.kill)
+        live.start()
+        _status, stuck = live.post("/api/chats", {})
+        status, busy = live.raw("POST", "/api/chats/%s/messages" % stuck["chat_id"],
+                                {"text": "hello"})
+        self.assertEqual(status, 201)
+        status, busy = live.raw("POST", "/api/chats/%s/messages" % stuck["chat_id"],
+                                {"text": "again"})
+        self.assertEqual(status, 409)
+        served.append(("POST /api/chats/<id>/messages (refused)", busy))
+        status, abandoned = live.raw("POST", "/api/chats/%s/abandon" % stuck["chat_id"], {})
+        self.assertEqual(status, 200)
+        served.append(("POST /api/chats/<id>/abandon", abandoned))
+        unknown_store = ChatStore(live.root)
+        unknown_session = unknown_store.list_sessions(stuck["chat_id"])[0][0]
+        secrets_elsewhere = [unknown_session["session_id"], "abandoned", "unknown"]
+        for where, body in served[-3:]:
+            for secret in secrets_elsewhere:
+                self.assertNotIn(secret, body,
+                                 "%s served the worker-internal value %r" % (where, secret))
 
         # Concrete worker-internal values, not words that might mean something
         # else: these exist only inside the store and must not appear anywhere.
@@ -264,7 +301,9 @@ class TestShellBoundaries(ShellCase):
         self.assertNotIn(event["event_id"], list_blob)
 
     def test_the_shell_starts_no_process(self):
-        """#86 launches nothing. #87 owns the launch boundary."""
+        """The shell launches nothing of its own: a turn reaches an agent only
+        through the configured launcher, and the one these tests configure is
+        in-process. The development launcher's real processes are #87's tests'."""
         from shellproc import children_of
 
         _status, chat = self.shell.post("/api/chats", {})

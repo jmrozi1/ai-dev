@@ -33,13 +33,13 @@ import unittest
 import support
 from support import StoreCheck, codes
 
+from dory_wrangler.errors import ProvenanceRefused
+
 
 class AChatThatRecoveredNowValidates(unittest.TestCase, StoreCheck):
 
     def _chat_that_recovered(self, salt, first_outcome, abandon):
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"launch_outcomes": [first_outcome]}}, salt)
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'launch_outcomes': [first_outcome]}})
         chat_id = harness.create_chat("Recovery after a failed start")
         harness.send_turn(chat_id, "hello")
         if abandon:
@@ -50,11 +50,11 @@ class AChatThatRecoveredNowValidates(unittest.TestCase, StoreCheck):
     def test_a_launch_failure_followed_by_a_served_turn(self):
         harness, chat_id = self._chat_that_recovered("k1", "unavailable", False)
         self.assertEqual(
-            [s["state"] for s in harness.store.sessions_of(chat_id)],
+            [s["state"] for s in support.view(harness).sessions_of(chat_id)],
             ["launch_failed", "completed"])
         self.assertEqual(len(harness.transcript(chat_id)), 3,
                          "one unanswered turn, one answered turn, one agent reply")
-        self.assertEqual(len(harness.store.all_of("launch_request")), 2)
+        self.assertEqual(len(support.view(harness).all_of("launch_request")), 2)
         self.assert_store_valid(
             harness.store, "turn-floor-launch-failure-then-served-turn",
             "The user's first turn was never sent to any agent (the launch failed "
@@ -65,7 +65,7 @@ class AChatThatRecoveredNowValidates(unittest.TestCase, StoreCheck):
     def test_the_abandon_and_rebind_flow_contract_5_4_promises(self):
         harness, chat_id = self._chat_that_recovered("k2", "unknown", True)
         self.assertEqual(
-            [s["state"] for s in harness.store.sessions_of(chat_id)],
+            [s["state"] for s in support.view(harness).sessions_of(chat_id)],
             ["abandoned", "completed"],
             "contract 5.4: abandoning is terminal, the binding is released, and "
             "the chat can bind a new agent")
@@ -79,13 +79,13 @@ class AChatThatRecoveredNowValidates(unittest.TestCase, StoreCheck):
         """What made this a defect in the rule rather than in the harness: the
         recovered store was correct in every other respect, and still is."""
         harness, _ = self._chat_that_recovered("k3", "unavailable", False)
-        self.assertEqual(codes(harness.store.snapshot()), [])
+        self.assertEqual(codes(support.view(harness).snapshot()), [])
 
     def test_the_same_chat_without_the_earlier_failure_validates(self):
         """The control. It validated before the fix and must still validate, so a
         rule that had simply been deleted would not be mistaken for a rule that
         was corrected -- see `TheFloorStillRefusesUnderRecording` below."""
-        harness = support.deterministic({"launcher": "scripted-stub"}, "k4")
+        harness = support.harness({'launcher': 'scripted-stub'})
         chat_id = harness.create_chat("No earlier failure")
         harness.send_turn(chat_id, "hello")
         harness.send_turn(chat_id, "let us try that again")
@@ -102,15 +102,16 @@ class ARecordedButUnansweredTurnNowValidates(unittest.TestCase, StoreCheck):
     """
 
     def test_a_recorded_but_unanswered_turn_validates(self):
-        harness = support.deterministic({"launcher": "scripted-stub"}, "k7")
+        harness = support.harness({'launcher': 'scripted-stub'})
         chat_id = harness.create_chat("A turn that was refused, then answered")
         harness.send_turn(chat_id, "hello")
-        harness._append_message(chat_id, "user", "are you still there?")
+        # The recorded-then-refused turn, written the way #86's shell wrote it.
+        harness.store.append_user_message(chat_id, "are you still there?")
         harness.send_turn(chat_id, "let us try again")
 
         self.assertEqual([a for _, a, _ in harness.transcript(chat_id)],
                          ["user", "agent", "user", "user", "agent"])
-        self.assertEqual(len(harness.store.all_of("launch_request")), 2)
+        self.assertEqual(len(support.view(harness).all_of("launch_request")), 2)
         self.assert_store_valid(
             harness.store, "turn-floor-recorded-but-unanswered-turn",
             "Three user turns, two of which were launched and answered, and one "
@@ -130,20 +131,40 @@ class TheFloorStillRefusesUnderRecording(unittest.TestCase, StoreCheck):
     """
 
     def test_an_answer_with_no_instruction_packet_at_all_is_refused(self):
-        harness = support.deterministic({"launcher": "scripted-stub"}, "k8")
+        harness = support.harness({'launcher': 'scripted-stub'})
         chat_id = harness.create_chat("An answer nobody asked for")
         harness.send_turn(chat_id, "hello")
         # A second answered turn whose instruction packet was never written: the
-        # under-recording the floor is for.
-        harness._append_message(chat_id, "user", "and again?")
-        harness._append_message(chat_id, "agent", "answer to: and again?")
-        self.assert_store_rejected_for(harness.store, "TURN_INSTRUCTION_MISSING")
+        # under-recording the floor is for. The store refuses to write that
+        # answer at all, so the shape is forged onto a snapshot of the real store
+        # and handed to the contract, which must refuse it for the floor.
+        harness.store.append_user_message(chat_id, "and again?")
+        forged = support.view(harness)
+        session_id = forged.sessions_of(chat_id)[0]["session_id"]
+        first_answer = [m for m in forged.messages(chat_id) if m["author"] == "agent"][0]
+        forged.put(dict(first_answer, message_id="msg_forgedanswer01", sequence=4,
+                        created_at=support.now(),
+                        content={"content_type": "text/plain",
+                                 "text": "answer to: and again?"},
+                        session_id=session_id))
+        self.assertEqual(codes(forged.snapshot()), ["TURN_INSTRUCTION_MISSING"])
+        with self.assertRaises(ProvenanceRefused):
+            harness.store.append_agent_message(
+                chat_id, session_id, first_answer["source_event_id"],
+                "answer to: and again?")
 
     def test_the_agent_speaking_first_is_still_refused(self):
-        harness = support.deterministic({"launcher": "scripted-stub"}, "k9")
+        harness = support.harness({'launcher': 'scripted-stub'})
         chat_id = harness.create_chat("The agent speaks first")
-        harness._append_message(chat_id, "agent", "hello, did you want something?")
-        self.assert_store_rejected_for(harness.store, "TURN_INSTRUCTION_MISSING")
+        forged = support.view(harness)
+        forged.put({
+            "record_type": "message", "record_version": 1,
+            "message_id": "msg_agentfirst001", "chat_id": chat_id, "sequence": 1,
+            "author": "agent", "created_at": support.now(),
+            "content": {"content_type": "text/plain",
+                        "text": "hello, did you want something?"},
+            "session_id": None, "source_event_id": None})
+        self.assert_store_rejected_for(forged, "TURN_INSTRUCTION_MISSING")
 
 
 if __name__ == "__main__":

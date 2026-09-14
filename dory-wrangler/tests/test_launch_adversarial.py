@@ -25,19 +25,24 @@ import unittest
 import support
 from support import StoreCheck, codes, run_three_turns
 
-from dory_wrangler import identity
+from dory_wrangler import atomic, contract, ids
 from dory_wrangler import launch_boundary as lb
 from dory_wrangler.launchers import dev_local
 from dory_wrangler.launchers import scripted_stub
 from dory_wrangler import session_manager
-from dory_wrangler import harness_store as store_module
+from dory_wrangler import store as store_module
 from dory_wrangler.wiring import open_harness
-from dory_wrangler.errors import ConcurrentLaunchRefused, InstructionTooLarge, NotPermitted
+from dory_wrangler.errors import (
+    ConcurrentLaunchRefused,
+    InstructionTooLarge,
+    NotPermitted,
+    TransitionRefused,
+)
 from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 
 
 def stub_harness(salt="a", **options):
-    return support.deterministic({"launcher": "scripted-stub", "options": options}, salt)
+    return support.harness({'launcher': 'scripted-stub', 'options': options})
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +59,7 @@ class AOneShotLauncherCannotObserveAStreamEnding(unittest.TestCase, StoreCheck):
         with self.assertRaises(lb.LaunchBoundaryError) as caught:
             harness.send_turn(chat_id, "hello")
         self.assertIn("no stream to end", str(caught.exception))
-        types = [e["interpreted_type"] for e in harness.store.all_of("diagnostic_event")]
+        types = [e["interpreted_type"] for e in support.view(harness).all_of("diagnostic_event")]
         self.assertNotIn("stream_end", types,
                          "the refused payload must not have been stored either")
 
@@ -69,7 +74,7 @@ class AOneShotLauncherCannotObserveAStreamEnding(unittest.TestCase, StoreCheck):
 
         launcher = FlagsAnEndWithoutSayingIt({"continuation": "fresh_binding",
                                               "response_shape": "one_shot"})
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("One-shot flagged end")
         with self.assertRaises(lb.LaunchBoundaryError) as caught:
             harness.send_turn(chat_id, "hello")
@@ -82,30 +87,32 @@ class AOneShotLauncherCannotObserveAStreamEnding(unittest.TestCase, StoreCheck):
                                response_shape="one_shot")
         chat_id = harness.create_chat("Smuggled stream end")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
-        harness.store.put({
+        session = support.view(harness).sessions_of(chat_id)[0]
+        forged = support.view(harness)
+        forged.put({
             "record_type": "diagnostic_event", "record_version": 1,
             "event_id": "evt_smuggled0001", "chat_id": chat_id,
             "session_id": session["session_id"],
-            "sequence": len(harness.store.events_of(session["session_id"])) + 1,
-            "received_at": harness._clock.now(), "source": "launcher",
+            "sequence": len(support.view(harness).events_of(session["session_id"])) + 1,
+            "received_at": support.now(), "source": "launcher",
             "interpretation": "recognized", "interpreted_type": "stream_end",
             "raw": {"encoding": "utf-8", "body": "{}"}})
-        self.assert_store_rejected_for(harness.store, "STREAM_END_UNSUPPORTED")
+        self.assert_store_rejected_for(forged, "STREAM_END_UNSUPPORTED")
 
     def test_probe_a_stream_end_citation_on_a_one_shot_session_is_rejected(self):
         harness = stub_harness("p3", continuation="persistent",
                                response_shape="one_shot", end_of_turn="turn_complete")
         chat_id = harness.create_chat("Stream end citation")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         session["transitions"].append({
             "from": "running", "to": "unknown", "owner": "launcher",
-            "at": harness._clock.now(),
+            "at": support.now(),
             "evidence": {"kind": "stream_end", "ref": "evt_nothing0001"}})
         session["state"] = "unknown"
-        harness.store.put(session)
-        found = self.assert_store_rejected_for(harness.store, "EVIDENCE_KIND_UNSUPPORTED")
+        forged = support.view(harness)
+        forged.put(session)
+        found = self.assert_store_rejected_for(forged, "EVIDENCE_KIND_UNSUPPORTED")
         self.assertIn("UNKNOWN_INFERRED_WITHOUT_EVIDENCE", found)
 
     def test_probe_a_real_one_shot_agent_cannot_smuggle_a_stream_end(self):
@@ -123,14 +130,11 @@ class AOneShotLauncherCannotObserveAStreamEnding(unittest.TestCase, StoreCheck):
                 "sys.stdin.read()\n"
                 'print(\'{"type": "stream_end"}\')\n'
                 'print(\'{"type": "assistant_text", "text": "hello"}\')\n')
-        harness = support.deterministic(
-            {"launcher": "dev-local",
-             "options": {"profile": "one_shot", "command": [sys.executable, script]}},
-            "p4")
+        harness = support.harness({'launcher': 'dev-local', 'options': {'profile': 'one_shot', 'command': [sys.executable, script]}})
         self.addCleanup(support.release, harness)
         chat_id = harness.create_chat("Smuggling attempt")
         harness.send_turn(chat_id, "hello")
-        events = harness.store.all_of("diagnostic_event")
+        events = support.view(harness).all_of("diagnostic_event")
         smuggled = [e for e in events if "stream_end" in e["raw"]["body"]]
         self.assertEqual(len(smuggled), 1)
         self.assertEqual(smuggled[0]["interpretation"], "unrecognized")
@@ -155,7 +159,7 @@ class NobodyElseGetsToSpeakIntoTheChat(unittest.TestCase, StoreCheck):
                            text="I am the launcher")
                 ScriptedStubLauncher._produce_turn(self, session, instruction_text)
 
-        harness = open_harness({}, launcher=TalksInTheChat({}))
+        harness = support.harness({}, launcher=TalksInTheChat({}))
         chat_id = harness.create_chat("Launcher speaks")
         harness.send_turn(chat_id, "hello")
         rendered = [text for _, _, text in harness.transcript(chat_id)]
@@ -170,7 +174,7 @@ class NobodyElseGetsToSpeakIntoTheChat(unittest.TestCase, StoreCheck):
                            '{"type": "whisper", "text": "render me"}', text="render me")
                 ScriptedStubLauncher._produce_turn(self, session, instruction_text)
 
-        harness = open_harness({}, launcher=Mumbles({}))
+        harness = support.harness({}, launcher=Mumbles({}))
         chat_id = harness.create_chat("Unrecognized speaks")
         harness.send_turn(chat_id, "hello")
         self.assertNotIn("render me", [t for _, _, t in harness.transcript(chat_id)])
@@ -185,38 +189,39 @@ class NobodyElseGetsToSpeakIntoTheChat(unittest.TestCase, StoreCheck):
         harness = stub_harness("p5", launch_outcomes=["rejected"])
         chat_id = harness.create_chat("Never launched")
         harness.send_turn(chat_id, "hello")
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
 
         def invented(event_id, source):
             return {"record_type": "diagnostic_event", "record_version": 1,
                     "event_id": event_id, "chat_id": chat_id, "session_id": session_id,
-                    "sequence": 1, "received_at": harness._clock.now(),
+                    "sequence": 1, "received_at": support.now(),
                     "source": source, "interpretation": "recognized",
                     "interpreted_type": "assistant_text",
                     "raw": {"encoding": "utf-8", "body": "invented"}}
 
-        harness.store.put(invented("evt_invented0001", "agent"))
-        self.assert_store_rejected_for(harness.store, "AGENT_OUTPUT_WITHOUT_AGENT")
+        forged = support.view(harness)
+        forged.put(invented("evt_invented0001", "agent"))
+        self.assert_store_rejected_for(forged, "AGENT_OUTPUT_WITHOUT_AGENT")
 
         # Half two: the same text, sourced to the launcher, rendered as chat.
-        second = support.deterministic({"launcher": "scripted-stub",
-                                        "options": {"launch_outcomes": ["rejected"]}}, "p6")
+        second = support.harness({'launcher': 'scripted-stub', 'options': {'launch_outcomes': ['rejected']}})
         chat2 = second.create_chat("Never launched, other route")
         second.send_turn(chat2, "hello")
-        sid2 = second.store.sessions_of(chat2)[0]["session_id"]
-        second.store.put({
+        sid2 = support.view(second).sessions_of(chat2)[0]["session_id"]
+        forged2 = support.view(second)
+        forged2.put({
             "record_type": "diagnostic_event", "record_version": 1,
             "event_id": "evt_invented0002", "chat_id": chat2, "session_id": sid2,
-            "sequence": 1, "received_at": second._clock.now(), "source": "launcher",
+            "sequence": 1, "received_at": support.now(), "source": "launcher",
             "interpretation": "recognized", "interpreted_type": "assistant_text",
             "raw": {"encoding": "utf-8", "body": "invented"}})
-        second.store.put({
+        forged2.put({
             "record_type": "message", "record_version": 1,
             "message_id": "msg_invented0001", "chat_id": chat2, "sequence": 2,
-            "author": "agent", "created_at": second._clock.now(),
+            "author": "agent", "created_at": support.now(),
             "content": {"content_type": "text/plain", "text": "invented"},
             "session_id": sid2, "source_event_id": "evt_invented0002"})
-        self.assert_store_rejected_for(second.store, "NON_AGENT_EVENT_RENDERED")
+        self.assert_store_rejected_for(forged2, "NON_AGENT_EVENT_RENDERED")
 
 
 # ---------------------------------------------------------------------------
@@ -228,10 +233,10 @@ class AHandleNobodyIssuedIsNoHandle(unittest.TestCase, StoreCheck):
 
     def test_the_harness_records_only_the_handle_the_launcher_returned(self):
         launcher = ScriptedStubLauncher({})
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = run_three_turns(harness, "Handles")
-        for session in harness.store.sessions_of(chat_id):
-            issued = [r["agent_handle"] for r in harness.store.all_of("launch_result")
+        for session in support.view(harness).sessions_of(chat_id):
+            issued = [r["agent_handle"] for r in support.view(harness).all_of("launch_result")
                       if r["session_id"] == session["session_id"]
                       and r["outcome"] == "accepted"]
             self.assertIn(session["agent_handle"], issued)
@@ -240,10 +245,11 @@ class AHandleNobodyIssuedIsNoHandle(unittest.TestCase, StoreCheck):
         harness = stub_harness("p7")
         chat_id = harness.create_chat("Fabricated handle")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         session["agent_handle"] = "a-handle-i-made-up"
-        harness.store.put(session)
-        self.assert_store_rejected_for(harness.store, "SESSION_HANDLE_NOT_ISSUED")
+        forged = support.view(harness)
+        forged.put(session)
+        self.assert_store_rejected_for(forged, "SESSION_HANDLE_NOT_ISSUED")
 
     def test_probe_a_session_that_ran_with_no_handle_at_all_is_rejected(self):
         """Keyed on having *reached* running, so moving to a terminal state does
@@ -251,10 +257,11 @@ class AHandleNobodyIssuedIsNoHandle(unittest.TestCase, StoreCheck):
         harness = stub_harness("p8")
         chat_id = harness.create_chat("No handle")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         del session["agent_handle"]
-        harness.store.put(session)
-        self.assert_store_rejected_for(harness.store, "SESSION_HANDLE_MISSING")
+        forged = support.view(harness)
+        forged.put(session)
+        self.assert_store_rejected_for(forged, "SESSION_HANDLE_MISSING")
 
 
 # ---------------------------------------------------------------------------
@@ -269,14 +276,15 @@ class UnknownRequiresAnObservationThatResolves(unittest.TestCase, StoreCheck):
                                response_shape="stream", end_of_turn="turn_complete")
         chat_id = harness.create_chat("Unknown without evidence")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         session["transitions"].append({
             "from": "running", "to": "unknown", "owner": "launcher",
-            "at": harness._clock.now(),
+            "at": support.now(),
             "evidence": {"kind": "observation", "ref": "obs_neverwritten1"}})
         session["state"] = "unknown"
-        harness.store.put(session)
-        self.assert_store_rejected_for(harness.store, "UNKNOWN_INFERRED_WITHOUT_EVIDENCE")
+        forged = support.view(harness)
+        forged.put(session)
+        self.assert_store_rejected_for(forged, "UNKNOWN_INFERRED_WITHOUT_EVIDENCE")
 
     def test_probe_an_unknown_citing_a_confirmed_stop_is_rejected(self):
         """A resolving reference is not enough; it has to say what the rule needs."""
@@ -284,25 +292,31 @@ class UnknownRequiresAnObservationThatResolves(unittest.TestCase, StoreCheck):
                                response_shape="stream", end_of_turn="turn_complete")
         chat_id = harness.create_chat("Wrong observation kind")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         observation_id = harness._record_observation(session, "stop_confirmed", None)
         session["transitions"].append({
             "from": "running", "to": "unknown", "owner": "launcher",
-            "at": harness._clock.now(),
+            "at": support.now(),
             "evidence": {"kind": "observation", "ref": observation_id}})
         session["state"] = "unknown"
-        harness.store.put(session)
-        self.assert_store_rejected_for(harness.store, "PRECONDITION_NOT_MET")
+        forged = support.view(harness)
+        forged.put(session)
+        self.assert_store_rejected_for(forged, "PRECONDITION_NOT_MET")
 
     def test_the_harness_refuses_an_unauthorized_transition_before_writing_it(self):
         harness = stub_harness("p11")
         chat_id = harness.create_chat("Unauthorized")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
-        with self.assertRaises(NotPermitted):
+        session = support.view(harness).sessions_of(chat_id)[0]
+        # #87's loop refused these with its own copy of the owner table
+        # (`NotPermitted`); that copy is merged into the store's, which checks
+        # the owner *and* precondition tables and refuses before writing.
+        before = support.view(harness).snapshot()
+        with self.assertRaises(TransitionRefused):
             harness._transition(session, "running", "launcher", "event", None)
-        with self.assertRaises(NotPermitted):
+        with self.assertRaises(TransitionRefused):
             harness._transition(session, "abandoned", "launcher", "user_action", None)
+        self.assertEqual(support.view(harness).snapshot(), before)
 
 
 # ---------------------------------------------------------------------------
@@ -316,50 +330,51 @@ class DecoyPacketsDoNotSatisfyTheTurnFloor(unittest.TestCase, StoreCheck):
         harness = stub_harness("p12", continuation="persistent",
                                response_shape="stream", end_of_turn="turn_complete")
         chat_id = run_three_turns(harness, "Decoy padding")
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
 
         # Remove a real delivery, then replace it with a packet on a session that
         # holds an instruction and terminates in launch_failed.
-        deliveries = harness.store.deliveries_of(session_id)
-        harness.store._records.pop(("delivery_request", deliveries[-1]["delivery_id"]))
-        harness.store._order.remove(("delivery_request", deliveries[-1]["delivery_id"]))
+        deliveries = support.view(harness).deliveries_of(session_id)
+        forged = support.view(harness)
+        forged.remove("delivery_request", deliveries[-1]["delivery_id"])
 
         decoy_session = "ses_decoy00000001"
-        harness.store.put({
+        forged.put({
             "record_type": "agent_session", "record_version": 1,
             "session_id": decoy_session, "chat_id": chat_id,
-            "created_at": harness._clock.now(), "launcher_id": "scripted-stub",
+            "created_at": support.now(), "launcher_id": "scripted-stub",
             "launcher_capabilities": harness.capabilities.as_record(),
             "state": "launch_failed",
             "transitions": [
                 {"from": None, "to": "pending", "owner": "user",
-                 "at": harness._clock.now(),
+                 "at": support.now(),
                  "evidence": {"kind": "user_action",
-                              "ref": harness.store.messages(chat_id)[0]["message_id"]}},
+                              "ref": support.view(harness).messages(chat_id)[0]["message_id"]}},
                 {"from": "pending", "to": "launch_failed", "owner": "harness",
-                 "at": harness._clock.now(),
+                 "at": support.now(),
                  "evidence": {"kind": "harness_action", "ref": None}}]})
-        harness.store.put({
+        forged.put({
             "record_type": "launch_request", "record_version": 1,
             "request_id": "req_decoy00000001", "chat_id": chat_id,
-            "session_id": decoy_session, "created_at": harness._clock.now(),
+            "session_id": decoy_session, "created_at": support.now(),
             "instruction_encoding": "utf-8", "instruction_text": "a packet nobody sent"})
-        self.assert_store_rejected_for(harness.store, "TURN_INSTRUCTION_MISSING")
+        self.assert_store_rejected_for(forged, "TURN_INSTRUCTION_MISSING")
 
     def test_probe_one_user_turn_cannot_open_two_agents_that_ran(self):
         harness = stub_harness("p13")
         chat_id = run_three_turns(harness, "Two agents, one turn")
-        sessions = harness.store.sessions_of(chat_id)
+        sessions = support.view(harness).sessions_of(chat_id)
         first_opener = sessions[0]["transitions"][0]["evidence"]["ref"]
         sessions[1]["transitions"][0]["evidence"]["ref"] = first_opener
-        harness.store.put(sessions[1])
-        self.assert_store_rejected_for(harness.store, "TURN_ALREADY_SERVED")
+        forged = support.view(harness)
+        forged.put(sessions[1])
+        self.assert_store_rejected_for(forged, "TURN_ALREADY_SERVED")
 
     def test_the_harness_never_opens_two_agents_from_one_turn(self):
         harness = stub_harness("p14")
         chat_id = run_three_turns(harness, "One turn, one agent")
         openers = [s["transitions"][0]["evidence"]["ref"]
-                   for s in harness.store.sessions_of(chat_id)]
+                   for s in support.view(harness).sessions_of(chat_id)]
         self.assertEqual(len(openers), len(set(openers)))
 
 
@@ -374,15 +389,16 @@ class DeliveryIsBoundedByWhatWasDeclaredAndWhatHappened(unittest.TestCase, Store
         harness = stub_harness("p15")
         chat_id = harness.create_chat("Delivery not supported")
         harness.send_turn(chat_id, "hello")
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
-        harness.store.put({
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
+        forged = support.view(harness)
+        forged.put({
             "record_type": "delivery_request", "record_version": 1,
             "delivery_id": "dlv_forbidden0001", "chat_id": chat_id,
             "session_id": session_id, "sequence": 1,
-            "created_at": harness._clock.now(), "instruction_encoding": "utf-8",
+            "created_at": support.now(), "instruction_encoding": "utf-8",
             "instruction_text": "a turn this launcher cannot deliver",
             "acknowledged": True})
-        self.assert_store_rejected_for(harness.store, "DELIVERY_NOT_SUPPORTED")
+        self.assert_store_rejected_for(forged, "DELIVERY_NOT_SUPPORTED")
 
     def test_probe_a_delivery_after_the_agent_exited_is_rejected(self):
         harness = stub_harness("p16", continuation="persistent",
@@ -390,26 +406,27 @@ class DeliveryIsBoundedByWhatWasDeclaredAndWhatHappened(unittest.TestCase, Store
         chat_id = harness.create_chat("Delivery after exit")
         harness.send_turn(chat_id, "hello")
         harness.stop_agent(chat_id, "the user said so")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "terminated")
-        harness.store.put({
+        forged = support.view(harness)
+        forged.put({
             "record_type": "delivery_request", "record_version": 1,
             "delivery_id": "dlv_toolate00001", "chat_id": chat_id,
             "session_id": session["session_id"], "sequence": 1,
-            "created_at": harness._clock.now(), "instruction_encoding": "utf-8",
+            "created_at": support.now(), "instruction_encoding": "utf-8",
             "instruction_text": "are you still there", "acknowledged": True})
-        self.assert_store_rejected_for(harness.store, "DELIVERY_AFTER_AGENT_EXIT")
+        self.assert_store_rejected_for(forged, "DELIVERY_AFTER_AGENT_EXIT")
 
     def test_no_escape_delivering_to_a_session_that_is_not_running(self):
         harness = stub_harness("p17", continuation="persistent",
                                response_shape="stream", launch_outcomes=["unknown"])
         chat_id = harness.create_chat("Deliver to unknown")
         harness.send_turn(chat_id, "hello")
-        self.assertEqual(harness.store.sessions_of(chat_id)[0]["state"], "unknown")
+        self.assertEqual(support.view(harness).sessions_of(chat_id)[0]["state"], "unknown")
         with self.assertRaises(ConcurrentLaunchRefused) as caught:
             harness.send_turn(chat_id, "still there?")
         self.assertIn("rather than 'running'", caught.exception.reason)
-        self.assertEqual(harness.store.all_of("delivery_request"), [])
+        self.assertEqual(support.view(harness).all_of("delivery_request"), [])
 
 
 # ---------------------------------------------------------------------------
@@ -421,13 +438,13 @@ class NoPayloadBoundIsAsserted(unittest.TestCase, StoreCheck):
 
     def test_every_launcher_in_this_package_declares_no_measured_bound(self):
         for name, config in support.CONFIGURATIONS:
-            launcher = support.deterministic(config, "q")
+            launcher = support.harness(config)
             self.addCleanup(support.release, launcher)
             self.assertIsNone(launcher.capabilities.instruction_bound_bytes, name)
 
     def test_probe_no_source_file_carries_an_invented_bound(self):
         for module in (lb, session_manager, store_module, dev_local, scripted_stub,
-                       identity):
+                       atomic, contract, ids):
             source = inspect.getsource(module)
             code = re.sub(r'"""(?:.|\n)*?"""', "", source)
             code = "\n".join(line.split("#")[0] for line in code.splitlines())
@@ -447,13 +464,13 @@ class NoPayloadBoundIsAsserted(unittest.TestCase, StoreCheck):
     def test_probe_the_refused_packet_is_not_recorded_as_though_it_were_sent(self):
         harness = stub_harness("p19", instruction_bound_bytes=16)
         chat_id = harness.create_chat("Refused packet")
-        before = len(harness.store.snapshot())
+        before = len(support.view(harness).snapshot())
         with self.assertRaises(InstructionTooLarge):
             harness.send_turn(chat_id, "x" * 17)
-        self.assertEqual(len(harness.store.snapshot()), before,
+        self.assertEqual(len(support.view(harness).snapshot()), before,
                          "nothing happened, so nothing may be recorded")
-        self.assertEqual(harness.store.all_of("launch_request"), [])
-        self.assertEqual(harness.store.messages(chat_id), [])
+        self.assertEqual(support.view(harness).all_of("launch_request"), [])
+        self.assertEqual(support.view(harness).messages(chat_id), [])
         harness.send_turn(chat_id, "short")
         self.assert_store_valid(harness.store, "declared-bound-respected")
 
@@ -463,20 +480,20 @@ class NoPayloadBoundIsAsserted(unittest.TestCase, StoreCheck):
                                end_of_turn="turn_complete", instruction_bound_bytes=16)
         chat_id = harness.create_chat("Bound on delivery")
         harness.send_turn(chat_id, "short")
-        before = len(harness.store.snapshot())
+        before = len(support.view(harness).snapshot())
         with self.assertRaises(InstructionTooLarge):
             harness.send_turn(chat_id, "y" * 17)
-        self.assertEqual(len(harness.store.snapshot()), before)
-        self.assertEqual(harness.store.all_of("delivery_request"), [])
+        self.assertEqual(len(support.view(harness).snapshot()), before)
+        self.assertEqual(support.view(harness).all_of("delivery_request"), [])
 
 
 class TheFreshBindingPacketCarriesNoPriorChat(unittest.TestCase, StoreCheck):
 
     def test_each_launch_packet_holds_only_that_turn(self):
         launcher = ScriptedStubLauncher({})
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = run_three_turns(harness, "No history")
-        packets = [r["instruction_text"] for r in harness.store.all_of("launch_request")]
+        packets = [r["instruction_text"] for r in support.view(harness).all_of("launch_request")]
         self.assertEqual(packets, list(support.THREE_TURNS))
         for i, packet in enumerate(packets):
             for earlier in support.THREE_TURNS[:i]:
@@ -490,13 +507,13 @@ class TheFreshBindingPacketCarriesNoPriorChat(unittest.TestCase, StoreCheck):
         check above fail; otherwise the check proves nothing."""
 
         def carries_history(chat_id, user_text, store):
-            prior = " ".join(m["content"]["text"] for m in store.messages(chat_id))
+            prior = " ".join(m["content"]["text"] for m in store.read_messages(chat_id))
             return (prior + " " + user_text).strip()
 
-        harness = open_harness({}, launcher=ScriptedStubLauncher({}),
+        harness = support.harness({}, launcher=ScriptedStubLauncher({}),
                                compose=carries_history)
         chat_id = run_three_turns(harness, "History carried")
-        packets = [r["instruction_text"] for r in harness.store.all_of("launch_request")]
+        packets = [r["instruction_text"] for r in support.view(harness).all_of("launch_request")]
         self.assertTrue(any(support.THREE_TURNS[0] in p for p in packets[1:]),
                         "the mutation did not actually carry history, so the probe "
                         "establishes nothing")
@@ -523,7 +540,7 @@ class MechanicsDoNotCrossAndAreNotRead(unittest.TestCase, StoreCheck):
                     session.handle = handle
                     return lb.LaunchResult("accepted", agent_handle=handle)
 
-            harness = open_harness({}, launcher=FixedHandle({}))
+            harness = support.harness({}, launcher=FixedHandle({}))
             chat_id = harness.create_chat("Opaque handle")
             harness.send_turn(chat_id, "hello")
             transcripts.append(harness.transcript(chat_id))
@@ -537,7 +554,7 @@ class MechanicsDoNotCrossAndAreNotRead(unittest.TestCase, StoreCheck):
         chat_id = harness.create_chat("Mechanics in text")
         text = "run ~/scripts/launch_agent.sh --host buildbox --pid 3319"
         harness.send_turn(chat_id, text)
-        packet = harness.store.all_of("launch_request")[0]
+        packet = support.view(harness).all_of("launch_request")[0]
         self.assertEqual(packet["instruction_text"], text)
         self.assertEqual(sorted(packet),
                          sorted(list(lb.LaunchInstruction.FIELDS)
@@ -550,7 +567,7 @@ class MechanicsDoNotCrossAndAreNotRead(unittest.TestCase, StoreCheck):
         chat_id = run_three_turns(harness, "Closed records")
         support.end_chat(harness, chat_id)
         specs = support.VALIDATOR.RECORD_SPECS
-        for record in harness.store.snapshot():
+        for record in support.view(harness).snapshot():
             allowed = set(specs[record["record_type"]]) | {"record_type", "record_version"}
             self.assertEqual(set(record) - allowed, set(), record["record_type"])
 
@@ -583,7 +600,7 @@ class NoEscapeFound(unittest.TestCase, StoreCheck):
         harness.send_turn(chat_id, "hello")
         with self.assertRaises(ConcurrentLaunchRefused):
             harness.send_turn(chat_id, "again")
-        self.assertEqual(len(harness.store.sessions_of(chat_id)), 1)
+        self.assertEqual(len(support.view(harness).sessions_of(chat_id)), 1)
 
     def test_no_escape_reattaching_twice_does_not_multiply_observations(self):
         harness = stub_harness("n4", continuation="persistent", response_shape="stream",
@@ -593,8 +610,8 @@ class NoEscapeFound(unittest.TestCase, StoreCheck):
         first = harness.reattach_on_start()
         second = harness.reattach_on_start()
         self.assertEqual(first, second)
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
-        kinds = [o["kind"] for o in harness.store.observations_of(session_id)]
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
+        kinds = [o["kind"] for o in support.view(harness).observations_of(session_id)]
         self.assertEqual(kinds, ["reattached", "reattached"])
         self.assert_store_valid(harness.store, "reattach-is-idempotent")
 
@@ -603,9 +620,8 @@ class NoEscapeFound(unittest.TestCase, StoreCheck):
                                response_shape="stream", end_of_turn="turn_complete")
         chat_id = harness.create_chat("Archived")
         harness.send_turn(chat_id, "hello")
-        chat = harness.store.get("chat", chat_id)
-        chat["state"] = "archived"
-        harness.store.put(chat)
+        harness.store.archive_chat(chat_id)
+        self.assertEqual(harness.store.read_chat(chat_id)["state"], "archived")
         with self.assertRaises(ConcurrentLaunchRefused):
             harness.send_turn(chat_id, "again")
 
@@ -613,13 +629,14 @@ class NoEscapeFound(unittest.TestCase, StoreCheck):
         harness = stub_harness("n6")
         chat_id = harness.create_chat("Two packets, one session")
         harness.send_turn(chat_id, "hello")
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
-        harness.store.put({
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
+        forged = support.view(harness)
+        forged.put({
             "record_type": "launch_request", "record_version": 1,
             "request_id": "req_second000001", "chat_id": chat_id,
-            "session_id": session_id, "created_at": harness._clock.now(),
+            "session_id": session_id, "created_at": support.now(),
             "instruction_encoding": "utf-8", "instruction_text": "a retry in disguise"})
-        self.assert_store_rejected_for(harness.store, "DUPLICATE_LAUNCH_REQUEST")
+        self.assert_store_rejected_for(forged, "DUPLICATE_LAUNCH_REQUEST")
 
     def test_no_escape_a_launcher_cannot_forge_a_harness_observation(self):
         """A launcher that tries to source an event to the harness cannot build
@@ -632,12 +649,12 @@ class NoEscapeFound(unittest.TestCase, StoreCheck):
                 lb.EventPayload(1, "harness", "recognized", b"{}",
                                 interpreted_type="reattached")
 
-        harness = open_harness({}, launcher=Forger({}))
+        harness = support.harness({}, launcher=Forger({}))
         chat_id = harness.create_chat("Forgery")
         outcome = harness.send_turn(chat_id, "hello")
         self.assertEqual(outcome.failure_category, "internal_error")
         self.assertEqual(
-            [e for e in harness.store.all_of("diagnostic_event")
+            [e for e in support.view(harness).all_of("diagnostic_event")
              if e["source"] == "harness"], [])
         self.assert_store_valid(harness.store, "harness-source-forgery-refused")
 
@@ -646,7 +663,7 @@ class NoEscapeFound(unittest.TestCase, StoreCheck):
                                end_of_turn="turn_complete")
         chat_id = harness.create_chat("Replay")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         harness._drain(session)
         harness._drain(session)
         self.assertEqual(len(harness.transcript(chat_id)), 2)
@@ -654,16 +671,26 @@ class NoEscapeFound(unittest.TestCase, StoreCheck):
         self.assert_store_valid(harness.store, "replayed-page-no-duplicate-message")
 
     def test_no_escape_the_store_refuses_a_duplicate_message_sequence(self):
+        """#87 drove its store's `append_message` with a sequence already used.
+        The converged store has no call that takes a sequence at all -- it
+        allocates one by exclusive creation -- so the probe is put to the thing
+        that allocates: a second writer of a taken message name is refused, and
+        two stores over one root interleaving sends leave one contiguous
+        history."""
         harness = stub_harness("n8")
         chat_id = harness.create_chat("Duplicate sequence")
         harness.send_turn(chat_id, "hello")
-        with self.assertRaises(store_module.StoreError):
-            harness.store.append_message({
-                "record_type": "message", "record_version": 1,
-                "message_id": "msg_duplicate0001", "chat_id": chat_id, "sequence": 1,
-                "author": "user", "created_at": harness._clock.now(),
-                "content": {"content_type": "text/plain", "text": "again"},
-                "session_id": None, "source_event_id": None})
+        import inspect as _inspect
+        self.assertNotIn("sequence",
+                         _inspect.signature(harness.store.append_user_message).parameters)
+        taken = os.path.join(harness.store.chats_dir, chat_id, "messages", "00000001.json")
+        with self.assertRaises(FileExistsError):
+            atomic.create_exclusive(taken, b"{}")
+        other = store_module.ChatStore(harness.store.root)
+        for i in range(3):
+            (harness.store if i % 2 else other).append_user_message(chat_id, "again %d" % i)
+        self.assertEqual([m["sequence"] for m in harness.store.read_messages(chat_id)],
+                         [1, 2, 3, 4, 5])
 
 
 if __name__ == "__main__":
@@ -689,28 +716,29 @@ class TheHarnessRefusesToWriteAnUnreadableHistory(unittest.TestCase, StoreCheck)
                 session.next_sequence += 1
                 return payload
 
-        harness = open_harness({}, launcher=Skips({}))
+        harness = support.harness({}, launcher=Skips({}))
         chat_id = harness.create_chat("Skipped sequence")
         with self.assertRaises(lb.LaunchBoundaryError) as caught:
             harness.send_turn(chat_id, "hello")
         self.assertIn("contiguous", str(caught.exception))
-        self.assertEqual(len(harness.store.all_of("diagnostic_event")), 1,
+        self.assertEqual(len(support.view(harness).all_of("diagnostic_event")), 1,
                          "the payload before the gap is kept; the gap is refused")
 
     def test_probe_a_store_with_a_gap_is_rejected_by_the_contract_too(self):
         harness = stub_harness("p23")
         chat_id = harness.create_chat("Gap")
         harness.send_turn(chat_id, "hello")
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
-        harness.store.put({
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
+        forged = support.view(harness)
+        forged.put({
             "record_type": "diagnostic_event", "record_version": 1,
             "event_id": "evt_gapped00000a", "chat_id": chat_id,
             "session_id": session_id,
-            "sequence": len(harness.store.events_of(session_id)) + 3,
-            "received_at": harness._clock.now(), "source": "launcher",
+            "sequence": len(support.view(harness).events_of(session_id)) + 3,
+            "received_at": support.now(), "source": "launcher",
             "interpretation": "unrecognized", "interpreted_type": None,
             "raw": {"encoding": "utf-8", "body": "{}"}})
-        self.assert_store_rejected_for(harness.store, "SEQUENCE_GAP")
+        self.assert_store_rejected_for(forged, "SEQUENCE_GAP")
 
     def test_probe_an_empty_turn_is_refused_before_anything_is_written(self):
         """Found by probing the `pending -> launch_failed` path. An empty turn
@@ -719,13 +747,13 @@ class TheHarnessRefusesToWriteAnUnreadableHistory(unittest.TestCase, StoreCheck)
         store containing one cannot be read back."""
         harness = stub_harness("p24")
         chat_id = harness.create_chat("Empty turn")
-        before = len(harness.store.snapshot())
+        before = len(support.view(harness).snapshot())
         with self.assertRaises(NotPermitted) as caught:
             harness.send_turn(chat_id, "")
         self.assertIn("empty turn is refused", caught.exception.reason)
-        self.assertEqual(len(harness.store.snapshot()), before)
-        self.assertEqual(harness.store.messages(chat_id), [])
-        self.assertEqual(harness.store.sessions_of(chat_id), [])
+        self.assertEqual(len(support.view(harness).snapshot()), before)
+        self.assertEqual(support.view(harness).messages(chat_id), [])
+        self.assertEqual(support.view(harness).sessions_of(chat_id), [])
         harness.send_turn(chat_id, "hello")
         self.assert_store_valid(harness.store, "empty-turn-refused")
 
@@ -737,19 +765,19 @@ class TheHarnessRefusesToWriteAnUnreadableHistory(unittest.TestCase, StoreCheck)
         def composes_nothing(chat_id, user_text, store):
             return ""
 
-        harness = open_harness({}, launcher=ScriptedStubLauncher({}),
+        harness = support.harness({}, launcher=ScriptedStubLauncher({}),
                                compose=composes_nothing)
         chat_id = harness.create_chat("Unformable packet")
         with self.assertRaises(NotPermitted):
             harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "launch_failed")
         self.assertEqual(session["transitions"][-1]["owner"], "harness",
                          "nothing was launched, so no launcher authorised anything")
         self.assertIsNone(session["transitions"][-1]["evidence"]["ref"])
-        self.assertEqual(harness.store.all_of("launch_request"), [],
+        self.assertEqual(support.view(harness).all_of("launch_request"), [],
                          "a packet that was never formed must not be recorded")
-        self.assertEqual(harness.store.open_bindings(chat_id), [])
+        self.assertEqual(support.view(harness).open_bindings(chat_id), [])
         self.assert_store_valid(harness.store, "packet-refused-at-the-seam")
 
     def test_probe_a_launcher_cannot_attribute_a_payload_to_another_session(self):
@@ -759,8 +787,8 @@ class TheHarnessRefusesToWriteAnUnreadableHistory(unittest.TestCase, StoreCheck)
         this VM; it is recorded for #90 rather than claimed here."""
         harness = stub_harness("p25")
         chat_id = run_three_turns(harness, "Attribution")
-        for event in harness.store.all_of("diagnostic_event"):
-            session = harness.store.get("agent_session", event["session_id"])
+        for event in support.view(harness).all_of("diagnostic_event"):
+            session = support.view(harness).get("agent_session", event["session_id"])
             self.assertEqual(event["chat_id"], session["chat_id"])
         self.assert_store_valid(harness.store, "payload-attribution")
 
@@ -832,7 +860,7 @@ class ALauncherThatCannotResumeIsRefusedRatherThanSpunOn(unittest.TestCase, Stor
 
     def test_probe_a_launcher_that_ignores_after_sequence_is_refused(self):
         launcher = self._Replaying()
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("A launcher that cannot resume")
         with self.assertRaises(lb.LaunchBoundaryError) as caught:
             harness.send_turn(chat_id, "hello")
@@ -843,7 +871,7 @@ class ALauncherThatCannotResumeIsRefusedRatherThanSpunOn(unittest.TestCase, Stor
         number of calls the launcher received rather than over elapsed time. A
         fix that merely made the loop slower would pass a wall-clock test."""
         launcher = self._Replaying()
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("Bounded")
         with self.assertRaises(lb.LaunchBoundaryError):
             harness.send_turn(chat_id, "hello")
@@ -855,16 +883,16 @@ class ALauncherThatCannotResumeIsRefusedRatherThanSpunOn(unittest.TestCase, Stor
         """What made F1 severe was not the loop but the held lock: nothing else
         could reach the chat. A refusal must leave the lock released."""
         launcher = self._Replaying()
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("Still usable")
         with self.assertRaises(lb.LaunchBoundaryError):
             harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "running",
                          "the refusal says nothing about whether the agent is alive")
         # The lock is free, so the user's own exits still work.
         harness.stop_agent(chat_id, "the launcher cannot resume")
-        self.assertIn(harness.store.get("agent_session", session["session_id"])["state"],
+        self.assertIn(support.view(harness).get("agent_session", session["session_id"])["state"],
                       ("terminated", "unknown"))
         support.end_chat(harness, chat_id)
         self.assert_store_valid(harness.store, "replay-refused-chat-still-usable")
@@ -874,11 +902,11 @@ class ALauncherThatCannotResumeIsRefusedRatherThanSpunOn(unittest.TestCase, Stor
         replay: a launcher that replays but whose first page ends the session
         never asks a second time, and must be served normally."""
         launcher = self._Replaying(terminal=True)
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("Replay that terminates")
         harness.send_turn(chat_id, "hello")
         self.assertEqual(launcher.events_calls, 1)
-        self.assertEqual(harness.store.sessions_of(chat_id)[0]["state"], "completed")
+        self.assertEqual(support.view(harness).sessions_of(chat_id)[0]["state"], "completed")
         self.assert_store_valid(harness.store, "replay-that-terminates-is-served")
 
     def test_a_launcher_that_honours_after_sequence_is_untouched(self):

@@ -612,7 +612,12 @@ class TestReopenFidelity(ProbeCase):
         try:
             from dory_wrangler.service import ChatService
 
-            rendered = ChatService(ChatStore(self.root, sweep=False)).open_chat(chat_id)
+            from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
+            from dory_wrangler.session_manager import SessionManager
+
+            rendered = ChatService(SessionManager(
+                ChatStore(self.root, sweep=False), ScriptedStubLauncher({}))
+            ).open_chat(chat_id)
             held = len(rendered["messages"]) == 2
             detail = "transcript rendered %d turns with the diagnostics tree unreadable" % len(
                 rendered["messages"]
@@ -793,13 +798,17 @@ class TestClosedContractFindings(ProbeCase):
         return violations
 
     def test_a_second_turn_sent_while_the_agent_is_running(self):
-        """#86 records the second turn; one agent per chat means no second packet.
+        """The served application refuses it before recording it; the other
+        policy's history still validates.
 
-        This is the user-visible side of the interaction #87 raised. #86's shell
-        does not refuse a send because an agent is busy -- `send_user_message`
-        makes the turn durable and only then notifies the listener -- so the
-        history really does hold two user messages against one instruction
-        packet. The old floor called that a missing packet.
+        **Changed expectation, decision 0003.** #86's shell recorded the second
+        turn and refused nothing; the converged application keeps #87's
+        refuse-before-recording, so `send_user_message` now raises and leaves
+        the chat exactly as it was. The shape #86 used to produce -- two user
+        messages against one instruction packet -- is still written below
+        through the store, as the record-then-refuse policy would write it,
+        because it is the H1 regression this test exists for and because it is
+        the evidence that flipping the policy back is contract-valid.
         """
         chat_id = self.store.create_chat("Two turns, one answer")["chat_id"]
         first = self.store.append_user_message(chat_id, "please look at the build")
@@ -822,9 +831,19 @@ class TestClosedContractFindings(ProbeCase):
             agent_handle=handle,
         )
 
-        # The user sends again while that agent is still running. Nothing refuses.
-        service = ChatService(self.store)
-        service.send_user_message(chat_id, "any luck?")
+        # The user sends again while that agent is still running. The served
+        # application refuses, before anything is written.
+        from dory_wrangler.errors import ConcurrentLaunchRefused
+        from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
+        from dory_wrangler.session_manager import SessionManager
+        service = ChatService(SessionManager(self.store, ScriptedStubLauncher({})))
+        before = self.store.export_records()
+        with self.assertRaises(ConcurrentLaunchRefused):
+            service.send_user_message(chat_id, "any luck?")
+        self.assertEqual(self.store.export_records(), before,
+                         "a refused turn left a record behind")
+        # The record-then-refuse policy's history, written as it would write it.
+        self.store.append_user_message(chat_id, "any luck?")
         # And a second agent is still refused, so there is no second packet.
         second = self.store.read_messages(chat_id)[-1]
         with self.assertRaises(ConcurrencyRefused):

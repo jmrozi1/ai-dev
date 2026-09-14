@@ -1300,6 +1300,63 @@ class ChatStore(object):
             % (session_id, _MAX_SEQUENCE_RETRIES, last_error)
         )
 
+    def record_delivery_acknowledgement(self, chat_id, session_id, delivery_id,
+                                        acknowledged):
+        """Record what `deliver` answered, on the delivery it answered.
+
+        Contract 6.4: a `delivery_request` is written *before* the call, with
+        `acknowledged: null`, because a turn sent to an agent and not recorded is
+        a turn nobody can investigate. The answer arrives afterwards, so it is the
+        one field of the one packet type that is filled in later -- and it is
+        filled in once. `null` means "unknown", which is what the record already
+        says; an acknowledgement already recorded is history and is not
+        rewritten. Everything else in the packet is carried over unchanged and
+        the whole record is re-checked by the contract before it is published.
+
+        Located by the record's own `delivery_id` within the named session, never
+        by a file name derived from the caller's arguments: the file replaced is
+        the one named after the record that was found, and it must still hold
+        that record.
+        """
+        if not isinstance(acknowledged, bool):
+            raise ValidationRefused(
+                "an acknowledgement is recorded as true or false; %r is not one, and "
+                "null is what an unanswered delivery already says" % (acknowledged,)
+            )
+        with self._lock(chat_id):
+            found = None
+            for packet in self.read_delivery_requests(chat_id, session_id):
+                if packet["delivery_id"] == delivery_id:
+                    found = packet
+                    break
+            if found is None:
+                raise ValidationRefused(
+                    "no delivery %r on session %s in chat %s"
+                    % (delivery_id, session_id, chat_id)
+                )
+            if found["acknowledged"] is not None:
+                raise ValidationRefused(
+                    "delivery %s already records acknowledged=%r; an answer that "
+                    "was received is not rewritten"
+                    % (delivery_id, found["acknowledged"])
+                )
+            updated = dict(found)
+            updated["acknowledged"] = acknowledged
+            self._check_record(updated, "delivery_request")
+            path = _under(
+                self._packets_dir(chat_id),
+                "delivery_request-%s-%s.json"
+                % (found["session_id"], _seq_name(found["sequence"])[:-len(".json")]),
+            )
+            on_disk = self._check_read(_loads(path), path) if os.path.isfile(path) else None
+            if on_disk is None or on_disk.get("delivery_id") != delivery_id:
+                raise StoreCorrupt(
+                    "delivery %s is not stored under the name its session and "
+                    "sequence give it" % delivery_id
+                )
+            atomic.replace(path, _dumps(updated))
+        return updated
+
     def append_session_observation(self, chat_id, session_id, kind, detail=None):
         """Record what an attempted boundary interaction actually produced.
 

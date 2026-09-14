@@ -1,6 +1,7 @@
 """Run the chat shell.
 
     python3 dory-wrangler/run_shell.py --root <store> [--host H] [--port P]
+        [--launcher dev-local|scripted-stub] [--launcher-options JSON]
 
 Binds to 127.0.0.1 by default: v0.1 has no authentication of any kind, so the
 shell is a local surface until someone decides otherwise, and that decision is
@@ -8,9 +9,11 @@ not this ticket's to make by default.
 """
 
 import argparse
+import json
 import os
 import sys
 
+from .service import DEFAULT_LAUNCHER
 from .webapp import build_server
 
 
@@ -24,9 +27,21 @@ def main(argv=None):
     parser.add_argument("--port-file", default=None,
                         help="write the bound port here once listening (used by tests)")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--launcher", default=DEFAULT_LAUNCHER["launcher"],
+                        help="the configured launcher's id (launchers/registry.py)")
+    parser.add_argument("--launcher-options", default=None,
+                        help="the launcher's own options, as a JSON object")
     args = parser.parse_args(argv)
 
-    server = build_server(args.root, host=args.host, port=args.port, quiet=args.quiet)
+    if args.launcher_options is not None:
+        options = json.loads(args.launcher_options)
+    elif args.launcher == DEFAULT_LAUNCHER["launcher"]:
+        options = dict(DEFAULT_LAUNCHER["options"])
+    else:
+        options = {}
+    config = {"launcher": args.launcher, "options": options}
+    server = build_server(args.root, host=args.host, port=args.port, quiet=args.quiet,
+                          launcher_config=config)
     bound = server.server_address[1]
     if args.port_file:
         with open(args.port_file, "w") as handle:

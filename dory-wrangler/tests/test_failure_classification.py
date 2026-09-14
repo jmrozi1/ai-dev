@@ -16,13 +16,14 @@ from support import StoreCheck
 
 from dory_wrangler import launch_boundary as lb
 from dory_wrangler import session_manager
+from dory_wrangler.store import ChatStore
 from dory_wrangler.wiring import open_harness
 from dory_wrangler.errors import NotPermitted
 from dory_wrangler.launchers.dev_local import DEV_AGENT
 
 
 def stub(salt, **options):
-    return support.deterministic({"launcher": "scripted-stub", "options": options}, salt)
+    return support.harness({'launcher': 'scripted-stub', 'options': options})
 
 
 class EveryFailureCategoryIsDurablyRecorded(unittest.TestCase, StoreCheck):
@@ -40,17 +41,17 @@ class EveryFailureCategoryIsDurablyRecorded(unittest.TestCase, StoreCheck):
                 self.assertEqual(outcome.launch_outcome, "failed")
                 self.assertEqual(outcome.failure_category, category)
 
-                session = harness.store.sessions_of(chat_id)[0]
+                session = support.view(harness).sessions_of(chat_id)[0]
                 self.assertEqual(session["state"], "launch_failed",
                                  "we never got an agent, which is launch_failed and not "
                                  "failed")
                 self.assertIsNone(session.get("agent_handle"))
-                results = harness.store.all_of("launch_result")
+                results = support.view(harness).all_of("launch_result")
                 self.assertEqual(len(results), 1)
                 self.assertEqual(results[0]["outcome"], "failed")
                 self.assertEqual(results[0]["failure_category"], category)
-                self.assertIsNone(results[0]["agent_handle"])
-                self.assertEqual(harness.store.open_bindings(chat_id), [],
+                self.assertIsNone(results[0].get("agent_handle"))
+                self.assertEqual(support.view(harness).open_bindings(chat_id), [],
                                  "a terminal session must not hold the chat hostage")
                 self.assert_store_valid(harness.store, "launch-failed-%s" % category)
 
@@ -60,13 +61,13 @@ class EveryFailureCategoryIsDurablyRecorded(unittest.TestCase, StoreCheck):
                 harness, chat_id, outcome = self._launch_failing_as(
                     "r%d" % i, "raise:%s" % category)
                 self.assertEqual(outcome.failure_category, category)
-                self.assertEqual(harness.store.sessions_of(chat_id)[0]["state"],
+                self.assertEqual(support.view(harness).sessions_of(chat_id)[0]["state"],
                                  "launch_failed")
 
     def test_an_unclassified_crash_becomes_internal_error(self):
         harness, chat_id, outcome = self._launch_failing_as("x", "crash")
         self.assertEqual(outcome.failure_category, "internal_error")
-        result = harness.store.all_of("launch_result")[0]
+        result = support.view(harness).all_of("launch_result")[0]
         self.assertIn("RuntimeError", result["detail"])
         self.assert_store_valid(harness.store, "launch-failed-unclassified-crash")
 
@@ -87,22 +88,18 @@ class EveryFailureCategoryIsDurablyRecorded(unittest.TestCase, StoreCheck):
             def stop(self, agent_handle, reason):
                 return lb.StopAck(True)
 
-        harness = open_harness({}, launcher=Liar())
+        harness = support.harness({}, launcher=Liar())
         chat_id = harness.create_chat("A mapping is not a result")
         outcome = harness.send_turn(chat_id, "hello")
         self.assertEqual(outcome.launch_outcome, "failed")
         self.assertEqual(outcome.failure_category, "internal_error")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "launch_failed")
         self.assertNotIn("running", [t["to"] for t in session["transitions"]])
         self.assert_store_valid(harness.store, "launcher-result-not-a-result")
 
     def test_a_real_process_that_says_nothing_is_no_acknowledgement(self):
-        harness = support.deterministic(
-            {"launcher": "dev-local",
-             "options": {"profile": "one_shot",
-                         "command": [sys.executable, DEV_AGENT, "--profile",
-                                     "one_shot", "--silent"]}}, "s")
+        harness = support.harness({'launcher': 'dev-local', 'options': {'profile': 'one_shot', 'command': [sys.executable, DEV_AGENT, '--profile', 'one_shot', '--silent']}})
         self.addCleanup(support.release, harness)
         chat_id = harness.create_chat("Silent process")
         outcome = harness.send_turn(chat_id, "hello")
@@ -110,10 +107,7 @@ class EveryFailureCategoryIsDurablyRecorded(unittest.TestCase, StoreCheck):
         self.assert_store_valid(harness.store, "real-process-no-acknowledgement")
 
     def test_a_process_that_cannot_start_is_unavailable(self):
-        harness = support.deterministic(
-            {"launcher": "dev-local",
-             "options": {"profile": "one_shot",
-                         "command": ["/nonexistent/launch_agent.sh"]}}, "u")
+        harness = support.harness({'launcher': 'dev-local', 'options': {'profile': 'one_shot', 'command': ['/nonexistent/launch_agent.sh']}})
         chat_id = harness.create_chat("Nothing to start")
         outcome = harness.send_turn(chat_id, "hello")
         self.assertEqual(outcome.failure_category, "unavailable",
@@ -128,22 +122,18 @@ class AgentFailureIsNotLaunchFailure(unittest.TestCase, StoreCheck):
         harness = stub("af", end_of_turn="session_failed")
         chat_id = harness.create_chat("Agent failure")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "failed")
         self.assertIn("running", [t["to"] for t in session["transitions"]])
         self.assertTrue(session["agent_handle"])
         self.assert_store_valid(harness.store, "agent-failed-after-running")
 
     def test_a_real_process_exiting_non_zero_is_failed(self):
-        harness = support.deterministic(
-            {"launcher": "dev-local",
-             "options": {"profile": "one_shot",
-                         "command": [sys.executable, DEV_AGENT, "--profile",
-                                     "one_shot", "--fail-exit"]}}, "afr")
+        harness = support.harness({'launcher': 'dev-local', 'options': {'profile': 'one_shot', 'command': [sys.executable, DEV_AGENT, '--profile', 'one_shot', '--fail-exit']}})
         self.addCleanup(support.release, harness)
         chat_id = harness.create_chat("Agent failure, for real")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "failed")
         self.assertEqual(len(harness.transcript(chat_id)), 2,
                          "the agent answered before it failed, and that answer stands")
@@ -161,14 +151,14 @@ class UnknownIsAStateNotAFailure(unittest.TestCase, StoreCheck):
         self.assertEqual(outcome.launch_outcome, "unknown")
         self.assertIsNone(outcome.failure_category)
 
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "unknown")
         self.assertNotIn("launch_failed", [t["to"] for t in session["transitions"]])
-        result = harness.store.all_of("launch_result")[0]
+        result = support.view(harness).all_of("launch_result")[0]
         self.assertEqual(result["outcome"], "unknown")
-        self.assertIsNone(result["failure_category"])
-        self.assertIsNone(result["agent_handle"])
-        self.assertEqual(len(harness.store.open_bindings(chat_id)), 1,
+        self.assertIsNone(result.get("failure_category"))
+        self.assertIsNone(result.get("agent_handle"))
+        self.assertEqual(len(support.view(harness).open_bindings(chat_id)), 1,
                          "unknown is not terminal; the agent may still be out there")
         self.assert_store_valid(harness.store, "launch-outcome-unknown")
 
@@ -177,35 +167,29 @@ class UnknownIsAStateNotAFailure(unittest.TestCase, StoreCheck):
         chat_id = harness.create_chat("Abandon")
         harness.send_turn(chat_id, "hello")
         self.assertEqual(harness.abandon(chat_id), "abandoned")
-        self.assertEqual(harness.store.open_bindings(chat_id), [])
-        last = harness.store.sessions_of(chat_id)[0]["transitions"][-1]
+        self.assertEqual(support.view(harness).open_bindings(chat_id), [])
+        last = support.view(harness).sessions_of(chat_id)[0]["transitions"][-1]
         self.assertEqual((last["owner"], last["evidence"]["kind"], last["evidence"]["ref"]),
                          ("user", "user_action", None),
                          "abandoning is a decision, not an observation")
         self.assert_store_valid(harness.store, "unknown-then-abandoned")
 
     def test_an_unconfirmed_stop_leads_to_unknown_rather_than_terminated(self):
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream",
-                         "end_of_turn": "turn_complete", "stop_confirms": False}}, "us")
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream', 'end_of_turn': 'turn_complete', 'stop_confirms': False}})
         chat_id = harness.create_chat("Unconfirmed stop")
         harness.send_turn(chat_id, "hello")
         self.assertEqual(harness.stop_agent(chat_id, "please stop"), "unknown")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "unknown")
         self.assertNotIn("terminated", [t["to"] for t in session["transitions"]])
-        kinds = [o["kind"] for o in harness.store.observations_of(session["session_id"])]
+        kinds = [o["kind"] for o in support.view(harness).observations_of(session["session_id"])]
         self.assertEqual(kinds, ["stop_unconfirmed"])
         self.assert_store_valid(harness.store, "stop-unconfirmed-then-unknown")
         harness.abandon(chat_id)
         self.assert_store_valid(harness.store, "stop-unconfirmed-then-abandoned")
 
     def test_a_stop_that_raises_is_also_an_unconfirmed_stop(self):
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream",
-                         "end_of_turn": "turn_complete", "stop_confirms": "raise"}}, "sr")
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream', 'end_of_turn': 'turn_complete', 'stop_confirms': 'raise'}})
         chat_id = harness.create_chat("Stop raises")
         harness.send_turn(chat_id, "hello")
         self.assertEqual(harness.stop_agent(chat_id, "please stop"), "unknown")
@@ -214,36 +198,29 @@ class UnknownIsAStateNotAFailure(unittest.TestCase, StoreCheck):
         """Contract 4.7 and 6.1. Two implementations that disagree on this drive
         healthy sessions to `unknown` on a transport hiccup, so the record says
         what actually happened: our read failed."""
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream",
-                         "end_of_turn": "turn_complete",
-                         "events_raise": "internal_error"}}, "rs")
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream', 'end_of_turn': 'turn_complete', 'events_raise': 'internal_error'}})
         chat_id = harness.create_chat("Read failure")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "unknown")
-        kinds = [o["kind"] for o in harness.store.observations_of(session["session_id"])]
+        kinds = [o["kind"] for o in support.view(harness).observations_of(session["session_id"])]
         self.assertEqual(kinds, ["stream_read_failed"])
         types = [e["interpreted_type"] for e in
-                 harness.store.events_of(session["session_id"])]
+                 support.view(harness).events_of(session["session_id"])]
         self.assertNotIn("stream_end", types,
                          "a read failure on our side is not the agent's stream closing")
         self.assert_store_valid(harness.store, "stream-read-failed-then-unknown")
 
     def test_a_stream_that_ends_without_a_lifecycle_event_leads_to_unknown(self):
         """Contract 5.3 cause 2: the stream *closing* is an observed fact."""
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream",
-                         "end_of_turn": "stream_end"}}, "se")
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream', 'end_of_turn': 'stream_end'}})
         chat_id = harness.create_chat("End of stream")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "unknown")
         last = session["transitions"][-1]
         self.assertEqual(last["evidence"]["kind"], "stream_end")
-        cited = harness.store.get("diagnostic_event", last["evidence"]["ref"])
+        cited = support.view(harness).get("diagnostic_event", last["evidence"]["ref"])
         self.assertEqual((cited["source"], cited["interpretation"],
                           cited["interpreted_type"]),
                          ("launcher", "recognized", "stream_end"))
@@ -253,11 +230,7 @@ class UnknownIsAStateNotAFailure(unittest.TestCase, StoreCheck):
         """The same thing with a real operating-system process: stdout closes and
         the agent is still alive, so all the launcher observed is an end of
         stream."""
-        harness = support.deterministic(
-            {"launcher": "dev-local",
-             "options": {"profile": "persistent",
-                         "command": [sys.executable, DEV_AGENT, "--profile",
-                                     "persistent", "--close-stdout"]}}, "sr2")
+        harness = support.harness({'launcher': 'dev-local', 'options': {'profile': 'persistent', 'command': [sys.executable, DEV_AGENT, '--profile', 'persistent', '--close-stdout']}})
         self.addCleanup(support.release, harness)
         chat_id = harness.create_chat("Real end of stream")
         harness.send_turn(chat_id, "hello")
@@ -265,12 +238,12 @@ class UnknownIsAStateNotAFailure(unittest.TestCase, StoreCheck):
         # no reason to read further at the time -- reading on and concluding
         # something would have been an inference from silence -- so the end of
         # stream surfaces on the next turn the user actually sends.
-        self.assertEqual(harness.store.sessions_of(chat_id)[0]["state"], "running")
+        self.assertEqual(support.view(harness).sessions_of(chat_id)[0]["state"], "running")
         harness.send_turn(chat_id, "still there?")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "unknown")
         types = [e["interpreted_type"] for e in
-                 harness.store.events_of(session["session_id"])]
+                 support.view(harness).events_of(session["session_id"])]
         self.assertIn("stream_end", types)
         self.assert_store_valid(harness.store, "real-stream-end-then-unknown")
         harness.abandon(chat_id)
@@ -283,14 +256,11 @@ class TerminationIsDistinguishable(unittest.TestCase, StoreCheck):
         states["launch_failed"] = self._state(stub("t1", launch_outcomes=["rejected"]))
         states["failed"] = self._state(stub("t2", end_of_turn="session_failed"))
         states["completed"] = self._state(stub("t3"))
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream",
-                         "end_of_turn": "turn_complete"}}, "t4")
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream', 'end_of_turn': 'turn_complete'}})
         chat_id = harness.create_chat("Terminated")
         harness.send_turn(chat_id, "hello")
         harness.stop_agent(chat_id, "the user said so")
-        states["terminated"] = harness.store.sessions_of(chat_id)[0]["state"]
+        states["terminated"] = support.view(harness).sessions_of(chat_id)[0]["state"]
         self.assertEqual(states,
                          {"launch_failed": "launch_failed", "failed": "failed",
                           "completed": "completed", "terminated": "terminated"})
@@ -298,7 +268,7 @@ class TerminationIsDistinguishable(unittest.TestCase, StoreCheck):
     def _state(self, harness):
         chat_id = harness.create_chat("Outcome")
         harness.send_turn(chat_id, "hello")
-        return harness.store.sessions_of(chat_id)[0]["state"]
+        return support.view(harness).sessions_of(chat_id)[0]["state"]
 
 
 if __name__ == "__main__":
@@ -357,7 +327,7 @@ class EveryFailureShapeStillProducesADurableOutcome(unittest.TestCase, StoreChec
     )
 
     def _turn_with_detail(self, salt, detail):
-        harness = support.deterministic({}, salt, launcher=self._BadDetail(detail))
+        harness = support.harness({}, launcher=self._BadDetail(detail))
         chat_id = harness.create_chat("A launcher that failed while failing")
         outcome = harness.send_turn(chat_id, "hello")
         return harness, chat_id, outcome
@@ -366,10 +336,10 @@ class EveryFailureShapeStillProducesADurableOutcome(unittest.TestCase, StoreChec
         for i, detail in enumerate(self.DETAILS):
             with self.subTest(detail=type(detail).__name__):
                 harness, chat_id, outcome = self._turn_with_detail("d%d" % i, detail)
-                session = harness.store.sessions_of(chat_id)[0]
+                session = support.view(harness).sessions_of(chat_id)[0]
                 self.assertEqual(session["state"], "launch_failed",
                                  "the session must not be left in `launching`")
-                self.assertEqual(len(harness.store.all_of("launch_result")), 1,
+                self.assertEqual(len(support.view(harness).all_of("launch_result")), 1,
                                  "the attempt must be recorded whatever the "
                                  "launcher put in `detail`")
                 self.assertEqual(outcome.launch_outcome, "failed")
@@ -382,7 +352,7 @@ class EveryFailureShapeStillProducesADurableOutcome(unittest.TestCase, StoreChec
             "d9", OSError("the bridge socket is gone"))
         self.assertEqual(outcome.failure_category, "unavailable",
                          "not internal_error: the launcher classified this itself")
-        result = harness.store.all_of("launch_result")[0]
+        result = support.view(harness).all_of("launch_result")[0]
         self.assertEqual(result["failure_category"], "unavailable")
         self.assertIsInstance(result["detail"], str)
         self.assertIn("the bridge socket is gone", result["detail"],
@@ -392,12 +362,12 @@ class EveryFailureShapeStillProducesADurableOutcome(unittest.TestCase, StoreChec
         """What made F2 severe: the chat was unusable for the life of the
         process, with no stop, no abandon and no further turn."""
         harness, chat_id, _ = self._turn_with_detail("d10", OSError("gone"))
-        session = harness.store.sessions_of(chat_id)[0]
-        binding = harness.store.binding_for_session(session["session_id"])
+        session = support.view(harness).sessions_of(chat_id)[0]
+        binding = support.view(harness).binding_for_session(session["session_id"])
         self.assertIsNotNone(binding["released_at"], "the binding must be released")
-        self.assertEqual(harness.store.open_bindings(chat_id), [])
+        self.assertEqual(support.view(harness).open_bindings(chat_id), [])
         # The chat takes another turn, which is the whole point.
-        second = support.deterministic({"launcher": "scripted-stub"}, "d11")
+        second = support.harness({'launcher': 'scripted-stub'})
         self.assertTrue(second)
         self.assert_store_valid(harness.store, "bad-detail-launch-failed-recorded")
 
@@ -432,14 +402,14 @@ class EveryFailureShapeStillProducesADurableOutcome(unittest.TestCase, StoreChec
             def launch(self, instruction):
                 raise Sneaky()
 
-        harness = support.deterministic({}, "d12", launcher=Raises(None))
+        harness = support.harness({}, launcher=Raises(None))
         chat_id = harness.create_chat("Classification that cannot succeed")
         outcome = harness.send_turn(chat_id, "hello")
         self.assertEqual(outcome.launch_outcome, "failed")
         self.assertEqual(outcome.failure_category, "internal_error")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "launch_failed")
-        self.assertEqual(len(harness.store.all_of("launch_result")), 1)
+        self.assertEqual(len(support.view(harness).all_of("launch_result")), 1)
         self.assert_store_valid(harness.store, "classification-failure-is-internal-error")
 
     def test_the_probe_would_have_failed_before_the_repair(self):
@@ -465,13 +435,13 @@ class EveryFailureShapeStillProducesADurableOutcome(unittest.TestCase, StoreChec
                 exc.raw_detail = OSError("the bridge socket is gone")
                 raise exc
 
-        harness = OldCallLaunch(session_manager.Store(None), RawDetail(None))
+        harness = OldCallLaunch(ChatStore(support.scratch_root()), RawDetail(None))
         chat_id = harness.create_chat("The defect, restored")
         with self.assertRaises(lb.LaunchBoundaryError):
             harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "launching",
                          "this is the state F2 left the session in")
-        self.assertEqual(harness.store.all_of("launch_result"), [])
-        self.assertEqual(support.codes(harness.store.snapshot()), [],
+        self.assertEqual(support.view(harness).all_of("launch_result"), [])
+        self.assertEqual(support.codes(support.view(harness).snapshot()), [],
                          "and the store validated, which is why nothing caught it")

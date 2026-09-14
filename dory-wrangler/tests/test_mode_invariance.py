@@ -54,7 +54,7 @@ class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreChec
     def test_every_configuration_produces_the_same_three_turn_transcript(self):
         transcripts = {}
         for name, config in CONFIGURATIONS:
-            harness = support.deterministic(config, "v")
+            harness = support.harness(config)
             self.addCleanup(support.release, harness)
             chat_id = run_three_turns(harness, "Mode invariance")
             transcripts[name] = harness.transcript(chat_id)
@@ -72,11 +72,11 @@ class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreChec
         record of what the integration did. Chats and messages must not."""
         shapes = {}
         for name, config in CONFIGURATIONS:
-            harness = support.deterministic(config, "w")
+            harness = support.harness(config)
             self.addCleanup(support.release, harness)
             chat_id = run_three_turns(harness, "Same shape")
             support.end_chat(harness, chat_id)
-            messages = harness.store.messages(chat_id)
+            messages = support.view(harness).messages(chat_id)
             shapes[name] = [
                 (m["sequence"], m["author"], m["content"],
                  m["session_id"] is None, m["source_event_id"] is None)
@@ -95,12 +95,11 @@ class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreChec
                 directory = tempfile.mkdtemp(prefix="dory-mode-")
                 self.addCleanup(shutil.rmtree, directory, True)
                 path = os.path.join(directory, "records.jsonl")
-                harness = support.deterministic(config, "y", store_path=path)
+                harness = support.harness(config, store_path=path)
                 self.addCleanup(support.release, harness)
                 chat_id = run_three_turns(harness, "Reopen")
                 support.end_chat(harness, chat_id)
-                reopened = support.deterministic(config, "z", store_path=path,
-                                                 start=support.RESTARTED)
+                reopened = support.harness(config, store_path=path)
                 self.addCleanup(support.release, reopened)
                 self.assertEqual(reopened.transcript(chat_id), expected_transcript())
 
@@ -117,19 +116,19 @@ class TheModeIsWhatTheLauncherWasActuallyAskedToDo(unittest.TestCase, StoreCheck
         launcher = ScriptedStubLauncher({"continuation": "persistent",
                                          "response_shape": "stream",
                                          "end_of_turn": "turn_complete"})
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = run_three_turns(harness, "Persistent")
 
         self.assertEqual(len(launcher.launch_calls), 1,
                          "a persistent agent is launched once")
         self.assertEqual(len(launcher.deliver_calls), 2,
                          "turns two and three were delivered to the running agent")
-        self.assertEqual(len(harness.store.sessions_of(chat_id)), 1)
-        self.assertEqual(len(harness.store.all_of("launch_request")), 1)
-        self.assertEqual(len(harness.store.all_of("delivery_request")), 2)
+        self.assertEqual(len(support.view(harness).sessions_of(chat_id)), 1)
+        self.assertEqual(len(support.view(harness).all_of("launch_request")), 1)
+        self.assertEqual(len(support.view(harness).all_of("delivery_request")), 2)
 
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
-        deliveries = harness.store.deliveries_of(session_id)
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
+        deliveries = support.view(harness).deliveries_of(session_id)
         self.assertEqual([d["sequence"] for d in deliveries], [1, 2])
         self.assertEqual([d["acknowledged"] for d in deliveries], [True, True])
         self.assertEqual([d["instruction_text"] for d in deliveries],
@@ -142,14 +141,14 @@ class TheModeIsWhatTheLauncherWasActuallyAskedToDo(unittest.TestCase, StoreCheck
     def test_fresh_binding_launches_three_times_and_delivers_nothing(self):
         launcher = ScriptedStubLauncher({"continuation": "fresh_binding",
                                          "response_shape": "one_shot"})
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = run_three_turns(harness, "Fresh binding")
 
         self.assertEqual(len(launcher.launch_calls), 3)
         self.assertEqual(launcher.deliver_calls, [])
-        self.assertEqual(len(harness.store.sessions_of(chat_id)), 3)
-        self.assertEqual(len(harness.store.all_of("launch_request")), 3)
-        self.assertEqual(harness.store.all_of("delivery_request"), [])
+        self.assertEqual(len(support.view(harness).sessions_of(chat_id)), 3)
+        self.assertEqual(len(support.view(harness).all_of("launch_request")), 3)
+        self.assertEqual(support.view(harness).all_of("delivery_request"), [])
         self.assert_store_valid(harness.store, "fresh-binding-three-agents-three-turns")
 
     def test_a_fresh_binding_launcher_refuses_delivery_at_the_seam(self):
@@ -174,12 +173,12 @@ class TheModeIsWhatTheLauncherWasActuallyAskedToDo(unittest.TestCase, StoreCheck
         launcher = NeverAcknowledges({"continuation": "persistent",
                                       "response_shape": "stream",
                                       "end_of_turn": "turn_complete"})
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("Delivery that is not acknowledged")
         harness.send_turn(chat_id, support.THREE_TURNS[0])
         harness.send_turn(chat_id, support.THREE_TURNS[1])
 
-        delivery = harness.store.all_of("delivery_request")[0]
+        delivery = support.view(harness).all_of("delivery_request")[0]
         self.assertIsNone(delivery["acknowledged"],
                           "an acknowledgement we never received is unknown, not false")
         self.assertEqual(delivery["instruction_text"], support.THREE_TURNS[1],
@@ -197,7 +196,7 @@ class TheComparisonHasTeeth(unittest.TestCase):
     """
 
     def _transcript(self, launcher):
-        harness = open_harness({}, launcher=launcher)
+        harness = support.harness({}, launcher=launcher)
         chat_id = run_three_turns(harness, "Mutation")
         return harness.transcript(chat_id)
 
@@ -300,7 +299,7 @@ class TheExperimentIsWhatItIsAndNotMore(unittest.TestCase):
         shapes = {}
         for name, config in CONFIGURATIONS:
             proxy = _CallLog(build_launcher(config))
-            harness = open_harness({}, launcher=proxy)
+            harness = support.harness({}, launcher=proxy)
             self.addCleanup(proxy.release_all)
             chat_id = run_three_turns(harness, "Instrumented")
             support.end_chat(harness, chat_id)
@@ -377,14 +376,14 @@ class TheExperimentIsWhatItIsAndNotMore(unittest.TestCase):
         # Spelling one: a payload typed `stream_end` from a launcher that
         # declared it returns a response rather than a stream.
         typed = dict(one_shot["options"], end_of_turn="stream_end")
-        harness = open_harness({"launcher": "scripted-stub", "options": typed})
+        harness = support.harness({"launcher": "scripted-stub", "options": typed})
         chat_id = harness.create_chat("One-shot stream end")
         with self.assertRaises(lb.LaunchBoundaryError) as caught:
             harness.send_turn(chat_id, "hello")
         self.assertIn("no stream to end", str(caught.exception))
         self.assertNotIn("stream_end",
                          [e["interpreted_type"]
-                          for e in harness.store.all_of("diagnostic_event")],
+                          for e in support.view(harness).all_of("diagnostic_event")],
                          "the refused payload must not have been stored either")
 
         # Spelling two: never emit the payload, just set the page's flag.
@@ -393,7 +392,7 @@ class TheExperimentIsWhatItIsAndNotMore(unittest.TestCase):
                 page = ScriptedStubLauncher.events(self, agent_handle, after_sequence)
                 return lb.EventsPage(page.payloads, stream_ended=True)
 
-        flagged = open_harness(
+        flagged = support.harness(
             {}, launcher=FlagsAnEndWithoutSayingIt(dict(one_shot["options"])))
         chat_id = flagged.create_chat("One-shot flagged end")
         with self.assertRaises(lb.LaunchBoundaryError) as caught:
@@ -404,7 +403,7 @@ class TheExperimentIsWhatItIsAndNotMore(unittest.TestCase):
         # `stream` is not caught by either of them.
         self.assertFalse(lb.LauncherCapabilities("fresh_binding", "one_shot").has_stream)
         self.assertTrue(lb.LauncherCapabilities("persistent", "stream").has_stream)
-        streaming = open_harness(
+        streaming = support.harness(
             {"launcher": "scripted-stub",
              "options": {"continuation": "persistent", "response_shape": "stream",
                          "end_of_turn": "stream_end"}})
@@ -412,7 +411,7 @@ class TheExperimentIsWhatItIsAndNotMore(unittest.TestCase):
         streaming.send_turn(chat_id, "hello")
         self.assertIn("stream_end",
                       [e["interpreted_type"]
-                       for e in streaming.store.all_of("diagnostic_event")],
+                       for e in support.view(streaming).all_of("diagnostic_event")],
                       "the guards must key on the declared response shape, not "
                       "refuse a stream end outright")
 

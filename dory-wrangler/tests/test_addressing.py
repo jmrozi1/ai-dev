@@ -23,6 +23,8 @@ harness that passed the session id if it never compared the two.
 from __future__ import annotations
 
 import inspect
+import os
+import tempfile
 import unittest
 
 import support
@@ -32,7 +34,15 @@ from support import StoreCheck, VALIDATOR, codes, end_chat, expected_transcript,
 from dory_wrangler import launch_boundary as lb
 from dory_wrangler import session_manager
 from dory_wrangler.wiring import open_harness
-from dory_wrangler.errors import ConcurrentLaunchRefused, NotPermitted
+from dory_wrangler import store as store_module
+from dory_wrangler.errors import (
+    ConcurrentLaunchRefused,
+    NotPermitted,
+    StoreCorrupt,
+    TransitionRefused,
+    ValidationRefused,
+)
+from dory_wrangler.store import ChatStore
 from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 
 
@@ -68,14 +78,14 @@ class TheHandleIsWhatIsActuallyPassed(unittest.TestCase, StoreCheck):
             with self.subTest(continuation=continuation):
                 launcher = ScriptedStubLauncher({"continuation": continuation,
                                                  "response_shape": shape})
-                harness = open_harness({}, launcher=launcher)
+                harness = support.harness({}, launcher=launcher)
                 chat_id = run_three_turns(harness, "Addressing")
                 end_chat(harness, chat_id)
 
                 handles = set(s.get("agent_handle")
-                              for s in harness.store.sessions_of(chat_id))
+                              for s in support.view(harness).sessions_of(chat_id))
                 session_ids = set(s["session_id"]
-                                  for s in harness.store.sessions_of(chat_id))
+                                  for s in support.view(harness).sessions_of(chat_id))
                 addressed = [address for _, address in launcher.addressed]
 
                 self.assertTrue(addressed, "nothing addressed the agent at all")
@@ -106,11 +116,11 @@ class TheHandleIsWhatIsActuallyPassed(unittest.TestCase, StoreCheck):
 
         launcher = ScriptedStubLauncher({})
         harness = AddressesBySessionId(
-            session_manager.Store(None), launcher)
+            ChatStore(support.scratch_root()), launcher)
         chat_id = harness.create_chat("Wrong address")
         harness.send_turn(chat_id, "hello")
 
-        handles = set(s.get("agent_handle") for s in harness.store.sessions_of(chat_id)
+        handles = set(s.get("agent_handle") for s in support.view(harness).sessions_of(chat_id)
                       if s.get("agent_handle"))
         addressed = [address for _, address in launcher.addressed]
         self.assertTrue(addressed)
@@ -135,24 +145,17 @@ class ALauncherMustRememberNothingBetweenCalls(unittest.TestCase, StoreCheck):
         self.path = os.path.join(directory, "records.jsonl")
 
     def test_a_restart_re_attaches_through_the_stored_handle_alone(self):
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream"}},
-            "a1", store_path=self.path)
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream'}}, store_path=self.path)
         chat_id = harness.create_chat("Restart by handle")
         harness.send_turn(chat_id, "are you there?")
-        live = harness.store.non_terminal_sessions(chat_id)[0]
+        live = support.view(harness).non_terminal_sessions(chat_id)[0]
         handle, session_id = live["agent_handle"], live["session_id"]
 
         # A launcher that knows this handle and has never seen this session id.
-        reopened = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream",
-                         "resume_handles": [handle]}},
-            "a2", store_path=self.path, start=support.RESTARTED)
+        reopened = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream', 'resume_handles': [handle]}}, store_path=self.path)
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "running")])
         self.assertEqual([kind for kind in
-                          (o["kind"] for o in reopened.store.observations_of(session_id))],
+                          (o["kind"] for o in support.view(reopened).observations_of(session_id))],
                          ["reattached"])
         self.assertEqual([address for _, address in reopened._boundary.addressed],
                          [handle], "re-attachment passed something other than the handle")
@@ -162,19 +165,12 @@ class ALauncherMustRememberNothingBetweenCalls(unittest.TestCase, StoreCheck):
     def test_a_launcher_that_knows_only_the_session_id_cannot_resume(self):
         """The mirror. A launcher holding the *session id* is no use, which is
         what makes the handle load-bearing rather than decorative."""
-        harness = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream"}},
-            "a3", store_path=self.path)
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream'}}, store_path=self.path)
         chat_id = harness.create_chat("Restart by session id")
         harness.send_turn(chat_id, "are you there?")
-        session_id = harness.store.non_terminal_sessions(chat_id)[0]["session_id"]
+        session_id = support.view(harness).non_terminal_sessions(chat_id)[0]["session_id"]
 
-        reopened = support.deterministic(
-            {"launcher": "scripted-stub",
-             "options": {"continuation": "persistent", "response_shape": "stream",
-                         "resume_handles": [session_id]}},
-            "a4", store_path=self.path, start=support.RESTARTED)
+        reopened = support.harness({'launcher': 'scripted-stub', 'options': {'continuation': 'persistent', 'response_shape': 'stream', 'resume_handles': [session_id]}}, store_path=self.path)
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "unknown")])
         reopened.abandon(chat_id)
         self.assert_store_valid(reopened.store, "restart-session-id-is-not-an-address")
@@ -185,12 +181,10 @@ class NothingIsAddressedWithoutAHandle(unittest.TestCase, StoreCheck):
     exists rather than only by a validator run afterwards."""
 
     def _unknown_launch(self, salt):
-        harness = support.deterministic(
-            {"launcher": "scripted-stub", "options": {"launch_outcomes": ["unknown"]}},
-            salt)
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'launch_outcomes': ['unknown']}})
         chat_id = harness.create_chat("No handle was ever issued")
         harness.send_turn(chat_id, "hello")
-        session = harness.store.sessions_of(chat_id)[0]
+        session = support.view(harness).sessions_of(chat_id)[0]
         self.assertEqual(session["state"], "unknown")
         self.assertIsNone(session.get("agent_handle"),
                           "an `unknown` outcome carries no handle (contract 6.3)")
@@ -201,13 +195,13 @@ class NothingIsAddressedWithoutAHandle(unittest.TestCase, StoreCheck):
         with self.assertRaises(NotPermitted) as caught:
             harness.stop_agent(chat_id, "the user pressed Stop")
         self.assertIn("never received an agent_handle", str(caught.exception))
-        self.assertEqual(harness.store.observations_of(session["session_id"]), [],
+        self.assertEqual(support.view(harness).observations_of(session["session_id"]), [],
                          "a refused stop must leave no observation claiming the "
                          "agent was addressed")
         # The user is not stuck: 5.4's exit needs no handle.
         harness.abandon(chat_id)
         self.assertEqual(
-            harness.store.get("agent_session", session["session_id"])["state"],
+            support.view(harness).get("agent_session", session["session_id"])["state"],
             "abandoned")
         self.assert_store_valid(harness.store, "no-handle-stop-refused-then-abandoned")
 
@@ -221,49 +215,53 @@ class NothingIsAddressedWithoutAHandle(unittest.TestCase, StoreCheck):
         self.addCleanup(shutil.rmtree, directory, True)
         path = os.path.join(directory, "records.jsonl")
 
-        harness = support.deterministic(
-            {"launcher": "scripted-stub", "options": {"launch_outcomes": ["unknown"]}},
-            "n2", store_path=path)
+        harness = support.harness({'launcher': 'scripted-stub', 'options': {'launch_outcomes': ['unknown']}}, store_path=path)
         chat_id = harness.create_chat("Unknown, then a restart")
         harness.send_turn(chat_id, "hello")
-        session_id = harness.store.sessions_of(chat_id)[0]["session_id"]
+        session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
 
-        reopened = support.deterministic({"launcher": "scripted-stub"}, "n3",
-                                         store_path=path, start=support.RESTARTED)
+        reopened = support.harness({'launcher': 'scripted-stub'}, store_path=path)
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "unknown")])
         self.assertEqual([address for _, address in reopened._boundary.addressed], [],
                          "the launcher must not have been called at all: there was "
                          "nothing to pass it")
-        kinds = [o["kind"] for o in reopened.store.observations_of(session_id)]
+        kinds = [o["kind"] for o in support.view(reopened).observations_of(session_id)]
         self.assertEqual(kinds, ["reattach_failed"])
         reopened.abandon(chat_id)
         self.assert_store_valid(reopened.store, "no-handle-restart-reattach-failed")
 
     def test_the_harness_refuses_to_write_an_addressing_observation_with_no_handle(self):
         """The guard itself, reached directly. Everything above routes around it;
-        this requires it to exist."""
+        this requires it to exist.
+
+        #87's chat loop kept its own copy of this guard, keyed on the session
+        carrying a handle, and raised `LaunchBoundaryError`. Convergence merged
+        it into the store's, which is keyed on the launcher having *issued* one
+        and refuses with `ValidationRefused`; the loop's copy is gone rather than
+        left as a clause no input could reach first."""
         harness, chat_id, session = self._unknown_launch("n4")
-        for kind in sorted(session_manager.ADDRESSING_OBSERVATION_KINDS):
+        for kind in sorted(store_module.ADDRESSING_OBSERVATION_KINDS):
             with self.subTest(kind=kind):
-                with self.assertRaises(lb.LaunchBoundaryError):
+                with self.assertRaises(ValidationRefused):
                     harness._record_observation(session, kind, "forged")
         # ... and the exempt kind is genuinely exempt.
         harness._record_observation(session, "reattach_failed", "honest")
         self.assertEqual([o["kind"] for o in
-                          harness.store.observations_of(session["session_id"])],
+                          support.view(harness).observations_of(session["session_id"])],
                          ["reattach_failed"])
 
     def test_a_store_that_gets_past_the_harness_is_still_refused_by_the_contract(self):
         """Defence at rest, so the guarantee does not rest on this harness being
         the only writer."""
         harness, chat_id, session = self._unknown_launch("n5")
-        harness.store.put({
+        forged = support.view(harness)
+        forged.put({
             "record_type": "session_observation", "record_version": 1,
             "observation_id": "obs_forgedstop01", "chat_id": chat_id,
             "session_id": session["session_id"],
-            "observed_at": harness._clock.now(),
+            "observed_at": support.now(),
             "kind": "stop_confirmed", "detail": "forged past the harness"})
-        self.assert_store_rejected_for(harness.store, "ADDRESSED_WITHOUT_HANDLE")
+        self.assert_store_rejected_for(forged, "ADDRESSED_WITHOUT_HANDLE")
 
 
 class DriftGuardsForTheAddressingRules(unittest.TestCase, StoreCheck):
@@ -275,16 +273,20 @@ class DriftGuardsForTheAddressingRules(unittest.TestCase, StoreCheck):
     """
 
     def test_the_addressing_observation_kinds_match_the_validators(self):
-        self.assertEqual(set(session_manager.ADDRESSING_OBSERVATION_KINDS),
+        """The copy that remains is the store's -- #86's carried "duplicated
+        contract constant". The chat loop's copy is gone, and this equality now
+        guards the store's in both directions."""
+        self.assertFalse(hasattr(session_manager, "ADDRESSING_OBSERVATION_KINDS"))
+        self.assertEqual(set(store_module.ADDRESSING_OBSERVATION_KINDS),
                          set(VALIDATOR.ADDRESSING_OBSERVATION_KINDS))
 
     def test_reattach_failed_is_exempt_in_both_copies(self):
-        self.assertNotIn("reattach_failed", session_manager.ADDRESSING_OBSERVATION_KINDS)
+        self.assertNotIn("reattach_failed", store_module.ADDRESSING_OBSERVATION_KINDS)
         self.assertNotIn("reattach_failed", VALIDATOR.ADDRESSING_OBSERVATION_KINDS)
         self.assertIn("reattach_failed", VALIDATOR.OBSERVATION_KINDS)
 
     def test_every_addressing_kind_is_one_the_validator_recognises(self):
-        for kind in session_manager.ADDRESSING_OBSERVATION_KINDS:
+        for kind in store_module.ADDRESSING_OBSERVATION_KINDS:
             self.assertIn(kind, VALIDATOR.OBSERVATION_KINDS)
 
     def _base_store(self, handle, issued_at, observed_at):
@@ -339,9 +341,14 @@ class ProcessDeath(BaseException):
 class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreCheck):
     """Re-review N1, and the enumeration that finds defects of its kind.
 
-    `_launch_turn` persists the handle and the `running` transition as two
-    durable writes, so a process death between them leaves a session `launching`
-    **with** a handle. Generalising the restart path from the two state names to
+    `_launch_turn` persisted the handle and the `running` transition as two
+    durable writes in #87's store, so a process death between them left a
+    session `launching` **with** a handle. On the converged store the handle
+    enters in the same write as `running`, so the window that shape needed is
+    gone and the shape the same crash now leaves is `launching` with an accepted
+    `launch_result` and no handle on the session. Both shapes are walked below:
+    the converged one by crashing where it is made, #87's by planting it, as a
+    store an earlier writer or a torn restore could leave. Generalising the restart path from the two state names to
     the handle put that shape in no branch: it passed the handle guard, matched
     neither outcome gate, and `return session["state"]` left it `launching` on
     every subsequent restart, with stop, abandon and every turn refused -- a chat
@@ -378,13 +385,13 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
             options["on_launch"] = die_inside
         config = {"launcher": "scripted-stub",
                   "options": dict(self.STUB["options"], **options)}
-        harness = support.deterministic(config, salt, store_path=self.path)
+        harness = support.harness(config, store_path=self.path)
         real = session_manager.SessionManager._transition
 
-        def die(manager, session, to, owner, kind, ref):
+        def die(manager, session, to, owner, kind, ref, agent_handle=None):
             if session["state"] == "launching" and to == at:
                 raise ProcessDeath("the process ended before the %s transition" % at)
-            return real(manager, session, to, owner, kind, ref)
+            return real(manager, session, to, owner, kind, ref, agent_handle=agent_handle)
 
         if at != "in_launch":
             session_manager.SessionManager._transition = die
@@ -399,25 +406,36 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
             self.fail("the crash never happened, so nothing was interrupted")
         session_manager.SessionManager._transition = real
         support.release(harness)
-        session = harness.store.non_terminal_sessions(chat_id)[0]
+        session = support.view(harness).non_terminal_sessions(chat_id)[0]
         self.assertEqual(session["state"], "launching",
                          "the crash must leave the session mid-launch")
-        return chat_id, session["session_id"], session.get("agent_handle")
+        self.assertIsNone(session.get("agent_handle"),
+                          "on the converged store no handle reaches a session "
+                          "except in the write that enters `running`")
+        result = support.view(harness).launch_result_of(session["session_id"])
+        return chat_id, session["session_id"], (result or {}).get("agent_handle")
+
+    def _plant_the_old_shape(self, chat_id, session_id, handle):
+        """#87's N1 shape: `launching` *with* the handle, which #87's two-write
+        launch left on disk and the converged store never writes."""
+        session = support.view(support.harness(self.STUB, store_path=self.path)).get(
+            "agent_session", session_id)
+        session["agent_handle"] = handle
+        support.plant(ChatStore(self.path), session)
 
     def _leaving_launching(self, harness, session_id):
         """The evidence cited by the transition that left `launching` -- which is
         the one this repair decides, and not necessarily the last one."""
-        session = harness.store.get("agent_session", session_id)
+        session = support.view(harness).get("agent_session", session_id)
         for transition in session["transitions"]:
             if transition["from"] == "launching":
                 return transition["evidence"]
         self.fail("the session never left `launching`")
 
-    def _restart(self, salt, options=None, start=support.RESTARTED):
+    def _restart(self, salt, options=None):
         config = {"launcher": "scripted-stub",
                   "options": dict(self.STUB["options"], **(options or {}))}
-        reopened = support.deterministic(config, salt, store_path=self.path,
-                                         start=start)
+        reopened = support.harness(config, store_path=self.path)
         self.addCleanup(support.release, reopened)
         return reopened
 
@@ -427,18 +445,19 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
         """The reproduction, run forwards. An ordinary stateless launcher, the
         one shape contract 6.1 mandates, and two restarts."""
         chat_id, session_id, handle = self._die_in_the_window("l1")
-        self.assertTrue(handle, "the handle reached the store before the crash")
+        self.assertTrue(handle, "the launcher's accepted report reached the store "
+                                "before the crash")
 
         first = self._restart("l2")
         self.assertEqual(first.reattach_on_start(), [(session_id, "unknown")])
-        self.assertEqual(first.store.get("agent_session", session_id)["state"],
+        self.assertEqual(support.view(first).get("agent_session", session_id)["state"],
                          "unknown",
                          "a session no branch transitions is a chat with no exit")
         # And `unknown`'s exit works, on the first restart, without a second one.
         first.abandon(chat_id)
-        self.assertEqual(first.store.get("agent_session", session_id)["state"],
+        self.assertEqual(support.view(first).get("agent_session", session_id)["state"],
                          "abandoned")
-        self.assertEqual(first.store.open_bindings(chat_id), [])
+        self.assertEqual(support.view(first).open_bindings(chat_id), [])
         outcome = first.send_turn(chat_id, "are you there?")
         self.assertEqual(outcome.session_state, "completed",
                          "the chat is usable again, which is what 'has an exit' "
@@ -456,35 +475,45 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
         across restarts too."""
         chat_id, session_id, _ = self._die_in_the_window("l3")
         self._restart("l4").reattach_on_start()
-        second = self._restart("l5", start="2026-09-13T12:00:00.000000Z")
+        second = self._restart("l5")
         self.assertEqual(second.reattach_on_start(), [(session_id, "unknown")])
         second.abandon(chat_id)
-        third = self._restart("l6", start="2026-09-14T12:00:00.000000Z")
+        third = self._restart("l6")
         self.assertEqual(third.reattach_on_start(), [],
                          "an abandoned session is terminal and is not re-attached")
         self.assert_store_valid(third.store, "launching-interrupted-two-restarts")
 
     def test_the_old_shape_bricks_the_chat_and_is_rejected_by_the_contract(self):
-        """The negative control. Restore the routing this rail removed -- fall
-        through to the handle-keyed branches with the state untouched -- and the
-        session is stuck, every user action is refused, and the store does not
-        even validate."""
+        """The negative control. Leave the state untouched instead of resolving it,
+        and the session is stuck, every user action is refused, and the store
+        does not even validate."""
         chat_id, session_id, _ = self._die_in_the_window("l7")
         reopened = self._restart("l8")
         reopened._resolve_interrupted_launch = lambda session: session["state"]
 
         for _ in range(2):
             self.assertEqual(reopened.reattach_on_start(), [(session_id, "launching")])
-            self.assertEqual(reopened.store.get("agent_session", session_id)["state"],
+            self.assertEqual(support.view(reopened).get("agent_session", session_id)["state"],
                              "launching")
         for action in (lambda: reopened.stop_agent(chat_id, "the user pressed Stop"),
                        lambda: reopened.abandon(chat_id),
                        lambda: reopened.send_turn(chat_id, "are you there?")):
             with self.assertRaises((NotPermitted, ConcurrentLaunchRefused)):
                 action()
-        self.assertIn("LAUNCH_OUTCOME_MISMATCH", codes(reopened.store.snapshot()),
+        self.assertIn("LAUNCH_OUTCOME_MISMATCH", codes(support.view(reopened).snapshot()),
                       "an accepted launch whose session never entered `running` is "
                       "not merely a stuck chat, it is a store the contract rejects")
+
+    def test_the_old_shape_still_reaches_an_exit_on_the_converged_code(self):
+        """#87's N1 shape, planted, meets the converged restart path and leaves
+        `launching` exactly as the converged shape does."""
+        chat_id, session_id, handle = self._die_in_the_window("l7c")
+        self._plant_the_old_shape(chat_id, session_id, handle)
+        reopened = self._restart("l8c")
+        self.assertEqual(reopened.reattach_on_start(), [(session_id, "unknown")])
+        reopened.abandon(chat_id)
+        self.assertEqual(reopened.send_turn(chat_id, "and now?").session_state, "completed")
+        self.assert_store_valid(reopened.store, "launching-old-shape-planted-then-abandoned")
 
     def test_widening_the_two_outcome_gates_is_not_the_fix(self):
         """The other candidate, measured rather than argued about: admit
@@ -503,8 +532,8 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
             observation_id = None
             try:
                 manager._boundary.events(
-                    session["agent_handle"],
-                    manager.store.last_event_sequence(session_id))
+                    session.get("agent_handle"),
+                    support.view(manager).last_event_sequence(session_id))
             except lb.LauncherError as exc:
                 observation_id = manager._record_observation(
                     session, "reattach_failed", "%s: %s" % (exc.category, exc.detail))
@@ -516,21 +545,27 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
                                 observation_id)
 
         stateless = self._restart("l10")
-        widened(stateless, stateless.store.get("agent_session", session_id))
-        self.assertEqual(stateless.store.get("agent_session", session_id)["state"],
+        widened(stateless, support.view(stateless).get("agent_session", session_id))
+        self.assertEqual(support.view(stateless).get("agent_session", session_id)["state"],
                          "unknown")
-        self.assertIn("LAUNCH_OUTCOME_MISMATCH", codes(stateless.store.snapshot()))
+        self.assertIn("LAUNCH_OUTCOME_MISMATCH", codes(support.view(stateless).snapshot()))
 
+        # The resumable half needs a session carrying the handle to address, which
+        # is #87's shape; the converged store refuses to put that candidate's
+        # records on disk at all rather than writing a store the contract
+        # rejects, which is a stronger form of the same finding.
+        chat_id, session_id, handle = self._die_in_the_window("l9b")
+        self._plant_the_old_shape(chat_id, session_id, handle)
         resumable = self._restart("l11", options={"resume_handles": [handle]})
-        session = resumable.store.get("agent_session", session_id)
-        session["state"] = "launching"
-        session["transitions"] = [t for t in session["transitions"]
-                                  if t["to"] != "unknown"]
-        resumable.store.put(session)
-        widened(resumable, resumable.store.get("agent_session", session_id))
-        self.assertEqual(resumable.store.get("agent_session", session_id)["state"],
-                         "running")
-        self.assertIn("PRECONDITION_NOT_MET", codes(resumable.store.snapshot()))
+        before = support.view(resumable).snapshot()
+        with self.assertRaises(TransitionRefused) as caught:
+            widened(resumable, support.view(resumable).get("agent_session", session_id))
+        self.assertIn("PRECONDITION_NOT_MET", str(caught.exception))
+        self.assertEqual(support.view(resumable).get("agent_session", session_id)["state"],
+                         "launching")
+        after = support.view(resumable).snapshot()
+        self.assertEqual([r for r in after if r not in before
+                          and r["record_type"] != "session_observation"], [])
 
     # -- every input the restart path can be handed in `launching` ---------
 
@@ -540,7 +575,7 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
         chat_id, session_id, handle = self._die_in_the_window("l12")
         reopened = self._restart("l13", options={"resume_handles": [handle]})
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "running")])
-        self.assertEqual([o["kind"] for o in reopened.store.observations_of(session_id)],
+        self.assertEqual([o["kind"] for o in support.view(reopened).observations_of(session_id)],
                          ["reattached"])
         self.assertEqual([address for _, address in reopened._boundary.addressed],
                          [handle], "the re-attachment addressed something other "
@@ -555,11 +590,11 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
         needs no handle."""
         chat_id, session_id, handle = self._die_in_the_window("l14", at="in_launch")
         self.assertIsNone(handle)
-        self.assertEqual(self._restart("l15").store.launch_result_of(session_id), None)
+        self.assertEqual(support.view(self._restart("l15")).launch_result_of(session_id), None)
 
         reopened = self._restart("l16")
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "unknown")])
-        self.assertEqual([o["kind"] for o in reopened.store.observations_of(session_id)],
+        self.assertEqual([o["kind"] for o in support.view(reopened).observations_of(session_id)],
                          ["reattach_failed"])
         self.assertEqual([address for _, address in reopened._boundary.addressed], [],
                          "there was nothing to pass, so the launcher must not have "
@@ -575,9 +610,9 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
             "l17", options={"launch_outcomes": ["unavailable"]}, at="launch_failed")
         reopened = self._restart("l18")
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "launch_failed")])
-        self.assertEqual(reopened.store.open_bindings(chat_id), [],
+        self.assertEqual(support.view(reopened).open_bindings(chat_id), [],
                          "a terminal session releases its binding")
-        self.assertEqual(reopened.store.observations_of(session_id), [],
+        self.assertEqual(support.view(reopened).observations_of(session_id), [],
                          "nothing was re-attached to, so nothing is recorded as if "
                          "it had been")
         self.assertEqual(reopened.send_turn(chat_id, "try again").session_state, "completed")
@@ -595,10 +630,10 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
         # what the transition cites. Manufacturing a `reattach_failed` instead
         # would record an attempt that was never made, on a session whose
         # outcome was never in doubt.
-        self.assertEqual(reopened.store.observations_of(session_id), [])
+        self.assertEqual(support.view(reopened).observations_of(session_id), [])
         self.assertEqual(self._leaving_launching(reopened, session_id),
                          {"kind": "launch_result",
-                          "ref": reopened.store.launch_request_of(session_id)["request_id"]})
+                          "ref": support.view(reopened).launch_request_of(session_id)["request_id"]})
         reopened.abandon(chat_id)
         self.assert_store_valid(reopened.store, "launching-interrupted-after-unknown")
 
@@ -606,28 +641,28 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
         """A chat has one launch_result per turn, so resolving `launching` from
         `the` launch_result is only right if it is read back by session. An
         earlier turn's report is a report about a different agent."""
-        first = support.deterministic(self.STUB, "l23", store_path=self.path)
+        first = support.harness(self.STUB, store_path=self.path)
         chat_id = first.create_chat("An earlier turn, then a crash")
         first.send_turn(chat_id, "the turn that completed")
-        finished = first.store.sessions_of(chat_id)[0]["session_id"]
+        finished = support.view(first).sessions_of(chat_id)[0]["session_id"]
         support.release(first)
+        self.assertEqual(len(support.view(first).all_of("launch_result")), 1)
 
         # The chat is free again, and the next turn is the one that crashes.
         crashed_chat, session_id, handle = self._die_in_the_window(
             "l24", chat_id=chat_id)
         self.assertEqual(crashed_chat, chat_id)
         self.assertNotEqual(session_id, finished)
-        self.assertEqual(len(first.store.all_of("launch_result")), 1)
 
         reopened = self._restart("l25")
-        self.assertEqual(len(reopened.store.all_of("launch_result")), 2)
-        self.assertEqual(reopened.store.launch_result_of(session_id)["session_id"],
+        self.assertEqual(len(support.view(reopened).all_of("launch_result")), 2)
+        self.assertEqual(support.view(reopened).launch_result_of(session_id)["session_id"],
                          session_id,
                          "the launch_result read back belongs to another session")
         self.assertEqual(reopened.reattach_on_start(), [(session_id, "unknown")])
         self.assertEqual(
             self._leaving_launching(reopened, session_id)["ref"],
-            reopened.store.launch_request_of(session_id)["request_id"],
+            support.view(reopened).launch_request_of(session_id)["request_id"],
             "the transition cited an earlier turn's launch request")
         reopened.abandon(chat_id)
         self.assert_store_valid(reopened.store, "launching-interrupted-after-an-earlier-turn")
@@ -665,48 +700,80 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
                 reopened = self._restart("f%d" % i)
                 resolved = reopened.reattach_on_start()
                 self.assertEqual([sid for sid, _ in resolved], [session_id])
-                state = reopened.store.get("agent_session", session_id)["state"]
+                state = support.view(reopened).get("agent_session", session_id)["state"]
                 self.assertNotEqual(state, "launching",
                                     "a restart left the session in `launching`, "
                                     "which no user action can leave")
                 # And the exit is real, not merely a different label.
                 if state == "unknown":
                     reopened.abandon(chat_id)
-                    state = reopened.store.get("agent_session", session_id)["state"]
-                self.assertIn(state, session_manager.TERMINAL_SESSION_STATES | {"running"})
-                if state in session_manager.TERMINAL_SESSION_STATES:
+                    state = support.view(reopened).get("agent_session", session_id)["state"]
+                self.assertIn(state, VALIDATOR.TERMINAL_SESSION_STATES | {"running"})
+                if state in VALIDATOR.TERMINAL_SESSION_STATES:
                     self.assertEqual(
                         reopened.send_turn(chat_id, "and now?").session_state,
                         "completed", "the chat did not become usable again")
-                self.assertEqual(support.violations(reopened.store.snapshot()), [])
+                self.assertEqual(support.violations(support.view(reopened).snapshot()), [])
 
     def test_an_accepted_result_with_no_handle_is_refused_rather_than_addressed(self):
         """The shape `LaunchResult` forbids and only a hand-written store can
-        hold. It must still leave the session somewhere the user can act, and it
-        must not manufacture an address."""
-        chat_id, session_id, _ = self._die_in_the_window("l21")
-        reopened = self._restart("l22")
-        session = reopened.store.get("agent_session", session_id)
-        del session["agent_handle"]
-        reopened.store.put(session)
-        result = reopened.store.launch_result_of(session_id)
-        result["agent_handle"] = None
-        reopened.store.put(result)
+        hold. It must not manufacture an address or conclude `running`.
 
-        self.assertEqual(reopened.reattach_on_start(), [(session_id, "unknown")])
-        self.assertEqual([o["kind"] for o in reopened.store.observations_of(session_id)],
+        **Changed by convergence, and listed in the handoff.** #87's store read
+        this record back and the restart routed the session to `unknown`, from
+        which the user abandoned. The converged store runs every record through
+        the contract on the way *out* (D3), and an accepted result with no handle
+        is `LAUNCH_RESULT_INCONSISTENT` on its own, so it is unreadable: the
+        restart leaves that chat alone rather than guessing, still re-attaches
+        every other chat, and this chat stays held until the damaged record is
+        repaired. The
+        branch the old test drove -- `outcome == accepted` with a falsy handle --
+        is still exercised directly below, over a record handed to the method."""
+        chat_id, session_id, _ = self._die_in_the_window("l21")
+        other_chat, other_session, _ = self._die_in_the_window("l21b", chat_id=None)
+        result = support.view(ChatStore(self.path)).launch_result_of(session_id)
+        result["agent_handle"] = None
+        support.plant(ChatStore(self.path), result, chat_id=chat_id)
+
+        reopened = self._restart("l22")
+        self.assertEqual(reopened.reattach_on_start(), [(other_session, "unknown")],
+                         "one unreadable chat must not stop every other chat's restart")
+        self.assertEqual(len(reopened._boundary.addressed), 1,
+                         "only the readable chat's agent may have been addressed")
+        with self.assertRaises(StoreCorrupt):
+            reopened.store.read_launch_results(chat_id, session_id)
+        # The session record itself reads, so the user's actions are refused by
+        # the lifecycle rather than by the read: the chat stays held until the
+        # damaged record is repaired, which is contract D3's fail-closed read
+        # meeting a record no writer of this store can produce.
+        with self.assertRaises(NotPermitted):
+            reopened.abandon(chat_id)
+        session = reopened.store.read_session(chat_id, session_id)
+        self.assertEqual(session["state"], "launching")
+        self.assertNotIn("running", [t["to"] for t in session["transitions"]])
+
+        # The branch itself: a result whose outcome says accepted and which
+        # carries no handle does not conclude `running`.
+        clean_path = self.path
+        self.path = os.path.join(tempfile.mkdtemp(prefix="dory-nohandle-"), "store")
+        chat_id, session_id, _ = self._die_in_the_window("l21c")
+        reopened = self._restart("l22c")
+        session = reopened.store.read_session(chat_id, session_id)
+        real_read = reopened.store.read_launch_results
+
+        def handle_less(chat, sid=None):
+            rows = real_read(chat, sid)
+            return [dict(r, agent_handle=None) for r in rows]
+
+        reopened.store.read_launch_results = handle_less
+        self.assertEqual(reopened._resolve_interrupted_launch(session), "unknown")
+        self.assertEqual([o["kind"] for o in support.view(reopened).observations_of(session_id)],
                          ["reattach_failed"])
         self.assertEqual([address for _, address in reopened._boundary.addressed], [])
-        self.assertNotIn(
-            "running",
-            [t["to"] for t in
-             reopened.store.get("agent_session", session_id)["transitions"]],
-            "`running` was concluded from a report with no handle in it, which "
-            "leaves the session in a state the harness cannot address and which "
-            "contract 5.2's precondition for `launching -> running` rejects")
         reopened.abandon(chat_id)
-        self.assertEqual(reopened.store.get("agent_session", session_id)["state"],
+        self.assertEqual(support.view(reopened).get("agent_session", session_id)["state"],
                          "abandoned")
+        self.path = clean_path
 
 
 if __name__ == "__main__":

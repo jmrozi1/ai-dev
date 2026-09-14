@@ -12,11 +12,12 @@ import os
 import re
 import unittest
 
-import support  # noqa: F401  (puts the harness on sys.path)
+import support  # noqa: F401  (puts the product package on sys.path)
 
+from dory_wrangler import atomic, contract, ids
 from dory_wrangler import launch_boundary as lb
 from dory_wrangler import session_manager
-from dory_wrangler import harness_store as store_module
+from dory_wrangler import store as store_module
 from support import VALIDATOR
 
 
@@ -174,12 +175,13 @@ class BoundaryShape(unittest.TestCase):
                                  "%s grew a %r parameter" % (name, bad))
 
     def test_nothing_above_the_seam_measures_elapsed_time(self):
-        """A source scan over the three environment-independent modules. It is a
+        """A source scan over the environment-independent modules -- the seam, the
+        chat loop, and the one store with every module it writes through. It is a
         lint, not the guarantee -- the guarantee is the operation set above and
         contract 5.2's evidence rules, which no timer can satisfy."""
         banned = re.compile(
             r"\b(sleep|monotonic|perf_counter|time\.time|timeout|Timer|deadline)\b")
-        for module in (lb, session_manager, store_module):
+        for module in (lb, session_manager, store_module, atomic, ids, contract):
             source = inspect.getsource(module)
             # Strip prose: the words appear in comments explaining their absence.
             code = "\n".join(
@@ -193,9 +195,28 @@ class BoundaryShape(unittest.TestCase):
 class DriftGuards(unittest.TestCase):
     """Two copies of one table is the divergence this contract exists to prevent."""
 
-    def test_the_transition_table_matches_the_validators(self):
-        self.assertEqual(session_manager.AUTHORIZED_TRANSITIONS,
+    def test_the_transition_table_has_one_copy_and_it_is_the_validators(self):
+        """Replaces #87's drift guard over the chat loop's own copy of 5.2's owner
+        table. There is no copy left to drift: the chat loop writes every
+        transition through `ChatStore.append_transition`, which checks the owner
+        table *and* the precondition table by calling the validator's own. So
+        the stronger statement is that no second copy exists, that the one the
+        store enforces is the validator's, and that it bites through the chat
+        loop."""
+        self.assertFalse(hasattr(session_manager, "AUTHORIZED_TRANSITIONS"))
+        self.assertFalse(hasattr(store_module, "AUTHORIZED_TRANSITIONS"))
+        self.assertEqual(contract.authorized_transitions(),
                          VALIDATOR.AUTHORIZED_TRANSITIONS)
+        from dory_wrangler.errors import TransitionRefused
+        harness = support.harness({"launcher": "scripted-stub"})
+        chat_id = harness.create_chat("Unauthorized")
+        harness.send_turn(chat_id, "hello")
+        session = support.view(harness).sessions_of(chat_id)[0]
+        self.assertEqual(session["state"], "completed")
+        before = support.view(harness).snapshot()
+        with self.assertRaises(TransitionRefused):
+            harness._transition(session, "running", "launcher", "event", None)
+        self.assertEqual(support.view(harness).snapshot(), before)
 
     def test_the_mechanics_denylist_matches_the_validators(self):
         self.assertEqual(set(lb._MECHANICS_FIELD_NAMES),
@@ -218,9 +239,15 @@ class DriftGuards(unittest.TestCase):
         self.assertEqual(set(lb.RESPONSE_SHAPES), set(VALIDATOR.RESPONSE_SHAPES))
         self.assertEqual(lb.PAYLOAD_STREAM_END, VALIDATOR.STREAM_END_TYPE)
 
-    def test_terminal_states_match_the_validators(self):
-        self.assertEqual(set(store_module.TERMINAL_SESSION_STATES),
+    def test_terminal_states_are_the_validators(self):
+        """Replaces #87's guard over its store's copy of the terminal states. The
+        chat loop and the store both read the validator's set."""
+        self.assertFalse(hasattr(store_module, "TERMINAL_SESSION_STATES"))
+        self.assertFalse(hasattr(session_manager, "TERMINAL_SESSION_STATES"))
+        self.assertEqual(set(contract.terminal_states()),
                          set(VALIDATOR.TERMINAL_SESSION_STATES))
+        manager = support.harness({"launcher": "scripted-stub"})
+        self.assertEqual(set(manager._terminal), set(VALIDATOR.TERMINAL_SESSION_STATES))
 
 
 if __name__ == "__main__":
