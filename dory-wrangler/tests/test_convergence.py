@@ -40,6 +40,8 @@ from dory_wrangler.session_manager import SessionManager
 from dory_wrangler.store import ChatStore
 
 PRODUCT = support.DORY
+PERSISTENT = {"continuation": "persistent", "response_shape": "stream",
+              "end_of_turn": "turn_complete"}
 SOURCES_ROOTS = (os.path.join(PRODUCT, "src"),)
 TOP_LEVEL_PROGRAMS = ("run_shell.py", "validate_store.py")
 
@@ -547,11 +549,160 @@ class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):
         self.assert_store_valid(harness.store, "abandon-waits-for-the-turn")
 
 
+def completes_in_another_thread(test, action, seconds=20):
+    """Run `action` in a fresh thread -- each HTTP request is one -- and require
+    it to finish. A lock left held by a failed thread shows up here as a hang."""
+    import threading
+    result = {}
+
+    def run():
+        try:
+            result["value"] = action()
+        except BaseException as exc:  # noqa: BLE001 - reported below
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    test.assertFalse(thread.is_alive(), "a later action on the chat is blocked: the "
+                                        "turn lock was left held")
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
+class TheTurnLockGivesBackWhatItTook(unittest.TestCase, StoreCheck):
+    """Review finding R6, and the lock's own paths the review's mutations left
+    unpinned (M01, M02, M06)."""
+
+    def open_descriptors_on(self, name):
+        return sum(1 for fd in os.listdir("/proc/self/fd")
+                   if os.path.realpath("/proc/self/fd/" + fd).endswith(name))
+
+    def test_a_failed_open_of_the_lock_file_leaves_nothing_held(self):
+        import errno
+        from dory_wrangler import session_manager
+        harness = support.harness({"launcher": "scripted-stub"})
+        chat_id = harness.create_chat("Open fails")
+        real_open = session_manager.os.open
+        armed = [True]
+
+        def fails_once(path, *args, **kwargs):
+            if armed[0] and str(path).endswith(session_manager.TURN_LOCK_NAME):
+                armed[0] = False
+                raise PermissionError(errno.EACCES, "Permission denied", path)
+            return real_open(path, *args, **kwargs)
+
+        session_manager.os.open = fails_once
+        try:
+            with self.assertRaises(PermissionError):
+                harness.send_turn(chat_id, "one")
+        finally:
+            session_manager.os.open = real_open
+        outcome = completes_in_another_thread(self, lambda: harness.send_turn(chat_id, "two"))
+        self.assertEqual(outcome.session_state, "completed")
+        self.assertEqual([t for _, a, t in harness.transcript(chat_id) if a == "user"], ["two"])
+        self.assert_store_valid(harness.store, "turn-lock-open-failed-once")
+
+    def test_a_failed_flock_leaves_nothing_held_and_leaks_no_descriptor(self):
+        import errno
+        from dory_wrangler import session_manager
+        harness = support.harness({"launcher": "scripted-stub"})
+        chat_id = harness.create_chat("flock fails")
+        real_flock = session_manager.fcntl.flock
+        armed = [True]
+
+        def fails_once(fd, operation):
+            if armed[0] and operation & session_manager.fcntl.LOCK_EX:
+                armed[0] = False
+                raise OSError(errno.ENOLCK, "No locks available")
+            return real_flock(fd, operation)
+
+        session_manager.fcntl.flock = fails_once
+        try:
+            with self.assertRaises(OSError):
+                harness.send_turn(chat_id, "one")
+        finally:
+            session_manager.fcntl.flock = real_flock
+        self.assertEqual(self.open_descriptors_on(session_manager.TURN_LOCK_NAME), 0)
+        outcome = completes_in_another_thread(self, lambda: harness.send_turn(chat_id, "two"))
+        self.assertEqual(outcome.session_state, "completed")
+        self.assertEqual(self.open_descriptors_on(session_manager.TURN_LOCK_NAME), 0)
+
+    def test_a_hold_refused_because_another_descriptor_holds_it_takes_nothing(self):
+        """M01. Two chat loops over one store in one process: the second's
+        re-attachment finds the chat held by the first and skips it -- and must
+        not keep the in-process lock it took on the way, or every later action of
+        the second loop on that chat, from any other thread, blocks forever."""
+        import threading
+        parked, release = threading.Event(), threading.Event()
+
+        class Parks(ScriptedStubLauncher):
+            def launch(self, instruction):
+                parked.set()
+                release.wait(30)
+                return ScriptedStubLauncher.launch(self, instruction)
+
+        root = support.scratch_root()
+        first = SessionManager(ChatStore(root), Parks({}))
+        chat_id = first.create_chat("Held by the other loop")
+        turn = threading.Thread(target=lambda: first.send_turn(chat_id, "first"))
+        turn.start()
+        self.assertTrue(parked.wait(30))
+        second = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+        self.assertEqual(second.reattach_on_start(), [])
+        release.set()
+        turn.join(30)
+        outcome = completes_in_another_thread(
+            self, lambda: second.send_turn(chat_id, "second"))
+        self.assertEqual(outcome.session_state, "completed")
+
+    def test_a_re_entrant_exit_keeps_the_file_lock_for_the_outer_hold(self):
+        """M02. A launcher that calls back into the loop during `launch` is
+        refused, and returning from that inner call must not release the file
+        lock the outer turn still holds: another descriptor still cannot take
+        it while the launch continues."""
+        seen = {}
+
+        class ReEnters(ScriptedStubLauncher):
+            def launch(self, instruction):
+                try:
+                    harness.send_turn(chat_id, "from inside the launch")
+                except ConcurrentLaunchRefused:
+                    seen["refused"] = True
+                other = SessionManager(ChatStore(harness.store.root), ScriptedStubLauncher({}))
+                with other._turns.hold(chat_id, blocking=False) as held:
+                    seen["other_acquired"] = held.acquired
+                return ScriptedStubLauncher.launch(self, instruction)
+
+        harness = support.harness({}, launcher=ReEnters({}))
+        chat_id = harness.create_chat("Re-entrant")
+        harness.send_turn(chat_id, "outer")
+        self.assertEqual(seen, {"refused": True, "other_acquired": False})
+
+    def test_the_lock_path_is_built_only_from_a_chat_that_exists(self):
+        """M06. The lock file's path is built from the store's own validated chat
+        directory, so a value that is not a chat identifier is refused as one and
+        creates no file anywhere -- in particular not in the store root."""
+        from dory_wrangler.errors import NotFound
+        from dory_wrangler.session_manager import TURN_LOCK_NAME
+        root = support.scratch_root()
+        harness = support.harness({"launcher": "scripted-stub"}, store_path=root)
+        for hostile in ("..", ".", "cht_doesnotexist0000", "../chats"):
+            with self.assertRaises(NotFound):
+                harness.send_turn(hostile, "hello")
+        for where in (root, os.path.join(root, "chats"), os.path.dirname(root)):
+            self.assertFalse(os.path.exists(os.path.join(where, TURN_LOCK_NAME)), where)
+        chat_id = harness.create_chat("Still works")
+        self.assertEqual(completes_in_another_thread(
+            self, lambda: harness.send_turn(chat_id, "hello")).session_state, "completed")
+
+
 class TheResumePointIsTheLastStoredSequence(unittest.TestCase, StoreCheck):
     """`events` is resumable by sequence, and the loop now reads its resume point
     from `ChatStore.next_event_sequence` rather than from #87's store. The drain's
-    value is pinned by every multi-page turn; re-attachment discards its page, so
-    its value is pinned here, by the argument the launcher was actually handed."""
+    value is pinned by every multi-page turn; re-attachment's is pinned here, by
+    the argument the launcher was actually handed."""
 
     def test_re_attachment_resumes_after_the_last_preserved_event(self):
         seen = []
@@ -577,6 +728,144 @@ class TheResumePointIsTheLastStoredSequence(unittest.TestCase, StoreCheck):
         self.assertEqual(seen, [stored])
         support.end_chat(reopened, chat_id)
         self.assert_store_valid(reopened.store, "reattach-resume-point")
+
+
+class PagedLauncher(lb.LaunchBoundary):
+    """A fresh-binding stream launcher that serves fixed pages, one per `events`."""
+
+    launcher_id = "scripted-stub"
+
+    def __init__(self, pages, handle="paged-agent-0001"):
+        self._pages = [list(page) for page in pages]
+        self._handle = handle
+        self._capabilities = lb.LauncherCapabilities("fresh_binding", "stream", None)
+        self.stops = []
+
+    @property
+    def capabilities(self):
+        return self._capabilities
+
+    def launch(self, instruction):
+        return lb.LaunchResult("accepted", agent_handle=self._handle)
+
+    def events(self, agent_handle, after_sequence):
+        return lb.EventsPage(self._pages.pop(0) if self._pages else [])
+
+    def stop(self, agent_handle, reason):
+        self.stops.append(agent_handle)
+        return lb.StopAck(True, detail="stopped")
+
+
+def agent_text(sequence, text):
+    return lb.EventPayload(sequence, "agent", "recognized",
+                           json.dumps({"type": "assistant_text", "text": text}).encode(),
+                           interpreted_type="assistant_text", text=text)
+
+
+def launcher_report(sequence, kind):
+    return lb.EventPayload(sequence, "launcher", "recognized",
+                           json.dumps({"type": kind}).encode(), interpreted_type=kind)
+
+
+class APageIsPreservedPastARefusal(unittest.TestCase, StoreCheck):
+    """Review finding R5: after a refusal in the middle of a page, the honest
+    payloads later on the same page are still preserved (contract 7, P1). #87
+    preserved `[1, 2, 3]`; convergence preserved `[1]`. Both causes."""
+
+    def preserved(self, harness, chat_id):
+        session = harness.store.list_sessions(chat_id)[0][0]
+        return [e["sequence"] for e in
+                harness.store.read_all_events_of_session(chat_id, session["session_id"])]
+
+    def test_after_a_contradicting_replay(self):
+        from dory_wrangler.errors import StoreCorrupt
+        contradiction = lb.EventPayload(1, "agent", "unrecognized",
+                                        b"different bytes at sequence one")
+        harness = SessionManager(ChatStore(support.scratch_root()), PagedLauncher([
+            [agent_text(1, "first")],
+            [contradiction, agent_text(2, "second"), launcher_report(3, "session_completed")],
+        ]))
+        chat_id = harness.create_chat("Contradicting replay")
+        with self.assertRaises(StoreCorrupt):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(self.preserved(harness, chat_id), [1, 2, 3])
+        self.assertEqual(harness.store.list_sessions(chat_id)[0][0]["state"], "completed")
+        self.assertEqual([t for _, a, t in harness.transcript(chat_id) if a == "agent"],
+                         ["first", "second"])
+        self.assert_store_valid(harness.store, "page-preserved-past-a-contradiction")
+
+    def test_after_a_clock_refusal_of_a_mid_page_completion(self):
+        harness = SessionManager(ChatStore(support.scratch_root()), PagedLauncher([
+            [agent_text(1, "first"), launcher_report(2, "session_completed"),
+             lb.EventPayload(3, "launcher", "unrecognized", b'{"type": "exit_report"}')],
+        ]))
+        chat_id = harness.create_chat("Clock refusal mid-page")
+        real = harness.store.append_transition
+
+        def clock_steps_back_for_completion(*args, **kwargs):
+            if args[3] == "completed":
+                real_now, ids.now = ids.now, lambda: "2000-01-01T00:00:00.000000Z"
+                try:
+                    return real(*args, **kwargs)
+                finally:
+                    ids.now = real_now
+            return real(*args, **kwargs)
+
+        harness.store.append_transition = clock_steps_back_for_completion
+        with self.assertRaises(ValidationRefused):
+            harness.send_turn(chat_id, "hello")
+        del harness.store.append_transition
+        self.assertEqual(self.preserved(harness, chat_id), [1, 2, 3])
+        # The completion was refused, so the session is where the store left it,
+        # and the one lifecycle action is its exit (decision D2).
+        self.assertEqual(harness.store.list_sessions(chat_id)[0][0]["state"], "running")
+        self.assertEqual(harness.abandon(chat_id), "terminated")
+        self.assert_store_valid(harness.store, "page-preserved-past-a-clock-refusal")
+
+
+class ReAttachmentPreservesWhatItReads(unittest.TestCase, StoreCheck):
+    """The third edge of the stop-then-abandon composition. On a launcher that
+    can resume, the page re-attachment reads can carry the agent's answer and
+    its completion; it is preserved and acted on, so the chat is not later
+    recorded as a user terminating an agent that had completed."""
+
+    def test_a_completion_reported_to_re_attachment_is_kept(self):
+        root = support.scratch_root()
+        first = support.harness({"launcher": "scripted-stub",
+                                 "options": PERSISTENT},
+                                store_path=root)
+        chat_id = first.create_chat("Completed while the harness was down")
+        first.send_turn(chat_id, "one")
+        session = support.view(first).sessions_of(chat_id)[0]
+        stored = len(support.view(first).events_of(session["session_id"]))
+        first.store.close()
+
+        resuming = ScriptedStubLauncher(dict(PERSISTENT,
+                                             resume_handles=[session["agent_handle"]]))
+        agent = resuming._sessions[session["agent_handle"]]
+        agent.next_sequence = stored + 1
+        resuming._emit(agent, "agent", "recognized",
+                       json.dumps({"type": "assistant_text", "text": "the late answer"}),
+                       interpreted_type="assistant_text", text="the late answer")
+        resuming._emit(agent, "agent", "recognized", json.dumps({"type": "turn_complete"}),
+                       interpreted_type="turn_complete")
+        resuming._emit(agent, "launcher", "recognized",
+                       json.dumps({"type": "session_completed"}),
+                       interpreted_type="session_completed")
+        reopened = support.harness({}, store_path=root, launcher=resuming)
+        self.assertEqual(reopened.reattach_on_start(),
+                         [(session["session_id"], "completed")])
+        events = support.view(reopened).events_of(session["session_id"])
+        self.assertEqual([e["sequence"] for e in events], list(range(1, stored + 4)))
+        self.assertEqual([t for _, a, t in reopened.transcript(chat_id) if a == "agent"],
+                         ["answer to: one", "the late answer"])
+        # Nothing left to abandon, and nothing was stopped.
+        with self.assertRaises(NotPermitted):
+            reopened.abandon(chat_id)
+        self.assertEqual(resuming.stop_calls, [])
+        self.assertEqual(reopened.send_turn(chat_id, "two").session_state, "running")
+        support.end_chat(reopened, chat_id)
+        self.assert_store_valid(reopened.store, "reattachment-page-preserved")
 
 
 class TheGuardsConvergenceAddedHaveExits(unittest.TestCase, StoreCheck):
@@ -823,12 +1112,13 @@ class TheServiceLayerAroundTheLoop(unittest.TestCase, StoreCheck):
 
 
 class ARunningSessionTheShellCannotDrain(unittest.TestCase, StoreCheck):
-    """Decision 0003, section 3: measured, pinned, and left for a decision.
+    """Decision 0003, section 3, resolved by decision D2.
 
     A launcher that misuses the seam mid-turn leaves the session `running` with
-    nothing reading it. The chat loop's exit is the user's Stop, which #87
-    proved and which still works; the shell exposes only Abandon, which the
-    contract admits from `unknown` alone.
+    nothing reading it. These tests used to pin that the shell had **no exit**
+    until a restart, and none at all on a launcher that can resume. Their
+    expectation changed deliberately: the shell's one lifecycle action is the
+    exit, through the user's `stop`, before and after a restart.
     """
 
     ONE_SHOT_THAT_ENDS_A_STREAM = {"continuation": "fresh_binding",
@@ -847,27 +1137,27 @@ class ARunningSessionTheShellCannotDrain(unittest.TestCase, StoreCheck):
         self.assertEqual(session["state"], "running")
         return root, harness, chat_id, session
 
-    def test_until_a_restart_the_shell_has_no_exit(self):
+    def test_without_a_restart_the_one_action_is_the_exit(self):
         _root, harness, chat_id, _session = self.stranded()
         with self.assertRaises(ConcurrentLaunchRefused):
             harness.send_turn(chat_id, "again")
-        with self.assertRaises(NotPermitted):
-            harness.abandon(chat_id)
-        # The loop's own exit is still there; the shell does not expose it.
-        harness.stop_agent(chat_id, "the user pressed Stop")
-        self.assertEqual(support.view(harness).sessions_of(chat_id)[0]["state"], "terminated")
-        self.assert_store_valid(harness.store, "stranded-running-stopped-through-the-loop")
+        self.assertEqual(harness.abandon(chat_id), "terminated")
+        harness._boundary._end_of_turn = "session_completed"
+        self.assertEqual(harness.send_turn(chat_id, "again").session_state, "completed")
+        self.assert_store_valid(harness.store, "stranded-running-abandoned-without-restart")
 
     def test_a_restart_on_a_launcher_that_cannot_resume_gives_abandon_back(self):
-        root, _harness, chat_id, session = self.stranded()
+        root, harness, chat_id, session = self.stranded()
+        harness.store.close()
         reopened = support.harness({"launcher": "scripted-stub"}, store_path=root)
         self.assertEqual(reopened.reattach_on_start(), [(session["session_id"], "unknown")])
-        reopened.abandon(chat_id)
+        self.assertEqual(reopened.abandon(chat_id), "abandoned")
         self.assertEqual(reopened.send_turn(chat_id, "again").session_state, "completed")
         self.assert_store_valid(reopened.store, "stranded-running-restart-abandon")
 
-    def test_a_restart_on_a_launcher_that_can_resume_does_not(self):
-        root, _harness, chat_id, session = self.stranded()
+    def test_a_restart_on_a_launcher_that_can_resume_has_the_same_exit(self):
+        root, harness, chat_id, session = self.stranded()
+        harness.store.close()
         reopened = support.harness(
             {"launcher": "scripted-stub",
              "options": {"resume_handles": [session["agent_handle"]]}},
@@ -875,10 +1165,11 @@ class ARunningSessionTheShellCannotDrain(unittest.TestCase, StoreCheck):
         self.assertEqual(reopened.reattach_on_start(), [(session["session_id"], "running")])
         with self.assertRaises(ConcurrentLaunchRefused):
             reopened.send_turn(chat_id, "again")
-        with self.assertRaises(NotPermitted):
-            reopened.abandon(chat_id)
+        self.assertEqual(reopened.abandon(chat_id), "terminated")
+        self.assertEqual(reopened.send_turn(chat_id, "again").session_state, "completed")
+        self.assert_store_valid(reopened.store, "stranded-running-resumed-then-abandoned")
 
-    def test_through_the_shell_the_misuse_is_a_502_and_then_refusals(self):
+    def test_through_the_shell_the_misuse_is_a_502_then_a_refusal_then_the_exit(self):
         from shellproc import ShellProcess
         root = support.scratch_root()
         shell = ShellProcess(root, launcher_options=self.ONE_SHOT_THAT_ENDS_A_STREAM)
@@ -889,16 +1180,251 @@ class ARunningSessionTheShellCannotDrain(unittest.TestCase, StoreCheck):
         self.assertEqual(shell.raw("POST", path + "/messages", {"text": "hello"})[0], 502)
         status, body = shell.raw("POST", path + "/messages", {"text": "again"})
         self.assertEqual((status, json.loads(body)["refused"]), (409, True))
-        self.assertEqual(shell.raw("POST", path + "/abandon", {})[0], 409)
+        self.assertEqual(shell.raw("POST", path + "/abandon", {})[0], 200)
         shell.kill()
-        # The restart is on a launcher that cannot resume and does not misuse the
-        # seam, so re-attachment leaves `unknown` and the one action works.
         shell = ShellProcess(root)
         self.addCleanup(shell.kill)
         shell.start()
-        self.assertEqual(shell.raw("POST", path + "/abandon", {})[0], 200)
         self.assertEqual(shell.raw("POST", path + "/messages", {"text": "again"})[0], 201)
-        self.assertEqual(ChatStore(root).verify(), [])
+        self.assertEqual(ChatStore(root, read_only=True).verify(), [])
+
+
+class EveryNonTerminalStateHasTheOneActionAsItsExit(unittest.TestCase, StoreCheck):
+    """Decision D2 and review finding R2: the exit table, state by state, driven
+    through `ChatService.abandon` -- the call the shell's one action makes.
+
+    Each test strands a session the way the review did, shows the chat refusing
+    turns, takes the one action, checks the exact transitions it wrote against
+    the route decision D2 names, and shows the chat taking a new turn."""
+
+    def service(self, launcher, root=None):
+        from dory_wrangler.service import ChatService
+        return ChatService(SessionManager(ChatStore(root or support.scratch_root()), launcher))
+
+    def route(self, service, chat_id, session_id):
+        session = service.store.read_session(chat_id, session_id)
+        return [(t["from"], t["to"], t["owner"], t["evidence"]["kind"])
+                for t in session["transitions"]]
+
+    def exits(self, service, chat_id, expected_tail, name, stranded=True):
+        session = service.store.list_sessions(chat_id)[0][0]
+        if stranded:
+            with self.assertRaises(ConcurrentLaunchRefused):
+                service.send_user_message(chat_id, "refused while stranded")
+        service.abandon(chat_id)
+        route = self.route(service, chat_id, session["session_id"])
+        self.assertEqual(route[-len(expected_tail):], expected_tail, route)
+        for transition in route:
+            self.assertIn((transition[0], transition[1]),
+                          __import__("dory_wrangler.contract", fromlist=["x"])
+                          .authorized_transitions())
+        service.sessions._boundary._launch_outcomes = []
+        after = service.send_user_message(chat_id, "a new turn after the exit")
+        self.assertEqual(after["messages"][-1]["author"], "agent")
+        self.assert_store_valid(service.store, name)
+
+    def clock_step_on(self, store, to_state):
+        real = store.append_transition
+
+        def stepped(*args, **kwargs):
+            if args[3] == to_state:
+                real_now, ids.now = ids.now, lambda: "2000-01-01T00:00:00.000000Z"
+                try:
+                    return real(*args, **kwargs)
+                finally:
+                    ids.now = real_now
+            return real(*args, **kwargs)
+
+        store.append_transition = stepped
+        return lambda: delattr(store, "append_transition")
+
+    def test_pending_stranded_by_a_clock_step_before_launching(self):
+        service = self.service(ScriptedStubLauncher({}))
+        chat_id = service.create_chat()["chat_id"]
+        undo = self.clock_step_on(service.store, "launching")
+        with self.assertRaises(ValidationRefused):
+            service.send_user_message(chat_id, "hello")
+        undo()
+        self.assertEqual(service.store.list_sessions(chat_id)[0][0]["state"], "pending")
+        self.exits(service, chat_id,
+                   [("pending", "launch_failed", "harness", "harness_action")],
+                   "d2-exit-pending")
+
+    def test_launching_stranded_by_a_clock_step_during_launch(self):
+        service = self.service(ScriptedStubLauncher({}))
+        chat_id = service.create_chat()["chat_id"]
+        undo = self.clock_step_on(service.store, "running")
+        with self.assertRaises(ValidationRefused):
+            service.send_user_message(chat_id, "hello")
+        undo()
+        self.assertEqual(service.store.list_sessions(chat_id)[0][0]["state"], "launching")
+        self.assertEqual([r["outcome"] for r in service.store.read_launch_results(chat_id)],
+                         ["accepted"])
+        self.exits(service, chat_id,
+                   [("launching", "running", "launcher", "launch_result"),
+                    ("running", "terminated", "user", "observation")],
+                   "d2-exit-launching-accepted")
+
+    def test_launching_whose_failure_was_recorded_but_not_its_state(self):
+        service = self.service(ScriptedStubLauncher({"launch_outcomes": ["rejected"]}))
+        chat_id = service.create_chat()["chat_id"]
+        undo = self.clock_step_on(service.store, "launch_failed")
+        with self.assertRaises(ValidationRefused):
+            service.send_user_message(chat_id, "hello")
+        undo()
+        self.exits(service, chat_id,
+                   [("launching", "launch_failed", "launcher", "launch_result")],
+                   "d2-exit-launching-failed")
+
+    def test_launching_whose_unknown_outcome_was_recorded_but_not_its_state(self):
+        service = self.service(ScriptedStubLauncher({"launch_outcomes": ["unknown"]}))
+        chat_id = service.create_chat()["chat_id"]
+        undo = self.clock_step_on(service.store, "unknown")
+        with self.assertRaises(ValidationRefused):
+            service.send_user_message(chat_id, "hello")
+        undo()
+        self.exits(service, chat_id,
+                   [("launching", "unknown", "launcher", "launch_result"),
+                    ("unknown", "abandoned", "user", "user_action")],
+                   "d2-exit-launching-unknown")
+
+    def test_launching_with_no_launch_result_at_all(self):
+        service = self.service(ScriptedStubLauncher({}))
+        chat_id = service.create_chat()["chat_id"]
+        real = service.store.append_launch_result
+
+        def io_error(*args, **kwargs):
+            raise ValidationRefused("the result could not be written")
+
+        service.store.append_launch_result = io_error
+        with self.assertRaises(ValidationRefused):
+            service.send_user_message(chat_id, "hello")
+        del service.store.append_launch_result
+        self.assertEqual(service.store.read_launch_results(chat_id), [])
+        self.exits(service, chat_id,
+                   [("launching", "unknown", "launcher", "observation"),
+                    ("unknown", "abandoned", "user", "user_action")],
+                   "d2-exit-launching-no-result")
+
+    def test_running_whose_stop_is_confirmed(self):
+        service = self.service(ScriptedStubLauncher(PERSISTENT))
+        chat_id = service.create_chat()["chat_id"]
+        service.send_user_message(chat_id, "hello")
+        session = service.store.list_sessions(chat_id)[0][0]
+        self.assertEqual(service.sessions.abandon(chat_id), "terminated")
+        self.assertEqual(self.route(service, chat_id, session["session_id"])[-1],
+                         ("running", "terminated", "user", "observation"))
+        # A confirmed stop leaves nothing to abandon, and that is the success.
+        with self.assertRaises(NotPermitted):
+            service.abandon(chat_id)
+        self.assert_store_valid(service.store, "d2-exit-running-confirmed")
+
+    def test_running_whose_stop_is_not_confirmed(self):
+        service = self.service(ScriptedStubLauncher(dict(PERSISTENT, stop_confirms=False)))
+        chat_id = service.create_chat()["chat_id"]
+        service.send_user_message(chat_id, "hello")
+        self.exits(service, chat_id,
+                   [("running", "unknown", "launcher", "observation"),
+                    ("unknown", "abandoned", "user", "user_action")],
+                   "d2-exit-running-unconfirmed", stranded=False)
+
+    def test_running_whose_stop_raises_something_other_than_a_launcher_error(self):
+        class StopCrashes(ScriptedStubLauncher):
+            def stop(self, agent_handle, reason):
+                raise RuntimeError("the stop path fell over")
+
+        service = self.service(StopCrashes(PERSISTENT))
+        chat_id = service.create_chat()["chat_id"]
+        service.send_user_message(chat_id, "hello")
+        self.exits(service, chat_id,
+                   [("running", "unknown", "launcher", "observation"),
+                    ("unknown", "abandoned", "user", "user_action")],
+                   "d2-exit-running-stop-crashes", stranded=False)
+        observations = service.store.read_session_observations(chat_id)
+        self.assertEqual(observations[0]["kind"], "stop_unconfirmed")
+        self.assertIn("RuntimeError", observations[0]["detail"])
+
+    def test_unknown(self):
+        service = self.service(ScriptedStubLauncher({"launch_outcomes": ["unknown"]}))
+        chat_id = service.create_chat()["chat_id"]
+        service.send_user_message(chat_id, "hello")
+        self.exits(service, chat_id, [("unknown", "abandoned", "user", "user_action")],
+                   "d2-exit-unknown")
+
+    def test_a_launcher_calling_back_during_an_action_in_flight_is_not_given_an_exit(self):
+        """What must not change: a turn in flight. Inside `launch` the session is
+        `launching` and the turn holds the chat; the one action, called back by
+        the launcher on the same thread, is refused and writes nothing."""
+        seen = {}
+
+        class CallsBack(ScriptedStubLauncher):
+            def launch(self, instruction):
+                before = service.store.list_sessions(chat_id)[0][0]
+                try:
+                    service.sessions.abandon(chat_id)
+                except NotPermitted:
+                    seen["refused"] = True
+                seen["unchanged"] = service.store.list_sessions(chat_id)[0][0] == before
+                return ScriptedStubLauncher.launch(self, instruction)
+
+        service = self.service(CallsBack({}))
+        chat_id = service.create_chat()["chat_id"]
+        service.send_user_message(chat_id, "hello")
+        self.assertEqual(seen, {"refused": True, "unchanged": True})
+        self.assertEqual(service.store.list_sessions(chat_id)[0][0]["state"], "completed")
+
+    def test_a_holder_killed_after_start_up_is_no_longer_a_stranding(self):
+        """Review finding R2, second half. Server B used to start while process A
+        held a chat mid-launch, skip that chat, and -- after A was killed -- keep
+        it stranded for B's whole life. Under decision D1 B cannot start while A
+        serves the store; once A is gone B starts, re-attaches, and the one
+        action is the exit."""
+        import signal
+        from dory_wrangler.errors import StoreInUse
+        from dory_wrangler.webapp import build_server
+        root = support.scratch_root()
+        store = ChatStore(root)
+        chat_id = store.create_chat("Held, then killed")["chat_id"]
+        store.close()
+        holder = textwrap.dedent('''
+            import os, sys, time
+            sys.path.insert(0, sys.argv[1])
+            from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
+            from dory_wrangler.store import ChatStore
+            from dory_wrangler.session_manager import SessionManager
+            root, chat_id, marker = sys.argv[2:5]
+            class Parks(ScriptedStubLauncher):
+                def launch(self, instruction):
+                    open(marker, "w").close()
+                    time.sleep(600)
+            SessionManager(ChatStore(root), Parks({})).send_turn(chat_id, "from the holder")
+        ''')
+        script = os.path.join(root, "..", os.path.basename(root) + "-killed-holder.py")
+        marker = os.path.join(root, "..", os.path.basename(root) + "-killed-entered")
+        with open(script, "w") as handle:
+            handle.write(holder)
+        child = subprocess.Popen([sys.executable, script, support.SRC, root, chat_id, marker])
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        while not os.path.exists(marker):
+            self.assertIsNone(child.poll())
+            time.sleep(0.02)
+        with self.assertRaises(StoreInUse):
+            build_server(root, port=0, quiet=True, launcher_config={"launcher": "scripted-stub"})
+        child.send_signal(signal.SIGKILL)
+        child.wait()
+        server = build_server(root, port=0, quiet=True,
+                              launcher_config={"launcher": "scripted-stub"})
+        try:
+            service = server.service
+            self.assertEqual(service.store.list_sessions(chat_id)[0][0]["state"], "unknown")
+            with self.assertRaises(ConcurrentLaunchRefused):
+                service.send_user_message(chat_id, "refused")
+            service.abandon(chat_id)
+            self.assertEqual(service.send_user_message(chat_id, "after")["messages"][-1]["text"],
+                             "answer to: after")
+            self.assert_store_valid(service.store, "d2-holder-killed-then-restart")
+        finally:
+            server.server_close()
 
 
 class AKillAtAnyWriteOfATurnLeavesAWholeStoreWithAnExit(unittest.TestCase, StoreCheck):

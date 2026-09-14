@@ -580,12 +580,22 @@ class MechanicsDoNotCrossAndAreNotRead(unittest.TestCase, StoreCheck):
 class NoEscapeFound(unittest.TestCase, StoreCheck):
 
     def test_no_escape_abandoning_a_running_agent(self):
+        """**Expectation changed by decision D2.** Abandoning a running agent used
+        to be refused. The one lifecycle action now takes it out by the only
+        contract-legal user route from `running`, the user's `stop`; what must
+        still be impossible is an escape from the lifecycle -- a `running ->
+        abandoned` transition, or an end the user did not ask for."""
         harness = stub_harness("n1", continuation="persistent", response_shape="stream",
                                end_of_turn="turn_complete")
         chat_id = harness.create_chat("Abandon a running agent")
         harness.send_turn(chat_id, "hello")
-        with self.assertRaises(NotPermitted):
-            harness.abandon(chat_id)
+        self.assertEqual(harness.abandon(chat_id), "terminated")
+        session = support.view(harness).sessions_of(chat_id)[0]
+        self.assertNotIn(("running", "abandoned"),
+                         [(t["from"], t["to"]) for t in session["transitions"]])
+        self.assertEqual([o["kind"] for o in support.view(harness).observations_of(
+            session["session_id"])], ["stop_confirmed"])
+        self.assert_store_valid(harness.store, "abandon-a-running-agent-is-a-stop")
 
     def test_no_escape_stopping_a_session_that_already_finished(self):
         harness = stub_harness("n2")

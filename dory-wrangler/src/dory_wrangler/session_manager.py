@@ -55,6 +55,7 @@ from .launch_boundary import (
     OUTCOME_FAILED,
     OUTCOME_UNKNOWN,
     SOURCE_LAUNCHER,
+    StopAck,
 )
 
 # The file, inside a chat's own directory, whose lock is held for the duration
@@ -104,6 +105,20 @@ def compose_launch_instruction(chat_id, user_text, store):
     return user_text
 
 
+class _PageTaken(object):
+    """What taking one page of payloads produced."""
+
+    __slots__ = ("turn_complete", "reached_terminal", "stream_end_event_id", "stored_any",
+                 "refusal")
+
+    def __init__(self):
+        self.turn_complete = False
+        self.reached_terminal = False
+        self.stream_end_event_id = None
+        self.stored_any = False
+        self.refusal = None
+
+
 class _ChatTurn(object):
     __slots__ = ("rlock", "depth", "fd")
 
@@ -122,6 +137,10 @@ class _Held(object):
         self._blocking = blocking
         self._turn = None
         self.acquired = False
+        # True when this hold is inside another hold of the same chat on the
+        # same thread: a launcher that called back into the loop while a user
+        # action on this chat is in flight.
+        self.nested = False
 
     def __enter__(self):
         path = os.path.join(self._turns.store._require_chat_dir(self._chat_id),
@@ -133,18 +152,32 @@ class _Held(object):
             turn = self._turns.table.setdefault(self._chat_id, _ChatTurn())
         if not turn.rlock.acquire(self._blocking):
             return self
-        if turn.depth == 0:
-            fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | (0 if self._blocking else fcntl.LOCK_NB))
-            except BlockingIOError:
-                os.close(fd)
-                turn.rlock.release()
-                return self
-            turn.fd = fd
+        # Review finding R6: everything between taking the in-process lock and
+        # holding the file lock can fail -- the open (a permission, a missing
+        # directory), the `flock` (ENOLCK on a filesystem that has none) -- and a
+        # failure that left the in-process lock held would hang every later
+        # request on this chat with no timeout, by design. So any failure gives
+        # the in-process lock back, and closes the descriptor if it was opened.
+        try:
+            if turn.depth == 0:
+                fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | (0 if self._blocking else fcntl.LOCK_NB))
+                except BaseException:
+                    os.close(fd)
+                    raise
+                turn.fd = fd
+        except BlockingIOError:
+            # Held by another descriptor: not acquired, and nothing is held.
+            turn.rlock.release()
+            return self
+        except BaseException:
+            turn.rlock.release()
+            raise
         turn.depth += 1
         self._turn = turn
         self.acquired = True
+        self.nested = turn.depth > 1
         return self
 
     def __exit__(self, exc_type, exc, tb):
@@ -557,36 +590,13 @@ class SessionManager(object):
                     "launcher declares response_shape 'one_shot' and has no stream, but "
                     "signalled that a stream ended")
 
-            turn_complete = False
-            reached_terminal = False
-            stream_end_event_id = None
-            stored_any = False
-
-            for payload in page.payloads:
-                if payload.interpreted_type == PAYLOAD_STREAM_END:
-                    self._reject_unsupported_stream_end(payload, capabilities)
-                event_id = self._preserve(session, payload)
-                if event_id is None:
-                    continue  # a replayed (session_id, sequence); already stored
-                stored_any = True
-                if payload.is_chat_text:
-                    agent_messages.append(
-                        self._store.append_agent_message(
-                            chat_id, session_id, event_id, payload.text)["message_id"])
-                if payload.interpretation != INTERPRETATION_RECOGNIZED:
-                    continue
-                if payload.interpreted_type == PAYLOAD_TURN_COMPLETE:
-                    turn_complete = True
-                elif payload.source != SOURCE_LAUNCHER:
-                    continue
-                elif payload.interpreted_type == PAYLOAD_SESSION_COMPLETED:
-                    self._transition(session, "completed", "launcher", "event", event_id)
-                    reached_terminal = True
-                elif payload.interpreted_type == PAYLOAD_SESSION_FAILED:
-                    self._transition(session, "failed", "launcher", "event", event_id)
-                    reached_terminal = True
-                elif payload.interpreted_type == PAYLOAD_STREAM_END:
-                    stream_end_event_id = event_id
+            taken = self._take_page(session, page, capabilities, agent_messages)
+            turn_complete, reached_terminal, stream_end_event_id, stored_any = (
+                taken.turn_complete, taken.reached_terminal, taken.stream_end_event_id,
+                taken.stored_any)
+            if taken.refusal is not None:
+                # Review finding R5: the rest of the page was preserved first.
+                raise taken.refusal
 
             if reached_terminal:
                 # The binding was released in the same write as the terminal
@@ -620,6 +630,60 @@ class SessionManager(object):
                     "advance means the launcher ignored after_sequence and reading "
                     "again cannot make progress"
                     % (len(page.payloads), session_id, after))
+
+    def _take_page(self, session, page, capabilities, agent_messages):
+        """Preserve every payload of one page, and act on what the launcher reported.
+
+        Used by the drain and by re-attachment, so what a page does to a chat
+        does not depend on which of the two read it.
+
+        **A store refusal of one payload does not cost the payloads after it**
+        (review finding R5; contract 7, P1). A payload that contradicts one
+        already preserved at its sequence, or a lifecycle transition the store
+        refuses because the wall clock stepped back, used to raise out of the
+        loop and drop every honest payload later on the same page -- #87
+        preserved them, convergence did not. Each payload is now taken on its
+        own: a `StoreError` it meets is kept, the next payload is taken, and the
+        first refusal is handed back once the whole page has been preserved, so
+        it is still not silent.
+
+        The seam's own refusals -- a sequence gap, an end of stream from a
+        launcher with no stream -- still stop the page where they are met; the
+        loss they cause is #88's intake checkpoint's, not this one's.
+        """
+        chat_id = session["chat_id"]
+        session_id = session["session_id"]
+        taken = _PageTaken()
+        for payload in page.payloads:
+            if payload.interpreted_type == PAYLOAD_STREAM_END:
+                self._reject_unsupported_stream_end(payload, capabilities)
+            try:
+                event_id = self._preserve(session, payload)
+                if event_id is None:
+                    continue  # a replayed (session_id, sequence); already stored
+                taken.stored_any = True
+                if payload.is_chat_text:
+                    agent_messages.append(
+                        self._store.append_agent_message(
+                            chat_id, session_id, event_id, payload.text)["message_id"])
+                if payload.interpretation != INTERPRETATION_RECOGNIZED:
+                    continue
+                if payload.interpreted_type == PAYLOAD_TURN_COMPLETE:
+                    taken.turn_complete = True
+                elif payload.source != SOURCE_LAUNCHER:
+                    continue
+                elif payload.interpreted_type == PAYLOAD_SESSION_COMPLETED:
+                    self._transition(session, "completed", "launcher", "event", event_id)
+                    taken.reached_terminal = True
+                elif payload.interpreted_type == PAYLOAD_SESSION_FAILED:
+                    self._transition(session, "failed", "launcher", "event", event_id)
+                    taken.reached_terminal = True
+                elif payload.interpreted_type == PAYLOAD_STREAM_END:
+                    taken.stream_end_event_id = event_id
+            except StoreError as exc:
+                if taken.refusal is None:
+                    taken.refusal = exc
+        return taken
 
     def _reject_unsupported_stream_end(self, payload, capabilities):
         if not capabilities.has_stream:
@@ -700,40 +764,101 @@ class SessionManager(object):
                     "session %s never received an agent_handle, so there is nothing "
                     "to stop; abandon it instead (contract 5.4)"
                     % (session["session_id"],))
-            try:
-                ack = self._boundary.stop(handle, reason)
-            except LauncherError as exc:
-                ack = None
-                detail = "%s: %s" % (exc.category, exc.detail)
-            else:
-                detail = ack.detail
-            confirmed = bool(ack is not None and ack.confirmed)
-            observation_id = self._record_observation(
-                session, "stop_confirmed" if confirmed else "stop_unconfirmed", detail)
-            if confirmed:
-                self._transition(session, "terminated", "user", "observation",
-                                 observation_id)
-            elif session["state"] == "running":
-                self._transition(session, "unknown", "launcher", "observation",
-                                 observation_id)
+            self._stop(session, handle, reason)
             return session["state"]
 
-    def abandon(self, chat_id):
-        """The user gives up on an `unknown` session (contract 5.1, 5.4).
+    def _stop(self, session, handle, reason):
+        """Issue the user's `stop` and record what came back, whatever came back.
 
-        This is a decision, not an observation, and it is the reason the user is
-        never stuck behind a silent agent. The harness never makes it. It is the
-        one lifecycle action the shell exposes (decision 0003).
+        The launcher may fail any way it likes. A `LauncherError`, any other
+        exception, or an answer that is not a usable `StopAck` is a stop the
+        boundary did not confirm -- contract 5.3 cause 4 -- and is recorded as
+        `stop_unconfirmed` rather than propagating with nothing written (review:
+        the first edge of the stop-then-abandon composition).
         """
-        with self._turns.hold(chat_id):
+        try:
+            ack = self._boundary.stop(handle, reason)
+        except LauncherError as exc:
+            ack, detail = None, "%s: %s" % (exc.category, exc.detail)
+        except Exception as exc:  # noqa: BLE001 - a launcher may fail any way it likes
+            ack, detail = None, "%s: %s" % (type(exc).__name__, exc)
+        else:
+            if isinstance(ack, StopAck):
+                detail = ack.detail if isinstance(ack.detail, str) else None
+            else:
+                detail = "launcher returned %r rather than a StopAck" % (type(ack).__name__,)
+                ack = None
+        confirmed = ack is not None and ack.confirmed is True
+        observation_id = self._record_observation(
+            session, "stop_confirmed" if confirmed else "stop_unconfirmed", detail)
+        if confirmed:
+            self._transition(session, "terminated", "user", "observation", observation_id)
+        elif session["state"] == "running":
+            self._transition(session, "unknown", "launcher", "observation", observation_id)
+
+    STOP_REASON = "the user abandoned this agent"
+
+    def abandon(self, chat_id):
+        """The one lifecycle action the shell exposes (decisions 0003 and D2).
+
+        It takes the chat's non-terminal session out of every state it can be
+        left in, by contract-legal transitions only, and it is always the user's
+        action: no timer, no inactivity inference, and the harness never takes
+        it on its own.
+
+        ==============  ==============================================================
+        `unknown`       `unknown -> abandoned` (user, `user_action`), as before.
+        `running`       the user's `stop` (contract 5.2): `running -> terminated` on a
+                        confirmed stop -- nothing is then left to abandon, and that is
+                        success -- or, on any unconfirmed stop, `running -> unknown`
+                        (`stop_unconfirmed`, 5.3 cause 4) then `unknown -> abandoned`.
+        `launching`     contract 5.4's resolution of an interrupted launch, for this
+                        chat, on demand and from its durable records alone
+                        (`_resolve_interrupted_launch`): the `launch_result` decides
+                        `running` / `launch_failed` / `unknown`, and with none the
+                        `reattach_failed` observation gives `unknown`. Then the row
+                        above for the state that yields.
+        `pending`       5.4's resolution of a launch never issued:
+                        `pending -> launch_failed` (harness, `harness_action`).
+        ==============  ==============================================================
+
+        The action never calls `events`: on a live agent that is quiet `events`
+        blocks, by design, and the exit must not.
+
+        **A user action in flight is not changed.** It holds the chat's turn lock,
+        so from another thread this waits for it to finish, as it always did; and
+        a launcher calling back into the loop during an action on this chat is
+        refused every exit but `unknown -> abandoned`, which it always had.
+        """
+        with self._turns.hold(chat_id) as held:
             session = self._active_session(chat_id)
             if session is None:
                 raise NotPermitted("chat %s has no session to abandon" % chat_id)
-            if session["state"] != "unknown":
+            state = session["state"]
+            if state == "unknown":
+                self._transition(session, "abandoned", "user", "user_action", None)
+                return session["state"]
+            if held.nested:
                 raise NotPermitted(
-                    "session %s is in state %r; only an 'unknown' session may be "
-                    "abandoned" % (session["session_id"], session["state"]))
-            self._transition(session, "abandoned", "user", "user_action", None)
+                    "session %s is in state %r and an action on chat %s is in flight "
+                    "on this thread; it is not abandoned from inside that action"
+                    % (session["session_id"], state, chat_id))
+            if state == "pending":
+                self._transition(session, "launch_failed", "harness", "harness_action", None)
+                return session["state"]
+            if state == "launching":
+                self._resolve_interrupted_launch(session)
+                if session["state"] == "unknown":
+                    self._transition(session, "abandoned", "user", "user_action", None)
+                if session["state"] in self._terminal:
+                    return session["state"]
+            if session["state"] != "running":
+                raise NotPermitted(
+                    "session %s is in state %r, which holds no agent to abandon"
+                    % (session["session_id"], session["state"]))
+            self._stop(session, session["agent_handle"], self.STOP_REASON)
+            if session["state"] == "unknown":
+                self._transition(session, "abandoned", "user", "user_action", None)
             return session["state"]
 
     # -- restart (contract 5.4) -------------------------------------------
@@ -812,8 +937,8 @@ class SessionManager(object):
             return "unknown"
 
         try:
-            self._boundary.events(handle,
-                                  self._store.next_event_sequence(chat_id, session_id) - 1)
+            page = self._boundary.events(
+                handle, self._store.next_event_sequence(chat_id, session_id) - 1)
         except LauncherError as exc:
             observation_id = self._record_observation(
                 session, "reattach_failed", "%s: %s" % (exc.category, exc.detail))
@@ -827,7 +952,34 @@ class SessionManager(object):
         observation_id = self._record_observation(session, "reattached", None)
         if state == "unknown":
             self._transition(session, "running", "launcher", "observation", observation_id)
+        if isinstance(page, EventsPage):
+            self._take_reattachment_page(session, page)
         return session["state"]
+
+    def _take_reattachment_page(self, session, page):
+        """Preserve what re-attachment read, and act on it as the drain would.
+
+        Re-attachment used to call `events` and discard the page. On a launcher
+        that can resume, that page can carry the agent's answer and the report
+        that it completed while the harness was down; discarded, a later Stop
+        recorded the user terminating an agent that had in fact completed, and
+        the evidence it had completed was gone (review, the third edge of the
+        stop-then-abandon composition). Preserving it is the minimum truthful
+        behaviour, and it is the same page handling the drain uses -- no new
+        classification: the launcher classified each payload, as it always has.
+
+        This partly satisfies #88's later intake checkpoint (the review's event
+        drop 1). A launcher returning something that is not a page is still
+        ignored here, as it was: there are no raw bytes to preserve (drop 4).
+        """
+        capabilities = self._boundary.capabilities
+        taken = self._take_page(session, page, capabilities, [])
+        if (taken.stream_end_event_id is not None and not taken.reached_terminal
+                and session["state"] == "running"):
+            self._transition(session, "unknown", "launcher", "stream_end",
+                             taken.stream_end_event_id)
+        if taken.refusal is not None:
+            raise taken.refusal
 
     def _resolve_interrupted_launch(self, session):
         """Finish the launch outcome a restart interrupted, from the record of it.

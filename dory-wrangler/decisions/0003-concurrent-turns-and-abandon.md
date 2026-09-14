@@ -76,9 +76,11 @@ requirement.
 **What is provided, and nothing more.**
 
 * `POST /api/chats/<id>/abandon` calls `SessionManager.abandon`, which takes the
-  turn lock, requires the chat's active session to be `unknown`, and appends
-  `unknown -> abandoned` owned by the user with `user_action` evidence. The store
-  releases the binding in the same write. The response is the reopened chat.
+  turn lock and takes the chat's non-terminal session out of whatever state it
+  is in, by contract-legal transitions only (decision D2, section 4 below). From
+  `unknown` that is `unknown -> abandoned`, owned by the user with `user_action`
+  evidence, as it always was. The store releases the binding in the same write
+  as the terminal state. The response is the reopened chat.
 * On the page, the action appears only as a button inside the notice that
   explains a refused send. There is no status indicator, no lifecycle panel, no
   session list, no poll: the page learns nothing about sessions except that the
@@ -96,10 +98,15 @@ new; every served body, including both abandon responses and the refused send,
 carries no worker internals), and #87's own `test_internal_bridge.py` restart
 tests on the converged loop.
 
-## 3. Open: a `running` session the shell can no longer drain
+## 3. Resolved by decision D2: a `running` session the shell can no longer drain
 
-Measured during convergence and **not** resolved here, because resolving it would
-add a second lifecycle action and the convergence rail authorised exactly one.
+*This section recorded an open question at convergence; it is kept, corrected,
+because the measurement still describes how the state is reached. The
+orchestrator's decision D2 resolved it, and section 4 is the rule.*
+
+Measured during convergence and not resolved then, because resolving it would
+have added a second lifecycle action and the convergence rail authorised exactly
+one.
 
 Some ways a turn ends leave the session `running` with the chat lock released
 and nothing left reading it: a launcher that misuses the seam mid-turn (#87's F1
@@ -119,7 +126,58 @@ application does today, pinned by
   Abandon then works;
 * on a launcher that can resume, the chat stays refused after the restart too.
 
-The choices are a shell Stop affordance (a second action), making the one
-affordance stop a `running` agent before abandoning it (Abandon then sends `stop`
-to a live agent), or accepting the restart as the exit for v0.1 because no
-in-tree launcher resumes. That is a product decision, not a convergence one.
+The choices were a shell Stop affordance (a second action), making the one
+affordance stop a `running` agent before abandoning it, or accepting the restart
+as the exit. The orchestrator chose the second, and then generalised it (D2):
+the three bullets above no longer describe the product, and
+`tests/test_convergence.py::ARunningSessionTheShellCannotDrain` now pins the
+exit instead of its absence.
+
+## 4. Every non-terminal state has the one action as its exit (decision D2)
+
+The independent review of convergence (finding R2) found the same stranding in
+two more states in a live process: `pending` and `launching`, left by a wall
+clock stepping back between the writes of a launch (or by any store or OS error
+there), with send, stop and abandon all refused until a restart. The rule now:
+
+* **Exactly one lifecycle action**, `Abandon`, and it exits every non-terminal
+  state. No second button, no timer, no inactivity inference, no automatic
+  recovery; the harness never takes an exit on its own.
+* **Contract-legal transitions only**, each checked by the store against
+  contract 5.2's owner and precondition tables as it is written:
+
+  | State | Route out | Transitions (owner, evidence) |
+  | --- | --- | --- |
+  | `unknown` | abandon | `unknown -> abandoned` (user, `user_action`) |
+  | `running` | the user's `stop`, confirmed | `running -> terminated` (user, `stop_confirmed` observation); nothing is left to abandon, and that is success |
+  | `running` | the user's `stop`, not confirmed -- including a launcher that raises anything at all or answers with something that is not a `StopAck` | `running -> unknown` (launcher, `stop_unconfirmed` observation, 5.3 cause 4), then `unknown -> abandoned` |
+  | `launching` with an accepted `launch_result` | 5.4's resolution from the durable result, then the `running` rows | `launching -> running` (launcher, `launch_result`) |
+  | `launching` with a failed `launch_result` | 5.4's resolution | `launching -> launch_failed` (launcher, `launch_result`) |
+  | `launching` with an unknown `launch_result` | 5.4's resolution, then abandon | `launching -> unknown` (launcher, `launch_result`), `unknown -> abandoned` |
+  | `launching` with no usable `launch_result` | 5.4's `reattach_failed`, then abandon | `launching -> unknown` (launcher, `reattach_failed` observation), `unknown -> abandoned` |
+  | `pending` | 5.4's resolution of a launch never issued | `pending -> launch_failed` (harness, `harness_action`, `ref: null`) |
+
+* **The action never calls `events`.** On a live agent that is quiet `events`
+  blocks by design, and the exit must not.
+* **A turn in flight is unchanged.** The action takes the chat's turn lock, so
+  from another thread it waits for the turn in flight to finish, as it always
+  did. A launcher that calls the action back from inside an action on the same
+  chat is refused every route but `unknown -> abandoned`, which it always had.
+  Whether a user's Stop must reach a turn in flight remains the human's open
+  decision.
+* **Re-attachment preserves what it reads.** On a launcher that can resume, the
+  page re-attachment reads may carry the agent's answer and its completion; it
+  is preserved and acted on exactly as the drain would, so the chat is not later
+  recorded as a user terminating an agent that had completed. This partly
+  satisfies #88's later intake checkpoint.
+* **Residual, stated.** A store record damaged by hand (for example a
+  `launch_result` the contract cannot read) still holds its chat: the action
+  reads it and fails closed (contract D3). No product write can produce it.
+  And a wall clock that stays behind the records already written refuses every
+  write on that session until it passes them; each retry of the action makes
+  whatever progress the clock allows.
+
+Evidence: `tests/test_convergence.py::EveryNonTerminalStateHasTheOneActionAsItsExit`
+(one test per row, each checking the transitions written and that the chat takes
+a new turn), `ReAttachmentPreservesWhatItReads`, and
+`ARunningSessionTheShellCannotDrain`.

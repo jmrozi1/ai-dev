@@ -206,10 +206,21 @@ class UserActionsAreTheOnlyWayOut(unittest.TestCase, StoreCheck):
         self.assertEqual(support.view(harness).open_bindings(chat_id), [])
         self.assert_store_valid(harness.store, "user-stop-confirmed")
 
-    def test_abandon_is_available_only_from_unknown(self):
+    def test_abandon_of_a_running_agent_is_the_users_stop(self):
+        """**Expectation changed by decision D2.** This was
+        `test_abandon_is_available_only_from_unknown`, which required abandoning
+        a running agent to be refused. The shell's one lifecycle action now
+        exits every non-terminal state by contract-legal transitions, and from
+        `running` that is the user's own `stop`: it is still only the user who
+        ends the agent, and the store records a confirmed stop, not an
+        abandonment."""
         harness = live_agent_harness("k")
         chat_id = harness.create_chat("Abandon")
         harness.send_turn(chat_id, "first")
+        self.assertEqual(harness.abandon(chat_id), "terminated")
+        session = harness.store.list_sessions(chat_id)[0][0]
+        self.assertEqual([t["to"] for t in session["transitions"]][-1], "terminated")
+        self.assertEqual(session["transitions"][-1]["owner"], "user")
         with self.assertRaises(NotPermitted):
             harness.abandon(chat_id)
 

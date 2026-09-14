@@ -742,11 +742,13 @@ class ASessionInterruptedInLaunchingAlwaysHasAnExit(unittest.TestCase, StoreChec
                          "only the readable chat's agent may have been addressed")
         with self.assertRaises(StoreCorrupt):
             reopened.store.read_launch_results(chat_id, session_id)
-        # The session record itself reads, so the user's actions are refused by
-        # the lifecycle rather than by the read: the chat stays held until the
-        # damaged record is repaired, which is contract D3's fail-closed read
-        # meeting a record no writer of this store can produce.
-        with self.assertRaises(NotPermitted):
+        # The chat stays held until the damaged record is repaired, which is
+        # contract D3's fail-closed read meeting a record no writer of this
+        # store can produce. **Expectation changed by decision D2:** the one
+        # action now resolves an interrupted launch from its launch_result, so
+        # it reads the damaged record and fails closed on the read (it used to
+        # be refused by the lifecycle before reading). Either way nothing moves.
+        with self.assertRaises(StoreCorrupt):
             reopened.abandon(chat_id)
         session = reopened.store.read_session(chat_id, session_id)
         self.assertEqual(session["state"], "launching")
