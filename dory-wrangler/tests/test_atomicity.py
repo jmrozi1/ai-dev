@@ -234,17 +234,44 @@ class TestConcurrentSenders(StoreCase):
     """
 
     def test_threads_racing_for_a_sequence_lose_nothing(self):
+        """Six writers, and the race is forced rather than hoped for.
+
+        Each writer computes the sequence it is about to claim and then waits on
+        a barrier, so in every round all six have chosen before any of them
+        publishes: at least the first round is a six-way collision on one name,
+        whatever the scheduler does. Exclusive creation lets exactly one through
+        and the rest retry against what it wrote; a last-writer-wins publish
+        (mutation M3) overwrites five turns in that round every time.
+
+        This replaces a version with no barrier, whose collisions depended on
+        timing. Under CPU load its threads stopped overlapping, so M3 passed
+        with the guard removed and the suite reported a false result (review of
+        #88's convergence, item K).
+        """
         chat_id = self.store.create_chat("Thread race")["chat_id"]
-        writers, per_writer = 6, 15
+        writers, rounds = 6, 5
+        barrier = threading.Barrier(writers)
         failures = []
 
         def write(worker):
             store = ChatStore(self.root, sweep=False)
-            for i in range(per_writer):
+            chosen = store._next_sequence
+            first_choice = {"pending": False}
+
+            def choose_then_wait(directory):
+                sequence = chosen(directory)
+                if first_choice["pending"]:
+                    first_choice["pending"] = False
+                    barrier.wait(60)
+                return sequence
+
+            store._next_sequence = choose_then_wait
+            for i in range(rounds):
+                first_choice["pending"] = True
                 try:
                     store.append_user_message(chat_id, "w%d-%d" % (worker, i))
                 except Exception as exc:  # pragma: no cover - reported, not swallowed
-                    failures.append("%s: %s" % (worker, exc))
+                    failures.append("%s: %r" % (worker, exc))
 
         threads = [threading.Thread(target=write, args=(w,)) for w in range(writers)]
         for thread in threads:
@@ -254,13 +281,13 @@ class TestConcurrentSenders(StoreCase):
         self.assertEqual(failures, [])
 
         messages = self.store.read_messages(chat_id)
-        expected = sorted("w%d-%d" % (w, i) for w in range(writers) for i in range(per_writer))
+        expected = sorted("w%d-%d" % (w, i) for w in range(writers) for i in range(rounds))
         self.assertEqual(
             sorted(m["content"]["text"] for m in messages), expected,
             "a turn was overwritten by a concurrent writer",
         )
         self.assertEqual(
-            [m["sequence"] for m in messages], list(range(1, writers * per_writer + 1))
+            [m["sequence"] for m in messages], list(range(1, writers * rounds + 1))
         )
         self.assertStoreValid()
 
