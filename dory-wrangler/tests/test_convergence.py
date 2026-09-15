@@ -350,8 +350,8 @@ class ExactlyOneStoreAndOneServedApplication(unittest.TestCase):
         ("src/dory_wrangler/atomic.py", "_rmtree", "os.rmdir"),
         ("src/dory_wrangler/atomic.py", "sweep_temp_files", "atomic._rmtree"),
         ("src/dory_wrangler/atomic.py", "ChatLock.__enter__", "os.open"),
-        ("src/dory_wrangler/atomic.py", "own_store", "os.makedirs"),
-        ("src/dory_wrangler/atomic.py", "own_store", "os.open"),
+        ("src/dory_wrangler/atomic.py", "_own", "os.makedirs"),
+        ("src/dory_wrangler/atomic.py", "_own", "os.open"),
         # store.py: every write behind the store-level lock (decision D1)
         ("src/dory_wrangler/store.py", "ChatStore.acquire", "atomic.own_store"),
         ("src/dory_wrangler/store.py", "ChatStore.acquire", "os.makedirs"),
@@ -419,7 +419,7 @@ class ExactlyOneStoreAndOneServedApplication(unittest.TestCase):
         self.assertGreater(len(report["product"]), 50)
         for file, function, event, held in report["product"]:
             self.assertIn((file, function), allowed, (file, function, event))
-            if (file, function) != ("src/dory_wrangler/atomic.py", "own_store"):
+            if (file, function) != ("src/dory_wrangler/atomic.py", "_own"):
                 self.assertTrue(held, "%s:%s wrote (%s) without the store lock"
                                 % (file, function, event))
         # Every site that makes a filesystem call itself -- rather than handing
