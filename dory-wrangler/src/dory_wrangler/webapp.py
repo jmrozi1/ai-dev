@@ -207,8 +207,12 @@ PAGE = r"""<!doctype html>
   #text {
     flex: 1 1 auto;
     resize: none;
-    min-height: 46px;
-    max-height: 180px;
+    /* One line to start; grows with its text to about seven lines, then scrolls
+       inside (fitComposer below sets the height). */
+    line-height: 1.55;
+    min-height: calc(1.55em + 26px);
+    max-height: calc(7 * 1.55em + 26px);
+    overflow-y: auto;
     padding: 12px 14px;
     border: 1px solid var(--line);
     border-radius: 10px;
@@ -249,7 +253,7 @@ PAGE = r"""<!doctype html>
   <div id="composer">
     <div id="refusal" hidden><span id="refusal-text"></span><button id="abandon" type="button">Abandon the agent</button></div>
     <form id="form">
-      <textarea id="text" placeholder="Send a message" autocomplete="off"></textarea>
+      <textarea id="text" rows="1" placeholder="Send a message" autocomplete="off"></textarea>
       <button id="send" type="submit">Send</button>
     </form>
   </div>
@@ -369,6 +373,7 @@ document.getElementById("form").addEventListener("submit", function (event) {
       .then(function (chat) {
         activeChatId = chat.chat_id;
         box.value = "";
+        fitComposer();
         renderChat(chat);
         return refreshList();
       });
@@ -397,6 +402,22 @@ document.getElementById("abandon").addEventListener("click", function () {
       if (err.refused) { showRefusal(err); } else { showProblem(err); }
     });
 });
+
+// The composer grows with its text as it wraps, up to the max-height in the
+// stylesheet (about seven lines), then scrolls inside; it shrinks as text is
+// removed and when a sent message clears it.
+function fitComposer() {
+  var box = document.getElementById("text");
+  box.style.height = "auto";
+  var limit = parseFloat(window.getComputedStyle(box).maxHeight);
+  var wanted = box.scrollHeight + box.offsetHeight - box.clientHeight;
+  box.style.height = Math.min(wanted, limit) + "px";
+  box.style.overflowY = wanted > limit ? "auto" : "hidden";
+}
+
+document.getElementById("text").addEventListener("input", fitComposer);
+window.addEventListener("resize", fitComposer);
+fitComposer();
 
 document.getElementById("text").addEventListener("keydown", function (event) {
   if (event.key === "Enter" && !event.shiftKey) {

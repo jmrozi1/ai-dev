@@ -58,6 +58,47 @@ class TestShellFlows(ShellCase):
             )
         self.assertIn("New chat", page)
 
+    def test_the_composer_grows_with_its_text_to_about_seven_lines_then_scrolls(self):
+        """The served page carries the mechanism: a one-line textarea whose
+        stylesheet bounds it at seven of its own lines, and a script that fits
+        its height to its text on every input, on resize, on load, and after a
+        sent message clears it. Visual behaviour is a browser's to show; this is
+        what can be held without one."""
+        import re
+        import pagemodel
+        status, page = self.shell.get_page()
+        self.assertEqual(status, 200)
+        textareas = re.findall(r"<textarea\b[^>]*>", page)
+        self.assertEqual(len(textareas), 1)
+        self.assertIn('id="text"', textareas[0])
+        self.assertIn('rows="1"', textareas[0])
+
+        path = [{"tag": "main", "id": "main", "classes": [], "attrs": {}},
+                {"tag": "div", "id": "composer", "classes": [], "attrs": {}},
+                {"tag": "form", "id": "form", "classes": [], "attrs": {}},
+                {"tag": "textarea", "id": "text", "classes": [], "attrs": {}}]
+        style = pagemodel.computed_style(pagemodel.stylesheet(page), path)
+        line = style["line-height"]
+        self.assertEqual(style["box-sizing"], "border-box")
+        chrome = "%dpx" % (2 * 12 + 2 * 1)  # padding 12px and border 1px, each side
+        self.assertEqual((style["padding"], style["border"].split()[0]), ("12px 14px", "1px"))
+        self.assertEqual(style["min-height"], "calc(%sem + %s)" % (line, chrome))
+        self.assertEqual(style["max-height"], "calc(7 * %sem + %s)" % (line, chrome))
+        self.assertEqual(style["resize"], "none")
+
+        script = re.search(r"function fitComposer\(\) \{(.*?)\n\}", page, re.S)
+        self.assertIsNotNone(script, "the page no longer fits the composer to its text")
+        body = script.group(1)
+        for needed in ('box.style.height = "auto"', "box.scrollHeight",
+                       "getComputedStyle(box).maxHeight",
+                       'box.style.overflowY = wanted > limit ? "auto" : "hidden"'):
+            self.assertIn(needed, body)
+        for binding in ('getElementById("text").addEventListener("input", fitComposer)',
+                        'window.addEventListener("resize", fitComposer)',
+                        '\nfitComposer();\n',
+                        'box.value = "";\n        fitComposer();'):
+            self.assertIn(binding, page)
+
     def test_new_chat_flow_then_list_then_open(self):
         status, first = self.shell.post("/api/chats", {})
         self.assertEqual(status, 201)
