@@ -34,7 +34,7 @@ Configuration comes from this process's own environment, never from the message:
 ``DORY_MODEL_CODEX_BEHAVIOUR``
     comma-separated switches for the next invocations: `synthetic-unrecognized`,
     `synthetic-malformed`, `synthetic-not-an-object`, `synthetic-item`,
-    `synthetic-typeless`, `thread-started-without-id-first`,
+    `synthetic-typeless`, `synthetic-padded`, `thread-started-without-id-first`,
     `agent-message-without-text`, `no-thread-started`, `no-output`,
     `two-messages`, and
     `plain-text-on-resume` -- the old guess that a resume prints bare text, kept
@@ -64,6 +64,8 @@ SYNTHETIC_ITEM = {"type": "item.completed",
 # The proven event types without the field that makes each usable.
 THREAD_STARTED_WITHOUT_ID = {"type": "thread.started"}
 AGENT_MESSAGE_WITHOUT_TEXT = {"type": "item.completed", "item": {"type": "agent_message"}}
+# A synthetic line with whitespace around it, which is part of its bytes.
+SYNTHETIC_PADDED = '  {"type": "synthetic.model-only.padded-line"}\t'
 # An object with no type at all, whatever else it carries.
 SYNTHETIC_TYPELESS = {"note": "SYNTHETIC model-only object with no type",
                       "item": {"type": "agent_message", "text": "SYNTHETIC: never chat"}}
@@ -128,6 +130,8 @@ def main(argv):
             lines.append(json.dumps(AGENT_MESSAGE_WITHOUT_TEXT))
         if "synthetic-typeless" in behaviour:
             lines.append(json.dumps(SYNTHETIC_TYPELESS))
+        if "synthetic-padded" in behaviour:
+            lines.append(SYNTHETIC_PADDED)
         answer = reply_to(thread["prompts"])
         if resume_id is not None and "plain-text-on-resume" in behaviour:
             lines = [answer]

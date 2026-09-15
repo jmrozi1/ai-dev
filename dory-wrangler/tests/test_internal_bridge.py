@@ -79,6 +79,14 @@ class ModelDirs(object):
         with open(path) as handle:
             return [json.loads(line) for line in handle]
 
+    def evidence(self, harness):
+        """What to read when an assertion here fails: every launch result and call."""
+        view = support.view(harness)
+        return "launch results %r; calls %r" % (
+            [(r["outcome"], r.get("failure_category"), r.get("detail"))
+             for r in view.all_of("launch_result")],
+            [(c["argv"][0][:40], c["thread_id"], c["exit"], len(c["stdout"])) for c in self.calls()])
+
     def emitted_lines(self):
         return [line.encode("utf-8") for call in self.calls() for line in call["stdout"]]
 
@@ -95,7 +103,8 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
 
         sessions = support.view(harness).sessions_of(chat_id)
         self.assertEqual([s["state"] for s in sessions], ["running"],
-                         "one agent serves every turn and is still there for the next")
+                         "one agent serves every turn and is still there for the next; %s"
+                         % self.evidence(harness))
         session = sessions[0]
         calls = self.calls()
         thread_id = calls[0]["thread_id"]
@@ -109,6 +118,10 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
         first = json.loads(raw_bytes(events[0]).decode("utf-8"))
         self.assertEqual((first["type"], first["thread_id"]), ("thread.started", thread_id),
                          "the handle is the thread_id the output carried")
+        started = [json.loads(raw_bytes(e).decode("utf-8")) for e in events
+                   if e["interpreted_type"] == "thread.started"]
+        self.assertEqual([e["thread_id"] for e in started], [thread_id] * 4,
+                         "every resumed turn reports the thread it resumed")
 
         view = support.view(harness)
         self.assertEqual([p["instruction_text"] for p in view.all_of("launch_request")],
@@ -131,7 +144,7 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
                                             "synthetic-unrecognized", "synthetic-malformed",
                                             "synthetic-not-an-object", "synthetic-item",
                                             "agent-message-without-text",
-                                            "synthetic-typeless"))
+                                            "synthetic-typeless", "synthetic-padded"))
         harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("Raw JSONL preserved")
         harness.send_turn(chat_id, "first")
@@ -150,6 +163,7 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
                     ("agent", "unrecognized", None),                # an item nothing has shown
                     ("agent", "malformed", None),                   # agent_message, no text
                     ("agent", "unrecognized", None),                # an object with no type
+                    ("agent", "unrecognized", None),                # padded with whitespace
                     ("agent", "recognized", "assistant_text")]
         self.assertEqual([(e["source"], e["interpretation"], e["interpreted_type"])
                           for e in events], per_turn * 2,
@@ -228,7 +242,8 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
 
         harness = support.harness({}, launcher=FreshEveryCall())
         chat_id = run_three_turns(harness, "A launcher per call")
-        self.assertEqual(harness.transcript(chat_id), expected_transcript())
+        self.assertEqual(harness.transcript(chat_id), expected_transcript(),
+                         self.evidence(harness))
         thread_id = self.calls()[0]["thread_id"]
         self.assertEqual([c["argv"][0] for c in self.calls()[1:]],
                          ["--resumeID=%s" % thread_id] * 2)
@@ -253,7 +268,8 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
         other = support.harness({}, launcher=self.launcher(continuation="fresh_binding"))
         for i in range(2):
             other.send_turn(other.create_chat("Handle %d" % i), "hello")
-        handles = sorted(s["agent_handle"] for s in support.view(other).all_of("agent_session"))
+        handles = sorted(s.get("agent_handle") or self.evidence(other)
+                         for s in support.view(other).all_of("agent_session"))
         self.assertEqual(handles, sorted(c["thread_id"] for c in self.calls()[1:]))
         self.assertEqual(len(set(handles)), 2)
 
@@ -279,7 +295,8 @@ class FreshBindingIsStillADeclaredCapability(unittest.TestCase, StoreCheck, Mode
     def test_three_turns_three_fresh_threads(self):
         harness = support.harness({}, launcher=self.launcher(continuation="fresh_binding"))
         chat_id = run_three_turns(harness, "Internal bridge, fresh binding")
-        self.assertEqual(harness.transcript(chat_id), expected_transcript())
+        self.assertEqual(harness.transcript(chat_id), expected_transcript(),
+                         self.evidence(harness))
         self.assertEqual([s["state"] for s in support.view(harness).sessions_of(chat_id)],
                          ["completed"] * 3)
         self.assertEqual([c["argv"] for c in self.calls()],
@@ -425,7 +442,7 @@ class ADeadBridgeIsDiscoverableOnlyByAttemptingATurn(unittest.TestCase, StoreChe
         launcher._behaviour = ()
         harness.send_turn(chat_id, "are you there now?")
         self.assertEqual([s["state"] for s in support.view(harness).sessions_of(chat_id)],
-                         ["launch_failed", "running"])
+                         ["launch_failed", "running"], self.evidence(harness))
         self.assert_store_valid(harness.store, "internal-bridge-jsonl-recovered")
         support.end_chat(harness, chat_id)
 
@@ -462,11 +479,20 @@ class TheHandleIsWhatSelectsTheThread(unittest.TestCase, StoreCheck, ModelDirs):
                          ["answer to: question 0"])
         self.assertEqual([p.text for p in launcher.events(two, 0).payloads if p.text],
                          ["answer to: question 1"])
+        from dory_wrangler import ids
+        session = support.view(harness).sessions_of(chats[0])[0]
+        packet = lb.DeliveryInstruction(
+            delivery_id=ids.new_id("dlv"), chat_id=chats[0], session_id=session["session_id"],
+            sequence=9, created_at=ids.now(), instruction_encoding="utf-8",
+            instruction_text="to a thread this launcher never started")
+        calls = len(self.calls())
         for operation in (lambda h: launcher.events(h, 0),
-                          lambda h: launcher.stop(h, "the user pressed Stop")):
+                          lambda h: launcher.stop(h, "the user pressed Stop"),
+                          lambda h: launcher.deliver(h, packet)):
             with self.assertRaises(lb.LauncherError) as caught:
                 operation(one + "-not-this-one")
             self.assertEqual(caught.exception.category, "unavailable")
+        self.assertEqual(len(self.calls()), calls, "an unknown address reached the script")
         for chat_id in chats:
             support.end_chat(harness, chat_id)
 

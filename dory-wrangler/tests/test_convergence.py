@@ -1628,6 +1628,22 @@ class APageIsPreservedPastARefusal(unittest.TestCase, StoreCheck):
                          ["first", "second"])
         self.assert_store_valid(harness.store, "page-preserved-past-a-contradiction")
 
+    def test_the_first_refusal_on_a_page_is_the_one_handed_back(self):
+        """Sweep M13: with two refusals on one page, the first is raised once the
+        page has been preserved, not the last."""
+        from dory_wrangler.errors import StoreCorrupt
+        harness = SessionManager(ChatStore(support.scratch_root()), PagedLauncher([
+            [agent_text(1, "first"), agent_text(2, "second")],
+            [lb.EventPayload(1, "agent", "unrecognized", b"different bytes at sequence one"),
+             lb.EventPayload(2, "agent", "unrecognized", b"different bytes at sequence two"),
+             launcher_report(3, "session_completed")],
+        ]))
+        chat_id = harness.create_chat("Two refusals")
+        with self.assertRaises(StoreCorrupt) as caught:
+            harness.send_turn(chat_id, "hello")
+        self.assertIn("sequence 1 ", str(caught.exception))
+        self.assertEqual(self.preserved(harness, chat_id), [1, 2, 3])
+
     def test_after_a_clock_refusal_of_a_mid_page_completion(self):
         harness = SessionManager(ChatStore(support.scratch_root()), PagedLauncher([
             [agent_text(1, "first"), launcher_report(2, "session_completed"),

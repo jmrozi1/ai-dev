@@ -164,6 +164,7 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
                                                      None)
         self._behaviour = tuple(behaviour)
         self._command = list(command) if command else [sys.executable, MODEL_SCRIPT]
+        self.last_stderr = ""
 
     @property
     def capabilities(self):
@@ -185,11 +186,12 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
             # go through the seam -- the rail handoff records it as an intake gap.
             if not lines:
                 raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
-                                       "launch_agent.sh exited %d and printed nothing"
-                                       % status)
+                                       "launch_agent.sh exited %d and printed nothing; "
+                                       "stderr ends: %s" % (status, self.last_stderr[-300:]))
             raise lb.LauncherError(lb.FAILURE_NO_ACKNOWLEDGEMENT,
                                    "launch_agent.sh exited %d, printed %d line(s) and no "
-                                   "thread started" % (status, len(lines)))
+                                   "thread started; stderr ends: %s"
+                                   % (status, len(lines), self.last_stderr[-300:]))
         self._append(handle, [("agent", raw) for raw in lines])
         if not self._capabilities.supports_delivery:
             # Under fresh_binding the next turn is a new launch, so this agent is
@@ -236,10 +238,13 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
                    DORY_MODEL_CODEX_BEHAVIOUR=",".join(self._behaviour))
         try:
             done = subprocess.run(self._command + list(args), stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, env=env)
+                                  stderr=subprocess.PIPE, env=env)
         except OSError as exc:
             raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
                                    "could not run launch_agent.sh: %s" % exc)
+        # stderr is not an event and is not preserved (nothing has shown its
+        # shape); its tail is kept on the launcher for a failure's detail only.
+        self.last_stderr = done.stderr[-2000:].decode("utf-8", "replace")
         return done.returncode, output_lines(done.stdout)
 
     def _spool_path(self, agent_handle):
