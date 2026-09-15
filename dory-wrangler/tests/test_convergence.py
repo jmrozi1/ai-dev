@@ -638,7 +638,7 @@ class OneServingProcessPerStore(unittest.TestCase, StoreCheck):
             % (support.SRC, root, chat_id))
         before = first.store.export_records()
         out = subprocess.check_output([sys.executable, "-c", program],
-                                      universal_newlines=True)
+                                      universal_newlines=True, timeout=60)
         self.assertEqual(out.strip(), "refused")
         self.assertEqual(first.store.export_records(), before)
 
@@ -734,6 +734,12 @@ class ASecondShellAgainstALiveOneChangesNothing(unittest.TestCase, StoreCheck):
         while not os.path.exists(started):
             self.assertIsNone(child.poll(), child.stderr.read() if child.poll() else "")
             time.sleep(0.01)
+        # A deadline for the test (see `other_process_holds`): if an attempt here
+        # waits for the store instead of being refused, the serving process is let
+        # go so the attempt lands and the assertions below fail.
+        watchdog = threading.Timer(180, lambda: open(release, "w").close())
+        watchdog.start()
+        self.addCleanup(watchdog.cancel)
         refused, opened = 0, 0
         # Until the serving process says it has finished -- it then waits, still
         # holding the store, so no attempt below can land after it exits.
@@ -1179,8 +1185,15 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
         while not os.path.exists(holding):
             self.assertIsNone(child.poll())
             time.sleep(0.01)
+        # A deadline for the test, not the product: an acquisition in this process
+        # that is not refused waits for the holder, which waits for this test.
+        # Letting the holder go after a minute turns that into a failed assertion.
+        watchdog = threading.Timer(60, lambda: open(release, "w").close())
+        watchdog.start()
+        self.addCleanup(watchdog.cancel)
 
         def let_go():
+            watchdog.cancel()
             open(release, "w").close()
             self.assertEqual(child.wait(), 0)
         return let_go
@@ -1191,8 +1204,9 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
                    "from dory_wrangler.errors import StoreInUse\n"
                    "try:\n    ChatStore(%r).acquire(); print('took')\n"
                    "except StoreInUse:\n    print('refused')\n" % (support.SRC, root))
+        # A child that is neither refused nor given the store would wait forever.
         return subprocess.check_output([sys.executable, "-c", program],
-                                       universal_newlines=True).strip()
+                                       universal_newlines=True, timeout=60).strip()
 
     def test_a_read_only_store_writes_nothing_and_takes_no_lock(self):
         from dory_wrangler.errors import ReadOnlyStore
