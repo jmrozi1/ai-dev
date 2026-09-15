@@ -2439,8 +2439,14 @@ class EveryNonTerminalStateHasTheOneActionAsItsExit(unittest.TestCase, StoreChec
         while not os.path.exists(marker):
             self.assertIsNone(child.poll())
             time.sleep(0.02)
+        # A deadline for the test: a start-up that waits for the store instead of
+        # being refused would otherwise wait out the holder's whole park.
+        watchdog = threading.Timer(60, child.kill)
+        watchdog.start()
+        self.addCleanup(watchdog.cancel)
         with self.assertRaises(StoreInUse):
             build_server(root, port=0, quiet=True, launcher_config={"launcher": "scripted-stub"})
+        watchdog.cancel()
         child.send_signal(signal.SIGKILL)
         child.wait()
         server = build_server(root, port=0, quiet=True,
