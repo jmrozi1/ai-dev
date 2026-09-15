@@ -42,8 +42,9 @@ one.
 
 A sent turn is offered to an agent through the configured launcher, and the send
 returns once that turn's answer is durable. The default launcher is `dev-local`
-with profile `one_shot`, the shape of the one proven internal path; choosing
-another is configuration only (`launch-boundary.md`). A turn the chat's agent
+with profile `one_shot`; choosing another is configuration only
+(`launch-boundary.md`), and `tests/internal_bridge.py` models the internal
+launcher's proven transport. A turn the chat's agent
 cannot take is refused before it is recorded. When a restart finds an agent that
 can no longer be reached, the refused send offers the one lifecycle action the
 shell has: abandon that agent.

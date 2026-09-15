@@ -66,8 +66,7 @@ they would be the visible record of the flip.
 
 **Why it is in scope.** A restart that finds a live or `unknown` session must
 leave the user a way out through the shell. Contract 5.4 re-attaches once at
-start; a launcher that cannot resume -- every launcher in this repository, and
-the modelled internal bridge, which remembers nothing across a restart -- leaves
+start; a launcher that cannot resume -- every launcher this product ships -- leaves
 the session `unknown`, and `unknown` refuses every new turn. Contract 5.2 makes
 the exit from `unknown` a user action, `unknown -> abandoned`. Without it the
 chat is stranded for the life of the store, which fails the release's reopen
@@ -95,8 +94,8 @@ requirement.
 a refused send that records nothing, the abandon, and a new turn answered),
 `tests/test_shell.py` (the route set now includes `/abandon` and nothing else
 new; every served body, including both abandon responses and the refused send,
-carries no worker internals), and #87's own `test_internal_bridge.py` restart
-tests on the converged loop.
+carries no worker internals), and `test_internal_bridge.py`, whose modelled internal launcher
+resumes across a real restart and ends in `unknown` only when it cannot.
 
 ## 3. Resolved by decision D2: a `running` session the shell can no longer drain
 

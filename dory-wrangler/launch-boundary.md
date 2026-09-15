@@ -27,7 +27,7 @@ it.
 | `launchers/dev_agent.py` | the local development agent program `dev_local` starts. Not part of the boundary. |
 | `launchers/scripted_stub.py` | a second, non-production launcher, selected only by configuration. |
 | `launchers/registry.py` | configuration to launcher. Adding the internal bridge is one module and one entry here. |
-| `dory-wrangler/tests/internal_bridge.py` | **test material, not a launcher this product ships**: a faithful model of the proven internal path, written against the seam alone. Registered nowhere and imported by no product module. |
+| `dory-wrangler/tests/internal_bridge.py` | **test material, not a launcher this product ships**: a model of the internal launcher over the JSONL transport proven internally, with `model_launch_agent.py` standing in for `launch_agent.sh`. Registered nowhere and imported by no product module. |
 | `dory-wrangler/tests/` | the one suite, including `test_launch_adversarial.py` and `test_internal_bridge.py`. |
 
 ## Running it
@@ -139,8 +139,11 @@ in `session_manager.py` is the one function a later answer changes.
    inside the launcher and travel only in `detail`, which is never parsed.
    `detail` is rendered and never parsed, so passing it an exception object
    rather than `str(exc)` is coerced rather than refused.
-5. **It synthesises an `agent_handle` if its transport issues none.** Handles are
-   opaque, so this is legal, and `LaunchResult` refuses `accepted` without one.
+5. **It takes the `agent_handle` from its transport, and synthesises one only if
+   the transport issues none.** Internally the transport issues one: the resume
+   ID is `thread.started.thread_id` in `codex exec --json` output, so the
+   internal launcher takes it from that output and makes nothing up. Handles are
+   opaque either way, and `LaunchResult` refuses `accepted` without one.
 6. **A synthesised handle must be unique across the launcher's own process
    lifetimes, not merely within one.** A launcher remembers nothing between
    calls, so every operation after `launch` is served by a process that may be
@@ -153,38 +156,51 @@ in `session_manager.py` is the one function a later answer changes.
    two live sessions share one address validates. Draw the handle from something
    that does not restart with the process --- a UUID, or an identifier the
    transport itself guarantees unique --- and never from a counter the
-   constructor initialises. `tests/internal_bridge.py` models this and
-   `AHandleMustBeUniqueAcrossRestartsNotOnlyWithinOne` holds it to it.
-7. **It buffers the response and serves it through `events`.** On a one-shot path
-   `launch` returns an outcome, not text, so the response cannot travel back
-   through the call that obtained it.
-8. **It emits a launcher-sourced `session_completed` or `session_failed` after
-   every response.** A bridge that reports the agent's text and nothing about its
-   exit leaves the session `running` forever, and every later turn is refused
-   until the user presses Stop. This is the difference between a working chat and
-   one that needs a manual Stop between every turn, and it is the obligation
-   easiest to miss.
-9. **It honours `after_sequence`.** `events` is resumable by sequence; a page
-   that does not advance is refused with a stated `LaunchBoundaryError` rather
-   than read again. Whether the internal bridge can resume is recorded as unknown
-   (C5), so this is the likeliest place an internal launcher first meets the seam.
-10. One entry in `launchers/registry.py`.
+   constructor initialises. A handle the transport issues, like Codex's
+   `thread_id`, has whatever uniqueness the transport gives it, which internally
+   is unproven.
+7. **It keeps each call's raw output until `events` has served it.** `launch`
+   and `deliver` return an outcome and an acknowledgement, not text, and
+   `events` must serve every payload from `sequence` 1 for the life of the
+   session, across a restart of the harness. A script that returns its output
+   once and exits therefore needs somewhere of the launcher's own to keep it,
+   keyed by the handle.
+8. **It classifies launch and deliver output through one path.** Internally both
+   are the same JSONL; there is no plain-text resume case. Only event types a
+   capture has shown are `recognized` (`thread.started`, and `item.completed`
+   with `item.type == "agent_message"` as `assistant_text` from `item.text`);
+   every other well-formed line is `unrecognized` and every other line
+   `malformed`.
+9. **Under `fresh_binding` it reports the agent's exit.** A session that never
+   leaves `running` holds its chat, and under `fresh_binding` every later turn
+   is then refused until the user abandons it. Under `persistent` a session
+   that stays `running` between turns is the normal case, not a defect.
+10. **It honours `after_sequence`.** `events` is resumable by sequence; a page
+    that does not advance is refused with a stated `LaunchBoundaryError` rather
+    than read again.
+11. One entry in `launchers/registry.py`.
 
 Nothing else changes. `tests/test_swappability.py` runs the full chat loop
 against a launcher defined in the test file and registered nowhere, and
-`tests/internal_bridge.py` is a faithful model of the proven internal path --
-one-shot, a blocking `launch` that returns the response with it, no issued
-handle, no state across a restart, no measured bound -- run through the whole
-chat loop by `tests/test_internal_bridge.py`. Three turns on it produce the same
-transcript as every other launcher and a store the contract validator accepts,
-and contract 6.1's four operations were sufficient: no operation, field, or
-capability was added for it. Start there rather than from this list alone.
+`tests/internal_bridge.py` models the internal launcher over the transport
+proven internally -- `launch_agent.sh "<message>"` and
+`launch_agent.sh --resumeID=<thread_id> "<message>"` over `codex exec --json`,
+both emitting the same JSONL; `continuation: persistent`; `response_shape:
+one_shot`, provisional until a real capture; no measured bound -- with
+`tests/model_launch_agent.py` standing in for the script as a real process per
+call. `tests/test_internal_bridge.py` runs it through the whole chat loop and
+the served shell: several turns resuming one thread, a real restart of the
+shell resuming the same `thread_id`, fresh binding still supported, every line
+of output preserved verbatim, and contract 6.1's four operations sufficient,
+with nothing in `src/` changed for it. Start there rather than from this list
+alone.
 
 What that model also establishes, as product properties rather than defects:
-the user's Stop cannot reach a turn in flight, so contract 5.2's
-`running -> terminated` is unreachable on the one-shot shape; the agent has no
-memory of the chat; a dead bridge is discoverable only by attempting a turn; and
-a restart with a live session ends in `unknown`, whose only exit is the user's
-`abandon`. Each has a named test in `tests/test_internal_bridge.py`. The converged
-shell exposes `abandon` as its one lifecycle action (decision 0003); Stop reaching
-a turn in flight remains the human's decision.
+the user's Stop cannot reach a turn in flight, because `launch` and `deliver`
+block for the agent's whole turn under the chat's turn lock; no stop operation
+has been shown for the script, so a stop is recorded unconfirmed and the one
+lifecycle action, `abandon`, is the exit; a dead bridge is discoverable only by
+attempting a turn; and a restart that finds no output of the thread ends in
+`unknown`, whose exit is the same action. Each has a named test in
+`tests/test_internal_bridge.py`. Stop reaching a turn in flight remains the
+human's decision.

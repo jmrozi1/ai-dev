@@ -1,172 +1,267 @@
-"""A faithful model of the proven internal path, written against the seam alone.
+"""A model of the internal launcher over the transport proven internally.
 
 **This is test material, not a launcher this product ships.** It lives under
-`tests/` and not under `harness/launchers/`, it is registered in
-`launchers/registry.py` nowhere, and the package never imports it -- the
-registry test that asserts `build_launcher({"launcher": "internal-bridge"})`
-fails closed is deliberately still true. It starts no process, opens no socket
-and reaches no bridge; it cannot, because the internal bridge is unreachable
-from this VM. What it models is the *shape* of the one internal path that is
-proven, so that the seam can be exercised against that shape rather than only
-against the two development launchers.
+`tests/`, it is registered in `launchers/registry.py` nowhere, and the package
+never imports it -- the registry test that asserts
+`build_launcher({"launcher": "internal-bridge"})` fails closed is deliberately
+still true. The internal bridge is unreachable from here; what this models is the
+*shape* of the internal path, so that "the internal launcher drops in unchanged"
+is checked against the interface the internal network actually has.
 
-It came out of the #87 checkpoint review, which wrote it to answer the release's
-largest open question -- can an internal-bridge launcher drop in against contract
-6.1's four operations unchanged? It can: three turns produced a transcript
-byte-identical to the mode-invariance reference and a store the contract
-validator accepts with zero violations, and no operation, field or capability
-was added. It is preserved here, adapted to the corrected seam, so #90 starts
-from a working model of the internal path rather than rebuilding one the morning
-it is needed.
+## What was proven internally, and is modelled (#87 and #88, 2026-09-14)
 
-The shape it models, from `facts-and-assumptions.md` F10:
+* `launch_agent.sh "<message>"` launches a new agent and returns its response and
+  a resume ID; `launch_agent.sh --resumeID=<id> "<message>"` resumes that same
+  agent. Continuity across separate invocations was demonstrated.
+* Underneath it is `codex exec --json` (fresh) and `codex exec resume --json`
+  (resume). **Both emit JSONL in the same shape.** The resume ID is
+  `thread.started.thread_id`. The reply is an `item.completed` event whose
+  `item.type == "agent_message"`, with its text in `item.text`.
 
-    ~/scripts/launch_agent.sh   <- instruction text
-                                -> the agent's own response text
+`model_launch_agent.py` stands in for the script, as a real process per call.
+This file is the launcher over it:
 
-* one-shot: `launch` blocks for the whole agent run and the response comes back
-  with it;
-* prerequisites -- an active user session and an initialised bridge -- and no way
-  to discover either except by attempting a turn;
-* no acknowledgement separate from the response;
-* **no handle issued by the script**, so the launcher synthesises one;
-* **no state across a harness restart**: a fresh instance remembers nothing, and
-  `events` on a handle it did not issue fails;
-* no measured payload bound (U2), so `instruction_bound_bytes` is `None`;
-* raw text rather than a structured transport, one event per response.
+======================  =====================================================
+`launch`                runs the script fresh; the `agent_handle` is the
+                        `thread_id` of the `thread.started` event in its output,
+                        **taken from the output and never made up**
+`deliver`               runs the script with `--resumeID=<agent_handle>`
+`events`                every output line of every call on that thread, in
+                        order, each through the one classification below
+`stop`                  unconfirmed: no stop operation has been shown, and each
+                        call had already returned
+capabilities            `continuation: persistent` (the normal internal case),
+                        `response_shape: one_shot`, no measured bound
+======================  =====================================================
 
-What that shape forces on a launcher author, all of it on this side of the seam
-and none of it above it:
+## One path for launch and deliver
 
-1. **Synthesise a handle, and make it unique across the launcher's own process
-   lifetimes.** `LaunchResult` refuses `accepted` without one and the script
-   issues none, so the launcher makes one up; handles are opaque, so that is
-   legal. What is *not* legal is a per-instance counter. The harness stores the
-   handle durably and hands it back to a fresh launcher process after a restart,
-   so a generator that restarts with the process re-issues a live chat's address
-   to a different agent -- see `AHandleMustBeUniqueAcrossRestartsNotOnlyWithinOne`
-   and the obligation in `harness/README.md`.
-2. **Buffer the response and serve it through `events`.** `launch` returns an
-   outcome, not text, so the response cannot travel back through the call that
-   obtained it.
-3. **Emit a launcher-sourced `session_completed` after every response.** The
-   bridge reports the agent's text and nothing about its exit. Without a
-   manufactured lifecycle event the session never leaves `running` and every
-   later turn is refused until the user presses Stop -- see
-   `AChatThatCannotReportAnExitNeedsAStopBetweenTurns`.
-4. **Honour `after_sequence`.** The harness refuses a launcher whose page does
-   not advance (review finding F1), which is a stated refusal rather than a hang.
+Neither `launch` nor `deliver` interprets what the script printed beyond finding
+the handle, and `launch` finds it with the same `classify` everything else goes
+through. Both append the raw output lines, byte for byte, to the thread's spool,
+and `events` is the only place a line becomes a payload. There is no plain-text
+resume case: a resumed turn that printed something other than JSONL is
+`malformed` exactly as a launch that did would be.
+
+`classify` recognises the two proven event types and nothing else:
+
+* `thread.started` carrying a non-empty string `thread_id` -> `recognized`,
+  typed `thread.started`; it carries the handle and nothing for the chat;
+* `item.completed` whose `item.type == "agent_message"` with string `item.text`
+  -> `recognized` `assistant_text`, text `item.text`;
+* any other well-formed JSON -> `unrecognized` (including an `item.completed`
+  of another item type, which is the honest reading until a capture shows one);
+* a line that is not JSON, or one of the two proven types missing the field
+  that makes it that type -> `malformed`.
+
+## `response_shape: one_shot`, provisionally
+
+Chosen on the only evidence there is, and provisional until a real capture
+arrives: the proven interface is a call that **returns** the response together
+with the resume ID, i.e. output is read after the process exits. `codex exec
+--json` writing its JSONL incrementally could support `stream`, but that is
+inferred, not shown for the internal wrapper, and a `stream` launcher must also
+signal an end of stream distinguishably from a quiet one (contract 6.1), which
+for a process per turn would read every finished turn as a closed stream.
+
+## What the model must keep, and where
+
+A launcher remembers nothing between calls (contract 6.1), yet `events` must
+serve what `launch` and every `deliver` produced, from sequence 1, for the life
+of the session. The script returns its output once and the process is gone, so
+**the launcher keeps each call's raw output in a spool of its own, keyed by the
+handle**, on disk under its own configuration: a fresh instance -- a restart --
+serves the same thread from the same spool. That is launcher-owned durable state
+(as `scripted_stub`'s `resume_handles` models), not memory in the object: every
+operation re-reads the spool and nothing else.
+
+What that shape obliges a launcher author to do, all on this side of the seam:
+
+1. **Take the handle from the output.** The script's own `thread_id` is the
+   opaque `agent_handle`; nothing is synthesised, so launcher-author obligation 6
+   (uniqueness across restarts) is Codex's property here, and unproven.
+2. **Keep the raw output of every call until `events` has served it**, from
+   sequence 1, across restarts.
+3. **Classify launch and deliver output through one path.**
+4. **Honour `after_sequence`** (review finding F1).
 5. Register it in `launchers/registry.py` -- which this file deliberately does
    not do, because it is a model and not the launcher.
+
+## Not modelled, because nothing has shown it
+
+The internal Codex version and every other event type; zero or several
+`agent_message` items per turn (the model can emit two, as a probe, not a
+claim); an explicit end-of-turn event distinct from process exit; error,
+non-zero-exit, stderr and prerequisite-failure shapes (the model's mapping below
+is a placeholder); stop or cancellation; `thread_id` lifetime and invalid-ID
+behaviour; concurrency; any payload bound.
 """
 
 from __future__ import annotations
 
+import base64
 import json
-import uuid
+import os
+import subprocess
+import sys
 
 from dory_wrangler import launch_boundary as lb
 
+MODEL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "model_launch_agent.py")
 
-def _default_script(instruction_text):
-    """Stands in for `~/scripts/launch_agent.sh`. Deliberately the same answer
-    shape as every other launcher in this suite, so a transcript produced through
-    the modelled internal path is comparable turn for turn with the others."""
-    return "answer to: %s" % instruction_text.strip()
+TYPE_THREAD_STARTED = "thread.started"
+TYPE_ITEM_COMPLETED = "item.completed"
+ITEM_AGENT_MESSAGE = "agent_message"
+
+
+def classify(sequence, raw):
+    """One raw output line -> one `EventPayload`. The only interpretation there is."""
+    try:
+        event = json.loads(raw.decode("utf-8"))
+    except ValueError:  # includes UnicodeDecodeError
+        return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_MALFORMED, raw)
+    kind = event.get("type") if isinstance(event, dict) else None
+    if kind == TYPE_THREAD_STARTED:
+        if thread_id_of(event) is None:
+            return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_MALFORMED,
+                                   raw)
+        return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_RECOGNIZED, raw,
+                               interpreted_type=TYPE_THREAD_STARTED)
+    if kind == TYPE_ITEM_COMPLETED:
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == ITEM_AGENT_MESSAGE:
+            if not isinstance(item.get("text"), str):
+                return lb.EventPayload(sequence, lb.SOURCE_AGENT,
+                                       lb.INTERPRETATION_MALFORMED, raw)
+            return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_RECOGNIZED,
+                                   raw, interpreted_type=lb.PAYLOAD_ASSISTANT_TEXT,
+                                   text=item["text"])
+    return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_UNRECOGNIZED, raw)
+
+
+def thread_id_of(event):
+    thread_id = event.get("thread_id")
+    return thread_id if isinstance(thread_id, str) and thread_id != "" else None
+
+
+def output_lines(stdout):
+    """The raw lines of one call's stdout, byte for byte. Blank lines carry no event."""
+    return [line for line in stdout.split(b"\n") if line.strip()]
 
 
 class InternalBridgeLauncher(lb.LaunchBoundary):
 
     launcher_id = "internal-bridge"
 
-    def __init__(self, bridge_ready=True, user_session_active=True, script=None,
-                 report_completion=True):
-        self._ready = bridge_ready
-        self._active = user_session_active
-        self._script = script or _default_script
-        # Handle -> buffered payloads, in this process only. A one-shot script
-        # has nowhere to keep this, which is exactly the point: a fresh instance
-        # is a harness restart, and it remembers nothing.
-        self._buffers = {}
-        self._counter = 0
-        # The handle must be unique across this launcher's *process lifetimes*,
-        # not merely within one. A fresh instance is a harness restart, and the
-        # harness still holds the handles the previous instance issued; a counter
-        # that starts again at one hands chat A's recorded address to chat B's
-        # live agent, and neither the harness nor the contract validator can
-        # notice, because a handle is opaque to both. Deliberately random rather
-        # than derived from the process: two instances in one process are two
-        # restarts as far as this seam is concerned. The cost is that a store
-        # produced through this launcher is no longer byte-identical run to run,
-        # which is the right trade -- a generator that is reproducible across
-        # restarts is precisely the broken one.
-        self._issuer = uuid.uuid4().hex[:12]
-        # Whether this bridge can say anything about the agent's exit. False
-        # models a bridge that can report only the agent's text.
-        self._report_completion = report_completion
-        # Every address this launcher was handed, so a claim about what crossed
-        # the seam never has to be taken on trust.
-        self.addressed = []
+    def __init__(self, codex_home, spool_dir, continuation=lb.CONTINUATION_PERSISTENT,
+                 behaviour=(), command=None):
+        # Configuration only, from the launcher's own environment. Nothing here
+        # is written after construction: every operation reads the spool.
+        self._codex_home = codex_home
+        self._spool_dir = spool_dir
+        self._capabilities = lb.LauncherCapabilities(continuation, lb.RESPONSE_SHAPE_ONE_SHOT,
+                                                     None)
+        self._behaviour = tuple(behaviour)
+        self._command = list(command) if command else [sys.executable, MODEL_SCRIPT]
 
     @property
     def capabilities(self):
-        # One-shot, and no bound has been measured internally either (U2).
-        return lb.LauncherCapabilities(
-            lb.CONTINUATION_FRESH_BINDING, lb.RESPONSE_SHAPE_ONE_SHOT, None)
+        return self._capabilities
+
+    # -- the four operations -------------------------------------------------
 
     def launch(self, instruction):
-        # The prerequisites, and the only way to discover them: attempt a turn.
-        if not self._active:
-            raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
-                                   "there is no active user session")
-        if not self._ready:
-            raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
-                                   "the bridge is not initialised")
-        try:
-            # Blocks for the whole agent run: the response comes back with the
-            # call that started it.
-            response = self._script(instruction.instruction_text)
-        except Exception as exc:  # noqa: BLE001 - the bridge may fail any way it likes
-            raise lb.LauncherError(lb.FAILURE_INTERNAL_ERROR,
-                                   "the bridge call failed: %s" % exc)
-        if not response:
-            # On a one-shot path the response *is* the acknowledgement, so
-            # nothing coming back is `no_acknowledgement` rather than a failure
-            # the bridge reported.
+        status, lines = self._run([instruction.instruction_text])
+        handle = None
+        for sequence, raw in enumerate(lines, 1):
+            if classify(sequence, raw).interpreted_type == TYPE_THREAD_STARTED:
+                handle = thread_id_of(json.loads(raw.decode("utf-8")))
+                break
+        if handle is None:
+            # No thread, so nothing that could be addressed again. Which category
+            # the real script's failures belong to is unproven; this mapping is
+            # the model's placeholder. The output of such a call has nowhere to
+            # go through the seam -- the rail handoff records it as an intake gap.
+            if not lines:
+                raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
+                                       "launch_agent.sh exited %d and printed nothing"
+                                       % status)
             raise lb.LauncherError(lb.FAILURE_NO_ACKNOWLEDGEMENT,
-                                   "the script returned nothing")
-
-        self._counter += 1
-        handle = "internal-bridge-%s-%04d" % (self._issuer, self._counter)
-
-        payloads = [lb.EventPayload(
-            1, lb.SOURCE_AGENT, lb.INTERPRETATION_RECOGNIZED,
-            response.encode("utf-8"),
-            interpreted_type=lb.PAYLOAD_ASSISTANT_TEXT, text=response)]
-        if self._report_completion:
-            payloads.append(lb.EventPayload(
-                2, lb.SOURCE_LAUNCHER, lb.INTERPRETATION_RECOGNIZED,
-                json.dumps({"type": "session_completed"}).encode("utf-8"),
-                interpreted_type=lb.PAYLOAD_SESSION_COMPLETED))
-        self._buffers[handle] = payloads
+                                   "launch_agent.sh printed %d line(s) and no thread started"
+                                   % len(lines))
+        self._append(handle, [("agent", raw) for raw in lines])
+        if not self._capabilities.supports_delivery:
+            # Under fresh_binding the next turn is a new launch, so this agent is
+            # done when its call returned. That is the launcher's own observation
+            # of the process it ran, sourced to the launcher: not a Codex event.
+            self._append(handle, [("launcher", json.dumps(
+                {"model_launcher_observation": "launch_agent.sh returned",
+                 "exit_status": status}).encode("utf-8"))])
         return lb.LaunchResult(lb.OUTCOME_ACCEPTED, agent_handle=handle)
 
+    def deliver(self, agent_handle, instruction):
+        if not self._capabilities.supports_delivery:
+            return lb.LaunchBoundary.deliver(self, agent_handle, instruction)
+        self._spool_entries(agent_handle)  # an address this launcher never issued fails here
+        status, lines = self._run(["--resumeID=%s" % agent_handle,
+                                   instruction.instruction_text])
+        self._append(agent_handle, [("agent", raw) for raw in lines])
+        if status != 0:
+            return lb.DeliveryAck(False, detail="launch_agent.sh --resumeID exited %d" % status)
+        return lb.DeliveryAck(True)
+
     def events(self, agent_handle, after_sequence):
-        self.addressed.append(("events", agent_handle))
-        buffered = self._buffers.get(agent_handle)
-        if buffered is None:
-            raise lb.LauncherError(
-                lb.FAILURE_UNAVAILABLE,
-                "no live record of agent %s; a one-shot bridge keeps no state "
-                "across a harness restart" % agent_handle)
-        # Honoured, not ignored: the page advances or the harness refuses (F1).
-        return lb.EventsPage(
-            [p for p in buffered if p.sequence > after_sequence], stream_ended=False)
+        payloads = []
+        for sequence, (source, raw) in enumerate(self._spool_entries(agent_handle), 1):
+            if sequence <= after_sequence:
+                continue
+            if source == "launcher":
+                payloads.append(lb.EventPayload(
+                    sequence, lb.SOURCE_LAUNCHER, lb.INTERPRETATION_RECOGNIZED, raw,
+                    interpreted_type=lb.PAYLOAD_SESSION_COMPLETED))
+            else:
+                payloads.append(classify(sequence, raw))
+        return lb.EventsPage(payloads, stream_ended=False)
 
     def stop(self, agent_handle, reason):
-        self.addressed.append(("stop", agent_handle))
-        if agent_handle not in self._buffers:
-            raise lb.LauncherError(lb.FAILURE_UNAVAILABLE, "nothing to stop")
-        return lb.StopAck(False,
-                          detail="the one-shot call had already returned; the "
-                                 "bridge cannot confirm the agent is gone")
+        self._spool_entries(agent_handle)
+        return lb.StopAck(False, detail="launch_agent.sh has no stop operation anyone has "
+                                        "shown, and every call had already returned")
+
+    # -- private -------------------------------------------------------------
+
+    def _run(self, args):
+        env = dict(os.environ, DORY_MODEL_CODEX_HOME=self._codex_home,
+                   DORY_MODEL_CODEX_BEHAVIOUR=",".join(self._behaviour))
+        try:
+            done = subprocess.run(self._command + list(args), stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, env=env)
+        except OSError as exc:
+            raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
+                                   "could not run launch_agent.sh: %s" % exc)
+        return done.returncode, output_lines(done.stdout)
+
+    def _spool_path(self, agent_handle):
+        # The handle is Codex's opaque string. It names a file only once encoded,
+        # so no handle can reach outside the spool directory.
+        name = base64.urlsafe_b64encode(agent_handle.encode("utf-8")).decode("ascii")
+        return os.path.join(self._spool_dir, name + ".jsonl")
+
+    def _append(self, agent_handle, entries):
+        os.makedirs(self._spool_dir, exist_ok=True)
+        with open(self._spool_path(agent_handle), "a") as spool:
+            for source, raw in entries:
+                spool.write(json.dumps({"source": source,
+                                        "raw": base64.b64encode(raw).decode("ascii")}) + "\n")
+
+    def _spool_entries(self, agent_handle):
+        if not isinstance(agent_handle, str) or not agent_handle:
+            raise lb.LauncherError(lb.FAILURE_UNAVAILABLE, "no thread is named")
+        path = self._spool_path(agent_handle)
+        if not os.path.isfile(path):
+            raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
+                                   "this launcher holds no output of thread %s" % agent_handle)
+        with open(path) as spool:
+            entries = [json.loads(line) for line in spool if line.strip()]
+        return [(entry["source"], base64.b64decode(entry["raw"])) for entry in entries]
