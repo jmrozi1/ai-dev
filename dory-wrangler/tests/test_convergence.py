@@ -1350,11 +1350,33 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
                 return real(*args, **kwargs)
             return call
 
+        def free(names):
+            out = []
+            for name in names:
+                fd = real_os_open(os.path.join(base, name, atomic.STORE_LOCK_NAME), os.O_RDWR)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    out.append(name)
+                except BlockingIOError:
+                    out.append("held:" + name)
+                finally:
+                    real_close(fd)
+            return " ".join(out)
+
+        real_os_open = os.open
+        report = []
+        # 0. A holder collected with the guard free is given back at once.
+        collected_holder("z")
+        gc.collect()
+        report.append(free("z"))
         # 1. A holder collected while `own_store` holds the guard.
         collected_holder("a")
         os.makedirs = collecting(real_makedirs)
-        ChatStore(os.path.join(base, "b")).acquire()
+        held = ChatStore(os.path.join(base, "b"))  # kept, so only `own_store` can apply "a"
+        held.acquire()
         os.makedirs = real_makedirs
+        report.append(free("ab"))
         # 2. A holder collected while an explicit close holds the guard.
         closing = ChatStore(os.path.join(base, "c"))
         closing.acquire()
@@ -1362,18 +1384,8 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
         os.close = collecting(real_close)
         closing.close()
         os.close = real_close
-
-        free = []
-        for name in "abcd":
-            fd = os.open(os.path.join(base, name, atomic.STORE_LOCK_NAME), os.O_RDWR)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                free.append(name)
-            except BlockingIOError:
-                pass
-            finally:
-                os.close(fd)
-        print(" ".join(free), len(atomic._OWNERS))
+        report.append(free("cd"))
+        print(" | ".join(report), len(atomic._OWNERS))
     """)
 
     def test_a_store_collected_while_the_guard_is_held_does_not_deadlock(self):
@@ -1390,8 +1402,9 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
                 timeout=60)
         except subprocess.TimeoutExpired:
             self.fail("a store collected while the store-lock guard was held deadlocked")
-        self.assertEqual((done.returncode, done.stdout.strip()), (0, "a b c d 0"),
-                         "every collected or closed hold is given back: %s" % done.stdout)
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "z | a held:b | c d 1"),
+                         "every collected or closed hold is given back, and by the time the "
+                         "call that met it returns: %s" % done.stdout)
 
     def test_the_lock_is_released_only_by_the_last_holder_in_the_process(self):
         root = support.scratch_root()

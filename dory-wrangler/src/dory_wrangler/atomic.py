@@ -239,7 +239,7 @@ _OWNERS = {}
 # by the same thread: a finalizer that waited for the guard there waited for
 # itself, forever (found by the remediation sweep's re-run). So a finalizer
 # never waits. It leaves its key here and applies it only if the guard is free;
-# whoever holds the guard applies every key left here before letting go.
+# whoever holds the guard applies every key left here once it has let go.
 _COLLECTED = []
 
 
@@ -263,10 +263,7 @@ def own_store(root):
     key = os.path.realpath(root)
     try:
         with _OWNERS_GUARD:
-            try:
-                return _own(key)
-            finally:
-                _apply_collected()
+            return _own(key)
     finally:
         _apply_collected_if_free()
 
@@ -304,10 +301,7 @@ def disown_store(key):
     """
     try:
         with _OWNERS_GUARD:
-            try:
-                _disown(key)
-            finally:
-                _apply_collected()
+            _disown(key)
     finally:
         _apply_collected_if_free()
 
@@ -316,7 +310,7 @@ def disown_collected_store(key):
     """`disown_store` for a finalizer, which may run with the guard already held.
 
     It never waits for the guard. If the guard is free the hold is given back
-    now; if not, the holder gives it back before it lets go of the guard.
+    now; if not, the holder gives it back as soon as it has let go of the guard.
     """
     _COLLECTED.append(key)
     _apply_collected_if_free()
@@ -345,8 +339,9 @@ def _apply_collected():
 def _apply_collected_if_free():
     """Without the guard: give back what finalizers left, if nobody holds it.
 
-    Whoever does hold it applies them before letting go, so nothing left here
-    outlives the guard's current holder.
+    Every guarded section calls this once it has let go, so a key left while
+    the guard was held -- by a finalizer on that thread or any other -- does not
+    outlive the guard's current holder.
     """
     while _COLLECTED and _OWNERS_GUARD.acquire(False):
         try:
