@@ -233,6 +233,14 @@ _OWNERS_GUARD = threading.Lock()
 # per process: two descriptors on the same file in one process would refuse each
 # other, and v0.1's rule is about processes, not about objects inside one.
 _OWNERS = {}
+# Holds given back by a `ChatStore` the garbage collector finalized, not yet
+# applied to `_OWNERS`. The collector runs a finalizer at any allocation, which
+# can be inside `own_store` or `disown_store` with `_OWNERS_GUARD` already held
+# by the same thread: a finalizer that waited for the guard there waited for
+# itself, forever (found by the remediation sweep's re-run). So a finalizer
+# never waits. It leaves its key here and applies it only if the guard is free;
+# whoever holds the guard applies every key left here before letting go.
+_COLLECTED = []
 
 
 def own_store(root):
@@ -253,45 +261,98 @@ def own_store(root):
     already has both.
     """
     key = os.path.realpath(root)
-    with _OWNERS_GUARD:
-        entry = _OWNERS.get(key)
-        if entry is not None and entry[2] == os.getpid():
-            entry[1] += 1
-            return key, False
-        if entry is not None:
-            # Inherited across a fork that did not exec: the lock is the
-            # parent's open file description, not this process's.
-            raise StoreInUse("the store at %s is held by another process" % key)
-        os.makedirs(key, exist_ok=True)
-        fd = os.open(os.path.join(key, STORE_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(fd)
-            raise StoreInUse(
-                "another process is serving the store at %s; v0.1 has one serving "
-                "process per store, and this one changed nothing" % key)
-        except BaseException:
-            os.close(fd)
-            raise
-        _OWNERS[key] = [fd, 1, os.getpid()]
-        return key, True
+    try:
+        with _OWNERS_GUARD:
+            try:
+                return _own(key)
+            finally:
+                _apply_collected()
+    finally:
+        _apply_collected_if_free()
+
+
+def _own(key):
+    entry = _OWNERS.get(key)
+    if entry is not None and entry[2] == os.getpid():
+        entry[1] += 1
+        return key, False
+    if entry is not None:
+        # Inherited across a fork that did not exec: the lock is the
+        # parent's open file description, not this process's.
+        raise StoreInUse("the store at %s is held by another process" % key)
+    os.makedirs(key, exist_ok=True)
+    fd = os.open(os.path.join(key, STORE_LOCK_NAME), os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        os.close(fd)
+        raise StoreInUse(
+            "another process is serving the store at %s; v0.1 has one serving "
+            "process per store, and this one changed nothing" % key)
+    except BaseException:
+        os.close(fd)
+        raise
+    _OWNERS[key] = [fd, 1, os.getpid()]
+    return key, True
 
 
 def disown_store(key):
-    """Give back one hold taken by `own_store`; the last one releases the lock."""
-    with _OWNERS_GUARD:
-        entry = _OWNERS.get(key)
-        if entry is None or entry[2] != os.getpid():
-            return
-        entry[1] -= 1
-        if entry[1] > 0:
-            return
-        del _OWNERS[key]
+    """Give back one hold taken by `own_store`; the last one releases the lock.
+
+    For an explicit close. It waits for the guard, so the hold is given back
+    before it returns.
+    """
+    try:
+        with _OWNERS_GUARD:
+            try:
+                _disown(key)
+            finally:
+                _apply_collected()
+    finally:
+        _apply_collected_if_free()
+
+
+def disown_collected_store(key):
+    """`disown_store` for a finalizer, which may run with the guard already held.
+
+    It never waits for the guard. If the guard is free the hold is given back
+    now; if not, the holder gives it back before it lets go of the guard.
+    """
+    _COLLECTED.append(key)
+    _apply_collected_if_free()
+
+
+def _disown(key):
+    entry = _OWNERS.get(key)
+    if entry is None or entry[2] != os.getpid():
+        return
+    entry[1] -= 1
+    if entry[1] > 0:
+        return
+    del _OWNERS[key]
+    try:
+        fcntl.flock(entry[0], fcntl.LOCK_UN)
+    finally:
+        os.close(entry[0])
+
+
+def _apply_collected():
+    """With the guard held: give back every hold a finalizer left."""
+    while _COLLECTED:
+        _disown(_COLLECTED.pop(0))
+
+
+def _apply_collected_if_free():
+    """Without the guard: give back what finalizers left, if nobody holds it.
+
+    Whoever does hold it applies them before letting go, so nothing left here
+    outlives the guard's current holder.
+    """
+    while _COLLECTED and _OWNERS_GUARD.acquire(False):
         try:
-            fcntl.flock(entry[0], fcntl.LOCK_UN)
+            _apply_collected()
         finally:
-            os.close(entry[0])
+            _OWNERS_GUARD.release()
 
 
 def describe_environment():

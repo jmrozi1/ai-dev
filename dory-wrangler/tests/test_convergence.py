@@ -1196,6 +1196,69 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
         third.acquire()
         self.assertFalse(os.path.exists(temp), "taking the lock did not sweep")
 
+    COLLECTED_WHILE_GUARDED = textwrap.dedent("""
+        import fcntl, gc, os, sys
+        sys.path.insert(0, sys.argv[1])
+        from dory_wrangler import atomic
+        from dory_wrangler.store import ChatStore
+        base = sys.argv[2]
+
+        def collected_holder(name):
+            store = ChatStore(os.path.join(base, name))
+            store.acquire()
+            store.cycle = store  # freed only by the cyclic collector
+
+        real_makedirs, real_close = os.makedirs, os.close
+
+        def collecting(real):
+            def call(*args, **kwargs):
+                gc.collect()
+                return real(*args, **kwargs)
+            return call
+
+        # 1. A holder collected while `own_store` holds the guard.
+        collected_holder("a")
+        os.makedirs = collecting(real_makedirs)
+        ChatStore(os.path.join(base, "b")).acquire()
+        os.makedirs = real_makedirs
+        # 2. A holder collected while an explicit close holds the guard.
+        closing = ChatStore(os.path.join(base, "c"))
+        closing.acquire()
+        collected_holder("d")
+        os.close = collecting(real_close)
+        closing.close()
+        os.close = real_close
+
+        free = []
+        for name in "abcd":
+            fd = os.open(os.path.join(base, name, atomic.STORE_LOCK_NAME), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                free.append(name)
+            except BlockingIOError:
+                pass
+            finally:
+                os.close(fd)
+        print(" ".join(free), len(atomic._OWNERS))
+    """)
+
+    def test_a_store_collected_while_the_guard_is_held_does_not_deadlock(self):
+        """Found when the remediation sweep was re-run: the collector finalized a
+        held `ChatStore` inside `own_store`, whose finalizer then waited for the
+        guard its own thread held, and the suite hung. Deterministic here by
+        collecting at exactly those points, in a child with a deadline, so a
+        regression fails this test rather than hanging the suite."""
+        base = support.scratch_root()
+        try:
+            done = subprocess.run(
+                [sys.executable, "-c", self.COLLECTED_WHILE_GUARDED, support.SRC, base],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True,
+                timeout=60)
+        except subprocess.TimeoutExpired:
+            self.fail("a store collected while the store-lock guard was held deadlocked")
+        self.assertEqual((done.returncode, done.stdout.strip()), (0, "a b c d 0"),
+                         "every collected or closed hold is given back: %s" % done.stdout)
+
     def test_the_lock_is_released_only_by_the_last_holder_in_the_process(self):
         root = support.scratch_root()
         first, second = ChatStore(root), ChatStore(root)

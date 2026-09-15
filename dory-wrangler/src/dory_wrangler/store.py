@@ -227,7 +227,9 @@ class ChatStore(object):
         if self._release is not None and self._release.alive:
             return
         key, first = atomic.own_store(self.root)
-        self._release = weakref.finalize(self, atomic.disown_store, key)
+        # A store dropped without `close` gives its hold back when collected,
+        # through the finalizer-safe release (it never waits for the guard).
+        self._release = weakref.finalize(self, atomic.disown_collected_store, key)
         os.makedirs(self.chats_dir, exist_ok=True)
         os.makedirs(self.diagnostics_dir, exist_ok=True)
         if first and self._sweep:
@@ -236,8 +238,10 @@ class ChatStore(object):
     def close(self):
         """Give the store-level lock back. A later write takes it again."""
         if self._release is not None:
-            self._release()
+            detached = self._release.detach()
             self._release = None
+            if detached is not None:
+                atomic.disown_store(*detached[2])
 
     @property
     def held(self):
