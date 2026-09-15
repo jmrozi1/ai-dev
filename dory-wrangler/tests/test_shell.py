@@ -102,6 +102,48 @@ class TestShellFlows(ShellCase):
                         'box.value = "";\n        fitComposer();'):
             self.assertIn(binding, page)
 
+    def test_enter_does_not_send_while_a_send_is_in_flight(self):
+        """Re-review N1, its one-tab half, held from the served source: the Enter
+        handler returns without submitting while Send is disabled -- the gate the
+        button itself has -- and the submit handler disables Send before it
+        starts a request and enables it only once that request has settled. No
+        browser runs here, so the key behaviour itself is not browser-verified;
+        the server's refusal of a send during a turn in flight is the guarantee
+        (test_convergence.ATurnInFlightRefusesEveryOtherUserAction)."""
+        import re
+        status, page = self.shell.get_page()
+        self.assertEqual(status, 200)
+        keydown = re.findall(
+            r'getElementById\("text"\)\.addEventListener\("keydown", function \(event\) \{'
+            r'(.*?)\n\}\);', page, re.S)
+        self.assertEqual(len(keydown), 1, "the page no longer has one composer key handler")
+        branch = re.search(r'if \(event\.key === "Enter" && !event\.shiftKey\) \{(.*?)\n  \}',
+                           keydown[0], re.S)
+        self.assertIsNotNone(branch, "the Enter branch is no longer where it was")
+        statements = [line.strip() for line in branch.group(1).splitlines()
+                      if line.strip() and not line.strip().startswith("//")]
+        self.assertEqual(statements, [
+            "event.preventDefault();",
+            'if (document.getElementById("send").disabled) { return; }',
+            'document.getElementById("form").dispatchEvent(new Event("submit", {cancelable: true}));',
+        ])
+
+        submit = re.search(
+            r'getElementById\("form"\)\.addEventListener\("submit", function \(event\) \{'
+            r'(.*?)\n\}\);', page, re.S)
+        self.assertIsNotNone(submit)
+        body = submit.group(1)
+        disabled = body.index('document.getElementById("send").disabled = true;')
+        self.assertLess(disabled, body.index("var started = "),
+                        "Send is disabled only after the request has started")
+        self.assertEqual(body.count("disabled = true"), 1)
+        self.assertEqual(body.count("disabled = false"), 1)
+        settled = re.search(r'started\.catch\(function \(err\) \{.*?\}\)\.then\(function \(\) \{'
+                            r'\s*document\.getElementById\("send"\)\.disabled = false;', body, re.S)
+        self.assertIsNotNone(settled, "Send is enabled before the request has settled")
+        self.assertEqual(len(re.findall(r'dispatchEvent\(new Event\("submit"', page)), 1,
+                         "another path submits the composer")
+
     def test_new_chat_flow_then_list_then_open(self):
         status, first = self.shell.post("/api/chats", {})
         self.assertEqual(status, 201)

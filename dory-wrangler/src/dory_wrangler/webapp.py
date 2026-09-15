@@ -430,6 +430,10 @@ fitComposer();
 document.getElementById("text").addEventListener("keydown", function (event) {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
+    // The same gate as the disabled Send button: no second send while one is in
+    // flight (decision 0003). The server refuses one anyway; this only keeps a
+    // single tab from provoking that refusal.
+    if (document.getElementById("send").disabled) { return; }
     document.getElementById("form").dispatchEvent(new Event("submit", {cancelable: true}));
   }
 });
