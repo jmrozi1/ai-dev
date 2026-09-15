@@ -776,6 +776,29 @@ class ASecondShellAgainstALiveOneChangesNothing(unittest.TestCase, StoreCheck):
                      launcher_config={"launcher": "scripted-stub"}).server_close()
 
 
+def refused_at_once(test, action, seconds=20):
+    """Run a user action that must be refused while another holder has the chat,
+    in its own thread -- each HTTP request is one -- with a deadline for the test,
+    not the product. Returns what it raised. A regression that waits for the
+    holder instead of refusing fails here rather than hanging the suite or
+    waiting out the holder."""
+    result = {}
+
+    def run():
+        try:
+            result["value"] = action()
+        except BaseException as exc:  # noqa: BLE001 - returned to the caller
+            result["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(seconds)
+    test.assertFalse(thread.is_alive(), "the action waited for the chat's holder instead "
+                                        "of being refused")
+    test.assertIn("error", result, "the action was not refused: %r" % (result.get("value"),))
+    return result["error"]
+
+
 class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):
     """The same lock, between threads, at the two points a race would bite.
 
@@ -821,8 +844,9 @@ class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):
         self.assertTrue(parked.wait(30))
         before = harness.store.export_records()
         # Still parked: the second send is refused while the first holds the chat.
-        with self.assertRaises(TurnInFlightRefused):
-            harness.send_turn(chat_id, "second")
+        self.assertIsInstance(
+            refused_at_once(self, lambda: harness.send_turn(chat_id, "second")),
+            TurnInFlightRefused)
         self.assertFalse(release.is_set())
         self.assertEqual(harness.store.export_records(), before, "a refused send wrote")
         self.assertEqual(calls, ["first"], "the refused send got as far as composing")
@@ -870,8 +894,7 @@ class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):
         before = harness.store.export_records()
         for action in (lambda: harness.abandon(chat_id),
                        lambda: harness.stop_agent(chat_id, "the user pressed Stop")):
-            with self.assertRaises(TurnInFlightRefused):
-                action()
+            self.assertIsInstance(refused_at_once(self, action), TurnInFlightRefused)
         self.assertFalse(release.is_set())
         self.assertEqual(harness.store.export_records(), before, "a refused action wrote")
         self.assertEqual(launcher.stop_calls, [])
@@ -985,8 +1008,9 @@ class ATurnInFlightRefusesEveryOtherUserAction(unittest.TestCase, StoreCheck):
                     before = harness.store.export_records()
                     addressed = list(launcher.addressed)
                     for name in self.ACTIONS:
-                        with self.assertRaises(TurnInFlightRefused, msg=name):
-                            self.act(harness, chat_id, name)
+                        self.assertIsInstance(
+                            refused_at_once(self, lambda: self.act(harness, chat_id, name)),
+                            TurnInFlightRefused, name)
                     self.assertEqual(harness.store.export_records(), before)
                     self.assertEqual(launcher.addressed, addressed)
                     let_go()
@@ -1003,8 +1027,8 @@ class ATurnInFlightRefusesEveryOtherUserAction(unittest.TestCase, StoreCheck):
         chat_id = harness.create_chat("Nothing yet")
         let_go = self.held_by_another_descriptor(harness, chat_id)
         before = harness.store.export_records()
-        with self.assertRaises(TurnInFlightRefused):
-            harness.send_turn(chat_id, "hello")
+        self.assertIsInstance(refused_at_once(self, lambda: harness.send_turn(chat_id, "hello")),
+                              TurnInFlightRefused)
         self.assertEqual(harness.store.export_records(), before)
         let_go()
         self.assertEqual(harness.send_turn(chat_id, "hello").session_state, "completed")
@@ -1037,8 +1061,9 @@ class ATurnInFlightRefusesEveryOtherUserAction(unittest.TestCase, StoreCheck):
         self.assertTrue(parked.wait(30))
         before = harness.store.export_records()
         for name in self.ACTIONS:
-            with self.assertRaises(TurnInFlightRefused, msg=name):
-                self.act(harness, chat_id, name)
+            self.assertIsInstance(
+                refused_at_once(self, lambda: self.act(harness, chat_id, name)),
+                TurnInFlightRefused, name)
         self.assertEqual(harness.store.export_records(), before)
         self.assertEqual(launcher.stop_calls, [])
         release.set()
