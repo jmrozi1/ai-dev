@@ -40,6 +40,7 @@ from .errors import (
     InstructionTooLarge,
     NotFound,
     StoreError,
+    TurnInFlightRefused,
 )
 from .launch_boundary import LaunchBoundaryError
 from .service import ChatService
@@ -53,6 +54,13 @@ REFUSED_BUSY = (
     "This chat's agent has not finished, or whether it has cannot be determined, "
     "so your message was not sent. If the agent cannot be reached, abandon it and "
     "send again."
+)
+# A send, or the Abandon action, that met a turn already in flight on the chat
+# (decision 0003): refused, not queued or deferred, and v0.1 does not interrupt
+# the turn in flight, so the user is told it must finish first.
+REFUSED_IN_FLIGHT = (
+    "This chat's agent is still answering, and that answer must finish first; it "
+    "cannot be interrupted. Nothing was sent or changed."
 )
 REFUSED_TOO_LARGE = "This message is larger than the agent here accepts; it was not sent."
 REFUSED_OTHER = "That is not possible for this chat right now; nothing was changed."
@@ -82,8 +90,8 @@ NEEDS_TEXT = "a message needs text"
 # Every sentence an error body may carry. A test holds every served error body
 # to this set, so adding a path that answers with anything else fails there.
 ERROR_WORDS = frozenset((
-    REFUSED_BUSY, REFUSED_TOO_LARGE, REFUSED_OTHER, INTEGRATION_FAILED, NO_SUCH_ROUTE,
-    NOT_FOUND, UNREADABLE, STORE_REFUSED, FAILED, BAD_LENGTH, TOO_LARGE, NOT_JSON,
+    REFUSED_BUSY, REFUSED_IN_FLIGHT, REFUSED_TOO_LARGE, REFUSED_OTHER, INTEGRATION_FAILED,
+    NO_SUCH_ROUTE, NOT_FOUND, UNREADABLE, STORE_REFUSED, FAILED, BAD_LENGTH, TOO_LARGE, NOT_JSON,
     NOT_AN_OBJECT, NEEDS_TEXT,
 ))
 
@@ -565,6 +573,8 @@ class _BadRequest(Exception):
 
 
 def _refusal_words(exc):
+    if isinstance(exc, TurnInFlightRefused):
+        return REFUSED_IN_FLIGHT
     if isinstance(exc, ConcurrentLaunchRefused):
         return REFUSED_BUSY
     if isinstance(exc, InstructionTooLarge):

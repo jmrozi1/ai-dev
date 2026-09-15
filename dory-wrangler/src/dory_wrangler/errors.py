@@ -102,6 +102,19 @@ class ConcurrentLaunchRefused(HarnessError):
     """
 
 
+class TurnInFlightRefused(ConcurrentLaunchRefused):
+    """An action met another user action already in flight on the same chat.
+
+    Decision 0003 and the human's decisions of 2026-09-15: a turn sent while a
+    turn on the chat is in flight is **refused, not queued**, and a Stop or
+    Abandon that meets one is **refused, not deferred**. v0.1 lets a dispatched
+    turn finish and does not interrupt it (interruption is #83's supervision
+    work), so the refused action has changed nothing, and the user may act again
+    once the turn in flight has ended. A subclass of `ConcurrentLaunchRefused`
+    because a second turn arriving during a first is that refusal's case too.
+    """
+
+
 class InstructionTooLarge(HarnessError):
     """The instruction exceeds a bound this launcher declared it has measured.
 

@@ -774,24 +774,29 @@ class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):
     """The same lock, between threads, at the two points a race would bite.
 
     Each test lets a second action start while the first is parked at the exact
-    point the lock exists to protect, then releases the first. With the lock the
-    second always waits, so the outcome below is certain; without it the second
-    runs into the window and the outcome differs. Nothing here depends on how
-    long anything takes when the lock is present.
+    point the lock exists to protect. Decision 0003 and the human's decisions of
+    2026-09-15 (re-review N1, N2): the second is **refused at once**, before it
+    writes anything -- not queued behind the first, and not deferred until it
+    ends. Nothing here depends on how long anything takes: the first action is
+    still parked, by construction, while the second's outcome is asserted.
+
+    Both tests changed expectation deliberately in the in-flight refusal rail.
+    They used to assert that the second send waited and was then delivered
+    (`first, answer, second, answer`), and that an Abandon waited for the turn
+    and then acted; that was the queueing N1 and N2 found.
     """
 
     def test_a_second_send_cannot_interleave_between_the_check_and_the_record(self):
         import threading
-        parked, release, entered_twice = threading.Event(), threading.Event(), threading.Event()
+        from dory_wrangler.errors import TurnInFlightRefused
+        parked, release = threading.Event(), threading.Event()
         calls = []
 
         def compose(chat_id, text, store):
             calls.append(text)
             if len(calls) == 1:
                 parked.set()
-                release.wait(10)
-            else:
-                entered_twice.set()
+                release.wait(30)
             return text
 
         harness = support.harness({"launcher": "scripted-stub"}, compose=compose)
@@ -806,51 +811,302 @@ class TheTurnLockHoldsWithinOneProcess(unittest.TestCase, StoreCheck):
 
         first = threading.Thread(target=send, args=("first",))
         first.start()
-        self.assertTrue(parked.wait(10))
-        second = threading.Thread(target=send, args=("second",))
-        second.start()
-        entered_twice.wait(1.0)  # with the lock this never happens before release
+        self.addCleanup(release.set)
+        self.assertTrue(parked.wait(30))
+        before = harness.store.export_records()
+        # Still parked: the second send is refused while the first holds the chat.
+        with self.assertRaises(TurnInFlightRefused):
+            harness.send_turn(chat_id, "second")
+        self.assertFalse(release.is_set())
+        self.assertEqual(harness.store.export_records(), before, "a refused send wrote")
+        self.assertEqual(calls, ["first"], "the refused send got as far as composing")
         release.set()
-        first.join(10)
-        second.join(10)
+        first.join(30)
         self.assertEqual(errors, [])
         self.assertEqual([t for _, _, t in harness.transcript(chat_id)],
-                         ["first", "answer to: first", "second", "answer to: second"])
-        self.assert_store_valid(harness.store, "two-threads-send-serialised")
+                         ["first", "answer to: first"])
+        # Once the turn has ended the chat takes a turn as before.
+        harness.send_turn(chat_id, "third")
+        self.assertEqual([t for _, _, t in harness.transcript(chat_id)],
+                         ["first", "answer to: first", "third", "answer to: third"])
+        self.assert_store_valid(harness.store, "two-threads-second-send-refused")
 
-    def test_abandon_waits_for_the_turn_in_flight(self):
+    def test_abandon_during_the_turn_in_flight_is_refused_and_records_nothing(self):
         import threading
+        from dory_wrangler.errors import TurnInFlightRefused
         parked, release = threading.Event(), threading.Event()
 
         class Parks(ScriptedStubLauncher):
+            armed = True
+
             def launch(self, instruction):
-                parked.set()
-                release.wait(10)
+                if Parks.armed:
+                    Parks.armed = False
+                    parked.set()
+                    release.wait(30)
                 return ScriptedStubLauncher.launch(self, instruction)
 
-        harness = support.harness({}, launcher=Parks({"launch_outcomes": ["unknown"]}))
+        # A persistent launcher that confirms stops: the shape on which a deferred
+        # Abandon used to record `running -> terminated` dated after the answer.
+        launcher = Parks({"continuation": "persistent", "response_shape": "one_shot",
+                          "stop_confirms": True})
+        harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("Abandon during a launch")
         outcome = {}
-        turn = threading.Thread(target=lambda: harness.send_turn(chat_id, "hello"))
-        turn.start()
-        self.assertTrue(parked.wait(10))
 
-        def abandon():
-            try:
-                outcome["state"] = harness.abandon(chat_id)
-            except Exception as exc:  # noqa: BLE001
-                outcome["error"] = exc
+        def turn():
+            outcome["turn"] = harness.send_turn(chat_id, "hello").session_state
 
-        user = threading.Thread(target=abandon)
-        user.start()
-        user.join(1.0)  # with the lock it is still waiting here
+        thread = threading.Thread(target=turn)
+        thread.start()
+        self.addCleanup(release.set)
+        self.assertTrue(parked.wait(30))
+        before = harness.store.export_records()
+        for action in (lambda: harness.abandon(chat_id),
+                       lambda: harness.stop_agent(chat_id, "the user pressed Stop")):
+            with self.assertRaises(TurnInFlightRefused):
+                action()
+        self.assertFalse(release.is_set())
+        self.assertEqual(harness.store.export_records(), before, "a refused action wrote")
+        self.assertEqual(launcher.stop_calls, [])
         release.set()
-        turn.join(10)
-        user.join(10)
-        self.assertEqual(outcome, {"state": "abandoned"},
-                         "abandon acted on a launch still in flight instead of waiting "
-                         "for the outcome it abandons")
-        self.assert_store_valid(harness.store, "abandon-waits-for-the-turn")
+        thread.join(30)
+        self.assertEqual(outcome, {"turn": "running"})
+        session = harness.store.list_sessions(chat_id)[0][0]
+        self.assertEqual([t["to"] for t in session["transitions"]],
+                         ["pending", "launching", "running"])
+        self.assertEqual(harness.store.read_session_observations(chat_id), [])
+        # After the turn the one action works as before: a Stop that reaches the
+        # agent, confirmed.
+        self.assertEqual(harness.abandon(chat_id), "terminated")
+        self.assertEqual(len(launcher.stop_calls), 1)
+        self.assert_store_valid(harness.store, "abandon-during-the-turn-refused")
+
+
+class ATurnInFlightRefusesEveryOtherUserAction(unittest.TestCase, StoreCheck):
+    """Decision 0003, re-review N1 and N2, over every session state and both ways
+    the chat's turn lock can be held elsewhere: by another thread of this loop
+    (the in-process lock) and by another descriptor on the lock file (the
+    `flock`, which is what another process holds). A send, an Abandon and a Stop
+    are each refused with `TurnInFlightRefused`, nothing is written, and the
+    launcher is asked nothing."""
+
+    ACTIONS = ("send_turn", "abandon", "stop_agent")
+
+    def act(self, harness, chat_id, name):
+        if name == "send_turn":
+            return harness.send_turn(chat_id, "refused while held")
+        if name == "abandon":
+            return harness.abandon(chat_id)
+        return harness.stop_agent(chat_id, "the user pressed Stop")
+
+    def held_by_another_thread(self, harness, chat_id):
+        import threading
+        taken, release = threading.Event(), threading.Event()
+
+        def hold():
+            with harness._turns.hold(chat_id, blocking=False) as held:
+                taken.acquired = held.acquired
+                taken.set()
+                release.wait(30)
+
+        thread = threading.Thread(target=hold, daemon=True)
+        thread.start()
+        self.assertTrue(taken.wait(30))
+        self.assertTrue(taken.acquired)
+
+        def let_go():
+            release.set()
+            thread.join(30)
+        self.addCleanup(let_go)
+        return let_go
+
+    def held_by_another_descriptor(self, harness, chat_id):
+        other = SessionManager(ChatStore(harness.store.root), ScriptedStubLauncher({}))
+        held = other._turns.hold(chat_id, blocking=False)
+        held.__enter__()
+        self.assertTrue(held.acquired)
+
+        def let_go():
+            if held.acquired:
+                held.__exit__(None, None, None)
+                held.acquired = False
+        self.addCleanup(let_go)
+        return let_go
+
+    def stranded_by_a_clock_step(self, harness, chat_id, to_state):
+        real = harness.store.append_transition
+
+        def stepped(*args, **kwargs):
+            if args[3] == to_state:
+                real_now, ids.now = ids.now, lambda: "2000-01-01T00:00:00.000000Z"
+                try:
+                    return real(*args, **kwargs)
+                finally:
+                    ids.now = real_now
+            return real(*args, **kwargs)
+
+        harness.store.append_transition = stepped
+        try:
+            with self.assertRaises(ValidationRefused):
+                harness.send_turn(chat_id, "hello")
+        finally:
+            del harness.store.append_transition
+
+    def in_state(self, state):
+        launcher = ScriptedStubLauncher(
+            {"continuation": "persistent", "response_shape": "one_shot",
+             "launch_outcomes": ["unknown"] if state == "unknown" else []})
+        harness = support.harness({}, launcher=launcher)
+        chat_id = harness.create_chat("Held in %s" % state)
+        if state == "pending":
+            self.stranded_by_a_clock_step(harness, chat_id, "launching")
+        elif state == "launching":
+            self.stranded_by_a_clock_step(harness, chat_id, "running")
+        else:
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(harness.store.list_sessions(chat_id)[0][0]["state"], state)
+        return harness, launcher, chat_id
+
+    def test_every_action_in_every_non_terminal_state_is_refused_while_held(self):
+        from dory_wrangler.errors import TurnInFlightRefused
+        for holder in ("thread", "descriptor"):
+            for state in ("pending", "launching", "running", "unknown"):
+                with self.subTest(holder=holder, state=state):
+                    harness, launcher, chat_id = self.in_state(state)
+                    let_go = (self.held_by_another_thread if holder == "thread"
+                              else self.held_by_another_descriptor)(harness, chat_id)
+                    before = harness.store.export_records()
+                    addressed = list(launcher.addressed)
+                    for name in self.ACTIONS:
+                        with self.assertRaises(TurnInFlightRefused, msg=name):
+                            self.act(harness, chat_id, name)
+                    self.assertEqual(harness.store.export_records(), before)
+                    self.assertEqual(launcher.addressed, addressed)
+                    let_go()
+                    # Given back, the one action is the exit it always was.
+                    harness.abandon(chat_id)
+                    self.assertIn(harness.store.list_sessions(chat_id)[0][0]["state"],
+                                  ("launch_failed", "terminated", "abandoned"))
+                    self.assert_store_valid(
+                        harness.store, "in-flight-refused-%s-%s" % (holder, state))
+
+    def test_a_chat_with_no_session_refuses_a_send_while_held(self):
+        from dory_wrangler.errors import TurnInFlightRefused
+        harness = support.harness({"launcher": "scripted-stub"})
+        chat_id = harness.create_chat("Nothing yet")
+        let_go = self.held_by_another_descriptor(harness, chat_id)
+        before = harness.store.export_records()
+        with self.assertRaises(TurnInFlightRefused):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(harness.store.export_records(), before)
+        let_go()
+        self.assertEqual(harness.send_turn(chat_id, "hello").session_state, "completed")
+
+    def test_a_turn_parked_in_deliver_refuses_a_send_an_abandon_and_a_stop(self):
+        """The persistent shape N1 names: between turns the session is `running`,
+        so the waiting turn used to be delivered after the first answer."""
+        import threading
+        from dory_wrangler.errors import TurnInFlightRefused
+        parked, release = threading.Event(), threading.Event()
+
+        class ParksInDeliver(ScriptedStubLauncher):
+            armed = False
+
+            def deliver(self, agent_handle, instruction):
+                if ParksInDeliver.armed:
+                    ParksInDeliver.armed = False
+                    parked.set()
+                    release.wait(30)
+                return ScriptedStubLauncher.deliver(self, agent_handle, instruction)
+
+        launcher = ParksInDeliver({"continuation": "persistent", "response_shape": "one_shot"})
+        harness = support.harness({}, launcher=launcher)
+        chat_id = harness.create_chat("Parked in deliver")
+        harness.send_turn(chat_id, "zero")
+        ParksInDeliver.armed = True
+        thread = threading.Thread(target=lambda: harness.send_turn(chat_id, "A"))
+        thread.start()
+        self.addCleanup(release.set)
+        self.assertTrue(parked.wait(30))
+        before = harness.store.export_records()
+        for name in self.ACTIONS:
+            with self.assertRaises(TurnInFlightRefused, msg=name):
+                self.act(harness, chat_id, name)
+        self.assertEqual(harness.store.export_records(), before)
+        self.assertEqual(launcher.stop_calls, [])
+        release.set()
+        thread.join(30)
+        self.assertEqual([t for _, _, t in harness.transcript(chat_id)],
+                         ["zero", "answer to: zero", "A", "answer to: A"])
+        self.assertEqual(len(launcher.deliver_calls), 1)
+        self.assert_store_valid(harness.store, "in-flight-deliver-refused")
+
+    def test_over_http_a_send_and_the_abandon_are_refused_with_fixed_words(self):
+        """Through the served application, in both continuation modes: a second
+        POST while the first turn is parked in `launch` answers 409 at once with
+        the in-flight words, writes nothing -- not even the chat's name -- and the
+        first turn completes as the only turn."""
+        import threading
+        from urllib.error import HTTPError
+        from urllib.request import Request, urlopen
+        from dory_wrangler import webapp
+
+        def call(port, path, payload):
+            request = Request("http://127.0.0.1:%d%s" % (port, path),
+                              data=json.dumps(payload).encode("utf-8"), method="POST",
+                              headers={"Content-Type": "application/json"})
+            try:
+                with urlopen(request, timeout=60) as response:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+            except HTTPError as exc:
+                return exc.code, json.loads(exc.read().decode("utf-8"))
+
+        for mode in ("persistent", "fresh_binding"):
+            with self.subTest(mode=mode):
+                parked, release = threading.Event(), threading.Event()
+                self.addCleanup(release.set)
+
+                class Parks(ScriptedStubLauncher):
+                    def launch(self, instruction):
+                        parked.set()
+                        release.wait(30)
+                        return ScriptedStubLauncher.launch(self, instruction)
+
+                launcher = Parks({"continuation": mode, "response_shape": "one_shot",
+                                  "stop_confirms": True})
+                root = support.scratch_root()
+                server = webapp.build_server(root, port=0, quiet=True, launcher=launcher)
+                threading.Thread(target=server.serve_forever,
+                                 kwargs={"poll_interval": 0.05}, daemon=True).start()
+                self.addCleanup(server.server_close)
+                self.addCleanup(server.shutdown)
+                port = server.server_address[1]
+                _status, chat = call(port, "/api/chats", {})
+                path = "/api/chats/%s" % chat["chat_id"]
+                first = {}
+                thread = threading.Thread(
+                    target=lambda: first.update(r=call(port, path + "/messages", {"text": "A"})))
+                thread.start()
+                self.assertTrue(parked.wait(30))
+                reader = ChatStore(root, read_only=True)
+                before = reader.export_records()
+                for route, payload in (("/messages", {"text": "B"}), ("/abandon", {})):
+                    status, body = call(port, path + route, payload)
+                    self.assertEqual((status, body),
+                                     (409, {"error": webapp.REFUSED_IN_FLIGHT, "refused": True}),
+                                     route)
+                self.assertFalse(release.is_set())
+                self.assertEqual(reader.export_records(), before, "a refused request wrote")
+                release.set()
+                thread.join(30)
+                self.assertEqual(first["r"][0], 201)
+                self.assertEqual([(m["author"], m["text"]) for m in first["r"][1]["messages"]],
+                                 [("user", "A"), ("agent", "answer to: A")])
+                self.assertEqual(first["r"][1]["title"], "A")
+                self.assertEqual(len(launcher.launch_calls), 1)
+                self.assertEqual(launcher.stop_calls, [])
+                self.assert_store_valid(reader, "in-flight-refused-http-%s" % mode)
 
 
 def completes_in_another_thread(test, action, seconds=20):
@@ -2462,6 +2718,97 @@ class EveryNonTerminalStateHasTheOneActionAsItsExit(unittest.TestCase, StoreChec
             self.assert_store_valid(service.store, "d2-holder-killed-then-restart")
         finally:
             server.server_close()
+
+    def test_a_turn_that_never_returns_is_exited_by_process_exit_restart_and_the_action(self):
+        """Decision 0003's claim about D2, verified rather than assumed: with an
+        Abandon during a turn in flight refused, a turn that never returns holds
+        its chat until its process exits. Here a persistent turn parks inside
+        `deliver` on a `running` session and never returns. While it is parked,
+        the one action in its own process is refused and writes nothing. Once the
+        process is killed, a restart re-attaches, and the one action is the exit:
+        on a launcher that cannot resume, `running -> unknown -> abandoned`; on one
+        that can, the user's confirmed stop, `running -> terminated`."""
+        import signal
+        import textwrap
+        from dory_wrangler.webapp import build_server
+        holder = textwrap.dedent(r"""
+            import os, sys, threading, time
+            sys.path.insert(0, sys.argv[1])
+            from dory_wrangler.errors import TurnInFlightRefused
+            from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
+            from dory_wrangler.store import ChatStore
+            from dory_wrangler.session_manager import SessionManager
+            root, chat_id, marker = sys.argv[2:5]
+            parked = threading.Event()
+            class ParksInDeliver(ScriptedStubLauncher):
+                def deliver(self, agent_handle, instruction):
+                    parked.set()
+                    time.sleep(600)
+            loop = SessionManager(ChatStore(root), ParksInDeliver(
+                {"continuation": "persistent", "response_shape": "one_shot"}))
+            loop.send_turn(chat_id, "zero")
+            threading.Thread(target=loop.send_turn, args=(chat_id, "never answered"),
+                             daemon=True).start()
+            parked.wait(60)
+            before = loop.store.export_records()
+            try:
+                loop.abandon(chat_id)
+                verdict = "abandon-was-not-refused"
+            except TurnInFlightRefused:
+                verdict = "refused" if loop.store.export_records() == before else "refused-but-wrote"
+            with open(marker + ".partial", "w") as handle:
+                handle.write(verdict)
+            os.replace(marker + ".partial", marker)
+            time.sleep(600)
+        """)
+        persistent = {"continuation": "persistent", "response_shape": "one_shot"}
+        for resumes in (False, True):
+            with self.subTest(resumes=resumes):
+                root = support.scratch_root()
+                store = ChatStore(root)
+                chat_id = store.create_chat("Never returns")["chat_id"]
+                store.close()
+                script = os.path.join(root, "..", os.path.basename(root) + "-never.py")
+                marker = os.path.join(root, "..", os.path.basename(root) + "-never-parked")
+                with open(script, "w") as handle:
+                    handle.write(holder)
+                child = subprocess.Popen([sys.executable, script, support.SRC, root, chat_id,
+                                          marker])
+                self.addCleanup(lambda child=child: child.poll() is None and child.kill())
+                # A deadline for the test, not the product.
+                watchdog = threading.Timer(120, child.kill)
+                watchdog.start()
+                self.addCleanup(watchdog.cancel)
+                while not os.path.exists(marker):
+                    self.assertIsNone(child.poll(), "the holder died before parking")
+                    time.sleep(0.02)
+                watchdog.cancel()
+                with open(marker) as handle:
+                    self.assertEqual(handle.read(), "refused")
+                child.send_signal(signal.SIGKILL)
+                child.wait()
+                reader = ChatStore(root, read_only=True)
+                session = reader.list_sessions(chat_id)[0][0]
+                self.assertEqual(session["state"], "running")
+                options = dict(persistent, resume_handles=[session["agent_handle"]]) \
+                    if resumes else dict(persistent)
+                server = build_server(root, port=0, quiet=True,
+                                      launcher=ScriptedStubLauncher(options))
+                try:
+                    service = server.service
+                    service.abandon(chat_id)
+                    route = [t["to"] for t in
+                             service.store.read_session(chat_id, session["session_id"])
+                             ["transitions"]]
+                    self.assertEqual(route[-2:], ["running", "terminated"] if resumes
+                                     else ["unknown", "abandoned"], route)
+                    after = service.send_user_message(chat_id, "after")
+                    self.assertEqual(after["messages"][-1]["text"], "answer to: after")
+                    self.assert_store_valid(
+                        service.store, "d2-never-returns-%s" % ("resumes" if resumes
+                                                                else "cannot-resume"))
+                finally:
+                    server.server_close()
 
 
 class AKillAtAnyWriteOfATurnLeavesAWholeStoreWithAnExit(unittest.TestCase, StoreCheck):

@@ -15,7 +15,7 @@ leave the user a way out.
 """
 
 from . import ids
-from .errors import StoreError
+from .errors import StoreError, TurnInFlightRefused
 from .wiring import open_harness
 
 DEFAULT_TITLE = "New chat"
@@ -131,12 +131,22 @@ class ChatService(object):
         the same history it would show after a restart. A refused turn raises
         before anything is recorded; a turn that was recorded names the chat even
         when what followed it failed.
+
+        A send refused because another turn on the chat is in flight writes
+        nothing at all, not even the chat's name (decision 0003, re-review N1):
+        the turn in flight belongs to another request, which names the chat
+        itself when it ends.
         """
         chat = self.store.read_chat(chat_id)
+        in_flight = False
         try:
             self.sessions.send_turn(chat_id, text)
+        except TurnInFlightRefused:
+            in_flight = True
+            raise
         finally:
-            self._name_from_first_turn(chat)
+            if not in_flight:
+                self._name_from_first_turn(chat)
         return self.open_chat(chat_id)
 
     def _name_from_first_turn(self, chat):

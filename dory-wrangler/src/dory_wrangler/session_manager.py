@@ -25,6 +25,7 @@ a harness action, or an explicit launcher observation.
 from __future__ import annotations
 
 import base64
+import contextlib
 import fcntl
 import os
 import threading
@@ -35,6 +36,7 @@ from .errors import (
     InstructionTooLarge,
     NotPermitted,
     StoreError,
+    TurnInFlightRefused,
     ValidationRefused,
 )
 from .launch_boundary import (
@@ -209,6 +211,13 @@ class ChatTurnLocks(object):
 
     A process that dies holding it releases it with its descriptor, so there is
     no stale lock to time out and nothing here measures time.
+
+    **No user action waits for it** (decision 0003; re-review N1, N2). Every user
+    action takes it without blocking and is refused, having written nothing, if
+    another thread or process holds it: a turn sent during a turn in flight is
+    refused rather than queued, and a Stop or Abandon is refused rather than
+    deferred. Only the same thread re-entering its own hold -- a launcher calling
+    back into the loop -- gets it, and meets the loop's own rules there.
     """
 
     def __init__(self, store):
@@ -275,11 +284,33 @@ class SessionManager(object):
                 "a user turn must carry text; an empty turn is refused rather than "
                 "recorded as a turn that happened")
 
-        with self._turns.hold(chat_id):
+        with self._user_action(chat_id):
             active = self._active_session(chat_id)
             if active is None:
                 return self._launch_turn(chat_id, text)
             return self._continue_turn(chat_id, active, text)
+
+    @contextlib.contextmanager
+    def _user_action(self, chat_id):
+        """Hold the chat's turn lock for one user action, or refuse the action.
+
+        The one place the in-flight policy lives (decision 0003). The hold is
+        taken **without waiting**: if another thread or process holds it, a user
+        action is already in flight on this chat, and v0.1 neither queues a turn
+        behind it, nor defers a Stop or Abandon until it ends, nor interrupts it.
+        The refusal is raised before anything durable is written, so the refused
+        action leaves no record, and the user may act again once the turn in
+        flight has finished. The same thread re-entering its own hold (a launcher
+        calling back into the loop) acquires it and meets the loop's own rules.
+        """
+        with self._turns.hold(chat_id, blocking=False) as held:
+            if not held.acquired:
+                raise TurnInFlightRefused(
+                    "chat %s has a user action in flight on another thread or "
+                    "process; v0.1 refuses this action rather than queueing or "
+                    "deferring it, and does not interrupt the action in flight, which "
+                    "must finish first (decision 0003)" % (chat_id,))
+            yield held
 
     def _active_session(self, chat_id):
         """The chat's live agent, if it has one.
@@ -743,8 +774,13 @@ class SessionManager(object):
         An unconfirmed stop is not a dead end and is not a failure: it is an
         observation that leaves liveness undeterminable, which carries the
         session to `unknown`, from which the user can always abandon.
+
+        A Stop that meets a user action in flight on this chat is refused with
+        `TurnInFlightRefused` and records nothing (decision 0003): v0.1 does not
+        interrupt a turn in flight, and a Stop that could not reach it must never
+        be recorded as `terminated` once the turn has ended.
         """
-        with self._turns.hold(chat_id):
+        with self._user_action(chat_id):
             session = self._active_session(chat_id)
             if session is None:
                 raise NotPermitted("chat %s has no live agent to stop" % chat_id)
@@ -825,12 +861,19 @@ class SessionManager(object):
         The action never calls `events`: on a live agent that is quiet `events`
         blocks, by design, and the exit must not.
 
-        **A user action in flight is not changed.** It holds the chat's turn lock,
-        so from another thread this waits for it to finish, as it always did; and
-        a launcher calling back into the loop during an action on this chat is
-        refused every exit but `unknown -> abandoned`, which it always had.
+        **A user action in flight is not interrupted, and this is not deferred
+        behind it.** The action in flight holds the chat's turn lock, so from
+        another thread or process this is refused at once with
+        `TurnInFlightRefused`, in every session state and with nothing recorded
+        (decision 0003): v0.1 lets a dispatched turn finish, and the user's action
+        is never turned into a `terminated` dated after it. The action is
+        available again as soon as the turn ends; a turn that never returns is
+        released when its process exits, and contract 5.4 re-attachment at the
+        next start gives the chat the exits above. A launcher calling back into
+        the loop during an action on this chat is refused every exit but
+        `unknown -> abandoned`, which it always had.
         """
-        with self._turns.hold(chat_id) as held:
+        with self._user_action(chat_id) as held:
             session = self._active_session(chat_id)
             if session is None:
                 raise NotPermitted("chat %s has no session to abandon" % chat_id)
