@@ -330,11 +330,17 @@ class ExactlyOneStoreAndOneServedApplication(unittest.TestCase):
     # call of that name -- `os.open` in session_manager.py, `atomic.replace`
     # through a module function in wiring.py -- was invisible; the review planted
     # exactly those two and every check stayed green. This one is exact at the
-    # granularity of the function: every call in the product that can create,
-    # change or remove a file, with the function it is made from. Equality, so a
-    # new writer anywhere -- a new function, a new call in an old function, an
-    # import that renames a publisher, an indirection through getattr/exec --
-    # fails here and has to be added deliberately.
+    # granularity of the function: every call `_writer` recognises as able to
+    # create, change or remove a file, with the function it is made from.
+    # Equality, so a new writer *of a recognised spelling* -- in a new function,
+    # a new call in an old function, an import that renames a publisher, an
+    # indirection through getattr/exec -- fails here and has to be added
+    # deliberately. The recognised spellings are `_writer`'s and only those:
+    # `open`/`io.open` in a writing mode, the `os` calls in `OS_WRITERS`, the
+    # atomic primitives, and anything from `shutil`, `tempfile` or `pathlib`.
+    # A writer spelled otherwise -- `codecs.open(path, "w")`, `io.FileIO(path,
+    # "w")` -- is not seen here (re-review N5), and the audited run below sees
+    # only the paths it exercises.
     WRITE_SITES = {
         # atomic.py: the primitives themselves
         ("src/dory_wrangler/atomic.py", "_write_temp", "os.open"),
@@ -1091,6 +1097,9 @@ class ATurnInFlightRefusesEveryOtherUserAction(unittest.TestCase, StoreCheck):
                 self.assertTrue(parked.wait(30))
                 reader = ChatStore(root, read_only=True)
                 before = reader.export_records()
+                # The words tell the user why, and what to do: wait for the answer.
+                self.assertIn("must finish first", webapp.REFUSED_IN_FLIGHT)
+                self.assertIn(webapp.REFUSED_IN_FLIGHT, webapp.ERROR_WORDS)
                 for route, payload in (("/messages", {"text": "B"}), ("/abandon", {})):
                     status, body = call(port, path + route, payload)
                     self.assertEqual((status, body),
