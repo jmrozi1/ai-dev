@@ -22,6 +22,7 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import unittest
 
@@ -573,6 +574,15 @@ class OneServingProcessPerStore(unittest.TestCase, StoreCheck):
         while not os.path.exists(marker):
             self.assertIsNone(child.poll(), "the other process died before launching")
             time.sleep(0.02)
+        # A deadline for the test, not the product: if this process is *not*
+        # refused, its turn waits on the chat's turn lock (by design, with no
+        # timeout) for the other process, which waits for this test. Releasing
+        # the other process after a minute turns that wait into the failed
+        # assertions below instead of a suite that never finishes (sweep A03,
+        # A04, A13). A refused run releases it itself, long before.
+        watchdog = threading.Timer(60, lambda: open(release, "w").close())
+        watchdog.start()
+        self.addCleanup(watchdog.cancel)
 
         reader = ChatStore(root, read_only=True)
         before = reader.export_records()
@@ -1053,6 +1063,34 @@ class StartUpGoesOnPastOneChatItCannotReAttach(unittest.TestCase, StoreCheck):
         status, body = call("POST", "/api/chats/%s/messages" % good, {"text": "again"})
         self.assertEqual((status, body["messages"][-1]["text"]), (201, "answer to: again"))
 
+    def test_what_is_not_a_chat_directory_is_not_listed_and_fails_validation(self):
+        """Sweep C02, S13, S14. The conversation list skips what cannot be a chat:
+        a directory whose name is not a chat id (nothing could address or open
+        it), a temp name, and a plain file even when named like a chat (the list
+        before convergence skipped non-directories too). That skip is a
+        behaviour change from convergence's `list_chats`, which failed the whole
+        list; it is not silent acceptance, because read-only validation still
+        fails closed on each shape."""
+        from dory_wrangler.service import ChatService
+        for name, make in (("notes", os.makedirs),
+                           (".tmp-staging", os.makedirs),
+                           ("cht_" + "0" * 24, lambda path: open(path, "w").close())):
+            root = support.scratch_root()
+            store = ChatStore(root)
+            good = store.create_chat("Good")["chat_id"]
+            store.close()
+            make(os.path.join(root, "chats", name))
+            service = ChatService.open(root, launcher_config={"launcher": "scripted-stub"})
+            self.assertEqual([(c["chat_id"], c.get("unreadable", False))
+                              for c in service.list_chats()], [(good, False)], name)
+            self.assertEqual(service.sessions.reattach_on_start(), [], name)
+            service.store.close()
+            tool = subprocess.run([sys.executable, os.path.join(PRODUCT, "validate_store.py"),
+                                   root], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                  universal_newlines=True)
+            expected = 0 if name.startswith(".tmp-") else 2
+            self.assertEqual(tool.returncode, expected, (name, tool.stdout))
+
     def test_an_archived_chat_is_re_attached_too(self):
         """M03. An archived chat's live agent is still a live agent."""
         root = support.scratch_root()
@@ -1195,6 +1233,102 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
         third = ChatStore(root)
         third.acquire()
         self.assertFalse(os.path.exists(temp), "taking the lock did not sweep")
+
+    FORKED_CHILD = textwrap.dedent("""
+        import fcntl, os, sys
+        sys.path.insert(0, sys.argv[1])
+        from dory_wrangler import atomic
+        from dory_wrangler.errors import StoreInUse
+        root = sys.argv[2]
+
+        def free():
+            fd = os.open(os.path.join(root, atomic.STORE_LOCK_NAME), os.O_RDWR)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                return True
+            except BlockingIOError:
+                return False
+            finally:
+                os.close(fd)
+
+        key, _first = atomic.own_store(root)
+        go_r, go_w = os.pipe()
+        report_r, report_w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(go_w)
+            os.close(report_r)
+            out = []
+            try:
+                atomic.own_store(root)
+                out.append("joined")
+            except StoreInUse:
+                out.append("refused")
+            atomic.disown_store(key)
+            out.append("parent-released" if free() else "parent-holds")
+            os.write(report_w, (" ".join(out) + "\\n").encode())
+            os.close(report_w)
+            os.read(go_r, 1)
+            os._exit(0)
+        os.close(go_r)
+        os.close(report_w)
+        child = b""
+        while not child.endswith(b"\\n"):
+            child += os.read(report_r, 100)
+        atomic.disown_store(key)  # while the child still has the inherited descriptor
+        after = "free" if free() else "still-held"
+        os.write(go_w, b"x")
+        os.waitpid(pid, 0)
+        print(child.decode().strip(), after)
+    """)
+
+    def test_a_forked_child_neither_joins_nor_gives_back_its_parents_hold(self):
+        """The three pid and unlock elements that only a fork without exec
+        reaches. Nothing in the product forks without exec, and they are pinned
+        rather than left untested by design because each guards the one lock
+        D1 rests on: a child joining the parent's hold would write without it,
+        a child's close would unlock the parent's open file description, and a
+        parent's close that only closed its descriptor would leave the lock held
+        by a child that inherited it. In a single-threaded child process."""
+        root = support.scratch_root()
+        done = subprocess.run([sys.executable, "-c", self.FORKED_CHILD, support.SRC, root],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              universal_newlines=True, timeout=60)
+        self.assertEqual((done.returncode, done.stdout.strip()),
+                         (0, "refused parent-holds free"), done.stdout)
+
+    @staticmethod
+    def descriptors():
+        return len(os.listdir("/proc/self/fd"))
+
+    def test_a_refused_acquisition_leaks_no_descriptor(self):
+        from dory_wrangler.errors import StoreInUse
+        root = support.scratch_root()
+        let_go = self.other_process_holds(root)
+        before = self.descriptors()
+        for _ in range(5):
+            with self.assertRaises(StoreInUse):
+                ChatStore(root).acquire()
+        self.assertEqual(self.descriptors(), before, "each refusal left a descriptor open")
+        let_go()
+
+    def test_a_store_lock_flock_that_fails_otherwise_leaks_nothing_and_holds_nothing(self):
+        import errno
+        from unittest import mock
+        from dory_wrangler import atomic
+        root = support.scratch_root()
+        before = self.descriptors()
+        failure = OSError(errno.ENOLCK, "No locks available")
+        with mock.patch.object(atomic.fcntl, "flock", side_effect=failure):
+            with self.assertRaises(OSError):
+                ChatStore(root).acquire()
+        self.assertEqual(self.descriptors(), before, "the failed flock left its descriptor open")
+        self.assertNotIn(os.path.realpath(root), atomic._OWNERS)
+        store = ChatStore(root)
+        store.acquire()
+        self.assertTrue(store.held)
+        store.close()
 
     COLLECTED_WHILE_GUARDED = textwrap.dedent("""
         import fcntl, gc, os, sys
@@ -1672,6 +1806,25 @@ class ATurnIsRecordedOnlyIfWhatItOpensIsAcceptable(unittest.TestCase, StoreCheck
         self.assertIn(outcome.session_state, ("completed", "running"))
         support.end_chat(good, chat_id)
         self.assert_store_valid(good.store, name)
+
+    def test_a_chat_whose_history_cannot_be_read(self):
+        """The pre-flight's creation precondition reads the chat's messages, and
+        it is the first thing on the launch path that does. A damaged history is
+        refused there, before the turn is written; without it the turn was
+        written and `create_session` then refused on the same damage (sweep S18)."""
+        from dory_wrangler.errors import StoreCorrupt
+        root = support.scratch_root()
+        harness = SessionManager(ChatStore(root), ScriptedStubLauncher({}))
+        chat_id = harness.create_chat("Damaged history")
+        harness.send_turn(chat_id, "hello")
+        messages = os.path.join(root, "chats", chat_id, "messages")
+        with open(os.path.join(messages, "00000001.json"), "w") as handle:
+            handle.write("{ not a record")
+        names, sessions = sorted(os.listdir(messages)), harness.store.list_sessions(chat_id)
+        with self.assertRaises(StoreCorrupt):
+            harness.send_turn(chat_id, "again")
+        self.assertEqual((sorted(os.listdir(messages)), harness.store.list_sessions(chat_id)),
+                         (names, sessions), "a turn was recorded on a history that cannot be read")
 
     def test_a_malformed_launcher_id(self):
         for name, value in (("pattern", "Not A Launcher Id!"), ("type", 42)):
