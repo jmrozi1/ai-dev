@@ -89,7 +89,10 @@ class TestShellFlows(ShellCase):
         script = re.search(r"function fitComposer\(\) \{(.*?)\n\}", page, re.S)
         self.assertIsNotNone(script, "the page no longer fits the composer to its text")
         body = script.group(1)
-        for needed in ('box.style.height = "auto"', "box.scrollHeight",
+        for needed in ('box.style.height = "auto"',
+                       # border-box: the height set must include the border, or the
+                       # text sits two pixels short of its box (sweep N14)
+                       "box.scrollHeight + box.offsetHeight - box.clientHeight",
                        "getComputedStyle(box).maxHeight",
                        'box.style.overflowY = wanted > limit ? "auto" : "hidden"'):
             self.assertIn(needed, body)

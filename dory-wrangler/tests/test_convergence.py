@@ -1091,6 +1091,26 @@ class StartUpGoesOnPastOneChatItCannotReAttach(unittest.TestCase, StoreCheck):
             expected = 0 if name.startswith(".tmp-") else 2
             self.assertEqual(tool.returncode, expected, (name, tool.stdout))
 
+    def test_the_list_hides_archived_chats_and_puts_the_latest_first(self):
+        """Sweep C04, C05. Listing by chat directory (R8) re-implements what
+        `list_chats` gave the served list before: archived chats are not listed,
+        and the most recently updated chat comes first."""
+        from dory_wrangler.service import ChatService
+        from unittest import mock
+        root = support.scratch_root()
+        ticks = iter(range(1, 1000))
+        with mock.patch.object(ids, "now",
+                               side_effect=lambda: "2099-01-01T00:00:00.%06dZ" % next(ticks)):
+            service = ChatService.open(root, launcher_config={"launcher": "scripted-stub"})
+            older = service.create_chat("Older")["chat_id"]
+            newer = service.create_chat("Newer")["chat_id"]
+            archived = service.create_chat("Archived")["chat_id"]
+            service.store.archive_chat(archived)
+            self.assertEqual([c["chat_id"] for c in service.list_chats()], [newer, older])
+            service.store.append_user_message(older, "touched last")
+            self.assertEqual([c["chat_id"] for c in service.list_chats()], [older, newer])
+        service.store.close()
+
     def test_an_archived_chat_is_re_attached_too(self):
         """M03. An archived chat's live agent is still a live agent."""
         root = support.scratch_root()
@@ -1443,6 +1463,72 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
                          launcher_config={"launcher": "scripted-stub"})
         self.assertEqual(ChatStore(root, read_only=True).export_records(), before)
         self.assertEqual(self.can_another_process_take(root), "took")
+
+    def test_a_shell_that_fails_to_start_gives_back_what_it_took_even_while_its_error_lives(self):
+        """Sweep W11, W12. `build_server` gives the store (and a bound port) back
+        itself when binding or re-attachment fails. Without that the hold lived
+        as long as anything kept the error's traceback -- which a caller that
+        logs or re-raises it does -- because only collecting the service let go."""
+        import socket
+        from dory_wrangler.webapp import build_server
+
+        # W11: the port is taken.
+        root = support.scratch_root()
+        taken = socket.socket()
+        taken.bind(("127.0.0.1", 0))
+        taken.listen(1)
+        self.addCleanup(taken.close)
+        kept = []
+        try:
+            build_server(root, port=taken.getsockname()[1], quiet=True,
+                         launcher_config={"launcher": "scripted-stub"})
+        except OSError as exc:
+            kept.append(exc)  # the traceback, and every frame's locals, stay alive
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(self.can_another_process_take(root), "took")
+        # The server cannot even make its socket: `socketserver` closes a server
+        # whose bind fails, but not one that never got a socket to bind.
+        import errno
+        from unittest import mock
+        root = support.scratch_root()
+        kept = []
+        with mock.patch("socketserver.socket.socket",
+                        side_effect=OSError(errno.EMFILE, "Too many open files")):
+            try:
+                build_server(root, port=0, quiet=True,
+                             launcher_config={"launcher": "scripted-stub"})
+            except OSError as exc:
+                kept.append(exc)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(self.can_another_process_take(root), "took")
+
+        # W12: re-attachment raises something no chat-level catch expects.
+        root = support.scratch_root()
+        first = SessionManager(ChatStore(root), ScriptedStubLauncher(PERSISTENT))
+        chat_id = first.create_chat("Re-attachment explodes")
+        first.send_turn(chat_id, "hello")
+        handle = first.store.list_sessions(chat_id)[0][0]["agent_handle"]
+        first.store.close()
+
+        class Explodes(ScriptedStubLauncher):
+            def events(self, agent_handle, after_sequence):
+                raise RuntimeError("not a launcher error")
+
+        probe = socket.socket()
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+        probe.close()
+        kept = []
+        try:
+            build_server(root, port=port, quiet=True,
+                         launcher=Explodes(dict(PERSISTENT, resume_handles=[handle])))
+        except RuntimeError as exc:
+            kept.append(exc)
+        self.assertEqual(len(kept), 1)
+        self.assertEqual(self.can_another_process_take(root), "took")
+        again = socket.socket()
+        self.addCleanup(again.close)
+        again.bind(("127.0.0.1", port))  # the failed shell's socket was closed
 
     def test_a_launcher_that_misuses_the_seam_during_re_attachment_costs_only_that_chat(self):
         root = support.scratch_root()
