@@ -1472,6 +1472,29 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
         self.assertEqual(stored, len(reopened.store.read_all_events_of_session(
             misused, reopened.store.list_sessions(misused)[0][0]["session_id"])))
 
+    def test_a_launcher_answering_re_attachment_with_no_page_changes_nothing_there(self):
+        """Sweep M16. Re-attachment preserves a page it reads; something that is
+        not a page carries no raw bytes to preserve (the review's drop 4, intake
+        scope) and is ignored as it was, rather than read as one and stopping
+        start-up for every chat."""
+        root = support.scratch_root()
+        first = SessionManager(ChatStore(root), ScriptedStubLauncher(PERSISTENT))
+        chat_id = first.create_chat("No page at restart")
+        first.send_turn(chat_id, "hello")
+        session = first.store.list_sessions(chat_id)[0][0]
+        stored = len(first.store.read_all_events_of_session(chat_id, session["session_id"]))
+        first.store.close()
+
+        class NoPage(ScriptedStubLauncher):
+            def events(self, agent_handle, after_sequence):
+                return None
+
+        reopened = SessionManager(ChatStore(root), NoPage(dict(
+            PERSISTENT, resume_handles=[session["agent_handle"]])))
+        self.assertEqual(reopened.reattach_on_start(), [(session["session_id"], "running")])
+        self.assertEqual(len(reopened.store.read_all_events_of_session(
+            chat_id, session["session_id"])), stored)
+
     def test_a_stop_answer_that_is_not_a_usable_confirmation_is_unconfirmed(self):
         cases = {
             "not a StopAck": lambda ack: "stopped, honestly",
