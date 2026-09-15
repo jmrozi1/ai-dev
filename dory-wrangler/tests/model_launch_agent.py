@@ -33,7 +33,10 @@ Configuration comes from this process's own environment, never from the message:
     launcher asked for is read off a log rather than taken on trust.
 ``DORY_MODEL_CODEX_BEHAVIOUR``
     comma-separated switches for the next invocations: `synthetic-unrecognized`,
-    `synthetic-malformed`, `no-thread-started`, `no-output`, `two-messages`, and
+    `synthetic-malformed`, `synthetic-not-an-object`, `synthetic-item`,
+    `synthetic-typeless`, `thread-started-without-id-first`,
+    `agent-message-without-text`, `no-thread-started`, `no-output`,
+    `two-messages`, and
     `plain-text-on-resume` -- the old guess that a resume prints bare text, kept
     only to show that nothing treats it specially.
 """
@@ -53,6 +56,17 @@ RECALL_PROMPT = "What was the first thing I said in this thread?"
 SYNTHETIC_UNRECOGNIZED = {"type": "synthetic.model-only.not-a-codex-event",
                           "note": "emitted by the test model to exercise unrecognized"}
 SYNTHETIC_MALFORMED = "SYNTHETIC MODEL-ONLY LINE: deliberately not JSON {{{"
+SYNTHETIC_NOT_AN_OBJECT = ["synthetic", "model-only", "well-formed JSON that is not an event object"]
+# A completed item of a type nothing has shown, named synthetic in its own type,
+# carrying text that must never become chat.
+SYNTHETIC_ITEM = {"type": "item.completed",
+                  "item": {"type": "synthetic-model-only-item", "text": "SYNTHETIC: never chat"}}
+# The proven event types without the field that makes each usable.
+THREAD_STARTED_WITHOUT_ID = {"type": "thread.started"}
+AGENT_MESSAGE_WITHOUT_TEXT = {"type": "item.completed", "item": {"type": "agent_message"}}
+# An object with no type at all, whatever else it carries.
+SYNTHETIC_TYPELESS = {"note": "SYNTHETIC model-only object with no type",
+                      "item": {"type": "agent_message", "text": "SYNTHETIC: never chat"}}
 
 
 def reply_to(prompts):
@@ -98,12 +112,22 @@ def main(argv):
             json.dump(thread, handle)
         os.replace(path + ".partial", path)
 
+        if "thread-started-without-id-first" in behaviour:
+            lines.append(json.dumps(THREAD_STARTED_WITHOUT_ID))
         if "no-thread-started" not in behaviour:
             lines.append(json.dumps({"type": "thread.started", "thread_id": thread_id}))
         if "synthetic-unrecognized" in behaviour:
             lines.append(json.dumps(SYNTHETIC_UNRECOGNIZED))
         if "synthetic-malformed" in behaviour:
             lines.append(SYNTHETIC_MALFORMED)
+        if "synthetic-not-an-object" in behaviour:
+            lines.append(json.dumps(SYNTHETIC_NOT_AN_OBJECT))
+        if "synthetic-item" in behaviour:
+            lines.append(json.dumps(SYNTHETIC_ITEM))
+        if "agent-message-without-text" in behaviour:
+            lines.append(json.dumps(AGENT_MESSAGE_WITHOUT_TEXT))
+        if "synthetic-typeless" in behaviour:
+            lines.append(json.dumps(SYNTHETIC_TYPELESS))
         answer = reply_to(thread["prompts"])
         if resume_id is not None and "plain-text-on-resume" in behaviour:
             lines = [answer]

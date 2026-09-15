@@ -127,7 +127,11 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
         support.end_chat(harness, chat_id)
 
     def test_every_output_line_of_launch_and_deliver_is_preserved_verbatim_in_order(self):
-        launcher = self.launcher(behaviour=("synthetic-unrecognized", "synthetic-malformed"))
+        launcher = self.launcher(behaviour=("thread-started-without-id-first",
+                                            "synthetic-unrecognized", "synthetic-malformed",
+                                            "synthetic-not-an-object", "synthetic-item",
+                                            "agent-message-without-text",
+                                            "synthetic-typeless"))
         harness = support.harness({}, launcher=launcher)
         chat_id = harness.create_chat("Raw JSONL preserved")
         harness.send_turn(chat_id, "first")
@@ -138,13 +142,22 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
         self.assertEqual([raw_bytes(e) for e in events], self.emitted_lines(),
                          "every line the script printed, launch and resume alike, "
                          "byte for byte and in order")
-        per_turn = [("agent", "recognized", "thread.started"),
-                    ("agent", "unrecognized", None),
-                    ("agent", "malformed", None),
+        per_turn = [("agent", "malformed", None),                   # thread.started, no id
+                    ("agent", "recognized", "thread.started"),
+                    ("agent", "unrecognized", None),                # synthetic type
+                    ("agent", "malformed", None),                   # not JSON
+                    ("agent", "unrecognized", None),                # JSON, not an object
+                    ("agent", "unrecognized", None),                # an item nothing has shown
+                    ("agent", "malformed", None),                   # agent_message, no text
+                    ("agent", "unrecognized", None),                # an object with no type
                     ("agent", "recognized", "assistant_text")]
         self.assertEqual([(e["source"], e["interpretation"], e["interpreted_type"])
                           for e in events], per_turn * 2,
                          "a resumed turn is classified exactly as a launched one")
+        self.assertEqual(support.view(harness).sessions_of(chat_id)[0]["agent_handle"],
+                         self.calls()[0]["thread_id"],
+                         "the handle is the first *usable* thread.started, not the first line "
+                         "typed thread.started")
         self.assertEqual([(a, t) for _, a, t in harness.transcript(chat_id)],
                          [("user", "first"), ("agent", "answer to: first"),
                           ("user", "second"), ("agent", "answer to: second")],

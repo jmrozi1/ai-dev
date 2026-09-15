@@ -188,8 +188,8 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
                                        "launch_agent.sh exited %d and printed nothing"
                                        % status)
             raise lb.LauncherError(lb.FAILURE_NO_ACKNOWLEDGEMENT,
-                                   "launch_agent.sh printed %d line(s) and no thread started"
-                                   % len(lines))
+                                   "launch_agent.sh exited %d, printed %d line(s) and no "
+                                   "thread started" % (status, len(lines)))
         self._append(handle, [("agent", raw) for raw in lines])
         if not self._capabilities.supports_delivery:
             # Under fresh_binding the next turn is a new launch, so this agent is

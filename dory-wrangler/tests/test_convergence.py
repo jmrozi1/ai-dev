@@ -1702,6 +1702,22 @@ class ReAttachmentPreservesWhatItReads(unittest.TestCase, StoreCheck):
         self.assert_store_valid(reopened.store, "reattachment-page-preserved")
 
 
+class WhatTheRemediationMovedItKept(unittest.TestCase):
+    """Sweep S30. Composing a message moved into one function the write and its
+    pre-flight share; the chat is still touched with the message's own stamp,
+    as before the move, rather than a second reading of the clock."""
+
+    def test_a_chat_is_touched_with_its_new_message_s_own_stamp(self):
+        from unittest import mock
+        store = ChatStore(support.scratch_root())
+        chat_id = store.create_chat("Stamped")["chat_id"]
+        ticks = iter(range(1, 1000))
+        with mock.patch.object(ids, "now",
+                               side_effect=lambda: "2099-01-01T00:00:00.%06dZ" % next(ticks)):
+            message = store.append_user_message(chat_id, "hello")
+        self.assertEqual(store.read_chat(chat_id)["updated_at"], message["created_at"])
+
+
 class TheGuardsConvergenceAddedHaveExits(unittest.TestCase, StoreCheck):
     """Each added guard: the input it refuses, and where that input goes."""
 
@@ -1859,6 +1875,29 @@ class ATurnIsRecordedOnlyIfWhatItOpensIsAcceptable(unittest.TestCase, StoreCheck
         self.refused_with_nothing_written(harness, chat_id, "hello", "capabilities")
         harness.store.close()
         self.exit_through_a_good_turn(root, chat_id, "preflight-mutated-capabilities")
+
+    def test_capabilities_that_are_not_a_mapping(self):
+        """Sweep S29: a launcher whose declared capabilities no longer read as a
+        mapping. The would-be session carries them as they are and the record
+        check refuses them -- a stated refusal with nothing written, not a
+        `TypeError` from building the record."""
+        class NotAMapping(ScriptedStubLauncher):
+            @property
+            def capabilities(self):
+                capabilities = ScriptedStubLauncher.capabilities.fget(self)
+
+                class Declared(object):
+                    instruction_bound_bytes = None
+
+                    def as_record(self):
+                        return "continuation=%s" % capabilities.continuation
+                return Declared()
+        root = support.scratch_root()
+        harness = SessionManager(ChatStore(root), NotAMapping({}))
+        chat_id = harness.create_chat("Capabilities not a mapping")
+        self.refused_with_nothing_written(harness, chat_id, "hello", "not a mapping")
+        harness.store.close()
+        self.exit_through_a_good_turn(root, chat_id, "preflight-capabilities-not-a-mapping")
 
     def test_a_lone_surrogate_on_the_launch_path_and_on_the_delivery_path(self):
         root = support.scratch_root()
