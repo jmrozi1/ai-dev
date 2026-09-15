@@ -309,8 +309,16 @@ class TestConcurrentSenders(StoreCase):
             )
             for i in range(8)
         ]
+        self.addCleanup(lambda: [child.kill() for child in children if child.poll() is None])
         for child in children:
-            _out, err = child.communicate()
+            # A deadline for the test, not the product (re-review N4): a child
+            # that waits for the store instead of being refused would otherwise
+            # hang the suite. The children are killed and this fails instead.
+            try:
+                _out, err = child.communicate(timeout=60)
+            except subprocess.TimeoutExpired:
+                self.fail("a second writing process waited for the store this one "
+                          "holds instead of being refused")
             self.assertNotEqual(child.returncode, 0)
             self.assertIn(b"StoreInUse", err)
         self.assertEqual(self.store.export_records(), before)

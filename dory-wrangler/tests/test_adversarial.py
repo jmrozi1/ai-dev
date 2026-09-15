@@ -751,8 +751,19 @@ class TestOneAgentPerChat(ProbeCase):
             % (os.path.join(os.path.dirname(TESTS_DIR), "src"), self.root,
                chat_id, user["message_id"])
         )
-        completed = subprocess.run([sys.executable, "-c", script],
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # A deadline for the test, not the product (re-review N4): a child that
+        # waits for the store instead of being refused is killed, and the probe
+        # records an escape rather than hanging the suite.
+        try:
+            completed = subprocess.run([sys.executable, "-c", script],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       timeout=60)
+        except subprocess.TimeoutExpired:
+            self.record("E3b-second-process-refused",
+                        "a second process calls create_session on a store this one serves",
+                        False, "the second process waited for the store instead of being "
+                        "refused")
+            return
         out = completed.stdout.decode("utf-8").strip()
         held = out == "refused" and self.store.export_records() == before
         self.record("E3b-second-process-refused",
