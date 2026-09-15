@@ -234,7 +234,6 @@ multi-writer would be new architecture for a property v0.1 does not require.
 ## Not decided here
 
 * Whether Stop must reach a turn in flight -- unchanged, still the human's.
-* Whether the shell needs an exit from a `running` session it can no longer
-  drain. See decision 0003's last section: it is reachable, it is measured, and
-  providing it would be a second lifecycle action, which the convergence rail did
-  not authorise.
+* The exit from a `running` session the shell can no longer drain is no longer
+  open here: decision D2 gives every non-terminal state an exit through the one
+  lifecycle action (decision 0003, sections 3 and 4).
