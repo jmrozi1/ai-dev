@@ -2,8 +2,18 @@
 
 Status: recorded by #88 (checkpoint `converge-the-two-implementations`). Both
 behaviours were decided by the orchestrator before convergence; this records how
-they are implemented, what proves them, and how to change the first.
+they are implemented, what proves them, and how to change the first. Corrected in
+place by the in-flight refusal rail (re-review N1, N2): a turn or Abandon that
+meets a turn **in flight** is refused, not queued or deferred, and v0.1 does not
+interrupt a turn in flight -- section 5.
 Scope: Dory-wrangler v0.1.
+
+> **v0.1 limitation.** Once a turn is dispatched, v0.1 lets it finish. While it
+> is in flight, a second send and the Abandon action (and the loop's Stop) on
+> that chat are refused at once with nothing recorded. Nothing interrupts the
+> turn in flight; stopping or interrupting an active turn is later supervision
+> work (#83). A Stop that could not reach a turn is never recorded or shown as
+> `terminated`.
 
 ## 1. Concurrent turns: refuse before recording
 
@@ -35,7 +45,8 @@ still in the composer; the chat's history is unchanged.
 * The check and the writes that follow run under the chat's turn lock, an
   `flock` held for the action, so a second thread or a second process serving the
   same store cannot interleave between "is this chat served?" and "record the
-  turn and open its session".
+  turn and open its session". A turn that finds the lock held is **refused**
+  there, before anything is written -- it does not wait for the lock (section 5).
 
 **Evidence.** `tests/test_binding.py` (a second turn to a live `fresh_binding`
 agent, ten concurrent threads resolving to one agent, a re-entrant launcher),
@@ -75,7 +86,7 @@ requirement.
 **What is provided, and nothing more.**
 
 * `POST /api/chats/<id>/abandon` calls `SessionManager.abandon`, which takes the
-  turn lock and takes the chat's non-terminal session out of whatever state it
+  turn lock -- or, if a turn is in flight, is refused (section 5) -- and takes the chat's non-terminal session out of whatever state it
   is in, by contract-legal transitions only (decision D2, section 4 below). From
   `unknown` that is `unknown -> abandoned`, owned by the user with `user_action`
   evidence, as it always was. The store releases the binding in the same write
@@ -158,12 +169,13 @@ there), with send, stop and abandon all refused until a restart. The rule now:
 
 * **The action never calls `events`.** On a live agent that is quiet `events`
   blocks by design, and the exit must not.
-* **A turn in flight is unchanged.** The action takes the chat's turn lock, so
-  from another thread it waits for the turn in flight to finish, as it always
-  did. A launcher that calls the action back from inside an action on the same
-  chat is refused every route but `unknown -> abandoned`, which it always had.
-  Whether a user's Stop must reach a turn in flight remains the human's open
-  decision.
+* **A turn in flight is not interrupted, and the action is not deferred behind
+  it.** *Corrected:* this bullet used to say the action waits for the turn in
+  flight to finish; it did, and then recorded its `terminated` after the answer
+  (re-review N2). The action is now refused while a turn is in flight (section 5),
+  and the human decided Stop does not reach a turn in flight in v0.1. A launcher
+  that calls the action back from inside an action on the same chat, on the same
+  thread, is refused every route but `unknown -> abandoned`, which it always had.
 * **Re-attachment preserves what it reads.** On a launcher that can resume, the
   page re-attachment reads may carry the agent's answer and its completion; it
   is preserved and acted on exactly as the drain would, so the chat is not later
@@ -180,3 +192,65 @@ Evidence: `tests/test_convergence.py::EveryNonTerminalStateHasTheOneActionAsItsE
 (one test per row, each checking the transitions written and that the chat takes
 a new turn), `ReAttachmentPreservesWhatItReads`, and
 `ARunningSessionTheShellCannotDrain`.
+
+## 5. A turn in flight: refused, not queued or deferred, and not interrupted
+
+**The decisions.** The human decided on 2026-09-15 that a concurrent turn while
+an agent is running is *refused, not queued* -- a queue would bring ordering,
+cancellation, editing and assumed-context semantics v0.1 does not need -- and
+that *Stop does not reach a turn in flight in v0.1*: once dispatched, a turn is
+let finish, and a Stop that could not reach it must never be recorded or shown as
+`terminated`. The orchestrator decided that an Abandon meeting a turn in flight
+is refused with fixed words and nothing recorded, rather than deferred.
+
+**What was wrong.** The focused re-review of convergence found both violated by
+one mechanism. Every user action took the chat's turn lock *blocking*, and the
+served application runs each request on its own thread. A second send during a
+turn waited for the lock and was then recorded and delivered after the first
+answer -- queued, in both continuation modes (N1). An Abandon during a turn waited
+too, and on a launcher that confirms stops then recorded `running -> terminated`
+dated after the answer (N2).
+
+**The rule now.**
+
+* Every user action -- `send_turn`, `abandon`, `stop_agent` -- takes the chat's
+  turn lock **without waiting**, in one place, `SessionManager._user_action`. If
+  another thread or process holds it, the action raises `TurnInFlightRefused` (a
+  `ConcurrentLaunchRefused`) before anything durable is written, in every session
+  state and whether or not the chat has a session. The launcher is asked nothing.
+* A send refused this way writes nothing at all, not even the chat's name from
+  its first turn: that turn belongs to the request still in flight, which names
+  the chat when it ends.
+* Over HTTP both routes answer `409` with `"refused": true` and the fixed words
+  `webapp.REFUSED_IN_FLIGHT`, which tell the user the answer in progress must
+  finish first and that nothing was sent or changed. No identifier, state name or
+  exception text.
+* On the page, Enter does not submit while Send is disabled -- the same gate as
+  the button -- so one tab does not provoke the refusal. The server's refusal is
+  the guarantee; the key behaviour is not browser-verified.
+* The same thread re-entering its own hold -- a launcher calling back into the
+  loop during an action on the chat -- still acquires it and meets the loop's own
+  rules: a second turn is refused by the one-agent rule, and the one action is
+  refused every route but `unknown -> abandoned`.
+* **Nothing interrupts the turn in flight.** No queue, retry, timer, polling or
+  cancellation was added.
+
+**Decision D2 still holds.** Every non-terminal state keeps the one action as its
+exit (section 4): the turn ending makes the action available again. A turn that
+never returns holds its chat until its process exits -- the kernel then releases
+the lock with the descriptor -- and contract 5.4 re-attachment at the next start
+carries the session to a state whose exit is the action: a `running` session on a
+launcher that cannot resume becomes `unknown`, then `abandoned`; on one that can,
+the user's confirmed stop gives `terminated`; a `launching` one resolves as in
+section 4.
+
+**Evidence.** `tests/test_convergence.py`:
+`TheTurnLockHoldsWithinOneProcess` (a second send, and an Abandon and Stop, while
+the first turn is parked; both changed expectation from waiting to refusal),
+`ATurnInFlightRefusesEveryOtherUserAction` (every action in `pending`,
+`launching`, `running` and `unknown`, with the lock held by another thread and by
+another descriptor; a turn parked in `deliver`; both continuation modes over HTTP,
+including that the refused send does not name the chat), and
+`EveryNonTerminalStateHasTheOneActionAsItsExit::test_a_turn_that_never_returns_is_exited_by_process_exit_restart_and_the_action`.
+`tests/test_shell.py::TestShellFlows::test_enter_does_not_send_while_a_send_is_in_flight`
+holds the page's Enter gate from the served source.

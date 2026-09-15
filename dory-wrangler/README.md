@@ -20,7 +20,7 @@ Release intent and the checkpoint roadmap are `jmrozi1/ai-dev` #81.
 | `launch-boundary.md` | the swappable single-agent launch boundary (#87): the seam, the launchers, and the launcher-author obligations |
 | `decisions/0001-runtime-and-storage.md` | the recorded runtime and storage choice, and its Rocky Linux 9 risks as claims to settle |
 | `decisions/0002-one-store-one-application.md` | how #86's and #87's implementations became one store, one chat loop, one seam and one served application, per component, with the evidence |
-| `decisions/0003-concurrent-turns-and-abandon.md` | a concurrent turn is refused before it is recorded (and how to flip that), and Abandon as the one lifecycle action |
+| `decisions/0003-concurrent-turns-and-abandon.md` | a concurrent turn is refused before it is recorded (and how to flip that), Abandon as the one lifecycle action, and the refusal of both while a turn is in flight |
 | `src/dory_wrangler/` | the one product package: the durable store (`store.py`), the chat loop (`session_manager.py`), the launch seam (`launch_boundary.py`), the launchers (`launchers/`), and the served shell (`webapp.py`) |
 | `run_shell.py` | run the shell |
 | `validate_store.py` | check a live store against the contract |
@@ -48,6 +48,15 @@ launcher's proven transport. A turn the chat's agent
 cannot take is refused before it is recorded. When a restart finds an agent that
 can no longer be reached, the refused send offers the one lifecycle action the
 shell has: abandon that agent.
+
+> **v0.1 limitation: a turn in flight cannot be stopped or interrupted.** Once a
+> turn is sent, v0.1 lets it finish. While it is in flight, another send and the
+> Abandon action on that chat are refused with nothing recorded -- not queued
+> behind the turn and not deferred until it ends -- and the page says the answer
+> must finish first. A Stop that could not reach a turn is never recorded or
+> shown as `terminated`. A turn that never returns holds its chat until the shell
+> process exits; after a restart the one action is the exit. Interrupting an
+> active turn is later supervision work (#83). See decision 0003, section 5.
 
 ## Validating
 
