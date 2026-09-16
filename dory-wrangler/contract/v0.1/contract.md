@@ -888,14 +888,31 @@ valid UTF-8.
 **P2. Interpretation is recorded, never assumed.**
 
 - `recognized` — parsed into a known type; `interpreted_type` names it.
-- `unrecognized` — well-formed but of a type this build does not know;
-  `interpreted_type` is `null`.
+- `unrecognized` — well-formed but of a type this build does not know, or knows
+  but cannot attribute on this session; `interpreted_type` is `null`.
 - `unrecognized` and `malformed` must have `interpreted_type: null`; `recognized`
   must name one (`EVENT_INTERPRETATION_INCONSISTENT`).
 - `malformed` — could not be parsed at all; `interpreted_type` is `null`.
 
 An unrecognized event is a **finding**, not an error. Its accumulation is the
 primary discovery output of v0.1 and the direct input to #89 and #90.
+
+**Why the second clause was added.** The earlier form read "well-formed but of a
+type this build does not know", which covered only ignorance and left a payload
+whose type the build *does* know, but may not record here, with nowhere to go.
+The reachable case is a launcher declaring `response_shape: "one_shot"` that
+emits a payload typed `stream_end`: 6.1 rejects that reading outright
+(`STREAM_END_UNSUPPORTED`), so both implementations refused the payload before
+preserving it, its bytes survived nowhere against P1, and the gap it left in the
+session's `sequence` made every later payload on that session unpreservable for
+the session's life. **No rule changes.** The assertion is still rejected exactly
+as 6.1 states it, no violation code, fixture, or validator check moves, and the
+executable already behaves this way: both rejection sites — the store and the
+validator — test `interpreted_type` alone and neither examines `raw.body`, so
+the same bytes preserved as `unrecognized` with `interpreted_type: null` are
+accepted today. Residual, stated rather than implied: a reader cannot tell a
+genuinely unknown type from a declined one without reading `raw.body`. Reported
+by #88; the widening is a human decision of 2026-09-15.
 
 **P2a. An agent's output presupposes an agent.** A `diagnostic_event` with
 `source: "agent"` requires its session to have reached `running`
