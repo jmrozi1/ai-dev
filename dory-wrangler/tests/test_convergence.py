@@ -1124,6 +1124,12 @@ class ATurnInFlightRefusesEveryOtherUserAction(unittest.TestCase, StoreCheck):
                 before = reader.export_records()
                 # The words tell the user why, and what to do: wait for the answer.
                 self.assertIn("must finish first", webapp.REFUSED_IN_FLIGHT)
+                # And they state the property the refusal establishes: nothing
+                # was written. Pinned here because the served-body assertion
+                # below compares the response to the constant itself, so any
+                # edit to the constant is self-consistent and invisible to it
+                # (check-rail finding F5).
+                self.assertIn("Nothing was sent or changed", webapp.REFUSED_IN_FLIGHT)
                 self.assertIn(webapp.REFUSED_IN_FLIGHT, webapp.ERROR_WORDS)
                 for route, payload in (("/messages", {"text": "B"}), ("/abandon", {})):
                     status, body = call(port, path + route, payload)
