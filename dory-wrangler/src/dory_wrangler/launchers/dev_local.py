@@ -6,20 +6,42 @@ newline-delimited-JSON transport. None of it crosses the launch boundary. What
 crosses is instruction text plus correlation in, and abstract outcomes,
 capabilities, opaque handles and preserved payloads out.
 
-Two profiles, both real processes on this VM, because the two continuation modes
-are both first-class and neither is a fallback:
+Two profiles, both real processes on the development host, because the two
+continuation modes are both first-class and neither is a fallback:
 
 ======================  ==========================  ===============
 `profile: one_shot`     `fresh_binding` / `one_shot`  run, answer, exit
 `profile: persistent`   `persistent` / `stream`       stay alive, one instruction per turn
 ======================  ==========================  ===============
 
-The `one_shot` profile is the shape of the one internal path that is proven:
-`~/scripts/launch_agent.sh` takes instruction text and returns the agent's
-response (facts-and-assumptions F10). It is deliberately the default here so
-that the mode we can actually rely on internally is the one exercised by
-default. Persistent multi-turn delivery is unproven internally (U1) and is
-declared by this launcher only because *this* launcher can genuinely do it.
+The internal path as it is now known (internal dogfood, 2026-09-14). This
+replaces the earlier reading of it that this docstring carried:
+
+* `launch_agent.sh "<message>"` launches a new agent and returns its response
+  together with a resume ID; `launch_agent.sh --resumeID=<id> "<message>"`
+  resumes that same agent. Continuity across separate invocations was
+  demonstrated with a nonce stored in one call and recalled in a later one.
+* Underneath it is `codex exec --json` and `codex exec resume --json`, and both
+  emit the same JSONL. The resume ID -- the `agent_handle` -- is
+  `thread.started.thread_id`. The reply is an `item.completed` event whose
+  `item.type` is `agent_message`, with its text in `item.text`.
+* So the normal internal case is `continuation: persistent`, not a fresh agent
+  per turn. `facts-and-assumptions.md` U1 still records persistent delivery as
+  unproven; that document is final for v0.1 and has not been reopened, but the
+  dogfood supersedes it. Fresh binding remains a supported declared capability,
+  not a fallback.
+* What is still unproven internally: the response shape. A call returns the
+  response, so `one_shot` is the only reading the evidence supports, and it is
+  provisional until a real capture arrives. No payload bound has been measured
+  (U2).
+
+Neither profile here is that path. `one_shot` is `fresh_binding`, and internal
+continuation is persistent; `persistent` here declares a `stream` response
+shape, and the internal call returns. `tests/internal_bridge.py` models the
+internal shape, over `tests/model_launch_agent.py`; this launcher models a real
+external process on this host and nothing more. `one_shot` is still the default
+(`service.DEFAULT_LAUNCHER`), and which profile is used is configuration
+(`serve.py --launcher-options`).
 
 `instruction_bound_bytes` is `None` in both profiles. No bound has been
 measured, here or internally, and asserting one would be a fabrication (U2).

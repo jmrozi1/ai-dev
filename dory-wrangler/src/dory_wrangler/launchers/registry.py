@@ -3,11 +3,19 @@
     build_launcher({"launcher": "dev-local", "options": {"profile": "one_shot"}})
     build_launcher({"launcher": "scripted-stub", "options": {...}})
 
-The internal VS Code/network bridge launcher is not reachable from this
-development VM and is not implemented here. Adding it is a new module under this
-package plus one entry in the table below; nothing in the chat, session, or
-store layers changes, and that is the swappability claim this file exists to
-make checkable rather than asserted.
+The internal launcher is not reachable from this development host and is not
+implemented here. Its path is now known: `launch_agent.sh "<message>"` fresh and
+`launch_agent.sh --resumeID=<id> "<message>"` to resume, over `codex exec --json`
+and `codex exec resume --json`, both emitting the same JSONL; the `agent_handle`
+is `thread.started.thread_id`; the reply is an `item.completed` event whose
+`item.type` is `agent_message`, with its text in `item.text`; and it declares
+`continuation: persistent`. `tests/internal_bridge.py` is a model of exactly that
+shape, and it is deliberately **not** in the table below -- `build_launcher({"launcher":
+"internal-bridge"})` still fails closed, which two tests hold.
+
+Adding the real one is a new module under this package plus one entry in the
+table below; nothing in the chat, session, or store layers changes, and that is
+the swappability claim this file exists to make checkable rather than asserted.
 """
 
 from __future__ import annotations

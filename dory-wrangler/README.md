@@ -8,6 +8,24 @@ anything here.
 
 Release intent and the checkpoint roadmap are `jmrozi1/ai-dev` #81.
 
+## Where this product lives
+
+`jmrozi1/ai-dev`, path `dory-wrangler/`, is canonical, and it is the only
+canonical copy. Two earlier locations still exist and neither is authoritative:
+
+- The former `jmrozi1/dory-wrangler` repository is **archived, not deleted**.
+  Its README reads "Archived -- Dory-wrangler moved to `jmrozi1/ai-dev`" and
+  names this repository and this directory as canonical; its description reads
+  "ARCHIVED -- superseded"; and its twelve issues are preserved read-only and
+  were deliberately not migrated. New work is opened on `jmrozi1/ai-dev`.
+- `relay/dory-wrangler/` on this repository's `main` branch is **superseded and
+  deliberately left untouched**. It is a one-way transport of issue snapshots
+  from that now-archived repository into the internal network, written before
+  this product moved here, and it still names that repository as the canonical
+  source of tickets -- which it no longer is. It is not a Dory-wrangler product
+  path, nothing under `dory-wrangler/` reads it, and `main` is not edited merely
+  to clean up a stale transport artifact.
+
 ## Contents
 
 | Path | What it is |

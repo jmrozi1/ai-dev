@@ -229,9 +229,22 @@ dated after the answer (N2).
   the button -- so one tab does not provoke the refusal. The server's refusal is
   the guarantee; the key behaviour is not browser-verified.
 * The same thread re-entering its own hold -- a launcher calling back into the
-  loop during an action on the chat -- still acquires it and meets the loop's own
-  rules: a second turn is refused by the one-agent rule, and the one action is
-  refused every route but `unknown -> abandoned`.
+  loop during an action on the chat -- still acquires it, and meets the loop's
+  own rules rather than this refusal. Those rules are **not the same for all
+  three actions**, and an earlier wording of this bullet read as though they
+  were (check-rail finding F1). What the code does:
+  * a nested send reaches `_continue_turn`, which refuses anything that is not a
+    `running` session on a `persistent` launcher and otherwise delivers;
+  * `abandon` tests `held.nested` and is refused every route but
+    `unknown -> abandoned`;
+  * `stop_agent` has no `held.nested` test, so a nested Stop runs the ordinary
+    Stop and, on a launcher that confirms stops, records `running -> terminated`.
+
+  The `stop_agent` asymmetry is a recorded finding carried to #90 with the nested
+  launcher-callback path it belongs to, and is not fixed here. It is not
+  user-reachable: it needs an out-of-tree launcher that holds the
+  `SessionManager` and calls back from inside its own `stop`, which contract 6.1
+  puts outside the seam, and the outer action then fails closed.
 * **Nothing interrupts the turn in flight.** No queue, retry, timer, polling or
   cancellation was added.
 

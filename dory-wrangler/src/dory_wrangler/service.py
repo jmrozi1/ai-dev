@@ -31,8 +31,12 @@ UNREADABLE_TITLE = "This chat cannot be read"
 TITLE_FROM_FIRST_TURN_CHARS = 60
 
 # The launcher the shell uses when none is configured: the external development
-# launcher in the shape of the one internal path that is proven, a one-shot
-# script. Configuration, not code, chooses another (`serve.py --launcher`).
+# launcher on its `one_shot` profile, a real local process that runs, answers and
+# exits. It is no longer the shape of the internal path -- internal continuation
+# is now known to be persistent, and the handle is a resume ID
+# (`launchers/dev_local.py`) -- so this default is a development convenience, not
+# a statement about the integration. Configuration, not code, chooses another
+# (`serve.py --launcher`).
 DEFAULT_LAUNCHER = {"launcher": "dev-local", "options": {"profile": "one_shot"}}
 
 

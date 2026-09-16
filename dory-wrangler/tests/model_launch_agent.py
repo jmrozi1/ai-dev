@@ -20,9 +20,26 @@ and the output is the JSONL shape proven internally for `codex exec --json` and
 
 Those two are the **only** Codex event types this file emits, because they are
 the only two anything has shown. Nothing here is taken from Codex documentation
-or from memory of it. Every other line it can be told to emit is synthetic and
-says so in its own bytes, so it can never be mistaken for a real Codex event:
-it exists to exercise the `unrecognized` and `malformed` paths and nothing else.
+or from memory of it. No other line invents a Codex event type; every one of
+them exists to exercise the `unrecognized` and `malformed` paths and nothing
+else.
+
+Most of those lines also say "synthetic" in their own bytes, so they can never
+be mistaken for a real Codex event. Three deliberately do not, because saying it
+would destroy the case each exists to make (re-review finding N8):
+
+* `THREAD_STARTED_WITHOUT_ID` and `AGENT_MESSAGE_WITHOUT_TEXT` are the two proven
+  types with the one field that makes each usable removed, and that missing field
+  *is* the case: a real `thread.started` with no `thread_id`, a real
+  `agent_message` with no `text`. A marker field would make them objects no Codex
+  could emit, and the case would go untested. Neither invents a type.
+* `plain-text-on-resume` prints the answer as bare text -- the old guess about
+  what a resume prints, kept to show nothing treats it specially. Its bytes are
+  the agent's real answer on purpose: the test
+  (`test_a_resume_that_prints_plain_text_is_malformed_like_any_other_line`)
+  asserts that real answer text arriving unwrapped is `malformed` and preserved
+  and never becomes chat. Replacing it with a marked string would remove the
+  content whose fate is the whole point.
 
 Configuration comes from this process's own environment, never from the message:
 
