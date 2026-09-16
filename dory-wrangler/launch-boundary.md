@@ -164,7 +164,15 @@ in `session_manager.py` is the one function a later answer changes.
    `events` must serve every payload from `sequence` 1 for the life of the
    session, across a restart of the harness. A script that returns its output
    once and exits therefore needs somewhere of the launcher's own to keep it,
-   keyed by the handle.
+   keyed by the handle. Contract 6.1 permits that -- what it forbids is the
+   *harness* resting on it, and the harness does not: probed by deleting the
+   model's spool between a turn and a restart, every preserved event and the
+   whole transcript are byte-identical afterwards, the session reaches `unknown`
+   through a recorded `reattach_failed`, and the user's one action reopens the
+   chat. What does not survive is the launcher's ability to address its own
+   thread again, so the next turn gets a new agent. **How long a launcher must be
+   able to do that is unspecified in v0.1** and is recorded here as a launcher
+   property rather than a harness one (re-review N3).
 8. **It classifies launch and deliver output through one path.** Internally both
    are the same JSONL; there is no plain-text resume case. Only event types a
    capture has shown are `recognized` (`thread.started`, and `item.completed`
@@ -178,7 +186,23 @@ in `session_manager.py` is the one function a later answer changes.
 10. **It honours `after_sequence`.** `events` is resumable by sequence; a page
     that does not advance is refused with a stated `LaunchBoundaryError` rather
     than read again.
-11. One entry in `launchers/registry.py`.
+11. **It carries back the output of a launch that issued no handle.** `events`
+    addresses an agent through the handle and nothing else, so a launch that
+    started no thread has no later call through which anything it printed could
+    be read -- and contract 7 P1 requires it preserved regardless. `LaunchResult`
+    and `LauncherError` therefore take an optional `payloads`, and the harness
+    preserves them against the session that failed to open, which is the reading
+    contract 6.1 states under *Known residual* and is what fixtures
+    `valid/05-launch-failure` and `valid/09-launch-outcome-unknown` already are.
+    Three rules, each one the contract already states: an **accepted** launch may
+    not use it, because `events` is its channel and two channels would preserve
+    the same payloads twice; every payload is **launcher-sourced**, because
+    nothing proved an agent exists and contract 7 P2a refuses agent-sourced
+    evidence on a session that never ran; and sequences are **1..N in order**,
+    because this is the whole history of a session that never ran. A launcher
+    that breaks them keeps its failure category -- #90 counts those -- and the
+    refusal is written into the durable `launch_result.detail`.
+12. One entry in `launchers/registry.py`.
 
 Nothing else changes. `tests/test_swappability.py` runs the full chat loop
 against a launcher defined in the test file and registered nowhere, and

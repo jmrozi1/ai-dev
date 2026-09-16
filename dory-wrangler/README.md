@@ -117,7 +117,15 @@ contract, the adjudication rules, and the decision-conformance pass.
 
 v0.1 has its contract (#85), its chat shell and durable persistence (#86), and
 the launch boundary with its launchers (#87), converged onto one store and one
-served application (#88, decision 0002). Event classification, rendering beyond
-agent text, and bounded diagnostic access are #88's remaining checkpoints. No
-observability (#82), supervision (#83), or multi-agent (#84) behavior is in
-scope.
+served application (#88, decision 0002), and intake that preserves every payload
+raw and correlated before anything reads it (#88). Event classification,
+rendering beyond agent text, malformed-event handling, and bounded diagnostic
+access are #88's remaining checkpoints. No observability (#82), supervision
+(#83), or multi-agent (#84) behavior is in scope.
+
+One payload shape is knowingly still unpreserved: a payload typed `stream_end`
+from a launcher declaring `response_shape: one_shot`, which is where contract 7
+P1 and contract 6.1's `STREAM_END_UNSUPPORTED` disagree. Both answers are
+implemented and tested behind `session_manager.PRESERVE_UNATTRIBUTABLE_STREAM_END`;
+which one v0.1 takes is an open orchestrator decision and may need a #85 wording
+correction to P2.
