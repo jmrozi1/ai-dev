@@ -169,6 +169,25 @@ class APageIsPreservedWhateverRefusesPartOfIt(IntakeCase):
                          "the launcher's claim about its stream is refused; the "
                          "payloads it had already produced are not")
 
+    def test_a_refusal_met_inside_that_page_is_the_one_reported(self):
+        # Both refusals are real on this page: a payload the store cannot take,
+        # and a launcher claiming a stream ended that it has none of. The one met
+        # while reading the page is the earlier fact and is the one a launcher
+        # author needs to see; found by mutating the re-raise away, which left
+        # the page's own refusal swallowed and only the page-level one reported.
+        launcher = PageLauncher(pages=[lb.EventsPage(
+            [agent_text(1, "one"), agent_text(5, "gapped")], stream_ended=True)])
+        harness = self.harness(launcher)
+        chat_id = harness.create_chat("Two refusals on one page")
+
+        with self.assertRaises(LaunchBoundaryError) as raised:
+            harness.send_turn(chat_id, "hello")
+        self.assertIn("sequence 5", str(raised.exception),
+                      "the refusal met while reading the page is reported, not the "
+                      "page-level one that was met after it")
+        self.assertEqual(self.sequences(harness.store, chat_id), [1],
+                         "and what could be preserved still was")
+
     def test_a_payload_that_could_not_be_parsed_at_all_is_preserved_verbatim(self):
         # Contract 7 P1: preservation "is *especially* required when structured
         # parsing fails, because those are the cases v0.1 exists to discover".
@@ -279,8 +298,9 @@ class ALaunchThatIssuedNoHandlePreservesWhatItProduced(IntakeCase):
         os.makedirs(self.codex_home)
 
     def test_the_model_s_output_and_exit_status_are_preserved_on_the_failed_session(self):
-        launcher = InternalBridgeLauncher(self.codex_home, self.spool,
-                                          behaviour=("no-thread-started",))
+        launcher = InternalBridgeLauncher(
+            self.codex_home, self.spool,
+            behaviour=("no-thread-started", "stderr-noise"))
         harness = self.harness(launcher)
         chat_id = harness.create_chat("A launch that started no thread")
         harness.send_turn(chat_id, "hello")
@@ -304,7 +324,10 @@ class ALaunchThatIssuedNoHandlePreservesWhatItProduced(IntakeCase):
         self.assertIn("model_launcher_observation", observation,
                       "the launcher's own line names itself as one in its own bytes")
         self.assertIn("exit_status", observation)
-        self.assertIn("stderr_tail", observation)
+        self.assertIn("a prerequisite check wrote this to stderr",
+                      observation.get("stderr_tail", ""),
+                      "stderr is preserved with its content, not as an empty key; "
+                      "on this path nothing else can carry it")
         self.assertIsNone(events[-1]["interpreted_type"],
                           "no event type is invented for it")
 
@@ -316,6 +339,79 @@ class ALaunchThatIssuedNoHandlePreservesWhatItProduced(IntakeCase):
                                 "A launch that started no thread, with the output it "
                                 "produced preserved against the session that failed "
                                 "to open.")
+
+    def test_a_launcher_that_returns_a_failure_rather_than_raising_keeps_its_output(self):
+        # `launch` may *return* a failed or unknown `LaunchResult` instead of
+        # raising, and the harness re-states every result through the
+        # constructor rather than trusting the launcher's object. Found by
+        # mutating that re-statement: it dropped `payloads` and nothing failed,
+        # because every other test here reaches this through `LauncherError`.
+        line = lb.EventPayload(1, lb.SOURCE_LAUNCHER, lb.INTERPRETATION_MALFORMED,
+                               b"prerequisite check failed")
+
+        class ReturnsAFailure(PageLauncher):
+            def launch(self, instruction):
+                return lb.LaunchResult(lb.OUTCOME_FAILED,
+                                       failure_category=lb.FAILURE_UNAVAILABLE,
+                                       detail="no active user session",
+                                       payloads=[line])
+
+        harness = self.harness(ReturnsAFailure())
+        chat_id = harness.create_chat("A returned failure")
+        harness.send_turn(chat_id, "hello")
+
+        events = self.preserved(harness.store, chat_id)
+        self.assertEqual([(e["sequence"], e["source"], e["interpretation"]) for e in events],
+                         [(1, "launcher", "malformed")])
+        self.assertEqual(events[0]["raw"]["body"], "prerequisite check failed",
+                         "preserved verbatim whether the launcher raised or returned")
+
+    def test_an_unknown_outcome_also_preserves_what_the_launch_produced(self):
+        # `unknown` carries no handle either, so it has the same problem and the
+        # same channel. Contract fixture `valid/09-launch-outcome-unknown` is
+        # exactly this shape.
+        line = lb.EventPayload(1, lb.SOURCE_LAUNCHER, lb.INTERPRETATION_UNRECOGNIZED,
+                               b'{"note":"the call returned nothing usable"}')
+
+        class OutcomeUnknown(PageLauncher):
+            def launch(self, instruction):
+                return lb.LaunchResult(lb.OUTCOME_UNKNOWN, detail="no acknowledgement",
+                                       payloads=[line])
+
+        harness = self.harness(OutcomeUnknown())
+        chat_id = harness.create_chat("An unknown outcome")
+        harness.send_turn(chat_id, "hello")
+
+        sessions = support.view(harness).sessions_of(chat_id)
+        self.assertEqual([s["state"] for s in sessions], ["unknown"])
+        self.assertEqual([e["sequence"] for e in self.preserved(harness.store, chat_id)], [1])
+        harness.abandon(chat_id)
+        self.assert_store_valid(harness.store, "intake-unknown-launch-output-preserved",
+                                "A launch whose outcome is `unknown`, with what it "
+                                "produced preserved on the session, then abandoned.")
+
+    def test_a_launch_that_printed_nothing_at_all_still_leaves_evidence(self):
+        # The other branch of the model's failure: the script exits non-zero and
+        # prints nothing, so there is no transport output to preserve. The
+        # launcher's own observation of the process it ran is the whole record,
+        # and without it this failure leaves no `diagnostic_event` at all --
+        # found by mutating that branch's payloads away.
+        launcher = InternalBridgeLauncher(
+            self.codex_home, self.spool, behaviour=("no-output", "stderr-noise"))
+        harness = self.harness(launcher)
+        chat_id = harness.create_chat("A launch that printed nothing")
+        harness.send_turn(chat_id, "hello")
+
+        events = self.preserved(harness.store, chat_id)
+        self.assertEqual([(e["sequence"], e["source"], e["interpretation"])
+                          for e in events],
+                         [(1, "launcher", "unrecognized")])
+        observation = json.loads(events[0]["raw"]["body"])
+        self.assertEqual(observation["exit_status"], 1)
+        self.assertIn("a prerequisite check wrote this to stderr",
+                      observation["stderr_tail"])
+        results = support.view(harness).all_of("launch_result")
+        self.assertEqual([r["failure_category"] for r in results], ["unavailable"])
 
     def test_the_seam_refuses_output_that_could_not_honestly_be_preserved(self):
         # Agent-sourced output on a launch that never ran is refused by contract
@@ -376,6 +472,25 @@ class TheOneShotEndOfStreamPayloadIsWhereP1AndSixOneDisagree(IntakeCase):
         self.assertIn("no stream to end", str(raised.exception),
                       "the claim is refused under either answer")
         return harness, chat_id
+
+    def test_the_shipped_answer_is_the_one_the_orchestrator_has_not_changed(self):
+        # The two tests below each set the constant themselves, so neither pins
+        # the value this build actually ships with -- found by mutating it. This
+        # one touches nothing and asserts the behaviour, not the name.
+        #
+        # **If this test fails, read it as the flip having been made**: the
+        # orchestrator answered the one-shot `stream_end` question with option A,
+        # and this expectation should change to `[1, 2, 3]` deliberately, with
+        # the reason recorded, exactly as decision 0003's flip was.
+        harness = self.harness(PageLauncher(pages=[self.page()]))
+        chat_id = harness.create_chat("The shipped answer")
+        with self.assertRaises(LaunchBoundaryError):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(
+            self.sequences(harness.store, chat_id), [1],
+            "this build refuses the payload before preserving it, which is what "
+            "#86 and #87 were both accepted doing and is what the rail was told "
+            "not to change on its own")
 
     def test_refused_before_preservation_is_the_accepted_behaviour_and_costs_the_rest(self):
         harness, chat_id = self.run_it(False)

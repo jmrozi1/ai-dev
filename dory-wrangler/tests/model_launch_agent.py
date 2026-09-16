@@ -107,6 +107,13 @@ def main(argv):
         return 64
     message = args[0]
 
+    if "stderr-noise" in behaviour:
+        # Not a claim about what the real script prints on stderr -- nothing has
+        # shown that, and the module's "not modelled" list says so. It exists so
+        # a probe can check that stderr is *preserved* where nothing else can
+        # carry it, rather than that a key with an empty value is written.
+        sys.stderr.write("model: a prerequisite check wrote this to stderr\n")
+
     threads = os.path.join(home, "threads")
     os.makedirs(threads, exist_ok=True)
     lines, status, thread_id = [], 0, None
