@@ -719,6 +719,36 @@ class TheNoHandleChannelObeysTheSameRulesAsTheDrain(IntakeCase):
                           "and the reading is still declined on the shape the "
                           "session was actually opened with")
 
+    def test_the_drain_reads_the_session_s_recorded_capabilities_too(self):
+        # The same C1 class on the *drain*, which the test above cannot reach
+        # because it goes through re-attachment. Found as a GREEN row in this
+        # rail's own mutation sweep: mutating `_drain` alone back to the
+        # configured launcher's capabilities broke nothing, so the drain half of
+        # the fix was unpinned. It is the same defect, on the path a *second
+        # turn* takes rather than a restart.
+        opened = self.harness(PageLauncher(pages=[lb.EventsPage([])]))
+        chat_id = opened.create_chat("A one-shot session that stays running")
+        opened.send_turn(chat_id, "hello")
+        self.assertEqual([s["state"] for s in support.view(opened).sessions_of(chat_id)],
+                         ["running"])
+
+        # A second turn, delivered by a process configured with a *stream*
+        # launcher. `_continue_turn` reads the session's recorded `continuation`,
+        # so the delivery is legal; the drain must read its recorded shape too.
+        page = lb.EventsPage([self.launcher_line(1, "one"), stream_end(2),
+                              self.launcher_line(3, "three")])
+        restarted = SessionManager(
+            ChatStore(self.root),
+            PageLauncher(pages=[page], shape=lb.RESPONSE_SHAPE_STREAM))
+        with self.assertRaises(LaunchBoundaryError) as raised:
+            restarted.send_turn(chat_id, "and again")
+        self.assertIn("no stream to end", str(raised.exception),
+                      "the session was opened one-shot, so this is the refusal "
+                      "its own record calls for")
+        self.assertEqual(self.sequences(restarted.store, chat_id), [1, 2, 3],
+                         "and the bytes behind it survive; reading the configured "
+                         "launcher instead loses 2 and then 3 to the gap")
+
 
 class TheOneShotEndOfStreamPayloadIsWhereP1AndSixOneDisagree(IntakeCase):
     """The escalated question, answered, and still pinned at both answers.
