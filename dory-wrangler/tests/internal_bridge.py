@@ -84,7 +84,12 @@ What that shape obliges a launcher author to do, all on this side of the seam:
    sequence 1, across restarts.
 3. **Classify launch and deliver output through one path.**
 4. **Honour `after_sequence`** (review finding F1).
-5. Register it in `launchers/registry.py` -- which this file deliberately does
+5. **Carry the output of a launch that started no thread back with the failure**,
+   sourced to the launcher. Without a handle there is no `events` call in that
+   session's future, so `LauncherError.payloads` is the only channel those bytes
+   have, and contract 7 P1 requires them preserved. Sourcing them to the agent
+   is refused by P2a and by the store: nothing proved an agent existed.
+6. Register it in `launchers/registry.py` -- which this file deliberately does
    not do, because it is a model and not the launcher.
 
 ## Not modelled, because nothing has shown it
@@ -93,7 +98,8 @@ The internal Codex version and every other event type; zero or several
 `agent_message` items per turn (the model can emit two, as a probe, not a
 claim); an explicit end-of-turn event distinct from process exit; error,
 non-zero-exit, stderr and prerequisite-failure shapes (the model's mapping below
-is a placeholder); stop or cancellation; `thread_id` lifetime and invalid-ID
+is a placeholder; what a failed launch *preserves* is settled, what its failure
+category should be is not); stop or cancellation; `thread_id` lifetime and invalid-ID
 behaviour; concurrency; any payload bound.
 """
 
@@ -182,16 +188,31 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
         if handle is None:
             # No thread, so nothing that could be addressed again. Which category
             # the real script's failures belong to is unproven; this mapping is
-            # the model's placeholder. The output of such a call has nowhere to
-            # go through the seam -- the rail handoff records it as an intake gap.
+            # the model's placeholder.
+            #
+            # The output of such a call used to have nowhere to go: no handle
+            # means no `events` call can ever ask for it, so the harness saw a
+            # category and a prose detail and the lines themselves were dropped
+            # at the seam -- the intake gap this model exposed. They now travel
+            # with the failure and the harness preserves them against the session
+            # that failed to open. Every one is sourced to the **launcher**:
+            # nothing here proved an agent exists, which is exactly what "no
+            # thread started" means, and contract 7 P2a refuses agent-sourced
+            # evidence on a session that never ran. Contract 6.1's *Known
+            # residual* states that reading. The bytes are the script's own, byte
+            # for byte, and `classify`'s interpretation of each line is unchanged;
+            # only the source differs from the resumable path.
+            payloads = self._failed_launch_payloads(lines, status)
             if not lines:
                 raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
                                        "launch_agent.sh exited %d and printed nothing; "
-                                       "stderr ends: %s" % (status, self.last_stderr[-300:]))
+                                       "stderr ends: %s" % (status, self.last_stderr[-300:]),
+                                       payloads=payloads)
             raise lb.LauncherError(lb.FAILURE_NO_ACKNOWLEDGEMENT,
                                    "launch_agent.sh exited %d, printed %d line(s) and no "
                                    "thread started; stderr ends: %s"
-                                   % (status, len(lines), self.last_stderr[-300:]))
+                                   % (status, len(lines), self.last_stderr[-300:]),
+                                   payloads=payloads)
         self._append(handle, [("agent", raw) for raw in lines])
         if not self._capabilities.supports_delivery:
             # Under fresh_binding the next turn is a new launch, so this agent is
@@ -201,6 +222,37 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
                 {"model_launcher_observation": "launch_agent.sh returned",
                  "exit_status": status}).encode("utf-8"))])
         return lb.LaunchResult(lb.OUTCOME_ACCEPTED, agent_handle=handle)
+
+    def _failed_launch_payloads(self, lines, status):
+        """What a launch that started no thread produced, ready to be preserved.
+
+        The script's own output lines first, in order, then one line of the
+        launcher's own: the exit status and the tail of stderr. That last line is
+        the model observing the process it ran, so it names itself as such in its
+        own bytes (`model_launcher_observation`) and invents no Codex event type
+        -- `classify` reads it as ordinary `unrecognized` JSON, which is the
+        honest reading of a type nothing in the transport defines. It is the same
+        shape the fresh-binding path already writes when a call returns.
+
+        stderr and the exit status were previously kept only on the launcher
+        object, for a failure's `detail` prose. They are evidence about what the
+        integration did, so on the one path where nothing else can carry them
+        they are preserved as bytes instead.
+        """
+        payloads = []
+        for sequence, raw in enumerate(lines, 1):
+            classified = classify(sequence, raw)
+            payloads.append(lb.EventPayload(sequence, lb.SOURCE_LAUNCHER,
+                                            classified.interpretation, raw,
+                                            interpreted_type=classified.interpreted_type))
+        observation = json.dumps({
+            "model_launcher_observation": "launch_agent.sh started no thread",
+            "exit_status": status,
+            "stderr_tail": self.last_stderr[-2000:],
+        }).encode("utf-8")
+        payloads.append(lb.EventPayload(len(payloads) + 1, lb.SOURCE_LAUNCHER,
+                                        lb.INTERPRETATION_UNRECOGNIZED, observation))
+        return payloads
 
     def deliver(self, agent_handle, instruction):
         if not self._capabilities.supports_delivery:
@@ -242,8 +294,11 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
         except OSError as exc:
             raise lb.LauncherError(lb.FAILURE_UNAVAILABLE,
                                    "could not run launch_agent.sh: %s" % exc)
-        # stderr is not an event and is not preserved (nothing has shown its
-        # shape); its tail is kept on the launcher for a failure's detail only.
+        # stderr is not a transport event and has no shown shape, so it is never
+        # classified as one. Its tail is kept on the launcher for a failure's
+        # `detail`, and on the one path where nothing else can carry it -- a
+        # launch that started no thread -- it is preserved as bytes inside the
+        # launcher's own observation line (`_failed_launch_payloads`).
         self.last_stderr = done.stderr[-2000:].decode("utf-8", "replace")
         return done.returncode, output_lines(done.stdout)
 

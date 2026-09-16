@@ -120,9 +120,18 @@ class LauncherError(Exception):
     better -- it turns a launcher's honest, correctly categorised failure into an
     unclassified crash. Coercion loses nothing, because nothing on this side of
     the seam parses `detail`.
+
+    **`payloads` is the output the failed operation produced**, if the launcher
+    has any. It exists because a `launch` that issues no handle leaves its output
+    with nowhere to go: `events` takes the handle and nothing else, so anything
+    the launcher read before it failed to start a thread can never be read back,
+    while contract 7 P1 requires it to be preserved regardless. `LaunchResult`
+    carries the same field and enforces the rules on it; this only holds what the
+    launcher handed over, so that a launcher's honest categorised failure is
+    never turned into an unclassified crash by the way it packed its output.
     """
 
-    def __init__(self, category, detail=None):
+    def __init__(self, category, detail=None, payloads=()):
         if category not in FAILURE_CATEGORIES:
             raise LaunchBoundaryError(
                 "failure category %r is not one of %s"
@@ -133,6 +142,7 @@ class LauncherError(Exception):
         Exception.__init__(self, "%s: %s" % (category, detail or ""))
         self.category = category
         self.detail = detail
+        self.payloads = tuple(payloads or ())
 
 
 def _require(condition, message):
@@ -303,11 +313,33 @@ class LaunchResult(object):
     The conditional-field rules are enforced here, at the seam, rather than only
     where the record is written: a launcher that reports `accepted` without a
     handle has not accepted anything, and this is where that stops.
+
+    **`payloads` is the output of a launch that issued no handle** (contract 7
+    P1). `events` addresses an agent through the handle and nothing else, so a
+    launch that ends `failed` or `unknown` has no later channel through which
+    anything it produced could be read: without this field that output is lost
+    at the seam, which is the intake gap the internal JSONL model exposed. Three
+    rules hold it honest, and each is a rule the contract already states:
+
+    * **An accepted launch may not carry payloads.** It has a handle, so `events`
+      is its channel and it must stay the only one; two channels for the same
+      output would preserve it twice at two sequences.
+    * **Every payload is launcher-sourced.** Nothing proved an agent exists --
+      that is what a failed launch means -- so agent-sourced output here is
+      refused by contract 7 P2a and by the store. Contract 6.1 under *Known
+      residual* states the honest reading directly: launcher-sourced events on a
+      session that never got a handle are accepted, "because the honest reading
+      is that the `launch` call itself returned that output".
+    * **Sequences are 1..N in order.** This output is the whole history of a
+      session that never ran, so it starts at 1 and is contiguous (contract P3).
+      Checking it here means the harness's preservation of it cannot meet a gap
+      it has no handle to record an observation about.
     """
 
-    __slots__ = ("outcome", "agent_handle", "failure_category", "detail")
+    __slots__ = ("outcome", "agent_handle", "failure_category", "detail", "payloads")
 
-    def __init__(self, outcome, agent_handle=None, failure_category=None, detail=None):
+    def __init__(self, outcome, agent_handle=None, failure_category=None, detail=None,
+                 payloads=()):
         _require(
             outcome in LAUNCH_OUTCOMES,
             "outcome must be one of %s" % "/".join(LAUNCH_OUTCOMES),
@@ -316,6 +348,25 @@ class LaunchResult(object):
             detail is None or isinstance(detail, str),
             "detail must be a string or None",
         )
+        payloads = tuple(payloads or ())
+        for expected, payload in enumerate(payloads, 1):
+            _require(
+                isinstance(payload, EventPayload),
+                "launch output must be EventPayload objects; a launcher does not "
+                "get to hand the store an arbitrary mapping",
+            )
+            _require(
+                payload.source == SOURCE_LAUNCHER,
+                "a launch that issued no handle may only report launcher-sourced "
+                "output: nothing proved an agent existed, and contract 7 P2a "
+                "refuses agent-sourced evidence on a session that never ran",
+            )
+            _require(
+                payload.sequence == expected,
+                "launch output is the whole history of a session that never ran, so "
+                "its sequences are contiguous from 1; payload %d is sequence %d"
+                % (expected, payload.sequence),
+            )
         if outcome == OUTCOME_ACCEPTED:
             _require(
                 isinstance(agent_handle, str) and agent_handle != "",
@@ -325,6 +376,12 @@ class LaunchResult(object):
             _require(
                 failure_category is None,
                 "an accepted launch must not carry a failure_category",
+            )
+            _require(
+                not payloads,
+                "an accepted launch reports its output through `events`, addressed "
+                "by the handle it just returned; carrying it here as well would "
+                "preserve the same payloads twice at two sequences",
             )
         elif outcome == OUTCOME_FAILED:
             _require(
@@ -346,12 +403,14 @@ class LaunchResult(object):
         self.agent_handle = agent_handle
         self.failure_category = failure_category
         self.detail = detail
+        self.payloads = payloads
 
     def __repr__(self):
-        return "LaunchResult(%s, handle=%r, category=%r)" % (
+        return "LaunchResult(%s, handle=%r, category=%r, payloads=%d)" % (
             self.outcome,
             self.agent_handle,
             self.failure_category,
+            len(self.payloads),
         )
 
 
