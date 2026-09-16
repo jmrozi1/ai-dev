@@ -123,9 +123,20 @@ rendering beyond agent text, malformed-event handling, and bounded diagnostic
 access are #88's remaining checkpoints. No observability (#82), supervision
 (#83), or multi-agent (#84) behavior is in scope.
 
-One payload shape is knowingly still unpreserved: a payload typed `stream_end`
-from a launcher declaring `response_shape: one_shot`, which is where contract 7
-P1 and contract 6.1's `STREAM_END_UNSUPPORTED` disagree. Both answers are
-implemented and tested behind `session_manager.PRESERVE_UNATTRIBUTABLE_STREAM_END`;
-which one v0.1 takes is an open orchestrator decision and may need a #85 wording
-correction to P2.
+Every payload shape is now preserved, including the last one that was not: a
+payload typed `stream_end` from a launcher declaring `response_shape: one_shot`,
+where contract 7 P1 and contract 6.1's `STREAM_END_UNSUPPORTED` appeared to
+disagree. **The human decided it on 2026-09-15: preserve the bytes.** The record
+is written `unrecognized` with `interpreted_type: null`, and the `stream_end`
+*assertion* is still refused exactly as 6.1 states it -- the turn fails and no
+session concludes anything from an end of stream a one-shot launcher could not
+have seen. What made it possible was one widened sentence of contract 7 P2,
+corrected on `dory-wrangler/issue-85` and carried here by merge: `unrecognized`
+now covers a type this build knows "but cannot attribute on this session". No
+rule, error code, fixture or validator check changed with it.
+
+It was never a loss of one payload. Refusing before preserving left that
+`sequence` unwritten, and the gap made every later payload on that session
+unpreservable for the session's life. Both answers stay implemented and pinned
+behind `session_manager.PRESERVE_UNATTRIBUTABLE_STREAM_END`, so what was
+decided, and what the other answer costs, is readable from the code.

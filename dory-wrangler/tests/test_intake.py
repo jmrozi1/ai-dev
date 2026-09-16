@@ -15,11 +15,12 @@ as a description:
   reading the store and nothing else. Classifying event types is a later
   checkpoint and nothing here does it.
 
-The one thing intake does **not** close is the single payload shape where P1 and
-6.1's `STREAM_END_UNSUPPORTED` genuinely disagree. Both values of
-`session_manager.PRESERVE_UNATTRIBUTABLE_STREAM_END` are tested below, so
-whichever the orchestrator chooses is already pinned and the flip is the whole
-change.
+The one shape intake left open -- where P1 and 6.1's `STREAM_END_UNSUPPORTED`
+appeared to disagree -- was answered by the human on 2026-09-15: preserve the
+bytes, decline the reading. Both values of
+`session_manager.PRESERVE_UNATTRIBUTABLE_STREAM_END` are still tested below, so
+the older accepted behaviour stays pinned alongside the shipped one, and the
+test that asserts the shipped value says which it is.
 """
 
 from __future__ import annotations
@@ -466,14 +467,21 @@ class ALaunchThatIssuedNoHandlePreservesWhatItProduced(IntakeCase):
 
 
 class TheOneShotEndOfStreamPayloadIsWhereP1AndSixOneDisagree(IntakeCase):
-    """The rail's escalated question, pinned at both of its answers.
+    """The escalated question, answered, and still pinned at both answers.
 
     Contract 7 P1 requires the bytes. Contract 6.1 rejects
     `interpreted_type: "stream_end"` on a session whose launcher declares
     `one_shot`, outright, "whichever evidence channel cites it or whether
-    anything cites it at all". `PRESERVE_UNATTRIBUTABLE_STREAM_END` holds the
-    answer; both values behave as described, so the decision is a one-line change
-    and neither outcome is untested.
+    anything cites it at all". **The human answered it on 2026-09-15: preserve
+    the bytes and decline the reading**, which contract 7 P2 now covers -- a type
+    this build knows "but cannot attribute on this session" is `unrecognized`
+    with `interpreted_type: null`. `PRESERVE_UNATTRIBUTABLE_STREAM_END` is
+    `True` accordingly.
+
+    The older accepted behaviour stays pinned below so what was given up is
+    readable, and so the assertion refusal -- which did **not** change -- is held
+    under both answers. A change that preserved the `stream_end` *assertion* as
+    well as its bytes would break every test in this class.
     """
 
     def page(self):
@@ -497,21 +505,70 @@ class TheOneShotEndOfStreamPayloadIsWhereP1AndSixOneDisagree(IntakeCase):
         # the value this build actually ships with -- found by mutating it. This
         # one touches nothing and asserts the behaviour, not the name.
         #
-        # **If this test fails, read it as the flip having been made**: the
-        # orchestrator answered the one-shot `stream_end` question with option A,
-        # and this expectation should change to `[1, 2, 3]` deliberately, with
-        # the reason recorded, exactly as decision 0003's flip was.
+        # **The expectation changed from `[1]` to `[1, 2, 3]` deliberately.** The
+        # human answered the one-shot `stream_end` question on 2026-09-15 with
+        # option A -- preserve the bytes, decline the reading -- and the enabling
+        # widening of contract 7 P2 was carried onto this branch from
+        # `dory-wrangler/issue-85`. This is what that flip looks like, recorded
+        # exactly as decision 0003's flip was. Nothing was weakened: the refusal
+        # of the *assertion* is still asserted here and in every test below.
         harness = self.harness(PageLauncher(pages=[self.page()]))
         chat_id = harness.create_chat("The shipped answer")
+        with self.assertRaises(LaunchBoundaryError) as raised:
+            harness.send_turn(chat_id, "hello")
+        self.assertIn("no stream to end", str(raised.exception),
+                      "the assertion is still refused; only the bytes are kept")
+        self.assertEqual(
+            self.sequences(harness.store, chat_id), [1, 2, 3],
+            "this build preserves the bytes and declines only the reading, which "
+            "is the human's decision of 2026-09-15 and the whole reason the "
+            "payloads behind it are no longer lost")
+        kept = self.preserved(harness.store, chat_id)[1]
+        self.assertEqual(kept["interpretation"], "unrecognized")
+        self.assertIsNone(kept["interpreted_type"],
+                          "preserving the bytes must never become recording the "
+                          "assertion; `interpreted_type` stays null so 6.1's "
+                          "STREAM_END_UNSUPPORTED is unreachable, not suppressed")
+
+    def test_the_preserved_payload_leaves_no_gap_behind_it_on_that_session(self):
+        # The point of the decision, and the thing the older behaviour really
+        # cost. Refusing before preserving left sequence 2 unwritten, so the
+        # store refused 3, and 4, and everything after it for the life of the
+        # session -- the loss was never one payload. A fourth payload offered on
+        # the *same* session after the page is the proof that the history is
+        # contiguous again.
+        launcher = PageLauncher(pages=[
+            self.page(),
+            lb.EventsPage([agent_text(4, "later, on the same session")])])
+        harness = self.harness(launcher)
+        chat_id = harness.create_chat("No gap left behind")
         with self.assertRaises(LaunchBoundaryError):
             harness.send_turn(chat_id, "hello")
+        self.assertEqual(self.sequences(harness.store, chat_id), [1, 2, 3])
+
+        harness.send_turn(chat_id, "are you still there")
         self.assertEqual(
-            self.sequences(harness.store, chat_id), [1],
-            "this build refuses the payload before preserving it, which is what "
-            "#86 and #87 were both accepted doing and is what the rail was told "
-            "not to change on its own")
+            self.sequences(harness.store, chat_id), [1, 2, 3, 4],
+            "at b871aa1 this second turn was refused as a gap -- 'sequence 4 "
+            "while 1 is stored' -- and stayed refused for the session's life")
+        sessions = support.view(harness).sessions_of(chat_id)
+        self.assertEqual(len(sessions), 1,
+                         "and it is the same session, not a new one opened "
+                         "around the damage")
+        # Kept from the *shipped* configuration -- this test sets no constant --
+        # so what the contract validator accepts is what this build produces.
+        self.assert_store_valid(
+            harness.store, "intake-one-shot-stream-end-no-gap-left",
+            "A one-shot launcher's `stream_end` payload preserved as bytes with "
+            "its reading declined, and a later payload on the same session "
+            "preserved behind it -- the contiguous history the refusal used to "
+            "destroy, accepted by the contract validator unchanged.")
 
     def test_refused_before_preservation_is_the_accepted_behaviour_and_costs_the_rest(self):
+        # Kept under its original name: this is what #86 and #87 were accepted
+        # doing, and it is no longer what ships. It stays so that the answer the
+        # human did not take is still measured rather than described, and so the
+        # decision remains a one-line change in either direction.
         harness, chat_id = self.run_it(False)
         self.assertEqual(self.sequences(harness.store, chat_id), [1],
                          "this is what #86 and #87 were both accepted doing")

@@ -67,37 +67,49 @@ from .launch_boundary import (
 # would wait on itself.
 TURN_LOCK_NAME = ".turn-lock"
 
-# The one open question of the intake checkpoint, with its answer parked here so
-# that changing it is a one-line change and not a redesign.
+# The intake checkpoint's one open question, **answered by the human on
+# 2026-09-15: preserve the bytes.** The answer stays parked here because both
+# behaviours remain pinned by tests, so the record of what was decided and what
+# it cost is one line and one comment rather than a reconstruction.
 #
-# **The tension.** Contract 7 P1: "Every payload the integration produces becomes
-# a `diagnostic_event` whose `raw.body` holds it exactly as received."
-# Contract 6.1: "A `diagnostic_event` of `interpreted_type: 'stream_end'` on such
-# a session is rejected outright (`STREAM_END_UNSUPPORTED`)", where "such a
-# session" is one whose launcher declares `response_shape: one_shot`. A one-shot
-# launcher that types a payload `stream_end` therefore produces bytes P1 requires
-# preserved and a reading 6.1 forbids recording. #86 and #87 both resolved it by
-# refusing before preserving, so the bytes survive nowhere, and both were
-# accepted that way.
+# **The tension it resolves.** Contract 7 P1: "Every payload the integration
+# produces becomes a `diagnostic_event` whose `raw.body` holds it exactly as
+# received." Contract 6.1: "A `diagnostic_event` of `interpreted_type:
+# 'stream_end'` on such a session is rejected outright
+# (`STREAM_END_UNSUPPORTED`)", where "such a session" is one whose launcher
+# declares `response_shape: one_shot`. A one-shot launcher that types a payload
+# `stream_end` therefore produces bytes P1 requires preserved and a reading 6.1
+# forbids recording. #86 and #87 both resolved it by refusing before preserving,
+# so the bytes survived nowhere, and both were accepted that way.
 #
-# **What each value does.** `False` is that accepted behaviour: the payload is
-# refused before it is written, and its bytes are lost. `True` preserves the
-# bytes and drops only the reading -- the record is written `unrecognized` with
+# **What each value does.** `True`, the shipped value, preserves the bytes and
+# drops only the reading -- the record is written `unrecognized` with
 # `interpreted_type: null` (`_preserve(..., attribute=False)`), so P1 is
 # satisfied and `STREAM_END_UNSUPPORTED` is never reachable, because both the
 # store (`store.py`) and the validator test `interpreted_type` alone and neither
-# examines `raw.body`. Under either value the *claim* is still refused: the page
-# raises, the turn fails, and no session ever concludes `unknown` from an end of
-# stream a one-shot launcher could not have seen.
+# examines `raw.body`. `False` is the older accepted behaviour: the payload is
+# refused before it is written and its bytes are lost. Under either value the
+# *claim* is still refused exactly as 6.1 states it: the page raises, the turn
+# fails, and no session ever concludes `unknown` from an end of stream a
+# one-shot launcher could not have seen. Preserving the bytes is not a step
+# towards accepting the assertion and must never become one.
 #
-# **Why it is `False` here.** `True` needs one sentence of contract 7 P2 widened
-# -- `unrecognized` reads "well-formed but of a type this build does not know",
-# and this build knows `stream_end`; what it cannot do is attribute it on this
-# session. That is #85's wording to change and the orchestrator's call to make,
-# not an executor's. The rail escalated it with the analysis; until it is
-# answered the accepted behaviour stands. Every *other* payload on the page is
-# preserved regardless -- that part needed no decision and is done.
-PRESERVE_UNATTRIBUTABLE_STREAM_END = False
+# **Why it is `True`.** Under `False` the loss was never one payload. Refusing
+# before preserving leaves that `sequence` unwritten, so the next payload is a
+# gap the store refuses, and so is every payload after it for the session's
+# life: measured on the probe page `[text@1, stream_end@2, text@3]`, `False`
+# preserves `[1]` and then refuses a later `[text@4]` on the same session, while
+# `True` preserves `[1, 2, 3]` and then `4`. The one thing that stood in the way
+# was prose, not a rule: contract 7 P2's `unrecognized` bullet read "well-formed
+# but of a type this build does not know", and this build knows `stream_end` --
+# what it cannot do is *attribute* it on this session. The human widened that
+# bullet on 2026-09-15 to cover "or knows but cannot attribute on this session"
+# (#85, carried here by the contract pick-up merge), which is why this is now
+# `True`. No rule, error code, fixture or validator check changed with it.
+#
+# Residual, stated rather than implied: a reader of the store cannot tell a
+# genuinely unknown type from a declined one without reading `raw.body`.
+PRESERVE_UNATTRIBUTABLE_STREAM_END = True
 
 
 class TurnOutcome(object):
@@ -766,11 +778,13 @@ class SessionManager(object):
         is now taken on its own whatever refuses it, and the first refusal is
         raised once the whole page has been offered to the store.
 
-        One refusal still precedes preservation, and one only: a payload typed
-        `stream_end` from a launcher declaring `one_shot`. That is the single
-        shape where contract 7 P1 and contract 6.1's `STREAM_END_UNSUPPORTED`
-        genuinely disagree, and the answer is the orchestrator's, not this rail's
-        -- see `PRESERVE_UNATTRIBUTABLE_STREAM_END`.
+        **No refusal precedes preservation any more.** The last one that did was
+        a payload typed `stream_end` from a launcher declaring `one_shot` -- the
+        single shape where contract 7 P1 and contract 6.1's
+        `STREAM_END_UNSUPPORTED` appeared to disagree. The human answered it on
+        2026-09-15: the bytes are preserved and only the reading is declined, so
+        that page now preserves all three of `[text@1, stream_end@2, text@3]`
+        and leaves no gap behind it. See `PRESERVE_UNATTRIBUTABLE_STREAM_END`.
         """
         chat_id = session["chat_id"]
         session_id = session["session_id"]
@@ -790,19 +804,30 @@ class SessionManager(object):
         of this checkpoint: a payload the seam will refuse to *read* is still a
         payload the integration produced, and P1 is unconditional. The two
         end-of-stream refusals below therefore run after `_preserve`, not before
-        it -- the evidence is kept and the claim is still refused.
+        it -- the evidence is kept and the claim is still refused. Since the
+        human's decision of 2026-09-15 that is true of *both* of them on every
+        shipped path; the pre-preservation raise above is the older answer, kept
+        reachable only through `PRESERVE_UNATTRIBUTABLE_STREAM_END`.
         """
         chat_id = session["chat_id"]
         session_id = session["session_id"]
         unattributable = (payload.interpreted_type == PAYLOAD_STREAM_END
                           and not capabilities.has_stream)
         if unattributable and not PRESERVE_UNATTRIBUTABLE_STREAM_END:
-            # The one shape where preserving would itself break a contract rule,
-            # and the one place this rail did not decide. See the constant.
+            # The older accepted behaviour, kept reachable and pinned so the
+            # human's decision stays a one-line change. Not what ships. See the
+            # constant.
             raise self._unattributable_stream_end(payload)
 
+        # `attribute=False` writes the bytes as `unrecognized` / `null`: contract
+        # 7 P2 covers "a type this build does not know, **or knows but cannot
+        # attribute on this session**" since the 2026-09-15 correction, and this
+        # session is exactly the second case.
         event_id = self._preserve(session, payload, attribute=not unattributable)
         if unattributable:
+            # The bytes are kept; the *assertion* is refused exactly as 6.1
+            # states it. Nothing recorded the `stream_end` reading, so
+            # `STREAM_END_UNSUPPORTED` is unreachable rather than suppressed.
             raise self._unattributable_stream_end(payload)
         if event_id is None:
             return  # a replayed (session_id, sequence); already stored
@@ -852,11 +877,13 @@ class SessionManager(object):
         replay, and the store refuses it (`StoreCorrupt`).
 
         `attribute=False` keeps the bytes and drops the launcher's reading of
-        them: the record is written `unrecognized` with `interpreted_type: null`.
-        It exists for the one reading the contract forbids on a session while
-        still requiring its bytes -- see `PRESERVE_UNATTRIBUTABLE_STREAM_END`.
-        The `raw.body` is identical either way, so nothing about the payload is
-        lost; only the harness's claim about what it was.
+        them: the record is written `unrecognized` with `interpreted_type: null`,
+        which contract 7 P2 covers for a type this build "knows but cannot
+        attribute on this session". It exists for the one reading the contract
+        forbids on a session while still requiring its bytes -- see
+        `PRESERVE_UNATTRIBUTABLE_STREAM_END`, which the human set to preserve on
+        2026-09-15. The `raw.body` is identical either way, so nothing about the
+        payload is lost; only the harness's claim about what it was.
         """
         try:
             body = payload.raw.decode("utf-8")
