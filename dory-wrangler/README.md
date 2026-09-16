@@ -23,8 +23,9 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
   from that now-archived repository into the internal network, written before
   this product moved here, and it still names that repository as the canonical
   source of tickets -- which it no longer is. It is not a Dory-wrangler product
-  path, nothing under `dory-wrangler/` reads it, and `main` is not edited merely
-  to clean up a stale transport artifact.
+  path and no code here reads it; `contract/v0.1/facts-and-assumptions.md` names
+  it only as the era some superseded prior observations came from. `main` is not
+  edited merely to clean up a stale transport artifact.
 
 ## Contents
 
