@@ -431,6 +431,25 @@ class ALaunchThatIssuedNoHandlePreservesWhatItProduced(IntakeCase):
         self.assertIn("could not cross the seam", result["detail"],
                       "and the loss is written down where it happened")
 
+    def test_output_that_is_not_an_event_payload_is_refused_at_the_seam(self):
+        # Without this check the next one reads `.source` off whatever the
+        # launcher handed over and raises `AttributeError`, which is not a
+        # `LaunchBoundaryError`, so it escapes the fallback and the launcher's
+        # honest `unavailable` becomes an unclassified `internal_error` that #90
+        # cannot count. Found by mutating the isinstance check away.
+        error = lb.LauncherError(lb.FAILURE_UNAVAILABLE, "prerequisite missing",
+                                 payloads=[{"sequence": 1, "raw": b"not a payload"}])
+        harness = self.harness(PageLauncher(launch_error=error))
+        chat_id = harness.create_chat("Output that is not a payload")
+        harness.send_turn(chat_id, "hello")
+
+        result = support.view(harness).all_of("launch_result")[0]
+        self.assertEqual(result["failure_category"], "unavailable",
+                         "the launcher's own category survives whatever it packed "
+                         "its output in")
+        self.assertIn("could not cross the seam", result["detail"])
+        self.assertEqual(self.preserved(harness.store, chat_id), [])
+
     def test_an_accepted_launch_may_not_carry_output_beside_its_events_channel(self):
         with self.assertRaises(LaunchBoundaryError) as raised:
             lb.LaunchResult(lb.OUTCOME_ACCEPTED, agent_handle="thread-1",
