@@ -36,6 +36,7 @@ from support import StoreCheck
 
 from dory_wrangler import launch_boundary as lb
 from dory_wrangler import session_manager as sm
+from dory_wrangler.errors import ValidationRefused
 from dory_wrangler.launch_boundary import LaunchBoundaryError
 from dory_wrangler.store import ChatStore
 from dory_wrangler.session_manager import SessionManager
@@ -464,6 +465,259 @@ class ALaunchThatIssuedNoHandlePreservesWhatItProduced(IntakeCase):
             lb.LaunchResult(lb.OUTCOME_FAILED, failure_category=lb.FAILURE_UNAVAILABLE,
                             payloads=[launcher_line])
         self.assertIn("contiguous from 1", str(raised.exception))
+
+
+class LauncherFailing(PageLauncher):
+    """A launcher whose `launch` fails carrying the output it produced."""
+
+    def __init__(self, payloads, category=lb.FAILURE_NO_ACKNOWLEDGEMENT, **kw):
+        PageLauncher.__init__(self, **kw)
+        self._payloads = list(payloads)
+        self._category = category
+
+    def launch(self, instruction):
+        raise lb.LauncherError(self._category, "no thread was started",
+                               payloads=self._payloads)
+
+
+class TheNoHandleChannelObeysTheSameRulesAsTheDrain(IntakeCase):
+    """Review findings F1, F2 and C1: the rules a new channel was never given.
+
+    `_preserve_launch_output` was added by the intake checkpoint and called
+    `_preserve` directly, so it inherited neither the decision of 2026-09-15 nor
+    the per-payload containment `_take_page` has. Every payload shape the drain
+    preserves was still being lost on this one, and the shape being lost was
+    precisely the one the human ruled on.
+
+    These are symmetry properties, so each is asserted against the drain path
+    carrying the **identical** payloads rather than against a number written
+    down here. Mutation cannot find a rule a channel was never given -- two
+    sweeps of 66 rows found 61 catches over the code these tests fail on -- so
+    the enumeration that finds it is the one in
+    `skills/adversarial-guard-verification/SKILL.md`, and these are its pins.
+    """
+
+    def launcher_line(self, sequence, body):
+        return lb.EventPayload(sequence, lb.SOURCE_LAUNCHER,
+                               lb.INTERPRETATION_UNRECOGNIZED, body.encode("utf-8"))
+
+    def shape_of(self, store, chat_id):
+        return [(e["sequence"], e["source"], e["interpretation"], e["interpreted_type"],
+                 e["raw"]["body"]) for e in self.preserved(store, chat_id)]
+
+    def three_payloads(self):
+        """One end-of-stream a one-shot launcher cannot attribute, between two others."""
+        return [self.launcher_line(1, "first line"), stream_end(2),
+                self.launcher_line(3, "third line")]
+
+    def test_a_failed_launch_keeps_the_end_of_stream_bytes_it_produced(self):
+        # F1. At `7fab5c5` this preserved `[1]`: `_preserve` was called with the
+        # default `attribute=True`, the store refused the `stream_end` reading
+        # with STREAM_END_UNSUPPORTED, the bytes were lost, and the gap took the
+        # payload behind them. This channel has no `events` call in its future,
+        # so those bytes existed nowhere afterwards.
+        harness = self.harness(LauncherFailing(self.three_payloads()))
+        chat_id = harness.create_chat("A failed launch that typed an end of stream")
+        with self.assertRaises(LaunchBoundaryError) as raised:
+            harness.send_turn(chat_id, "hello")
+        self.assertIn("no stream to end", str(raised.exception),
+                      "the assertion is refused on this channel exactly as 6.1 "
+                      "states it and as the drain refuses it")
+
+        self.assertEqual(self.sequences(harness.store, chat_id), [1, 2, 3])
+        kept = self.preserved(harness.store, chat_id)[1]
+        self.assertEqual(kept["interpretation"], "unrecognized")
+        self.assertIsNone(kept["interpreted_type"],
+                          "the bytes are kept and only the reading is declined; "
+                          "recording the assertion stays unreachable")
+        self.assertEqual(kept["raw"]["body"], '{"type":"stream_end"}',
+                         "preserved verbatim")
+
+    def test_the_two_channels_preserve_the_identical_payloads_identically(self):
+        # The review's A9 against its control A11. One set of payloads, the same
+        # one-shot launcher, two channels: what the store holds afterwards must
+        # not depend on which of them carried it. This is the property, and the
+        # test above is one reading of it.
+        failed = self.harness(LauncherFailing(self.three_payloads()))
+        no_handle_chat = failed.create_chat("Through the launch call")
+        with self.assertRaises(LaunchBoundaryError):
+            failed.send_turn(no_handle_chat, "hello")
+
+        drained = self.harness(
+            PageLauncher(pages=[lb.EventsPage(self.three_payloads())]),
+            root=tempfile.mkdtemp(prefix="dory-intake-drain-"))
+        self.addCleanup(shutil.rmtree, drained.store.root, True)
+        drain_chat = drained.create_chat("Through events")
+        with self.assertRaises(LaunchBoundaryError):
+            drained.send_turn(drain_chat, "hello")
+
+        self.assertEqual(self.shape_of(failed.store, no_handle_chat),
+                         self.shape_of(drained.store, drain_chat),
+                         "the no-handle channel and the drain must preserve the "
+                         "same payloads into the same records; at `7fab5c5` the "
+                         "first held [1] and the second [1, 2, 3]")
+
+    def test_a_returned_unknown_outcome_keeps_them_too(self):
+        # The same shape reached by *returning* a result rather than raising.
+        # `unknown` carries no handle either, so it has the same one channel.
+        payloads = self.three_payloads()
+
+        class OutcomeUnknown(PageLauncher):
+            def launch(self, instruction):
+                return lb.LaunchResult(lb.OUTCOME_UNKNOWN, detail="no acknowledgement",
+                                       payloads=payloads)
+
+        harness = self.harness(OutcomeUnknown())
+        chat_id = harness.create_chat("An unknown outcome that typed an end of stream")
+        with self.assertRaises(LaunchBoundaryError):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(self.sequences(harness.store, chat_id), [1, 2, 3])
+
+    def test_one_payload_s_refusal_does_not_cost_the_payloads_after_it(self):
+        # F2, the containment `_take_page` already had. Two refusable payloads in
+        # one set, so a loop that stops at the first refusal is visible as such:
+        # at `7fab5c5` this preserved `[1]` of five.
+        payloads = [self.launcher_line(1, "one"), stream_end(2),
+                    self.launcher_line(3, "three"), stream_end(4),
+                    self.launcher_line(5, "five")]
+        harness = self.harness(LauncherFailing(payloads))
+        chat_id = harness.create_chat("Two refusals in one set")
+        with self.assertRaises(LaunchBoundaryError):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual(self.sequences(harness.store, chat_id), [1, 2, 3, 4, 5],
+                         "every payload is offered to the store on its own, and "
+                         "the first refusal is reported once they all have been")
+        self.assertEqual(
+            [e["interpreted_type"] for e in self.preserved(harness.store, chat_id)],
+            [None, None, None, None, None],
+            "and no reading the session forbids was recorded to buy that")
+
+    def test_the_stranded_launch_is_still_recoverable_and_still_valid(self):
+        # The refusal cannot be recorded as an observation -- every observation
+        # kind addresses the agent through a handle this session never had -- so
+        # it is raised, leaving the recoverable `launching` shape a restart
+        # finishes from the launcher's own `launch_result`. D2's exit still
+        # works, and the store a user is left with satisfies the contract.
+        harness = self.harness(LauncherFailing(self.three_payloads()))
+        chat_id = harness.create_chat("A stranded launch with its output kept")
+        with self.assertRaises(LaunchBoundaryError):
+            harness.send_turn(chat_id, "hello")
+        self.assertEqual([s["state"] for s in support.view(harness).sessions_of(chat_id)],
+                         ["launching"])
+        harness.abandon(chat_id)
+        self.assertEqual([s["state"] for s in support.view(harness).sessions_of(chat_id)],
+                         ["launch_failed"],
+                         "D2's exit resolves it from the launcher's own durable "
+                         "launch_result rather than inventing a transition, so the "
+                         "state it lands in is the one the launcher reported")
+        self.assert_store_valid(
+            harness.store, "intake-no-handle-unattributable-preserved",
+            "A launch that issued no handle and typed an end of stream its own "
+            "declared shape cannot have: the bytes are preserved as "
+            "`unrecognized` with no `interpreted_type`, and the chat is "
+            "abandoned out of the state the refusal left it in.")
+
+    def test_a_packing_mistake_costs_only_the_payloads_behind_it(self):
+        # F2's other half (review case A3). An agent-sourced payload among
+        # launcher-sourced ones used to drop the whole set, honest payloads
+        # included, because `_failure_carrying_its_output` rebuilt the result
+        # with no payloads at all. What crosses now is the longest prefix the
+        # seam accepts; the rest cannot, because this channel is the whole
+        # history of a session that never ran and a payload dropped from the
+        # middle would leave a gap (contract P3).
+        payloads = [self.launcher_line(1, "honest launcher line"),
+                    agent_text(2, "an agent nobody launched"),
+                    self.launcher_line(3, "another honest launcher line")]
+        harness = self.harness(LauncherFailing(payloads,
+                                               category=lb.FAILURE_UNAVAILABLE))
+        chat_id = harness.create_chat("A packing mistake in the middle")
+        harness.send_turn(chat_id, "hello")
+
+        self.assertEqual(self.sequences(harness.store, chat_id), [1],
+                         "the honest payload before the mistake is preserved; at "
+                         "`7fab5c5` every payload was dropped with it")
+        result = support.view(harness).all_of("launch_result")[0]
+        self.assertEqual(result["failure_category"], "unavailable",
+                         "a packing mistake still does not downgrade an honest "
+                         "category #90 counts")
+        self.assertIn("payloads 2..3 could not cross the seam",
+                      result["detail"],
+                      "and what was lost is named where it happened, rather than "
+                      "the loss being reported as the whole set")
+
+    def test_what_a_store_refusal_still_costs_is_the_gap_it_would_leave(self):
+        # Stated rather than implied, because it is the one thing this rail does
+        # not close. A store refusal that leaves a sequence unwritten makes every
+        # payload behind it a gap, and contract P3 says a gap is never closed
+        # silently -- so the containment above cannot preserve them, on this
+        # channel or on the drain (carried finding C2). What it does do is offer
+        # every one of them to the store rather than escaping at the first, and
+        # report the first refusal rather than the derived one.
+        offered = []
+
+        class RefusesTheSecond(ChatStore):
+            def next_event_sequence(self, chat_id, session_id):
+                # Asked once per payload the loop takes, before anything is
+                # written, so this counts what the loop reached rather than what
+                # the store accepted.
+                offered.append(len(offered) + 1)
+                return ChatStore.next_event_sequence(self, chat_id, session_id)
+
+            def append_diagnostic_event(self, chat_id, session_id, sequence,
+                                        *args, **kwargs):
+                if sequence == 2:
+                    raise ValidationRefused("a planted store refusal at sequence 2")
+                return ChatStore.append_diagnostic_event(
+                    self, chat_id, session_id, sequence, *args, **kwargs)
+
+        payloads = [self.launcher_line(1, "one"), self.launcher_line(2, "two"),
+                    self.launcher_line(3, "three")]
+        harness = SessionManager(RefusesTheSecond(self.root),
+                                 LauncherFailing(payloads))
+        chat_id = harness.create_chat("A store refusal in the middle")
+        with self.assertRaises(ValidationRefused) as raised:
+            harness.send_turn(chat_id, "hello")
+        self.assertIn("planted store refusal", str(raised.exception),
+                      "the first refusal is what is reported, not the gap it "
+                      "caused two payloads later")
+        self.assertEqual(self.sequences(harness.store, chat_id), [1],
+                         "2 was refused by the store and 3 would have closed the "
+                         "gap that refusal left, which contract P3 forbids; this "
+                         "is the carried C2 residual and it is the same on the "
+                         "drain")
+        self.assertEqual(len(offered), 3,
+                         "the loop still took every payload on its own; at "
+                         "`7fab5c5` the store refusal escaped and the third "
+                         "payload was never reached at all")
+
+    def test_preservation_reads_the_session_s_own_recorded_capabilities(self):
+        # Carried finding C1, the same one-line class as F1. The store decides
+        # whether a `stream_end` record may exist from the session's recorded
+        # `launcher_capabilities`; preservation used to ask the *configured*
+        # launcher. A restart configured with a launcher of a different shape
+        # therefore disagreed with the store, and the payload and everything
+        # behind it on the page were lost: measured `[1, 2]` of `[1, 2, 3, 4]`.
+        opened = self.harness(PageLauncher(pages=[lb.EventsPage([])]))
+        chat_id = opened.create_chat("A session opened by a one-shot launcher")
+        opened.send_turn(chat_id, "hello")
+        self.assertEqual([s["state"] for s in support.view(opened).sessions_of(chat_id)],
+                         ["running"])
+
+        page = lb.EventsPage([self.launcher_line(1, "one"),
+                              self.launcher_line(2, "two"), stream_end(3),
+                              self.launcher_line(4, "four")])
+        restarted = SessionManager(
+            ChatStore(self.root),
+            PageLauncher(pages=[page], shape=lb.RESPONSE_SHAPE_STREAM))
+        restarted.reattach_on_start()
+
+        self.assertEqual(self.sequences(restarted.store, chat_id), [1, 2, 3, 4],
+                         "the session's own recorded shape decides, so preservation "
+                         "and the store cannot disagree about what may be written")
+        preserved = self.preserved(restarted.store, chat_id)
+        self.assertIsNone(preserved[2]["interpreted_type"],
+                          "and the reading is still declined on the shape the "
+                          "session was actually opened with")
 
 
 class TheOneShotEndOfStreamPayloadIsWhereP1AndSixOneDisagree(IntakeCase):

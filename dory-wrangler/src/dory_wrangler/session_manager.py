@@ -57,6 +57,7 @@ from .launch_boundary import (
     OUTCOME_ACCEPTED,
     OUTCOME_FAILED,
     OUTCOME_UNKNOWN,
+    RESPONSE_SHAPE_STREAM,
     SOURCE_LAUNCHER,
     StopAck,
 )
@@ -592,16 +593,38 @@ class SessionManager(object):
         The category is the launcher's honest answer and #90 counts them, so it
         survives however the launcher packed its output. If the output does not
         satisfy the seam's rules -- not launcher-sourced, or not contiguous from
-        1 -- the result is rebuilt without it and the refusal is written into the
-        `detail`, which is durable on the `launch_result`. Losing the category to
-        report a packing mistake would turn an honest `unavailable` into an
-        `internal_error` and make the failure uncountable.
+        1 -- the refusal is written into the `detail`, which is durable on the
+        `launch_result`. Losing the category to report a packing mistake would
+        turn an honest `unavailable` into an `internal_error` and make the
+        failure uncountable.
+
+        **One payload's packing mistake does not cost the others** (review
+        finding F2; contract 7 P1). The whole set used to be dropped, so a single
+        agent-sourced payload among launcher-sourced ones lost every honest
+        payload with it. What crosses now is the longest prefix the seam accepts,
+        which is the most this seam can carry: its rules are that the output is
+        launcher-sourced and is the whole history of a session that never ran,
+        contiguous from 1, so a payload dropped from the middle would leave a gap
+        the harness has no handle to record an observation about. The prefix is
+        found by *asking the seam*, one payload shorter at a time, rather than by
+        restating its rules here -- a second copy of the rules is a second thing
+        to keep in step with them.
         """
+        payloads = tuple(getattr(exc, "payloads", ()) or ())
         try:
             return LaunchResult(OUTCOME_FAILED, failure_category=exc.category,
-                                detail=exc.detail,
-                                payloads=getattr(exc, "payloads", ()))
+                                detail=exc.detail, payloads=payloads)
         except LaunchBoundaryError as refused:
+            for kept in range(len(payloads) - 1, -1, -1):
+                try:
+                    return LaunchResult(
+                        OUTCOME_FAILED, failure_category=exc.category,
+                        detail="%s [payloads %d..%d could not cross the seam and were "
+                               "not preserved: %s]"
+                               % (exc.detail or "", kept + 1, len(payloads), refused),
+                        payloads=payloads[:kept])
+                except LaunchBoundaryError:
+                    continue
             return LaunchResult(
                 OUTCOME_FAILED, failure_category=exc.category,
                 detail="%s [the launcher's own output could not cross the seam and "
@@ -664,7 +687,7 @@ class SessionManager(object):
         chat_id = session["chat_id"]
         session_id = session["session_id"]
         agent_handle = self._agent_handle(session)
-        capabilities = self._boundary.capabilities
+        has_stream = self._session_has_stream(session)
         agent_messages = []
 
         while True:
@@ -696,7 +719,7 @@ class SessionManager(object):
                     % (type(page).__name__,))
                 raise LaunchBoundaryError(
                     "events must return an EventsPage; got %r" % (type(page).__name__,))
-            if page.stream_ended and not capabilities.has_stream:
+            if page.stream_ended and not has_stream:
                 # The one-shot form of inferring from silence. Refused as a fact,
                 # not merely as a spelling: the typed payload is refused below.
                 #
@@ -706,14 +729,14 @@ class SessionManager(object):
                 # whole page, which is strictly more than the typed-payload cause
                 # below discards. What a page does to a chat must not depend on
                 # which refusal the page also happens to trip.
-                taken = self._take_page(session, page, capabilities, agent_messages)
+                taken = self._take_page(session, page, has_stream, agent_messages)
                 if taken.refusal is not None:
                     raise taken.refusal
                 raise LaunchBoundaryError(
                     "launcher declares response_shape 'one_shot' and has no stream, but "
                     "signalled that a stream ended")
 
-            taken = self._take_page(session, page, capabilities, agent_messages)
+            taken = self._take_page(session, page, has_stream, agent_messages)
             turn_complete, reached_terminal, stream_end_event_id, stored_any = (
                 taken.turn_complete, taken.reached_terminal, taken.stream_end_event_id,
                 taken.stored_any)
@@ -754,7 +777,7 @@ class SessionManager(object):
                     "again cannot make progress"
                     % (len(page.payloads), session_id, after))
 
-    def _take_page(self, session, page, capabilities, agent_messages):
+    def _take_page(self, session, page, has_stream, agent_messages):
         """Preserve every payload of one page, and act on what the launcher reported.
 
         Used by the drain and by re-attachment, so what a page does to a chat
@@ -791,44 +814,29 @@ class SessionManager(object):
         taken = _PageTaken()
         for payload in page.payloads:
             try:
-                self._take_payload(session, payload, capabilities, taken, agent_messages)
+                self._take_payload(session, payload, has_stream, taken, agent_messages)
             except (StoreError, LaunchBoundaryError) as exc:
                 if taken.refusal is None:
                     taken.refusal = exc
         return taken
 
-    def _take_payload(self, session, payload, capabilities, taken, agent_messages):
+    def _take_payload(self, session, payload, has_stream, taken, agent_messages):
         """Preserve one payload, then act on what the launcher said it was.
 
         Preservation comes first and interpretation second, which is the whole
         of this checkpoint: a payload the seam will refuse to *read* is still a
-        payload the integration produced, and P1 is unconditional. The two
-        end-of-stream refusals below therefore run after `_preserve`, not before
-        it -- the evidence is kept and the claim is still refused. Since the
-        human's decision of 2026-09-15 that is true of *both* of them on every
-        shipped path; the pre-preservation raise above is the older answer, kept
-        reachable only through `PRESERVE_UNATTRIBUTABLE_STREAM_END`.
+        payload the integration produced, and P1 is unconditional. The
+        end-of-stream refusal below therefore runs after the payload is
+        preserved, not before it -- the evidence is kept and the claim is still
+        refused. The other end-of-stream refusal, and the decision of
+        2026-09-15 behind it, live in
+        `_preserve_declining_what_it_cannot_attribute`, which every channel that
+        preserves calls.
         """
         chat_id = session["chat_id"]
         session_id = session["session_id"]
-        unattributable = (payload.interpreted_type == PAYLOAD_STREAM_END
-                          and not capabilities.has_stream)
-        if unattributable and not PRESERVE_UNATTRIBUTABLE_STREAM_END:
-            # The older accepted behaviour, kept reachable and pinned so the
-            # human's decision stays a one-line change. Not what ships. See the
-            # constant.
-            raise self._unattributable_stream_end(payload)
-
-        # `attribute=False` writes the bytes as `unrecognized` / `null`: contract
-        # 7 P2 covers "a type this build does not know, **or knows but cannot
-        # attribute on this session**" since the 2026-09-15 correction, and this
-        # session is exactly the second case.
-        event_id = self._preserve(session, payload, attribute=not unattributable)
-        if unattributable:
-            # The bytes are kept; the *assertion* is refused exactly as 6.1
-            # states it. Nothing recorded the `stream_end` reading, so
-            # `STREAM_END_UNSUPPORTED` is unreachable rather than suppressed.
-            raise self._unattributable_stream_end(payload)
+        event_id = self._preserve_declining_what_it_cannot_attribute(
+            session, payload, has_stream)
         if event_id is None:
             return  # a replayed (session_id, sequence); already stored
 
@@ -860,6 +868,64 @@ class SessionManager(object):
             taken.reached_terminal = True
         elif payload.interpreted_type == PAYLOAD_STREAM_END:
             taken.stream_end_event_id = event_id
+
+    def _preserve_declining_what_it_cannot_attribute(self, session, payload, has_stream):
+        """Preserve one payload, declining only a reading this session forbids.
+
+        **Every channel that preserves calls this**, so the rules are applied by
+        construction rather than by each call site remembering them. Review
+        finding F1 was exactly that omission: the no-handle `payloads` channel
+        was added calling `_preserve` directly, so it inherited neither this
+        decision nor the containment around it, and the one payload shape the
+        human ruled on was still refused before preservation on it. A rule that
+        lives in one function cannot be missed by the next channel; a rule
+        copied into each call site can be, and mutation cannot see the gap
+        because there is no guard there to mutate.
+
+        `attribute=False` writes the bytes as `unrecognized` / `null`: contract
+        7 P2 covers "a type this build does not know, **or knows but cannot
+        attribute on this session**" since the 2026-09-15 correction, and a
+        `stream_end` from a launcher with no stream is exactly the second case.
+        The bytes are kept and the *assertion* is refused exactly as 6.1 states
+        it -- nothing recorded the `stream_end` reading, so
+        `STREAM_END_UNSUPPORTED` is unreachable rather than suppressed.
+
+        Returns the event id, or None for a replay the store already holds.
+        """
+        unattributable = (payload.interpreted_type == PAYLOAD_STREAM_END
+                          and not has_stream)
+        if unattributable and not PRESERVE_UNATTRIBUTABLE_STREAM_END:
+            # The older accepted behaviour, kept reachable and pinned so the
+            # human's decision stays a one-line change. Not what ships. See the
+            # constant.
+            raise self._unattributable_stream_end(payload)
+        event_id = self._preserve(session, payload, attribute=not unattributable)
+        if unattributable:
+            raise self._unattributable_stream_end(payload)
+        return event_id
+
+    def _session_has_stream(self, session):
+        """Whether the session's own recorded launcher declares a stream.
+
+        Read from the session, not from `self._boundary.capabilities` (review
+        finding C1). The store decides whether a `stream_end` record may exist
+        from `session["launcher_capabilities"]["response_shape"]`, so a
+        preservation that asked the *configured* launcher instead could disagree
+        with it -- and did, whenever a restart was configured with a launcher of
+        a different shape from the one the session was opened with: the payload
+        was refused by the store, its bytes lost, and the gap took everything
+        behind it on the page. This is the mirror image of the store's own read,
+        by deliberate construction, so the two cannot disagree again.
+
+        Defensive in the same way the store is: a record that is not a mapping
+        answers no, which preserves the bytes and declines the reading rather
+        than asserting something about a session whose capabilities are
+        unreadable.
+        """
+        capabilities = session.get("launcher_capabilities")
+        shape = (capabilities.get("response_shape")
+                 if isinstance(capabilities, dict) else None)
+        return shape == RESPONSE_SHAPE_STREAM
 
     def _unattributable_stream_end(self, payload):
         return LaunchBoundaryError(
@@ -930,20 +996,48 @@ class SessionManager(object):
         Correlation is the chat and the session that failed to open, at
         sequences 1..N, written **before** the terminal transition: a terminal
         session has released its binding, and evidence about a launch belongs to
-        the launch. The seam has already checked that these are launcher-sourced
-        and contiguous from 1 (`LaunchResult`), so the only refusal reachable
-        here is the store's own, and it cannot be recorded as an observation --
-        every observation kind that would fit addresses the agent through a
-        handle this session does not have. So a refusal here is not swallowed:
-        it leaves the session in `launching` with its `launch_result` already
-        durable, which is the ordinary interrupted-launch shape that
-        `_resolve_interrupted_launch` finishes at the next start from the record
-        the launcher itself produced. Failing closed into a recoverable shape is
-        better than reporting a launch outcome whose evidence was silently
-        dropped.
+        the launch.
+
+        **This channel carries the same kind of data as `events`, so it applies
+        the same two rules** (review findings F1 and F2; contract 7 P1). It
+        preserves through `_preserve_declining_what_it_cannot_attribute`, so a
+        `stream_end`-typed payload from a launcher with no stream keeps its
+        bytes and loses only the reading, exactly as it does on the drain; and
+        it takes each payload on its own rather than stopping at the first
+        refusal. Before that, a `one_shot` launcher's failed launch preserved the
+        payloads up to the first `stream_end`-typed one and lost the rest -- the
+        single shape the human ruled on, on the one channel the ruling was not
+        applied to.
+
+        Taking each payload on its own recovers every payload whose refusal
+        leaves its own sequence written, which is all of them the seam refuses.
+        It does not recover a payload behind a refusal that left a sequence
+        *unwritten* -- a store refusal of a not-yet-stored sequence -- because
+        preserving it would close a gap, and contract P3 says a gap is never
+        closed silently. That residual is the same on this channel and on
+        `_take_page`, and it is the one thing still not preserved anywhere.
+
+        A refusal here still cannot be recorded as an observation -- every
+        observation kind that would fit addresses the agent through a handle this
+        session does not have -- so it is not swallowed either: the first one is
+        raised once every payload has been offered to the store, leaving the
+        session in `launching` with its `launch_result` already durable, which is
+        the ordinary interrupted-launch shape that `_resolve_interrupted_launch`
+        finishes at the next start from the record the launcher itself produced.
+        Failing closed into a recoverable shape is better than reporting a launch
+        outcome whose evidence was silently dropped.
         """
+        has_stream = self._session_has_stream(session)
+        refusal = None
         for payload in payloads:
-            self._preserve(session, payload)
+            try:
+                self._preserve_declining_what_it_cannot_attribute(
+                    session, payload, has_stream)
+            except (StoreError, LaunchBoundaryError) as exc:
+                if refusal is None:
+                    refusal = exc
+        if refusal is not None:
+            raise refusal
 
     # -- user actions ------------------------------------------------------
 
@@ -1213,8 +1307,7 @@ class SessionManager(object):
         drop 1). A launcher returning something that is not a page is still
         ignored here, as it was: there are no raw bytes to preserve (drop 4).
         """
-        capabilities = self._boundary.capabilities
-        taken = self._take_page(session, page, capabilities, [])
+        taken = self._take_page(session, page, self._session_has_stream(session), [])
         if (taken.stream_end_event_id is not None and not taken.reached_terminal
                 and session["state"] == "running"):
             self._transition(session, "unknown", "launcher", "stream_end",

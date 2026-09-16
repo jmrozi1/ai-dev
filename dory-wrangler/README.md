@@ -118,7 +118,8 @@ contract, the adjudication rules, and the decision-conformance pass.
 v0.1 has its contract (#85), its chat shell and durable persistence (#86), and
 the launch boundary with its launchers (#87), converged onto one store and one
 served application (#88, decision 0002), and intake that preserves every payload
-raw and correlated before anything reads it (#88). Event classification,
+raw and correlated before anything reads it, with the one exception named below
+(#88). Event classification,
 rendering beyond agent text, malformed-event handling, and bounded diagnostic
 access are #88's remaining checkpoints. No observability (#82), supervision
 (#83), or multi-agent (#84) behavior is in scope.
@@ -140,3 +141,23 @@ It was never a loss of one payload. Refusing before preserving left that
 unpreservable for the session's life. Both answers stay implemented and pinned
 behind `session_manager.PRESERVE_UNATTRIBUTABLE_STREAM_END`, so what was
 decided, and what the other answer costs, is readable from the code.
+
+The decision, and the per-payload containment around it, apply on **every**
+channel that preserves: through `events` on the drain and on re-attachment, and
+through the `launch` call itself for a launch that issued no handle and so has no
+`events` call in its future. They did not at first. The no-handle channel was
+added without them and lost exactly the shape the decision is about, which is
+what the intake checkpoint's review found; they are one function now,
+`_preserve_declining_what_it_cannot_attribute`, which every channel calls.
+Which shape a session may attribute is read from the session's own recorded
+`launcher_capabilities` -- the same record the store reads -- so a restart
+configured with a launcher of a different shape cannot disagree with it.
+
+**The one exception, named rather than implied.** A payload whose own `sequence`
+cannot be written is preserved nowhere, and nothing durable records that it
+arrived, so that sequence can later be filled by different content. That is a
+payload arriving out of order, and a payload behind a store refusal that left a
+sequence unwritten. Contract P3 is why: a gap means a turn was lost and is never
+closed silently, so neither the payload that would write the gap nor the payloads
+behind it can be preserved. Everything else this harness receives is preserved
+before anything interprets it, on every channel that receives it.

@@ -57,10 +57,15 @@ exists because a runner without it produced false evidence here.
 6. **Confirm every CAUGHT by re-running its named tests**, and require *that
    same test* to fail under the mutation while the unmutated control passes on
    the same tree. Match the test by identity, not by parsing a line of output.
+   Confirm on a **small named subset** -- the one to three tests you claim catch
+   the row -- not on every test the mutation broke.
    *Why:* a test-name parse that did not match the runner's output format made
    **every confirmation read as unconfirmed**; and on a host whose sandbox can
    refuse `exec`, a failed process can fake a CAUGHT but never a GREEN, so the
-   confirmation is the only thing separating the two.
+   confirmation is the only thing separating the two. *Why the subset:* six rows
+   here broke 141-200 tests each and every one confirmed first time on its named
+   subset, while a confirmation run over everything a mutation breaks fails for
+   reasons unrelated to the guard and turns a real catch into an unconfirmed row.
 7. **Run hang-sensitive rows against the full suite**, not the subset you think
    is relevant.
    *Why:* subset-only runs hid a full-suite hang: a waiter with no deadline in a
@@ -85,6 +90,21 @@ not GREEN is void.
   inputs the new code accepts and the old one did not, and show that each one
   still has a legal exit. A relocated guard is two rows, not one: the place it
   left and the place it arrived.
+- **Symmetry: for every channel, path or call site the diff *adds* that carries
+  the same kind of data as an existing one, enumerate the rules the existing path
+  applies and show the new one applies each, or say why it must not.** Write the
+  enumeration out, rule by rule, and answer each; a diff that adds no such path
+  answers this in one line.
+  *Why:* **mutation cannot reach a guard a new channel was never given.** There
+  is nothing there to mutate, so the rows all pass and the sweep says nothing.
+  Here, 66 rows across two sweeps returned 61 catches and no unadjudicated greens
+  on a revision that shipped a new preservation channel missing both of the rules
+  the existing one applied -- losing, on that channel, exactly the payload shape
+  the release had just escalated to a human to decide. No future sweep would have
+  found it. When the answer is "it must not", the honest ones are usually that
+  the new path has no agent to attribute output to, or that a lifecycle
+  transition belongs to the caller; say which, and the enumeration is the
+  evidence either way.
 - **Scope the sweep to what the diff changed.** A sweep costs roughly one full
   suite per row. Mutating untouched code re-measures the last release.
 
@@ -125,7 +145,10 @@ in-process call, because that is where the decision is promised.
 Per row: the identifier, the file and element, the exact patch, the verdict, the
 target test set, and for a CAUGHT the confirming test's full name. Per sweep:
 the control's result, the counts, every adjudication with its evidence, the
-decision-conformance results, and the apparatus rules this runner implemented.
+symmetry enumeration, the decision-conformance results, and the apparatus rules
+this runner implemented. The symmetry enumeration is reported whether or not it
+found anything -- it is the only part of this skill that can speak about a guard
+the sweep could not reach.
 
 Publish an interim result before a long run. A sweep here can take hours, and an
 unpublished sweep that is interrupted is a sweep that did not happen.
