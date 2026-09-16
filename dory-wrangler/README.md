@@ -40,6 +40,7 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | `decisions/0002-one-store-one-application.md` | how #86's and #87's implementations became one store, one chat loop, one seam and one served application, per component, with the evidence |
 | `decisions/0003-concurrent-turns-and-abandon.md` | a concurrent turn is refused before it is recorded (and how to flip that), Abandon as the one lifecycle action, and the refusal of both while a turn is in flight |
 | `src/dory_wrangler/` | the one product package: the durable store (`store.py`), the chat loop (`session_manager.py`), the launch seam (`launch_boundary.py`), the launchers (`launchers/`), and the served shell (`webapp.py`) |
+| `skills/adversarial-guard-verification/SKILL.md` | how this product checks that a diff's guards are really pinned: the mutation-runner contract, how to enumerate and adjudicate rows, and the decision-conformance pass |
 | `run_shell.py` | run the shell |
 | `validate_store.py` | check a live store against the contract |
 | `tests/` | the one test suite for all of it, including both sides' adversarial probes |
@@ -105,6 +106,11 @@ phases: the unit suite; every store the suite kept, handed to the contract
 validator as a separate program; and the contract's own fixtures. The second
 command prints #86's adversarial probe table: every guarantee the store claims,
 the attack made on it, and what the attack found.
+
+A green suite is not evidence that a guard is pinned. When a change adds,
+removes, relocates or generalises one, check it by mutation under
+`skills/adversarial-guard-verification/SKILL.md`, which carries the runner
+contract, the adjudication rules, and the decision-conformance pass.
 
 ## Status
 
