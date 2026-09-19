@@ -5,9 +5,17 @@ description: Decide and govern checkpoint, promotion, or in-flight review compos
 
 # ChatGPT Auto-Review
 
-Own review policy and judgment for the current AI Dev lifecycle stage. This is
-the decision-oriented side of auto-review. The executor audience owns the
-deterministic repository helpers and their execution.
+Apply review policy and judgment to decisions reserved to ChatGPT or escalated
+by the named Claude/Coxswain orchestrator. Routine checkpoint and promotion
+review, reviewer commissioning, remediation and recording belong to that
+orchestrator within its mandate. Do not make ChatGPT a second mandatory gate
+or directly task executors or reviewers.
+
+In the guidance below, a delegated lifecycle decision remains with its named
+owner. Apply the review criteria when judging an escalation, setting mandate
+boundaries, or deciding an explicitly reserved acceptance. Loading this skill
+does not reclaim delegated authority. The receiving orchestrator owns
+deterministic helpers and their execution.
 
 ## Contract
 
@@ -83,8 +91,8 @@ Do not authorize promotion while a candidate remains merely "reassess later," an
 accepted skill investment is pending or in progress, or the required ticket skill
 sections are absent/ambiguous.
 
-Request or consume evidence gathered by the executor before making
-applicability decisions. Claude runs `ai-dev review-evidence --mode
+Request evidence from the receiving orchestrator or consume its durable evidence
+before making applicability decisions. Its execution environment runs `ai-dev review-evidence --mode
 checkpoint|promotion`, which invokes the canonical
 `skills/copilot/auto-review/scripts/review-evidence` helper through supported
 interpreter selection. The helper gathers evidence, including
@@ -105,7 +113,9 @@ Consider in-flight review only when all of the following hold:
 - you are at a natural handoff, meaning the previous executor rail has ended in
   a published handoff, block, or failure and no executor is currently executing
   an authorized rail;
-- you are about to issue the next rail for that same named checkpoint.
+- the receiving orchestrator is considering the next rail for that checkpoint
+  and has escalated the process decision, or that decision is explicitly reserved
+  to ChatGPT.
 
 It never interrupts, pauses, or preempts an executor mid-rail, and never requires
 a running executor to stop and self-review. It is additive: it never replaces,
@@ -160,6 +170,9 @@ accepted state and authorized rail under a control plane, otherwise
 strategy unchanged; revisit it only with a stated reason grounded in new
 evidence.
 
+Have the ticket owner carry the decision into its state and rails; ChatGPT does
+not rewrite executor tasking or publish a competing successor rail.
+
 In-flight review may add a `Skill Candidates` entry when evidence warrants, but
 it does not perform and does not satisfy the named-checkpoint or promotion
 skill-candidate disposition gate.
@@ -186,8 +199,9 @@ Once the judgment is complete and authorized, the canonical recorder is:
 
 `skills/copilot/auto-review/scripts/record-promotion-review`
 
-ChatGPT authorizes that transition; it should not turn review policy into an
-unbounded repository command-running loop.
+The receiving orchestrator authorizes and records that transition within its
+mandate. ChatGPT decides only reserved or escalated questions and does not
+turn review policy into an unbounded repository command-running loop.
 
 ## ChatGPT Interaction
 

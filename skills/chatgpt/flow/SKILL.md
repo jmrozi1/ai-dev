@@ -8,8 +8,9 @@ description: Interpret AI Dev Flow lifecycle state and decide valid transitions 
 Use this skill for lifecycle meaning and decision-making around the shared Flow
 runtime. Flow commands and workflow state remain deterministic repository
 runtime owned by AI Dev; routine command mechanics belong to the executor
-audience. New execution work routes to Claude; existing Copilot behavior stays
-supported for work already running on it.
+audience. ChatGPT coordinates a named Claude or Coxswain orchestrator; that
+orchestrator owns repository execution and any existing executor sessions.
+ChatGPT never directly tasks executors.
 
 ## Contract
 
@@ -17,14 +18,13 @@ supported for work already running on it.
   clean/dirty state, blocked workflows, and pending synchronization state.
 - Interpret `flow-status -v`, `flow-diff`, review-gate, and promotion-sync
   evidence as decision surfaces.
-- Decide whether the next valid transition is start, checkpoint, promote,
-  complete, reset, block, resume, or escalation, based on the active intent and
-  Flow safety rules.
-- Preserve orchestrator authority over lifecycle intent, scope, promotion,
-  completion, and reconciliation decisions.
-- Delegate routine command execution and repository inspection to the Claude
-  executor when appropriate, with explicit scope and expected evidence.
-  Delegate to Copilot only for work already running on that path.
+- Delegate routine valid transitions within the approved mandate to the receiving
+  orchestrator. Decide lifecycle intent when it is reserved to ChatGPT or escalated
+  beyond that mandate, using active intent and Flow safety rules.
+- Preserve the named owner's authority over promotion, completion and
+  reconciliation; do not introduce a second checkpoint gate in ChatGPT.
+- Route repository inspection and lifecycle outcomes to the Claude/Coxswain
+  orchestrator, which owns command execution and executor coordination.
 - Escalate when state is blocked, contradictory, stale, unsafe, or requires a
   product, scope, permission, or reconciliation decision.
 
@@ -46,10 +46,9 @@ supported for work already running on it.
 ## Command and Report Use
 
 Understand `/status` semantics for orchestration, but delegate the interaction
-to the executor's installed package. Claude exposes `ai-dev status`, which does
-not collide with Claude's built-in `/status`; Copilot exposes `ticket-status`.
-Either renders the active ticket's named roadmap progress and may return Flow
-diagnostics only when they require a decision, recovery, or escalation. Flow's
+to the receiving orchestrator. Claude exposes `ai-dev status`, which renders
+the active ticket's named roadmap progress and may return Flow diagnostics when
+they require a decision, recovery, or escalation. Flow's
 numeric `checkpoint` is never the roadmap index. Avoid carrying executor-level
 launcher and shell procedure unless reviewing such an execution failure.
 
