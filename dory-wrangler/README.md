@@ -41,6 +41,7 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | `decisions/0002-one-store-one-application.md` | how #86's and #87's implementations became one store, one chat loop, one seam and one served application, per component, with the evidence |
 | `decisions/0003-concurrent-turns-and-abandon.md` | a concurrent turn is refused before it is recorded (and how to flip that), Abandon as the one lifecycle action, and the refusal of both while a turn is in flight |
 | `decisions/0004-classifying-event-types.md` | the recognized event types per wire format, declared once, where classification happens, the `unrecognized`/`malformed` boundary, and the rule for adding a type |
+| `decisions/0005-rendering-useful-events.md` | what the conversation renders -- one agent message per recognized agent text event, its text exactly, in event order, nothing else -- and the exact-text gate over every kept store |
 | `src/dory_wrangler/` | the one product package: the durable store (`store.py`), the chat loop (`session_manager.py`), the launch seam (`launch_boundary.py`), the launchers (`launchers/`), and the served shell (`webapp.py`) |
 | `skills/adversarial-guard-verification/SKILL.md` | how this product checks that a diff's guards are really pinned: the mutation-runner contract, how to enumerate and adjudicate rows, and the decision-conformance pass |
 | `run_shell.py` | run the shell |
@@ -103,9 +104,11 @@ python3 dory-wrangler/tests/run_tests.py
 python3 dory-wrangler/tests/test_adversarial.py --report
 ```
 
-Stdlib `unittest`; no pytest and no test framework required. The runner has three
+Stdlib `unittest`; no pytest and no test framework required. The runner has four
 phases: the unit suite; every store the suite kept, handed to the contract
-validator as a separate program; and the contract's own fixtures. The second
+validator as a separate program; every event in those stores re-classified from
+its bytes, and every agent message checked against its cited event's text
+(`tests/reclassify_stores.py`); and the contract's own fixtures. The second
 command prints #86's adversarial probe table: every guarantee the store claims,
 the attack made on it, and what the attack found.
 
@@ -121,8 +124,10 @@ the launch boundary with its launchers (#87), converged onto one store and one
 served application (#88, decision 0002), and intake that preserves every payload
 raw and correlated before anything reads it, with the one exception named below
 (#88), and event classification from a recognized set declared once per wire
-format (#88, decision 0004). Rendering beyond agent text, malformed-event
-handling, and bounded diagnostic access are #88's remaining checkpoints. No observability (#82), supervision
+format (#88, decision 0004), and rendering of the useful subset (#88, decision
+0005). Malformed-event handling -- including telling the user that something
+arrived which could not be shown -- and bounded diagnostic access are #88's
+remaining checkpoints. No observability (#82), supervision
 (#83), or multi-agent (#84) behavior is in scope.
 
 Every payload shape is now preserved, including the last one that was not: a
@@ -171,6 +176,15 @@ without costing the rest of its turn. A line of only ASCII whitespace carries no
 event and is not preserved. Every recorded reading is reproducible from the
 preserved `raw.body`, and every suite run checks that over every store it keeps
 (`tests/reclassify_stores.py`, phase 3 of `run_tests.py`).
+
+**What the conversation shows is decided by one rule** (decision 0005). Each
+recognized, agent-sourced event with non-empty text becomes exactly one agent
+message whose text is exactly that event's text -- whitespace and newlines
+included -- in event order; a turn with several such events shows several
+messages and a turn with none shows none. Every other event shows nothing and is
+still preserved. The page inserts message text as text, never as HTML, and keeps
+its whitespace. Every suite run checks every agent message in every kept store
+against its cited event's bytes.
 
 **The one exception, named rather than implied.** A payload whose own `sequence`
 cannot be written is preserved nowhere, and nothing durable records that it
