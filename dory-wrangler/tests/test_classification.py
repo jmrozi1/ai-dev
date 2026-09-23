@@ -409,6 +409,51 @@ class ClassificationIsAFunctionOfThePreservedBytes(unittest.TestCase, StoreCheck
                           last["raw"]["body"]),
                          ("launcher", "unrecognized", None, '{"type": "stream_end"}'))
 
+    def test_the_whole_store_re_read_fails_on_a_disagreement(self):
+        """Review F2: `reclassify_stores.py` -- phase 3 of `run_tests.py` -- exits
+        non-zero on a record that does not reproduce and on a synthesised record
+        inconsistent with its own bytes, unless `ADJUDICATED` names it."""
+        import contextlib
+        harness = support.harness({"launcher": "scripted-stub",
+                                   "options": {"unknown_type": True}})
+        chat_id = harness.create_chat("Re-read gate")
+        harness.send_turn(chat_id, "hello")
+        records = harness.store.export_records()
+        events = [r for r in records if r["record_type"] == "diagnostic_event"]
+        unknown = [e for e in events if e["source"] == "agent"
+                   and e["interpretation"] == "unrecognized"][0]
+        lifecycle = [e for e in events if e["source"] == "launcher"][0]
+
+        def run(records, adjudicate=()):
+            base = tempfile.mkdtemp(prefix="dory-reread-")
+            self.addCleanup(shutil.rmtree, base, True)
+            with open(os.path.join(base, "planted.json"), "w") as out:
+                json.dump({"records": records}, out)
+            with mock.patch.dict(reclassify_stores.ADJUDICATED,
+                                 dict((key, "planted") for key in adjudicate)), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                return reclassify_stores.main([base])
+
+        def planted(event, **fields):
+            changed = json.loads(json.dumps(records))
+            target = [r for r in changed if r.get("event_id") == event["event_id"]][0]
+            for name, value in fields.items():
+                if name == "body":
+                    target["raw"]["body"] = value
+                else:
+                    target[name] = value
+            return changed
+
+        self.assertEqual(run(records), 0)
+        not_reproduced = planted(unknown, body='{"type": "turn_complete"}')
+        self.assertEqual(run(not_reproduced), 1)
+        self.assertEqual(run(not_reproduced, [("planted.json", unknown["sequence"],
+                                               ("unrecognized", None))]), 0)
+        inconsistent = planted(lifecycle, interpreted_type="session_failed")
+        self.assertEqual(run(inconsistent), 1)
+        self.assertEqual(run(inconsistent, [("planted.json", lifecycle["sequence"],
+                                             ("recognized", "session_failed"))]), 0)
+
     def test_the_codex_model_on_launch_resume_and_a_failed_launch(self):
         self.make_dirs()
         behaviour = ("synthetic-unrecognized", "synthetic-malformed", "synthetic-item",
