@@ -7,14 +7,17 @@ Standard library only: this VM has Python 3.9 and no pytest, and the internal
 target is the same platform interpreter, so a test suite that needs a framework
 is a test suite that may not run where it matters.
 
-Three phases, and the second is the point of having phases at all:
+Four phases, and the second is the point of having phases at all:
 
 1. the unit suite;
 2. every store the suite kept (`support.StoreCheck.keep`) handed to
    `dory-wrangler/validator/validate_contract.py` on the command line -- the
    executable contract run as a separate program over files on disk, rather than
    a library call inside the tests that produced them;
-3. the contract's own fixtures, which must still pass unchanged.
+3. every event in those same kept stores re-classified from its `raw.body`
+   (`tests/reclassify_stores.py`), which exits non-zero on any record that does
+   not reproduce and is not adjudicated by name;
+4. the contract's own fixtures, which must still pass unchanged.
 
 With a `pattern`, only the matching test modules run, and phase 2 validates the
 stores those modules kept. Exit 0 only when every phase that ran passed.
@@ -72,8 +75,16 @@ def main(argv):
         if completed != 0:
             return completed
 
+        print("", flush=True)
+        print("== phase 3: every kept event re-classified from its bytes ==", flush=True)
+        completed = subprocess.call(
+            [sys.executable, os.path.join(TESTS_DIR, "reclassify_stores.py"),
+             support.FIXTURE_OUT], cwd=REPO)
+        if completed != 0:
+            return completed
+
     print("", flush=True)
-    print("== phase 3: the contract's own fixtures still pass ==", flush=True)
+    print("== phase 4: the contract's own fixtures still pass ==", flush=True)
     return subprocess.call(
         [sys.executable, support.VALIDATOR_PATH,
          os.path.join(PRODUCT_DIR, "fixtures", "v0.1")], cwd=REPO)

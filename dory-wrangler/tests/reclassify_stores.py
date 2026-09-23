@@ -33,11 +33,15 @@ Each event lands in exactly one row:
     test probes written against the interface alone.
 
 A record that does not reproduce is printed with its store, session and
-sequence. Probes that subclass `ScriptedStubLauncher` keep its launcher id and
-hand the harness readings no classifier would produce, on purpose; they show up
-here as non-reproducing and are adjudicated by name, not hidden.
+sequence. Probes that keep a shipped launcher's id and hand the harness readings
+no classifier would produce, on purpose, show up here as non-reproducing or
+inconsistent and are adjudicated by name in `ADJUDICATED`, not hidden.
 
-Exit status 0 when every row was computed; the verdict is the printed counts.
+**Exit status** is 0 only when every re-classified record reproduced and every
+synthesised record is consistent with its own bytes, apart from the records
+`ADJUDICATED` names; any other disagreement exits 1. `run_tests.py` runs this
+over every kept store as its own phase, so the re-read is a gate, not a
+one-time measurement.
 """
 
 import base64
@@ -55,6 +59,20 @@ from dory_wrangler.launchers import dev_transport  # noqa: E402
 
 DEV_TRANSPORT_LAUNCHERS = ("dev-local", "scripted-stub")
 CODEX_LAUNCHERS = ("internal-bridge",)
+
+# Records that disagree with their bytes on purpose, each by store file,
+# sequence and recorded reading, with the reason. Nothing else may disagree.
+ADJUDICATED = {
+    ("page-preserved-past-a-clock-refusal.json", 3, ("unrecognized", None)):
+        "test_convergence.PagedLauncher, a probe that keeps the scripted-stub id, "
+        "hands the harness a launcher-sourced {\"type\": \"exit_report\"} stated "
+        "unrecognized; no launcher synthesises it, so there is no reading to match",
+}
+
+
+def adjudicated(row):
+    """`row` is a printed disagreement: (store, launcher, session, sequence, source, recorded, ...)."""
+    return (row[0], row[3], tuple(row[5])) in ADJUDICATED
 
 
 def raw_bytes(event):
@@ -135,6 +153,7 @@ def main(argv):
                 if not synthesised_consistent(event, session):
                     inconsistent.append((name, launcher, event["session_id"],
                                          event["sequence"], event["source"], recorded))
+    failing = [m for m in mismatches + inconsistent if not adjudicated(m)]
     result = {
         "stores": len(names),
         "per_launcher": dict((k, dict(v)) for k, v in sorted(counts.items(), key=str)),
@@ -142,10 +161,11 @@ def main(argv):
                          for k, v in sorted(readings.items(), key=str)),
         "not_reproduced": mismatches,
         "synthesised_inconsistent": inconsistent,
+        "unadjudicated": failing,
     }
     if as_json:
         print(json.dumps(result, indent=1, default=str))
-        return 0
+        return 1 if failing else 0
     print("%d store(s) in %s" % (len(names), store_dir))
     for launcher, c in result["per_launcher"].items():
         print("%-16s %s" % (launcher, ", ".join("%s %d" % kv for kv in sorted(c.items()))))
@@ -155,7 +175,11 @@ def main(argv):
     print("synthesised and inconsistent with their own bytes: %d" % len(inconsistent))
     for m in inconsistent:
         print("  %s %s %s #%s %s recorded %s" % m)
-    return 0
+    print("adjudicated by name: %d; unadjudicated: %d"
+          % (len(mismatches) + len(inconsistent) - len(failing), len(failing)))
+    for m in failing:
+        print("  UNADJUDICATED %s %s %s #%s %s recorded %s" % m[:6])
+    return 1 if failing else 0
 
 
 if __name__ == "__main__":
