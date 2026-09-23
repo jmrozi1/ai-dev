@@ -838,6 +838,30 @@ class OnceAcrossReattachmentAndRestart(unittest.TestCase, Checks, ModelDirs):
                          [("recognized", "turn_complete"), ("unrecognized", None)])
         self.assert_store_valid(manager.store, "c-reattach-declined-claim")
 
+    def test_new_payloads_on_a_stream_are_not_a_turn_end_at_re_attachment(self):
+        """Sweep row M32. Only a `one_shot` launcher's new output implies its call
+        returned; on a stream, re-attachment reading new payloads with no turn end
+        among them has observed nothing, and writes nothing."""
+        root = support.scratch_root()
+        stub = scripted([THINKING], "persistent", "stream")
+        manager = SessionManager(ChatStore(root), stub)
+        chat_id = manager.create_chat("Stream, no end at re-attachment")
+        events = stub.events
+
+        def dies(_handle, _after):
+            raise Died()
+        stub.events = dies
+        with self.assertRaises(Died):
+            manager.send_turn(chat_id, "first")
+        manager.store.close()
+        stub.events = events
+        manager = SessionManager(ChatStore(root), stub)
+        manager.reattach_on_start()
+        records = manager.store.export_records()
+        self.assertEqual(transcript(records), [("user", "first")])
+        self.assertEqual(len([e for e in records if e["record_type"] == "diagnostic_event"]), 1)
+        self.assert_store_valid(manager.store, "c-reattach-stream-no-end")
+
     def test_re_attachment_that_observes_no_end_writes_nothing(self):
         """Died *before* the call returned: the spool holds nothing of the turn,
         re-attachment reads an empty page, and nothing is concluded."""
