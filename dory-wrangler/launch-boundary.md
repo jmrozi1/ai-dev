@@ -178,7 +178,10 @@ in `session_manager.py` is the one function a later answer changes.
    capture has shown are `recognized` (`thread.started`, and `item.completed`
    with `item.type == "agent_message"` as `assistant_text` from `item.text`);
    every other well-formed line is `unrecognized` and every other line
-   `malformed`.
+   `malformed`. The set is data in one place, read by the one classifier
+   (decision 0004); the in-repo model declares it in
+   `tests/internal_bridge.py`, and the real launcher should carry that
+   declaration rather than a second copy of it.
 9. **Under `fresh_binding` it reports the agent's exit.** A session that never
    leaves `running` holds its chat, and under `fresh_binding` every later turn
    is then refused until the user abandons it. Under `persistent` a session

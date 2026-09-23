@@ -40,6 +40,7 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | `decisions/0001-runtime-and-storage.md` | the recorded runtime and storage choice, and its Rocky Linux 9 risks as claims to settle |
 | `decisions/0002-one-store-one-application.md` | how #86's and #87's implementations became one store, one chat loop, one seam and one served application, per component, with the evidence |
 | `decisions/0003-concurrent-turns-and-abandon.md` | a concurrent turn is refused before it is recorded (and how to flip that), Abandon as the one lifecycle action, and the refusal of both while a turn is in flight |
+| `decisions/0004-classifying-event-types.md` | the recognized event types per wire format, declared once, where classification happens, the `unrecognized`/`malformed` boundary, and the rule for adding a type |
 | `src/dory_wrangler/` | the one product package: the durable store (`store.py`), the chat loop (`session_manager.py`), the launch seam (`launch_boundary.py`), the launchers (`launchers/`), and the served shell (`webapp.py`) |
 | `skills/adversarial-guard-verification/SKILL.md` | how this product checks that a diff's guards are really pinned: the mutation-runner contract, how to enumerate and adjudicate rows, and the decision-conformance pass |
 | `run_shell.py` | run the shell |
@@ -119,9 +120,9 @@ v0.1 has its contract (#85), its chat shell and durable persistence (#86), and
 the launch boundary with its launchers (#87), converged onto one store and one
 served application (#88, decision 0002), and intake that preserves every payload
 raw and correlated before anything reads it, with the one exception named below
-(#88). Event classification,
-rendering beyond agent text, malformed-event handling, and bounded diagnostic
-access are #88's remaining checkpoints. No observability (#82), supervision
+(#88), and event classification from a recognized set declared once per wire
+format (#88, decision 0004). Rendering beyond agent text, malformed-event
+handling, and bounded diagnostic access are #88's remaining checkpoints. No observability (#82), supervision
 (#83), or multi-agent (#84) behavior is in scope.
 
 Every payload shape is now preserved, including the last one that was not: a
@@ -152,6 +153,18 @@ what the intake checkpoint's review found; they are one function now,
 Which shape a session may attribute is read from the session's own recorded
 `launcher_capabilities` -- the same record the store reads -- so a restart
 configured with a launcher of a different shape cannot disagree with it.
+
+**What a payload is, is decided once per wire format** (decision 0004). The
+development transport that `dev-local` and `scripted-stub` share recognizes
+`assistant_text` (with a string `text`) and `turn_complete`; the Codex JSONL the
+internal path emits recognizes `thread.started` (with a `thread_id`) and
+`item.completed` / `agent_message` (with a string `item.text`), declared in the
+in-repo model until the real internal launcher (#90) carries it. Any other
+well-formed line is `unrecognized`; a line that is not JSON, or a known type
+missing its required field, is `malformed`; neither ever becomes chat. A type is
+added only on the evidence of real output that carries it. Every recorded
+reading is reproducible from the preserved `raw.body`
+(`tests/reclassify_stores.py`).
 
 **The one exception, named rather than implied.** A payload whose own `sequence`
 cannot be written is preserved nowhere, and nothing durable records that it
