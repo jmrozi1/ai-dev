@@ -379,8 +379,22 @@ class ExactTextTheGateReads(unittest.TestCase, StoreCheck, ModelDirs):
         self.assertEqual([(a, t) for _, a, t in harness.transcript(chat_id)],
                          [("user", "go"), ("agent", "answer to: go")]
                          + [("agent", t) for t in TRICKY_TEXTS])
+        records = harness.store.export_records()
         self.assert_store_valid(harness.store, "f2-tricky-codex")
         support.end_chat(harness, chat_id)
+        # The gate's converse reads whitespace-only text as text (render review
+        # R12): drop that one message and the event is rendered never.
+        self.assertEqual(run_gate(self, {"s.json": records})[0], 0)
+        dropped = [r for r in records if not (r["record_type"] == "message"
+                                              and r["content"]["text"] == TRICKY_TEXTS[-1])]
+        code, output = run_gate(self, {"s.json": dropped})
+        self.assertEqual(code, 1)
+        self.assertIn("rendered 0 time(s)", output)
+        crlf = copy(records)
+        [m for m in by_type(crlf, "message")
+         if m["content"]["text"] == TRICKY_TEXTS[0]][0]["content"]["text"] = \
+            TRICKY_TEXTS[0].replace("\r\n", "\n")
+        self.assertEqual(run_gate(self, {"s.json": crlf})[0], 1)
         self.make_dirs()
         root = support.scratch_root()
         shell, kill = model_shell(self, root, self.codex_home, self.spool, ("tricky-texts",))
