@@ -387,6 +387,69 @@ class AOneShotStreamEndTypedPayload(unittest.TestCase, Checks):
                                         % continuation)
 
 
+class SilentStreamEndedPage(ScriptedStubLauncher):
+    """A one-shot turn with nothing to show whose page also claims its stream
+    ended -- the drain's other refusal branch, which takes the page first."""
+
+    def _produce_turn(self, session, instruction_text):
+        self._emit_agent_line(session, json.dumps({"type": "turn_complete"}))
+
+    def events(self, agent_handle, after_sequence):
+        page = ScriptedStubLauncher.events(self, agent_handle, after_sequence)
+        return lb.EventsPage(page.payloads, stream_ended=True)
+
+
+class Silent(ScriptedStubLauncher):
+    def _produce_turn(self, session, instruction_text):
+        self._emit_agent_line(session, json.dumps({"type": "turn_complete"}))
+
+
+class RefusesTheNotice(ChatStore):
+    """A store that cannot write the notice, as a damaged or clock-refusing one
+    could not."""
+
+    def append_system_message(self, chat_id, text):
+        from dory_wrangler.errors import ValidationRefused
+        raise ValidationRefused("this store cannot write the notice")
+
+
+class TheNoticeOnEveryReadingPath(unittest.TestCase, Checks):
+    """Sweep rows M07, M08 and M11: the refusal branch that takes a stream-ended
+    page applies the rule too; and a notice that cannot be written never replaces
+    a refusal the turn already reports, while on a turn with no refusal it is not
+    swallowed."""
+
+    def test_the_stream_ended_page_branch_writes_the_notice_before_refusing(self):
+        harness = support.harness({}, launcher=SilentStreamEndedPage(
+            {"continuation": "persistent", "response_shape": "one_shot"}))
+        chat_id = harness.create_chat("Stream-ended, nothing to show")
+        with self.assertRaises(lb.LaunchBoundaryError) as raised:
+            harness.send_turn(chat_id, "first")
+        self.assertIn("signalled that a stream ended", str(raised.exception))
+        self.assertEqual(transcript(harness.store.export_records()),
+                         [("user", "first"), NOTICE])
+        self.assert_store_valid(harness.store, "c-stream-ended-page-silent")
+
+    def test_a_notice_that_cannot_be_written_does_not_replace_the_refusal(self):
+        root = support.scratch_root()
+        manager = SessionManager(RefusesTheNotice(root), SilentStreamEndStub(
+            {"continuation": "persistent", "response_shape": "one_shot",
+             "end_of_turn": "stream_end"}))
+        chat_id = manager.create_chat("Refusal first")
+        with self.assertRaises(lb.LaunchBoundaryError) as raised:
+            manager.send_turn(chat_id, "first")
+        self.assertIn("no stream to end", str(raised.exception))
+
+    def test_a_notice_that_cannot_be_written_fails_a_turn_with_no_refusal(self):
+        from dory_wrangler.errors import ValidationRefused
+        root = support.scratch_root()
+        manager = SessionManager(RefusesTheNotice(root), Silent(
+            {"continuation": "persistent", "response_shape": "one_shot"}))
+        chat_id = manager.create_chat("Nothing else to report")
+        with self.assertRaises(ValidationRefused):
+            manager.send_turn(chat_id, "first")
+
+
 # ---------------------------------------------------------------------------
 # C. When the notice is not written.
 # ---------------------------------------------------------------------------
