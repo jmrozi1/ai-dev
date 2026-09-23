@@ -17,6 +17,11 @@ JSON on stdout, one object per line, `{"type": ..., ...}`.
                           evidence that could not be interpreted (contract P1)
     --unknown-type        emit one well-formed line of a type this build does not
                           know, which is a finding rather than an error (P2)
+    --lookalike           emit two lines that look like an answer and are not:
+                          `assistant_text` with no `text`, and with a `text`
+                          that is not a string. Each is a known type missing
+                          what makes it that type, so each is `malformed` and
+                          never chat; both say LOOKALIKE in their own bytes
     --fail-exit           exit non-zero after answering
     --silent              answer nothing at all and exit 0
     --close-stdout        close stdout after the first answer and then block on
@@ -44,6 +49,9 @@ def respond(out, instruction, args):
         out.flush()
     if args.unknown_type:
         emit(out, {"type": "agent_thinking", "detail": "a type this build does not know"})
+    if args.lookalike:
+        emit(out, {"type": "assistant_text", "txt": "LOOKALIKE: never chat"})
+        emit(out, {"type": "assistant_text", "text": ["LOOKALIKE: never chat"]})
     emit(out, {"type": "assistant_text", "text": answer(instruction)})
     emit(out, {"type": "turn_complete"})
 
@@ -53,6 +61,7 @@ def main(argv):
     parser.add_argument("--profile", choices=("one_shot", "persistent"), required=True)
     parser.add_argument("--garbage", action="store_true")
     parser.add_argument("--unknown-type", action="store_true")
+    parser.add_argument("--lookalike", action="store_true")
     parser.add_argument("--fail-exit", action="store_true")
     parser.add_argument("--silent", action="store_true")
     parser.add_argument("--close-stdout", action="store_true")
