@@ -49,7 +49,7 @@ exactly one message, and a session's messages cite its events in event order.
 Any disagreement fails the suite unless `ADJUDICATED_MESSAGES` names it with a
 reason; that table is empty. A message on a session recorded against a launcher
 no classifier in the repository reads is counted as `other launcher`, never as
-exact.
+exact, and fails the gate unless the launcher is adjudicated by name (below).
 
 This is the rule #85's queued attribution wording correction waits on. The
 contract is not changed here; that correction stays queued.
@@ -67,12 +67,21 @@ anything visible. The preview is a one-line, ellipsised summary
 (`white-space: nowrap`) and is not where a message is read. There is no browser
 on the development host, so this is from the page's source and served bytes.
 
-## Deferred
+## Deferred, and where it went
 
 Telling the user that something arrived which could not be shown -- an
-`unrecognized` or `malformed` event, or a turn that produced no text -- belongs
-to the next checkpoint, `handle-unsupported-and-malformed-events`. It is not
-built here, and nothing here decides how it will be shown.
+`unrecognized` or `malformed` event, or a turn that produced no text -- was
+deferred from here to `handle-unsupported-and-malformed-events`, and is decided
+in `0006-no-showable-reply-notice.md`: a turn observed to end with no agent
+message gets one `system` message in fixed words; nothing per event and no
+counts. It changes nothing above: no event renders differently, and agent
+messages are still exactly their events' text.
+
+The gate described above now also fails on a record under a launcher no
+classifier here reads, unless that launcher is named with a reason in
+`ADJUDICATED_LAUNCHERS` (render review F1), and keys every adjudication on the
+store, the session, the sequence and a hash of the record's body (classification
+check L1).
 
 ## Evidence
 

@@ -42,6 +42,7 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | `decisions/0003-concurrent-turns-and-abandon.md` | a concurrent turn is refused before it is recorded (and how to flip that), Abandon as the one lifecycle action, and the refusal of both while a turn is in flight |
 | `decisions/0004-classifying-event-types.md` | the recognized event types per wire format, declared once, where classification happens, the `unrecognized`/`malformed` boundary, and the rule for adding a type |
 | `decisions/0005-rendering-useful-events.md` | what the conversation renders -- one agent message per recognized agent text event, its text exactly, in event order, nothing else -- and the exact-text gate over every kept store |
+| `decisions/0006-no-showable-reply-notice.md` | the one notice a turn gets when it ends with nothing that can be shown, when it is and is not written, and the rule that system text is the harness's fixed words only |
 | `src/dory_wrangler/` | the one product package: the durable store (`store.py`), the chat loop (`session_manager.py`), the launch seam (`launch_boundary.py`), the launchers (`launchers/`), and the served shell (`webapp.py`) |
 | `skills/adversarial-guard-verification/SKILL.md` | how this product checks that a diff's guards are really pinned: the mutation-runner contract, how to enumerate and adjudicate rows, and the decision-conformance pass |
 | `run_shell.py` | run the shell |
@@ -107,8 +108,11 @@ python3 dory-wrangler/tests/test_adversarial.py --report
 Stdlib `unittest`; no pytest and no test framework required. The runner has four
 phases: the unit suite; every store the suite kept, handed to the contract
 validator as a separate program; every event in those stores re-classified from
-its bytes, and every agent message checked against its cited event's text
-(`tests/reclassify_stores.py`); and the contract's own fixtures. The second
+its bytes, every agent message checked against its cited event's text, every
+system message checked to be the harness's fixed words in its place, and any
+record on a launcher no classifier reads failing the run unless that launcher
+is named with a reason (`tests/reclassify_stores.py`); and the contract's own
+fixtures. The second
 command prints #86's adversarial probe table: every guarantee the store claims,
 the attack made on it, and what the attack found.
 
@@ -121,17 +125,17 @@ contract, the adjudication rules, and the decision-conformance pass.
 
 v0.1 has its contract (#85), its chat shell and durable persistence (#86), and
 the launch boundary with its launchers (#87), converged onto one store and one
-served application (#88, decision 0002), and intake that preserves every payload
-raw and correlated before anything reads it, with the one exception named below
-(#88), and event classification from a recognized set declared once per wire
-format (#88, decision 0004), and rendering of the useful subset (#88, decision
-0005). Malformed-event handling -- including telling the user that something
-arrived which could not be shown -- and bounded diagnostic access are #88's
-remaining checkpoints. No observability (#82), supervision
-(#83), or multi-agent (#84) behavior is in scope.
+served application (#88, decision 0002), and intake that preserves what the
+integration hands it raw and correlated before anything reads it, with the
+exceptions named below (#88), and event classification from a recognized set
+declared once per wire format (#88, decision 0004), and rendering of the useful
+subset (#88, decision 0005), and handling of what cannot be shown -- the chat
+survives every such turn and says so once, in fixed words (#88, decision 0006).
+Bounded diagnostic access is #88's remaining checkpoint. No observability (#82),
+supervision (#83), or multi-agent (#84) behavior is in scope.
 
-Every payload shape is now preserved, including the last one that was not: a
-payload typed `stream_end` from a launcher declaring `response_shape: one_shot`,
+The last payload shape that was refused before it was preserved is preserved
+now: a payload typed `stream_end` from a launcher declaring `response_shape: one_shot`,
 where contract 7 P1 and contract 6.1's `STREAM_END_UNSUPPORTED` appeared to
 disagree. **The human decided it on 2026-09-15: preserve the bytes.** The record
 is written `unrecognized` with `interpreted_type: null`, and the `stream_end`
@@ -181,16 +185,54 @@ preserved `raw.body`, and every suite run checks that over every store it keeps
 recognized, agent-sourced event with non-empty text becomes exactly one agent
 message whose text is exactly that event's text -- whitespace and newlines
 included -- in event order; a turn with several such events shows several
-messages and a turn with none shows none. Every other event shows nothing and is
-still preserved. The page inserts message text as text, never as HTML, and keeps
-its whitespace. Every suite run checks every agent message in every kept store
-against its cited event's bytes.
+messages and a turn with none shows no agent message. Every other event shows
+nothing and is still preserved. The page inserts message text as text, never as
+HTML, and keeps its whitespace. Every suite run checks every agent message in
+every kept store against its cited event's bytes on every launcher a classifier
+here reads, and fails on a record under any other launcher unless that launcher
+is one of the three test probes named, with reasons, in
+`reclassify_stores.ADJUDICATED_LAUNCHERS` -- so #90's real launcher fails the run
+until it is given a classifier there.
 
-**The one exception, named rather than implied.** A payload whose own `sequence`
-cannot be written is preserved nowhere, and nothing durable records that it
-arrived, so that sequence can later be filled by different content. That is a
-payload arriving out of order, and a payload behind a store refusal that left a
-sequence unwritten. Contract P3 is why: a gap means a turn was lost and is never
-closed silently, so neither the payload that would write the gap nor the payloads
-behind it can be preserved. Everything else this harness receives is preserved
-before anything interprets it, on every channel that receives it.
+**What cannot be shown does not break the conversation** (decision 0006). A turn
+of only unrecognized or malformed events, a recognized type that carries no
+text, an answer-shaped line missing its text, an empty answer, and events that
+arrive after the turn ended are all preserved with the reading their bytes give,
+the turn completes, and the next turn is answered. When a turn is **observed to
+end** -- a one-shot call returned with its whole response, or the launcher
+reported a turn end, a terminal lifecycle event or an end of stream -- and it
+produced no agent message, the harness writes exactly one `system` message, in
+fixed words:
+
+> The agent's turn ended without a reply that can be shown here. Whatever it sent has been preserved.
+
+It carries nothing from the integration, is never written because time passed
+(a turn that never ends stays in flight, with no notice), is written at most once
+per turn and never for a turn that showed a reply, and is not written over a
+payload that was lost, because it says nothing was. Re-attachment after a
+restart applies the same rule, from the chat's durable messages. The store
+refuses any other system text: system text is the harness's fixed words only.
+
+**What is not preserved, named rather than implied.**
+
+* **A payload whose own `sequence` cannot be written** is preserved nowhere, and
+  nothing durable records that it arrived, so that sequence can later be filled
+  by different content. That is a payload arriving out of order, and a payload
+  behind a store refusal that left a sequence unwritten. Contract P3 is why: a
+  gap means a turn was lost and is never closed silently, so neither the payload
+  that would write the gap nor the payloads behind it can be preserved.
+* **A failed launch's output behind a payload that cannot cross the seam** -- one
+  sourced to the agent, or out of order. What crosses is the longest prefix the
+  seam accepts, with the launcher's own failure category, and the `detail` names
+  what was not preserved; a gap cannot be left in a session that never ran. This
+  holds whether the launcher raised its failure or returned it.
+* **A line of only ASCII whitespace** on a newline-delimited transport is framing,
+  not a payload (decision 0004).
+* **What a launcher never hands the harness.** `dev-local` discards its agent's
+  stderr (it is not a transport payload), and the Codex model keeps stderr only
+  inside the observation it preserves for a launch that started no thread. A line
+  `dev-local` has read but not yet returned from `events` is held in the launcher
+  process and is gone if the harness process dies before the call returns.
+
+Everything else the harness receives is preserved before anything interprets it,
+on every channel that receives it.
