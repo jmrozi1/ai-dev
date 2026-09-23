@@ -24,6 +24,8 @@ tested here beyond "it is not chat".
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import os
 import shutil
@@ -108,7 +110,8 @@ class EachWireFormatDeclaresItsSetOnce(unittest.TestCase, ModelDirs):
 
         def dev_local_reads(raw):
             session = type("S", (), {"next_sequence": 1})()
-            return reading(DevLocalLauncher._agent_payload(None, session, raw.decode() + "\n"))
+            line = dev_transport.read_line(io.BytesIO(raw + b"\n"))
+            return reading(DevLocalLauncher._agent_payload(None, session, line))
 
         def stub_reads(raw):
             stub = ScriptedStubLauncher({})
@@ -203,6 +206,10 @@ class TheBoundaryReadsEveryShapeTheSameWayEveryTime(unittest.TestCase):
         (b'"assistant_text"', ("unrecognized", None, None)),
         (b'null', ("unrecognized", None, None)),
         (b'{"type": "Assistant_Text", "text": "x"}', ("unrecognized", None, None)),
+        # The type string is matched exactly: no whitespace is trimmed from it.
+        (b'{"type": "assistant_text ", "text": "x"}', ("unrecognized", None, None)),
+        (b'{"type": " assistant_text", "text": "x"}', ("unrecognized", None, None)),
+        (b'{"type": "turn_complete\\n"}', ("unrecognized", None, None)),
         (b'not json {{{', ("malformed", None, None)),
         (b'\xff\xfe{"type": "turn_complete"}', ("malformed", None, None)),
         (b'{"type": "assistant_text", "text": "\xff"}', ("malformed", None, None)),
@@ -212,6 +219,16 @@ class TheBoundaryReadsEveryShapeTheSameWayEveryTime(unittest.TestCase):
     CODEX = [
         (b'{"type": "thread.started", "thread_id": "t1"}', ("recognized", "thread.started", None)),
         (b'{"type": "thread.started", "thread_id": ""}', ("malformed", None, None)),
+        # Non-empty means non-empty, not non-blank: a whitespace handle is a handle.
+        (b'{"type": "thread.started", "thread_id": " "}', ("recognized", "thread.started", None)),
+        (b'{"type": "thread.started", "thread_id": "\\t"}', ("recognized", "thread.started", None)),
+        # The type strings are matched exactly: no whitespace is trimmed from them.
+        (b'{"type": "thread.started ", "thread_id": "t1"}', ("unrecognized", None, None)),
+        (b'{"type": " thread.started", "thread_id": "t1"}', ("unrecognized", None, None)),
+        (b'{"type": "item.completed ", "item": {"type": "agent_message", "text": "x"}}',
+         ("unrecognized", None, None)),
+        (b'{"type": "item.completed", "item": {"type": "agent_message ", "text": "x"}}',
+         ("unrecognized", None, None)),
         (b'{"type": "thread.started", "thread_id": 5}', ("malformed", None, None)),
         (b'{"type": "thread.started"}', ("malformed", None, None)),
         (b'{"type": "item.completed", "item": {"type": "agent_message", "text": ""}}',
@@ -257,14 +274,57 @@ class TheBoundaryReadsEveryShapeTheSameWayEveryTime(unittest.TestCase):
     def test_the_codex_model(self):
         self.check(internal_bridge.classify, self.CODEX)
 
+    # The development transport's framing (`dev_transport.read_line`), which
+    # `dev-local` reads both profiles through: wire bytes -> the raw bytes of
+    # each line the classifier is handed. Split on b"\n" only; nothing decoded,
+    # trimmed or translated.
+    FRAMING = [
+        (b'{"type": "assistant_text", "text": "caf\xc3\xa9"}\n',
+         [b'{"type": "assistant_text", "text": "caf\xc3\xa9"}']),
+        # trailing whitespace stays in `raw` (review F4)
+        (b'{"type": "agent_thinking"}  \t \n', [b'{"type": "agent_thinking"}  \t ']),
+        (b'  {"type": "turn_complete"}\n', [b'  {"type": "turn_complete"}']),
+        # a CR is part of the line, not its end
+        (b'{"type": "agent_thinking"}\r\n', [b'{"type": "agent_thinking"}\r']),
+        (b'{"type": "agent_thinking"}\rX\n', [b'{"type": "agent_thinking"}\rX']),
+        # U+2028, U+0085 and the other characters str.splitlines splits on do not
+        # end a line
+        ('{"type": "assistant_text", "text": "l\u2028r"}\n'.encode("utf-8"),
+         ['{"type": "assistant_text", "text": "l\u2028r"}'.encode("utf-8")]),
+        ('{"type": "assistant_text", "text": "l\u0085r\u2029\x0b\x0c\x1c"}\n'.encode("utf-8"),
+         ['{"type": "assistant_text", "text": "l\u0085r\u2029\x0b\x0c\x1c"}'.encode("utf-8")]),
+        # bytes that are not UTF-8 are not decoded, so they arrive
+        (b'{"type": "agent_thinking", "x": "\xff"}\n', [b'{"type": "agent_thinking", "x": "\xff"}']),
+        # blank lines carry no event; the last line needs no b"\n"
+        (b'\n\r\n \t\na\n\nb', [b'a', b'b']),
+        (b'', []),
+    ]
+
+    def test_the_framing_splits_bytes_on_newline_only(self):
+        for wire, lines in self.FRAMING:
+            with self.subTest(wire=wire):
+                stream = io.BytesIO(wire)
+                self.assertEqual(list(iter(lambda: dev_transport.read_line(stream), None)),
+                                 lines)
+
     def test_dev_local_reads_a_line_as_its_bytes_without_the_newline(self):
-        session = type("S", (), {"next_sequence": 3})()
-        payload = DevLocalLauncher._agent_payload(
-            None, session, '{"type": "assistant_text", "text": "caf\u00e9"}\n')
-        self.assertEqual((payload.sequence, payload.raw, reading(payload)),
-                         (3, '{"type": "assistant_text", "text": "caf\u00e9"}'.encode("utf-8"),
-                          ("recognized", "assistant_text", "caf\u00e9")))
-        self.assertEqual(session.next_sequence, 4)
+        cases = [
+            (b'{"type": "assistant_text", "text": "caf\xc3\xa9"}\n',
+             ("recognized", "assistant_text", "caf\u00e9")),
+            (b'{"type": "agent_thinking"}  \t \n', ("unrecognized", None, None)),
+            (b'{"type": "turn_complete"}\r\n', ("recognized", "turn_complete", None)),
+            ('{"type": "assistant_text", "text": "l\u2028r"}\n'.encode("utf-8"),
+             ("recognized", "assistant_text", "l\u2028r")),
+            (b'{"type": "assistant_text", "text": "\xff"}\n', ("malformed", None, None)),
+        ]
+        for wire, expected in cases:
+            with self.subTest(wire=wire):
+                session = type("S", (), {"next_sequence": 3})()
+                line = dev_transport.read_line(io.BytesIO(wire))
+                payload = DevLocalLauncher._agent_payload(None, session, line)
+                self.assertEqual((payload.sequence, payload.raw, reading(payload)),
+                                 (3, wire[:-1], expected))
+                self.assertEqual(session.next_sequence, 4)
 
 
 class ClassificationIsAFunctionOfThePreservedBytes(unittest.TestCase, StoreCheck, ModelDirs):
@@ -462,6 +522,118 @@ class UnrecognizedAndMalformedAreNeverChat(unittest.TestCase, StoreCheck, ModelD
                     records, ["answer to: %s" % t for t in THREE_TURNS[:2]])
                 if launcher == "dev-local":
                     self.assertEqual(len(self.lookalikes(unread)), 4)
+
+
+
+# An agent that writes, before each answer, the lines a text-mode reader used to
+# lose or split (review F1): an answer with a raw U+2028 in its text, a line with
+# a raw U+0085, a line that is not UTF-8, a CR-terminated line, and a line with
+# trailing whitespace. Then a normal answer and `turn_complete`.
+ODD_LINES = [
+    '{"type": "assistant_text", "text": "left\u2028right"}'.encode("utf-8"),
+    '{"type": "agent_thinking", "x": "a\u0085b"}'.encode("utf-8"),
+    b'{"type": "agent_thinking", "x": "\xff"}',
+    b'{"type": "agent_thinking", "cr": true}\r',
+    b'{"type": "agent_thinking", "ws": true}  \t ',
+]
+ODD_READINGS = [("recognized", "assistant_text"), ("unrecognized", None), ("malformed", None),
+                ("unrecognized", None), ("unrecognized", None)]
+ODD_AGENT = r"""
+import sys
+LINES = [bytes.fromhex(h) for h in sys.argv[2].split(",")]
+out = sys.stdout.buffer
+def turn(instruction):
+    for line in LINES:
+        out.write(line + b"\n")
+    out.write(b'{"type": "assistant_text", "text": "answer to: '
+              + instruction.strip().encode("utf-8") + b'"}\n{"type": "turn_complete"}\n')
+    out.flush()
+if sys.argv[1] == "one_shot":
+    turn(sys.stdin.buffer.read().decode("utf-8"))
+else:
+    for line in sys.stdin.buffer:
+        turn(line.decode("utf-8"))
+"""
+
+
+class DevLocalFramesTheWireBytesTheSameInBothProfiles(unittest.TestCase, StoreCheck):
+    """Review F1, closed by reading `dev-local`'s stdout as bytes and framing on
+    b"\n" only in both profiles (`dev_transport.read_line`). The same wire bytes
+    are the same events under `one_shot` and `persistent`; a line that is not
+    UTF-8 is preserved `malformed` with its bytes intact and costs nothing else;
+    a CR and trailing whitespace stay in `raw`. In process and over HTTP."""
+
+    def options(self, profile):
+        base = tempfile.mkdtemp(prefix="dory-framing-")
+        self.addCleanup(shutil.rmtree, base, True)
+        agent = os.path.join(base, "odd_agent.py")
+        with open(agent, "w") as handle:
+            handle.write(ODD_AGENT)
+        return {"profile": profile,
+                "command": [sys.executable, agent, profile,
+                            ",".join(line.hex() for line in ODD_LINES)]}
+
+    def raw_of(self, event):
+        body = event["raw"]["body"]
+        return base64.b64decode(body) if event["raw"]["encoding"] == "base64" else body.encode("utf-8")
+
+    def check(self, records, profile, texts):
+        events = [r for r in records if r["record_type"] == "diagnostic_event"]
+        agent = [e for e in events if e["source"] == "agent"]
+        expected = []
+        for text in texts:
+            answer = ('{"type": "assistant_text", "text": "answer to: %s"}' % text).encode("utf-8")
+            expected += [(line, reading) for line, reading in zip(ODD_LINES, ODD_READINGS)]
+            expected += [(answer, ("recognized", "assistant_text")),
+                         (b'{"type": "turn_complete"}', ("recognized", "turn_complete"))]
+        self.assertEqual([(self.raw_of(e), (e["interpretation"], e["interpreted_type"]))
+                          for e in agent], expected)
+        not_utf8 = [e for e in agent if self.raw_of(e) == ODD_LINES[2]]
+        self.assertEqual([e["raw"]["encoding"] for e in not_utf8], ["base64"] * len(texts))
+        messages = [(r["author"], r["content"]["text"]) for r in records
+                    if r["record_type"] == "message"]
+        self.assertEqual(messages, [row for t in texts for row in (
+            ("user", t), ("agent", "left\u2028right"), ("agent", "answer to: %s" % t))])
+        states = [r["state"] for r in records if r["record_type"] == "agent_session"]
+        self.assertEqual(states, ["completed"] * len(texts) if profile == "one_shot"
+                         else ["running"], "no session is stranded")
+
+    def test_in_process(self):
+        for profile in ("one_shot", "persistent"):
+            with self.subTest(profile=profile):
+                harness = support.harness({"launcher": "dev-local",
+                                           "options": self.options(profile)})
+                self.addCleanup(support.release, harness)
+                chat_id = harness.create_chat("Framing, %s" % profile)
+                for text in THREE_TURNS[:2]:
+                    harness.send_turn(chat_id, text)
+                self.check(harness.store.export_records(), profile, THREE_TURNS[:2])
+                self.assert_store_valid(harness.store, "framing-dev-local-%s" % profile)
+
+    def test_over_http_through_run_shell(self):
+        from shellproc import ShellProcess
+        for profile in ("one_shot", "persistent"):
+            with self.subTest(profile=profile):
+                root = support.scratch_root()
+                shell = ShellProcess(root, launcher="dev-local",
+                                     launcher_options=self.options(profile))
+                self.addCleanup(shell.kill)
+                shell.start()
+                _status, chat = shell.post("/api/chats", {})
+                path = "/api/chats/%s" % chat["chat_id"]
+                for text in THREE_TURNS[:2]:
+                    self.assertEqual(shell.raw("POST", path + "/messages", {"text": text})[0],
+                                     201)
+                status, body = shell.raw("GET", path)
+                self.assertEqual(status, 200)
+                self.assertEqual(
+                    [(m["author"], m["text"]) for m in json.loads(body)["messages"]],
+                    [row for t in THREE_TURNS[:2] for row in (
+                        ("user", t), ("agent", "left\u2028right"), ("agent", "answer to: %s" % t))])
+                shell.kill()
+                store = ChatStore(root, read_only=True)
+                self.assertEqual(store.verify(), [])
+                self.check(store.export_records(), profile, THREE_TURNS[:2])
 
 
 if __name__ == "__main__":

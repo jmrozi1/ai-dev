@@ -160,11 +160,17 @@ development transport that `dev-local` and `scripted-stub` share recognizes
 internal path emits recognizes `thread.started` (with a `thread_id`) and
 `item.completed` / `agent_message` (with a string `item.text`), declared in the
 in-repo model until the real internal launcher (#90) carries it. Any other
-well-formed line is `unrecognized`; a line that is not JSON, or a known type
-missing its required field, is `malformed`; neither ever becomes chat. A type is
-added only on the evidence of real output that carries it. Every recorded
-reading is reproducible from the preserved `raw.body`
-(`tests/reclassify_stores.py`).
+well-formed line is `unrecognized`; a line that is not UTF-8 JSON, or a known
+type missing its required field, is `malformed`; neither ever becomes chat. A
+type is added only on the evidence of real output that carries it. `dev-local`
+reads its agent's stdout as bytes and frames a line on `\n` alone, in both
+profiles (`dev_transport.read_line`), so a line is classified from exactly the
+bytes the agent wrote: a `\r`, trailing whitespace, U+2028 inside a string and
+bytes that are not UTF-8 all reach `raw`, and the last is preserved `malformed`
+without costing the rest of its turn. A line of only ASCII whitespace carries no
+event and is not preserved. Every recorded reading is reproducible from the
+preserved `raw.body`, and every suite run checks that over every store it keeps
+(`tests/reclassify_stores.py`, phase 3 of `run_tests.py`).
 
 **The one exception, named rather than implied.** A payload whose own `sequence`
 cannot be written is preserved nowhere, and nothing durable records that it

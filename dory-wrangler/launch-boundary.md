@@ -181,7 +181,12 @@ in `session_manager.py` is the one function a later answer changes.
    `malformed`. The set is data in one place, read by the one classifier
    (decision 0004); the in-repo model declares it in
    `tests/internal_bridge.py`, and the real launcher should carry that
-   declaration rather than a second copy of it.
+   declaration rather than a second copy of it. **It frames the output as
+   bytes, split on `\n` only, before anything decodes it** -- the model's
+   `output_lines`, and `dev-local`'s `dev_transport.read_line`. A text-mode pipe
+   or `str.splitlines` splits a line on U+2028, U+0085 and others, drops `\r`,
+   and turns a line that is not UTF-8 into an exception that loses the whole
+   turn instead of one `malformed` record.
 9. **Under `fresh_binding` it reports the agent's exit.** A session that never
    leaves `running` holds its chat, and under `fresh_binding` every later turn
    is then refused until the user abandons it. Under `persistent` a session

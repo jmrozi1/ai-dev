@@ -49,7 +49,9 @@ measured, here or internally, and asserting one would be a fabrication (U2).
 
 from __future__ import annotations
 
+import io
 import json
+import locale
 import os
 import subprocess
 import sys
@@ -75,7 +77,7 @@ from ..launch_boundary import (
     SOURCE_LAUNCHER,
     StopAck,
 )
-from .dev_transport import classify
+from .dev_transport import classify, read_line
 
 DEV_AGENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dev_agent.py")
 
@@ -85,10 +87,27 @@ PROFILES = {
 }
 
 # What a line of the agent's transport is, is decided in one place for this wire
-# format -- `dev_transport.RECOGNIZED` and `dev_transport.classify` -- which the
-# scripted stub reads too. This launcher only adds what it observes of its own
-# child process (lifecycle and end of stream), which it synthesises rather than
-# reads.
+# format -- `dev_transport.read_line` frames it, `dev_transport.RECOGNIZED` and
+# `dev_transport.classify` read it, and the scripted stub reads through the same
+# classifier. This launcher only adds what it observes of its own child process
+# (lifecycle and end of stream), which it synthesises rather than reads.
+#
+# The agent's stdout is read as **bytes**, in both profiles, and framed by
+# `read_line` on `b"\n"` alone: nothing is decoded, and no newline is
+# translated, before the classifier sees a line. So a `\r`, trailing
+# whitespace, U+2028 / U+0085 inside a JSON string, and bytes that are not UTF-8
+# all reach `raw` as the agent wrote them, and the same wire bytes read the same
+# way under `one_shot` and `persistent`.
+#
+# The instruction side of the pipe carries no evidence -- the harness has
+# recorded the instruction before the launcher is called -- so it is still text,
+# encoded here with exactly the encoding the text-mode pipe used before
+# (`locale.getpreferredencoding(False)`, which `subprocess` text mode uses), so
+# the agent receives the same bytes it always did.
+
+
+def _instruction_bytes(text):
+    return text.encode(locale.getpreferredencoding(False))
 
 
 def _release_pipes(process):
@@ -146,8 +165,6 @@ class DevLocalLauncher(LaunchBoundary):
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                universal_newlines=True,
-                bufsize=1,
             )
         except OSError as exc:
             # A launch prerequisite was not satisfied. Internally this same
@@ -162,8 +179,9 @@ class DevLocalLauncher(LaunchBoundary):
         session = _Session(handle, process, self._profile)
 
         if self._profile == "one_shot":
-            stdout, _ = process.communicate(instruction.instruction_text)
-            lines = [line for line in (stdout or "").splitlines() if line.strip()]
+            stdout, _ = process.communicate(_instruction_bytes(instruction.instruction_text))
+            output = io.BytesIO(stdout or b"")
+            lines = list(iter(lambda: read_line(output), None))
             if not lines:
                 # The call returned without a usable acknowledgement. For a
                 # one-shot launcher the response *is* the acknowledgement, so
@@ -178,7 +196,8 @@ class DevLocalLauncher(LaunchBoundary):
             session.stream_ended = False  # a one-shot launcher has no stream
         else:
             try:
-                process.stdin.write(instruction.instruction_text.rstrip("\n") + "\n")
+                process.stdin.write(
+                    _instruction_bytes(instruction.instruction_text.rstrip("\n") + "\n"))
                 process.stdin.flush()
             except (OSError, ValueError) as exc:
                 raise LauncherError(FAILURE_INTERNAL_ERROR,
@@ -202,7 +221,7 @@ class DevLocalLauncher(LaunchBoundary):
         with session.lock:
             try:
                 session.process.stdin.write(
-                    instruction.instruction_text.rstrip("\n") + "\n")
+                    _instruction_bytes(instruction.instruction_text.rstrip("\n") + "\n"))
                 session.process.stdin.flush()
             except (OSError, ValueError) as exc:
                 return DeliveryAck(False, detail="the agent is not accepting input: %s" % exc)
@@ -236,13 +255,11 @@ class DevLocalLauncher(LaunchBoundary):
         """
         produced = []
         while True:
-            line = session.process.stdout.readline()
-            if line == "":
+            line = read_line(session.process.stdout)
+            if line is None:
                 session.stream_ended = True
                 produced.append(self._end_of_stream_payload(session))
                 return produced
-            if not line.strip():
-                continue
             payload = self._agent_payload(session, line)
             session.payloads.append(payload)
             produced.append(payload)
@@ -324,15 +341,16 @@ class DevLocalLauncher(LaunchBoundary):
         return session
 
     def _agent_payload(self, session, line):
-        """One line the agent wrote, launch and later turns alike.
+        """One line the agent wrote, launch and later turns alike: the raw bytes
+        `read_line` framed, never decoded here.
 
-        Classified from the bytes that are preserved, through the development
-        transport's one classifier, so what is recorded is reproducible from
-        `raw.body` alone.
+        Classified from exactly the bytes that are preserved, through the
+        development transport's one classifier, so what is recorded is
+        reproducible from `raw.body` alone.
         """
         sequence = session.next_sequence
         session.next_sequence += 1
-        return classify(sequence, line.rstrip("\n").encode("utf-8"))
+        return classify(sequence, line)
 
     def _lifecycle_payload(self, session, returncode):
         sequence = session.next_sequence

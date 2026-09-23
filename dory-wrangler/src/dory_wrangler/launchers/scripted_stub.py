@@ -235,11 +235,12 @@ class ScriptedStubLauncher(LaunchBoundary):
     def _emit_agent_line(self, session, body):
         """One line of the agent's output, read by the development transport's
         one classifier (`dev_transport`), exactly as `dev_local` reads a line
-        from a real process. The stub decides only which bytes the agent says;
-        what those bytes *are* is decided where `dev_local` decides it, so the
-        two launchers cannot disagree about the same line, and every record is
-        reproducible from its `raw.body`. It still goes through `_emit`, the one
-        place a payload is numbered and kept."""
+        from a real process once `dev_transport.read_line` has framed it. The
+        stub has no pipe and so no framing: it decides only which bytes one line
+        of the agent says; what those bytes *are* is decided where `dev_local`
+        decides it, so the two launchers cannot disagree about the same line,
+        and every record is reproducible from its `raw.body`. It still goes
+        through `_emit`, the one place a payload is numbered and kept."""
         raw = body if isinstance(body, bytes) else body.encode("utf-8")
         interpretation, interpreted_type, text = interpret(raw)
         return self._emit(session, SOURCE_AGENT, interpretation, raw,

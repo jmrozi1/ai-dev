@@ -1,13 +1,24 @@
-"""The development transport: its recognized set, declared once, and its one classifier.
+r"""The development transport: its framing, its recognized set, declared once, and its one classifier.
 
 The development agent (`dev_agent.py`) writes newline-delimited JSON, one object
 per line, `{"type": ..., ...}`. `dev_local.py` reads that transport from a real
 process, and `scripted_stub.py` produces payloads in exactly the same bytes
 in-process, so the two launchers share one wire format -- and therefore one
-declaration and one classifier, both here. Nothing else in the package decides
-what a line of this transport is. The internal Codex JSONL is a different wire
-format with its own declaration (`tests/internal_bridge.py`, a model, not a
-shipped launcher).
+framing, one declaration and one classifier, all here. Nothing else in the
+package decides what a line of this transport is. The internal Codex JSONL is a
+different wire format with its own declaration (`tests/internal_bridge.py`, a
+model, not a shipped launcher).
+
+**Framing (`read_line`).** A line is the agent's stdout **bytes** up to a
+`b"\n"`, and nothing else ends one: not `\r`, not U+2028 or U+0085, not any
+other character `str.splitlines` would split on. The line is handed to the
+classifier as those bytes, without the `\n` and otherwise untouched -- a `\r`,
+trailing spaces and tabs, and bytes that are not UTF-8 all stay in `raw`. Nothing
+is decoded before the classifier, so a line that is not UTF-8 reaches it and is
+`malformed`, with its bytes preserved (base64 in the store). A line whose bytes
+are only ASCII whitespace carries no event and is skipped, as in the Codex
+model's `internal_bridge.output_lines`. `dev-local` reads both of its profiles
+through this one function.
 
 This is the launcher side of the seam (contract 6.1: a launcher parses its own
 transport and reports what it recognised). The harness never classifies; it
@@ -58,6 +69,24 @@ RECOGNIZED = {
     "assistant_text": Recognized(PAYLOAD_ASSISTANT_TEXT, "text"),
     "turn_complete": Recognized(PAYLOAD_TURN_COMPLETE, None),
 }
+
+
+def read_line(stream):
+    r"""The next line of the transport from a binary `stream`, as its raw bytes
+    without the terminating `b"\n"`, or None at end of stream.
+
+    Split on `b"\n"` only (a binary `readline`), never decoded. A line of only
+    ASCII whitespace -- `b""`, `b"\r"`, spaces, tabs -- carries no event and is
+    skipped. The last line may lack its `b"\n"`; it is still a line.
+    """
+    while True:
+        line = stream.readline()
+        if not line:
+            return None
+        if line.endswith(b"\n"):
+            line = line[:-1]
+        if line.strip():
+            return line
 
 
 def interpret(raw):

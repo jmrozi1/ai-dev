@@ -26,6 +26,20 @@ produced byte-for-byte in-process by `scripted-stub`. Declared in
 `launchers/dev_transport.py` as `RECOGNIZED`; classified by
 `dev_transport.interpret` / `classify`.
 
+*Framing* is part of the wire format and is also in one place,
+`dev_transport.read_line`, which `dev-local` reads both profiles through. It
+reads the agent's stdout as **bytes** and ends a line at `b"\n"` and nothing
+else -- not `\r`, not U+2028 or U+0085 -- and hands the classifier the line's
+bytes without that `\n` and otherwise untouched. Nothing is decoded first, so a
+`\r`, trailing whitespace and bytes that are not UTF-8 are all in `raw`, and
+the same wire bytes read the same way under `one_shot` and `persistent`. A line
+of only ASCII whitespace carries no event and is skipped. The Codex model frames
+the same way (`internal_bridge.output_lines`). The instruction written *to* the
+agent stays text, encoded with the encoding the text-mode pipe always used; it
+carries no evidence, because the harness records the instruction before the
+launcher sees it. `scripted-stub` has no pipe and so no framing: it hands the
+classifier each line's bytes directly.
+
 | Wire `type` | Recorded `interpreted_type` | Required | Chat text |
 | --- | --- | --- | --- |
 | `assistant_text` | `assistant_text` | `text`, a string | `text` |
@@ -51,7 +65,7 @@ read, so no classifier re-reads them; their own bytes name the type recorded
 
 ## The boundary between `recognized`, `unrecognized`, and `malformed`
 
-For every wire format:
+For every wire format, applied to the bytes of one framed line:
 
 * **`malformed`** -- the line is not UTF-8 JSON, **or** it is a declared type
   missing the field the declaration requires. A body that looks like an
@@ -88,12 +102,19 @@ means is its own change.
 
 ## Evidence
 
-`tests/test_classification.py`: each format's exact set; the declaration changed
+`tests/test_classification.py`: each format's exact set, the type string matched
+exactly (no whitespace trimmed) and the model's non-empty `thread_id` meaning
+non-empty rather than non-blank; the declaration changed
 under both development launchers and under the model's launch, resume and
 failed-launch paths, and every one follows it; the same line read identically on
 launch and on resume; every event each launcher preserves re-read from
 `raw.body` reproducing what was recorded; no `unrecognized` or `malformed`
 payload -- the answer lookalikes included -- becoming a message, at the store and
 over HTTP through `run_shell.py` with `dev-local` and `scripted-stub` chosen by
-configuration. `tests/reclassify_stores.py` runs the re-read over every store
-the suite keeps.
+configuration; and `dev-local`'s framing -- the same wire bytes read the same way
+in both profiles, a line that is not UTF-8 preserved `malformed` with its bytes
+intact while the rest of its turn is answered, a `\r` and trailing whitespace
+kept in `raw` -- in process and over HTTP. `tests/reclassify_stores.py` runs the
+re-read over every store the suite keeps, as phase 3 of `run_tests.py`, and
+fails the run on any record that does not reproduce and is not adjudicated by
+name.
