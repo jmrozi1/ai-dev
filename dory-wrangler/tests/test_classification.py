@@ -301,11 +301,24 @@ class TheBoundaryReadsEveryShapeTheSameWayEveryTime(unittest.TestCase):
     ]
 
     def test_the_framing_splits_bytes_on_newline_only(self):
+        class ReadOnceAtTheEnd(io.BytesIO):
+            """End of stream is reported once and must be taken as the end: a
+            framing that reads past it would never return."""
+            ended = False
+
+            def readline(self, *args):
+                line = io.BytesIO.readline(self, *args)
+                if not line:
+                    if self.ended:
+                        raise AssertionError("read past the end of the stream")
+                    self.ended = True
+                return line
+
         for wire, lines in self.FRAMING:
             with self.subTest(wire=wire):
-                stream = io.BytesIO(wire)
-                self.assertEqual(list(iter(lambda: dev_transport.read_line(stream), None)),
-                                 lines)
+                stream = ReadOnceAtTheEnd(wire)
+                self.assertEqual([dev_transport.read_line(stream) for _ in range(len(lines) + 1)],
+                                 lines + [None])
 
     def test_dev_local_reads_a_line_as_its_bytes_without_the_newline(self):
         cases = [
@@ -449,6 +462,11 @@ class ClassificationIsAFunctionOfThePreservedBytes(unittest.TestCase, StoreCheck
         self.assertEqual(run(not_reproduced), 1)
         self.assertEqual(run(not_reproduced, [("planted.json", unknown["sequence"],
                                                ("unrecognized", None))]), 0)
+        self.assertEqual(run(not_reproduced, [("planted.json", unknown["sequence"] + 1,
+                                               ("unrecognized", None))]), 1,
+                         "a name covers one record, not every record of its reading")
+        self.assertEqual(run(not_reproduced, [("other.json", unknown["sequence"],
+                                               ("unrecognized", None))]), 1)
         inconsistent = planted(lifecycle, interpreted_type="session_failed")
         self.assertEqual(run(inconsistent), 1)
         self.assertEqual(run(inconsistent, [("planted.json", lifecycle["sequence"],
@@ -654,6 +672,21 @@ class DevLocalFramesTheWireBytesTheSameInBothProfiles(unittest.TestCase, StoreCh
                     harness.send_turn(chat_id, text)
                 self.check(harness.store.export_records(), profile, THREE_TURNS[:2])
                 self.assert_store_valid(harness.store, "framing-dev-local-%s" % profile)
+
+    def test_the_instruction_reaches_the_agent_as_it_always_did(self):
+        """Only the agent's stdout became binary. The instruction is still
+        written as text in the pipe's old encoding, so a non-ASCII turn reaches
+        the shipped development agent intact in both profiles."""
+        text = "caf\u00e9 \u2713 \"quoted\" \\ back"
+        for profile in ("one_shot", "persistent"):
+            with self.subTest(profile=profile):
+                harness = support.harness({"launcher": "dev-local",
+                                           "options": {"profile": profile}})
+                self.addCleanup(support.release, harness)
+                chat_id = harness.create_chat("Instruction, %s" % profile)
+                harness.send_turn(chat_id, text)
+                self.assertEqual([(a, t) for _, a, t in harness.transcript(chat_id)],
+                                 [("user", text), ("agent", "answer to: %s" % text)])
 
     def test_over_http_through_run_shell(self):
         from shellproc import ShellProcess
