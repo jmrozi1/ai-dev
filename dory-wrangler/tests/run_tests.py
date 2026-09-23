@@ -14,9 +14,10 @@ Four phases, and the second is the point of having phases at all:
    `dory-wrangler/validator/validate_contract.py` on the command line -- the
    executable contract run as a separate program over files on disk, rather than
    a library call inside the tests that produced them;
-3. every event in those same kept stores re-classified from its `raw.body`
-   (`tests/reclassify_stores.py`), which exits non-zero on any record that does
-   not reproduce and is not adjudicated by name;
+3. every event in those same kept stores re-classified from its `raw.body`, and
+   every agent message checked to carry exactly its cited event's text
+   (`tests/reclassify_stores.py`, decision 0005), which exits non-zero on any
+   record that does not reproduce and is not adjudicated by name;
 4. the contract's own fixtures, which must still pass unchanged.
 
 With a `pattern`, only the matching test modules run, and phase 2 validates the
@@ -76,7 +77,8 @@ def main(argv):
             return completed
 
         print("", flush=True)
-        print("== phase 3: every kept event re-classified from its bytes ==", flush=True)
+        print("== phase 3: every kept event re-classified from its bytes, every agent "
+              "message against it ==", flush=True)
         completed = subprocess.call(
             [sys.executable, os.path.join(TESTS_DIR, "reclassify_stores.py"),
              support.FIXTURE_OUT], cwd=REPO)

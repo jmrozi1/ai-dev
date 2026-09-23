@@ -8,6 +8,7 @@ what lets a test restart the shell for real (SIGKILL, then a new process) with
 the chat resuming on the same thread.
 
     model_shell.py --root <store> --port-file <file> --codex-home <dir> --spool <dir>
+        [--behaviour <comma-separated model_launch_agent.py switches>]
 """
 
 import argparse
@@ -28,9 +29,12 @@ def main(argv=None):
     parser.add_argument("--port-file", required=True)
     parser.add_argument("--codex-home", required=True)
     parser.add_argument("--spool", required=True)
+    parser.add_argument("--behaviour", default="")
     args = parser.parse_args(argv)
+    behaviour = tuple(b for b in args.behaviour.split(",") if b)
     server = build_server(args.root, port=0, quiet=True,
-                          launcher=InternalBridgeLauncher(args.codex_home, args.spool))
+                          launcher=InternalBridgeLauncher(args.codex_home, args.spool,
+                                                          behaviour=behaviour))
     with open(args.port_file + ".partial", "w") as handle:
         handle.write(str(server.server_address[1]))
     os.replace(args.port_file + ".partial", args.port_file)

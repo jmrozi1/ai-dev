@@ -53,7 +53,12 @@ Configuration comes from this process's own environment, never from the message:
     `synthetic-malformed`, `synthetic-not-an-object`, `synthetic-item`,
     `synthetic-typeless`, `synthetic-padded`, `thread-started-without-id-first`,
     `agent-message-without-text`, `no-thread-started`, `no-output`,
-    `two-messages`, and
+    `two-messages`, `no-agent-message` (a thread starts and no `agent_message`
+    follows: a turn that produces no text), `padded-message` (the answer's
+    `item.text` carries leading and trailing whitespace and newlines, which are
+    part of the text), `park` (before printing anything, create `parked` in the
+    Codex home and wait up to a minute for `release` there, so a test can act
+    while a turn is in flight), and
     `plain-text-on-resume` -- the old guess that a resume prints bare text, kept
     only to show that nothing treats it specially.
 """
@@ -61,6 +66,7 @@ Configuration comes from this process's own environment, never from the message:
 import json
 import os
 import sys
+import time
 import uuid
 
 # The prompt that asks the agent for something only the thread can know. The
@@ -86,6 +92,9 @@ SYNTHETIC_PADDED = '  {"type": "synthetic.model-only.padded-line"}\t'
 # An object with no type at all, whatever else it carries.
 SYNTHETIC_TYPELESS = {"note": "SYNTHETIC model-only object with no type",
                       "item": {"type": "agent_message", "text": "SYNTHETIC: never chat"}}
+# What `padded-message` wraps the answer in. Whitespace an agent wrote is its text.
+PADDED_BEFORE = "\n  \t"
+PADDED_AFTER = "  \n\n \t"
 
 
 def reply_to(prompts):
@@ -113,6 +122,12 @@ def main(argv):
         # a probe can check that stderr is *preserved* where nothing else can
         # carry it, rather than that a key with an empty value is written.
         sys.stderr.write("model: a prerequisite check wrote this to stderr\n")
+
+    if "park" in behaviour:
+        open(os.path.join(home, "parked"), "a").close()
+        deadline = time.time() + 60
+        while not os.path.exists(os.path.join(home, "release")) and time.time() < deadline:
+            time.sleep(0.02)
 
     threads = os.path.join(home, "threads")
     os.makedirs(threads, exist_ok=True)
@@ -157,9 +172,11 @@ def main(argv):
         if "synthetic-padded" in behaviour:
             lines.append(SYNTHETIC_PADDED)
         answer = reply_to(thread["prompts"])
+        if "padded-message" in behaviour:
+            answer = PADDED_BEFORE + answer + PADDED_AFTER
         if resume_id is not None and "plain-text-on-resume" in behaviour:
             lines = [answer]
-        else:
+        elif "no-agent-message" not in behaviour:
             lines.append(json.dumps({"type": "item.completed",
                                      "item": {"type": "agent_message", "text": answer}}))
         if "two-messages" in behaviour:
