@@ -60,7 +60,17 @@ Configuration comes from this process's own environment, never from the message:
     Codex home and wait up to a minute for `release` there, so a test can act
     while a turn is in flight), and
     `plain-text-on-resume` -- the old guess that a resume prints bare text, kept
-    only to show that nothing treats it specially.
+    only to show that nothing treats it specially. Also `synthetic-not-utf8`
+    (a line that is not UTF-8, saying SYNTHETIC in its own bytes), `empty-agent-message`
+    (the answer's `item.text` is `""`: the proven type with the one value that
+    shows nothing, which -- like the two field-less cases above -- would be
+    destroyed by a marker), and `tricky-texts` (three extra answers whose text
+    carries `\r\n`, a decomposed character and only whitespace, all part of
+    the text).
+``behaviour-once`` (a file in the Codex home)
+    comma-separated switches added for the **next invocation only**; the file
+    is removed when read. It lets a test change what one turn's agent does
+    without restarting the process that hosts the launcher.
 """
 
 import json
@@ -92,6 +102,10 @@ SYNTHETIC_PADDED = '  {"type": "synthetic.model-only.padded-line"}\t'
 # An object with no type at all, whatever else it carries.
 SYNTHETIC_TYPELESS = {"note": "SYNTHETIC model-only object with no type",
                       "item": {"type": "agent_message", "text": "SYNTHETIC: never chat"}}
+# Not UTF-8, and saying so in its own bytes.
+SYNTHETIC_NOT_UTF8 = b"SYNTHETIC MODEL-ONLY LINE: \xff\xfe is not UTF-8 {{{"
+# What `tricky-texts` answers with, in order: text a transcript must keep exactly.
+TRICKY_TEXTS = ("line one\r\nline two\r\n", "cafe\u0301 and n\u0303", " \t\n  ")
 # What `padded-message` wraps the answer in. Whitespace an agent wrote is its text.
 PADDED_BEFORE = "\n  \t"
 PADDED_AFTER = "  \n\n \t"
@@ -107,6 +121,11 @@ def reply_to(prompts):
 def main(argv):
     home = os.environ["DORY_MODEL_CODEX_HOME"]
     behaviour = set(b for b in os.environ.get("DORY_MODEL_CODEX_BEHAVIOUR", "").split(",") if b)
+    once = os.path.join(home, "behaviour-once")
+    if os.path.exists(once):
+        with open(once) as handle:
+            behaviour |= set(b for b in handle.read().strip().split(",") if b)
+        os.unlink(once)
     args = list(argv)
     resume_id = None
     if args and args[0].startswith("--resumeID="):
@@ -169,6 +188,8 @@ def main(argv):
             lines.append(json.dumps(AGENT_MESSAGE_WITHOUT_TEXT))
         if "synthetic-typeless" in behaviour:
             lines.append(json.dumps(SYNTHETIC_TYPELESS))
+        if "synthetic-not-utf8" in behaviour:
+            lines.append(SYNTHETIC_NOT_UTF8)
         if "synthetic-padded" in behaviour:
             lines.append(SYNTHETIC_PADDED)
         answer = reply_to(thread["prompts"])
@@ -176,20 +197,31 @@ def main(argv):
             answer = PADDED_BEFORE + answer + PADDED_AFTER
         if resume_id is not None and "plain-text-on-resume" in behaviour:
             lines = [answer]
+        elif "empty-agent-message" in behaviour:
+            lines.append(json.dumps({"type": "item.completed",
+                                     "item": {"type": "agent_message", "text": ""}}))
         elif "no-agent-message" not in behaviour:
             lines.append(json.dumps({"type": "item.completed",
                                      "item": {"type": "agent_message", "text": answer}}))
+        if "tricky-texts" in behaviour:
+            for text in TRICKY_TEXTS:
+                lines.append(json.dumps({"type": "item.completed",
+                                         "item": {"type": "agent_message", "text": text}}))
         if "two-messages" in behaviour:
             lines.append(json.dumps({"type": "item.completed",
                                      "item": {"type": "agent_message",
                                               "text": "and a second message"}}))
 
-    out = "".join(line + "\n" for line in lines)
-    sys.stdout.write(out)
+    out = b"".join((line if isinstance(line, bytes) else line.encode("utf-8")) + b"\n"
+                   for line in lines)
+    sys.stdout.buffer.write(out)
     sys.stdout.flush()
     with open(os.path.join(home, "calls.jsonl"), "a") as log:
         log.write(json.dumps({"argv": list(argv), "thread_id": thread_id,
-                              "stdout": lines, "exit": status}) + "\n")
+                              "stdout": [line.decode("utf-8", "backslashreplace")
+                                         if isinstance(line, bytes) else line
+                                         for line in lines],
+                              "exit": status}) + "\n")
     return status
 
 

@@ -3,7 +3,8 @@
 The rule (decision 0005): each recognized, agent-sourced event carrying non-empty
 text becomes exactly one agent message whose text is exactly that event's text,
 in event order; every other event renders nothing and is still preserved. No
-new content type, author, record kind, or `system` message.
+new content type, author, record kind, or `system` message for rendering; a turn
+with no text instead gets decision 0006's one fixed notice.
 
 Measured, not read off the code, for both wire formats -- the development
 transport (`dev-local`, a real process, with an agent program written here and
@@ -52,6 +53,7 @@ import reclassify_stores
 from dory_wrangler.errors import TurnInFlightRefused
 from dory_wrangler.launchers import dev_transport
 from dory_wrangler.launchers.dev_local import DEV_AGENT
+from dory_wrangler.notices import NO_SHOWABLE_REPLY
 from dory_wrangler.store import ChatStore
 from dory_wrangler import webapp
 from internal_bridge import InternalBridgeLauncher
@@ -255,10 +257,14 @@ class ZeroOrSeveralTextEventsPerTurn(unittest.TestCase, StoreCheck, Rendering, M
     TURNS = ("2: first question", "0: a turn that says nothing", "3: third question")
 
     def expected(self, turns):
+        """A turn with no text event ends with decision 0006's notice instead
+        (changed expectation, `handle-unsupported-and-malformed-events`)."""
         rows = []
         for text in turns:
             rows.append(("user", text))
             rows.extend(("agent", t) for t in expected_parts(text))
+            if not expected_parts(text):
+                rows.append(("system", NO_SHOWABLE_REPLY))
         return rows
 
     def test_the_development_transport_in_process(self):
@@ -324,7 +330,7 @@ class ZeroOrSeveralTextEventsPerTurn(unittest.TestCase, StoreCheck, Rendering, M
         self.assertEqual(transcript(records), [
             ("user", "first"), ("agent", "\n  \tanswer to: first  \n\n \t"),
             ("agent", "and a second message"),
-            ("user", "second"),
+            ("user", "second"), ("system", NO_SHOWABLE_REPLY),
             ("user", "third"), ("agent", "answer to: third"),
             ("agent", "and a second message")])
         self.assert_rendered_exactly(records, internal_bridge.interpret)
@@ -434,7 +440,8 @@ class ZeroOrSeveralTextEventsPerTurn(unittest.TestCase, StoreCheck, Rendering, M
                 status, body = post(shell, path + "/messages", {"text": "second"})
                 self.assertEqual(status, 201)
                 if "no-agent-message" in behaviour:
-                    expected = [("user", "first"), ("user", "second")]
+                    expected = [("user", "first"), ("system", NO_SHOWABLE_REPLY),
+                                ("user", "second"), ("system", NO_SHOWABLE_REPLY)]
                 else:
                     expected = [row for t in ("first", "second") for row in (
                         ("user", t), ("agent", "\n  \tanswer to: %s  \n\n \t" % t),
@@ -657,13 +664,18 @@ class TheWholeStoreRenderingGate(unittest.TestCase, ModelDirs):
                 self.assertEqual(self.run_gate(stripped)[0],
                                  0 if name == "development transport" else 1,
                                  "the codex answer is padded, so stripping it is a change")
+                # Keys name one record (classification check L1): store, session,
+                # message sequence and the hash of the text.
+                skey = reclassify_stores.session_keys(one_char)[message["session_id"]]
+                text_hash = reclassify_stores.body_hash(
+                    agent_messages(one_char)[0]["content"]["text"])
                 self.assertEqual(
-                    self.run_gate(one_char, [("planted.json", message["sequence"],
-                                              agent_messages(one_char)[0]["content"]["text"])])[0],
+                    self.run_gate(one_char, [("planted.json", skey, message["sequence"],
+                                              text_hash)])[0],
                     0, "a name covers exactly its record")
                 self.assertEqual(
-                    self.run_gate(one_char, [("planted.json", message["sequence"] + 1,
-                                              agent_messages(one_char)[0]["content"]["text"])])[0],
+                    self.run_gate(one_char, [("planted.json", skey, message["sequence"] + 1,
+                                              text_hash)])[0],
                     1)
 
     def test_it_fails_on_a_text_event_rendered_never_or_twice(self):
@@ -691,6 +703,10 @@ class TheWholeStoreRenderingGate(unittest.TestCase, ModelDirs):
 # ---------------------------------------------------------------------------
 
 MARKUP = '<script>alert("x")</script> &amp; <b>bold</b>'
+# Whitespace inside a turn: the shell trims only the ends of what the user typed,
+# and the stub answers with the turn as it arrived, so these runs reach both
+# messages and must come back exactly (render review F3).
+INNER_WHITESPACE = "\n\n  \tindented  two  spaces\t\ttabs\n   \nend"
 
 
 class TheServedPageShowsMessageTextAsText(unittest.TestCase):
@@ -724,18 +740,24 @@ class TheServedPageShowsMessageTextAsText(unittest.TestCase):
         shell.start()
         _status, chat = shell.post("/api/chats", {})
         path = "/api/chats/%s" % chat["chat_id"]
-        status, _body = shell.raw("POST", path + "/messages", {"text": MARKUP})
+        sent = MARKUP + INNER_WHITESPACE
+        status, _body = shell.raw("POST", path + "/messages", {"text": sent})
         self.assertEqual(status, 201)
         status, body = shell.raw("GET", path)
         self.assertEqual(status, 200)
         # The JSON carries the characters themselves: `json.dumps` escapes none
         # of < > &, and the page puts the decoded string into textContent.
-        self.assertIn('"text": "answer to: <script>alert(\\"x\\")</script> &amp; <b>bold</b>"',
+        self.assertIn('"text": "answer to: <script>alert(\\"x\\")</script> &amp; <b>bold</b>',
                       body)
-        self.assertEqual([m["text"] for m in json.loads(body)["messages"]],
-                         [MARKUP, "answer to: " + MARKUP])
+        texts = [m["text"] for m in json.loads(body)["messages"]]
+        self.assertEqual(texts, [sent, "answer to: " + sent])
+        # Every newline, tab and run of spaces inside the turn is served as sent.
+        for text in texts:
+            self.assertTrue(text.endswith(INNER_WHITESPACE))
+            self.assertIn("\n\n  \t", text)
+            self.assertIn("two  spaces\t\ttabs\n   \n", text)
         status, listing = shell.raw("GET", "/api/chats")
-        self.assertEqual(json.loads(listing)[0]["preview"], "answer to: " + MARKUP)
+        self.assertEqual(json.loads(listing)[0]["preview"], "answer to: " + sent)
         _status, page = shell.get_page()
         self.assertEqual(page, webapp.PAGE, "the page is static; no message text is in it")
 

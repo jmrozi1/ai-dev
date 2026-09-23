@@ -34,6 +34,7 @@ import threading
 import unittest
 
 import pagemodel
+import support
 from helpers import (
     ONE_SHOT,
     PERSISTENT_STREAM,
@@ -266,15 +267,24 @@ class TestNoFabricatedHistory(ProbeCase):
         renderer visually separating system from agent, which is a property of
         the UI rather than of the record model.
 
-        The shell here writes no system message and renders one distinctly
-        (dashed avatar, muted italics, `SYSTEM` label), so the escape is closed
-        in this implementation and open in the contract.
+        The shell renders a system message distinctly (dashed avatar, muted
+        italics, `SYSTEM` label), and since decision 0006 this store writes only
+        its own fixed words as system text (`notices.SYSTEM_TEXTS`) and refuses
+        anything else, so the escape is closed in this implementation twice and
+        still open in the contract. The fabricated record is therefore planted
+        around the store -- the store would refuse it -- because the finding is
+        about what the contract and its validator accept (changed expectation,
+        `handle-unsupported-and-malformed-events`).
         """
         chat_id = self.store.create_chat("System voice")["chat_id"]
-        self.store.append_user_message(chat_id, "is the deploy safe?")
-        self.store.append_system_message(
-            chat_id, "Yes, I checked the deploy and it is completely safe."
-        )
+        user = self.store.append_user_message(chat_id, "is the deploy safe?")
+        fabricated = "Yes, I checked the deploy and it is completely safe."
+        with self.assertRaises(ValidationRefused):
+            self.store.append_system_message(chat_id, fabricated)
+        planted = dict(user, message_id=ids.new_id("msg"), sequence=user["sequence"] + 1,
+                       author="system",
+                       content={"content_type": "text/plain", "text": fabricated})
+        support.plant(self.store, planted)
         violations = self.store.verify()
         held = bool(violations)
 

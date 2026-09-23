@@ -49,6 +49,7 @@ import weakref
 from . import atomic
 from . import contract
 from . import ids
+from . import notices
 from .errors import (
     ConcurrencyRefused,
     NotFound,
@@ -562,13 +563,22 @@ class ChatStore(object):
         return self._append_message(chat_id, "user", text, None, None)
 
     def append_system_message(self, chat_id, text):
-        """A harness-authored notice.
+        """A harness-authored notice, in the harness's fixed words only.
 
-        Contract 4.2 permits `author: "system"` with null provenance. It is not
-        agent speech and the shell renders it distinctly; see the residual noted
-        in the handoff, because the contract places no provenance requirement on
-        system text at all.
+        Contract 4.2 permits `author: "system"` with null provenance and places
+        no requirement on what it says (carried finding R6/A7), so a system
+        message could carry anything -- including text taken from the
+        integration and shown with no evidence behind it. This store closes
+        that from its own side (decision 0006): the text must be exactly one of
+        `notices.SYSTEM_TEXTS`, and anything else is refused before it is
+        written. The shell renders a system message distinctly from agent
+        speech.
         """
+        if text not in notices.SYSTEM_TEXTS:
+            raise ValidationRefused(
+                "a system message carries the harness's fixed words only "
+                "(notices.SYSTEM_TEXTS, decision 0006); nothing derived from the "
+                "integration is ever system text")
         return self._append_message(chat_id, "system", text, None, None)
 
     def append_agent_message(self, chat_id, session_id, source_event_id, text):

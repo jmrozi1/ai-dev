@@ -31,6 +31,7 @@ import os
 import threading
 
 from .contract import terminal_states
+from .notices import NO_SHOWABLE_REPLY
 from .errors import (
     ConcurrentLaunchRefused,
     InstructionTooLarge,
@@ -154,10 +155,19 @@ def compose_launch_instruction(chat_id, user_text, store):
 
 
 class _PageTaken(object):
-    """What taking one page of payloads produced."""
+    """What taking one page of payloads produced.
+
+    `turn_end_reported` is whether the launcher reported, on this page, that the
+    turn ended: a recognized `turn_complete`, a launcher's terminal lifecycle
+    event, or a launcher's end of stream on a session that has one -- read from
+    the preserved payload, whether or not a transition it asks for was then
+    recorded. `lost` is whether any payload on the page is not held by the store
+    exactly as it arrived; a refusal that came after the payload was preserved
+    (a claim the harness declines) loses nothing.
+    """
 
     __slots__ = ("turn_complete", "reached_terminal", "stream_end_event_id", "stored_any",
-                 "refusal")
+                 "refusal", "turn_end_reported", "lost")
 
     def __init__(self):
         self.turn_complete = False
@@ -165,6 +175,23 @@ class _PageTaken(object):
         self.stream_end_event_id = None
         self.stored_any = False
         self.refusal = None
+        self.turn_end_reported = False
+        self.lost = False
+
+
+class _TurnSeen(object):
+    """What one read of a turn observed: whether the turn was seen to end, and
+    whether everything read was preserved exactly (decision 0006)."""
+
+    __slots__ = ("ended", "lost")
+
+    def __init__(self):
+        self.ended = False
+        self.lost = False
+
+    def took(self, taken):
+        self.ended = self.ended or taken.turn_end_reported
+        self.lost = self.lost or taken.lost
 
 
 class _ChatTurn(object):
@@ -582,10 +609,30 @@ class SessionManager(object):
         # rules raises here, inside `_call_launch`'s guarantee, and becomes a
         # classified failure instead of a record the store refuses mid-launch
         # with the session left in `launching`.
-        return LaunchResult(result.outcome, agent_handle=result.agent_handle,
-                            failure_category=result.failure_category,
-                            detail=result.detail,
-                            payloads=getattr(result, "payloads", ()))
+        #
+        #
+        # A *failed* result that is sound in every field but its output is the
+        # one exception, and it takes the raised path's rule (carried from the
+        # intake check; `_failure_carrying_its_output`): the launcher's category
+        # and the longest prefix of its output the seam accepts are kept,
+        # rather than both being lost to `internal_error`. Returning a failure
+        # and raising one are two spellings of the same report, so what they
+        # preserve must not depend on which the launcher chose. Any other fault
+        # -- a handle on a failure, a category or detail the seam refuses --
+        # still raises here, as it always did.
+        payloads = getattr(result, "payloads", ())
+        try:
+            return LaunchResult(result.outcome, agent_handle=result.agent_handle,
+                                failure_category=result.failure_category,
+                                detail=result.detail,
+                                payloads=payloads)
+        except LaunchBoundaryError:
+            if result.outcome != OUTCOME_FAILED:
+                raise
+            LaunchResult(OUTCOME_FAILED, agent_handle=result.agent_handle,
+                         failure_category=result.failure_category, detail=result.detail)
+            return self._failed_keeping_what_crosses(
+                result.failure_category, result.detail, payloads)
 
     def _failure_carrying_its_output(self, exc):
         """A launcher's categorised failure, with whatever output it produced.
@@ -610,25 +657,34 @@ class SessionManager(object):
         restating its rules here -- a second copy of the rules is a second thing
         to keep in step with them.
         """
-        payloads = tuple(getattr(exc, "payloads", ()) or ())
+        return self._failed_keeping_what_crosses(
+            exc.category, exc.detail, getattr(exc, "payloads", ()))
+
+    def _failed_keeping_what_crosses(self, category, detail, payloads):
+        """A failed launch result with the launcher's category and as much of its
+        output as the seam accepts: the one rule for a failure that was raised
+        and one that was returned. Callers have already established that the
+        category and detail cross the seam; only the output is in question.
+        """
+        payloads = tuple(payloads or ())
         try:
-            return LaunchResult(OUTCOME_FAILED, failure_category=exc.category,
-                                detail=exc.detail, payloads=payloads)
+            return LaunchResult(OUTCOME_FAILED, failure_category=category,
+                                detail=detail, payloads=payloads)
         except LaunchBoundaryError as refused:
             for kept in range(len(payloads) - 1, -1, -1):
                 try:
                     return LaunchResult(
-                        OUTCOME_FAILED, failure_category=exc.category,
+                        OUTCOME_FAILED, failure_category=category,
                         detail="%s [payloads %d..%d could not cross the seam and were "
                                "not preserved: %s]"
-                               % (exc.detail or "", kept + 1, len(payloads), refused),
+                               % (detail or "", kept + 1, len(payloads), refused),
                         payloads=payloads[:kept])
                 except LaunchBoundaryError:
                     continue
             return LaunchResult(
-                OUTCOME_FAILED, failure_category=exc.category,
+                OUTCOME_FAILED, failure_category=category,
                 detail="%s [the launcher's own output could not cross the seam and "
-                       "was not preserved: %s]" % (exc.detail or "", refused))
+                       "was not preserved: %s]" % (detail or "", refused))
 
     # -- delivering (persistent continuation) ------------------------------
 
@@ -676,6 +732,27 @@ class SessionManager(object):
     # -- reading what the agent produced -----------------------------------
 
     def _drain(self, session):
+        """Read this turn's output through `events`, preserve it, and, when the
+        turn was seen to end with nothing to show, say so (decision 0006).
+
+        The notice is written from what this read observed and from nothing
+        else -- never because time passed -- and only when everything it read
+        is held exactly as it arrived, because the notice says so. A read that
+        ends in a refusal still writes it when the turn was reported ended and
+        nothing was lost (a declined claim loses nothing), and the refusal is
+        then raised as before.
+        """
+        agent_messages = []
+        seen = _TurnSeen()
+        try:
+            self._read_turn(session, agent_messages, seen)
+        except (StoreError, LaunchBoundaryError):
+            self._notice_if_seen_unanswered(session, seen, refused=True)
+            raise
+        self._notice_if_seen_unanswered(session, seen)
+        return agent_messages
+
+    def _read_turn(self, session, agent_messages, seen):
         """Read this turn's output through `events` and preserve all of it.
 
         Terminates on what the launcher reported and on nothing else: a turn
@@ -683,12 +760,18 @@ class SessionManager(object):
         with nothing in it. There is no timeout and no poll interval; an agent
         that is merely quiet blocks here, which is v0.1's honest behaviour and
         #83's gap rather than something to paper over with a timer.
+
+        `seen` records whether the turn was **observed to end** (decision 0006):
+        the launcher reported a turn end on a page it read, or -- for a session
+        whose launcher declares `one_shot`, whose call has already returned with
+        its whole response -- the read reached a page with nothing more on it.
+        A read failure, a page that is not a page, and an empty page on a
+        session with a stream are not turn ends: nothing observed the turn end.
         """
         chat_id = session["chat_id"]
         session_id = session["session_id"]
         agent_handle = self._agent_handle(session)
         has_stream = self._session_has_stream(session)
-        agent_messages = []
 
         while True:
             after = self._store.next_event_sequence(chat_id, session_id) - 1
@@ -730,6 +813,7 @@ class SessionManager(object):
                 # below discards. What a page does to a chat must not depend on
                 # which refusal the page also happens to trip.
                 taken = self._take_page(session, page, has_stream, agent_messages)
+                seen.took(taken)
                 if taken.refusal is not None:
                     raise taken.refusal
                 raise LaunchBoundaryError(
@@ -737,6 +821,7 @@ class SessionManager(object):
                     "signalled that a stream ended")
 
             taken = self._take_page(session, page, has_stream, agent_messages)
+            seen.took(taken)
             turn_complete, reached_terminal, stream_end_event_id, stored_any = (
                 taken.turn_complete, taken.reached_terminal, taken.stream_end_event_id,
                 taken.stored_any)
@@ -755,6 +840,13 @@ class SessionManager(object):
                     self._transition(session, "unknown", "launcher", "stream_end",
                                      stream_end_event_id)
                 return agent_messages
+            if not page.payloads and not has_stream:
+                # A one-shot launcher's call has returned with its whole
+                # response, so a page with nothing more on it is the end of
+                # what that call produced: the turn is observed to have ended.
+                # On a session with a stream an empty page is only a quiet
+                # stream, which is not evidence of anything (contract 5.3).
+                seen.ended = True
             if turn_complete or not page.payloads:
                 return agent_messages
             if not stored_any:
@@ -783,34 +875,33 @@ class SessionManager(object):
         Used by the drain and by re-attachment, so what a page does to a chat
         does not depend on which of the two read it.
 
-        **A store refusal of one payload does not cost the payloads after it**
-        (review finding R5; contract 7, P1). A payload that contradicts one
-        already preserved at its sequence, or a lifecycle transition the store
-        refuses because the wall clock stepped back, used to raise out of the
-        loop and drop every honest payload later on the same page -- #87
-        preserved them, convergence did not. Each payload is now taken on its
-        own: a `StoreError` it meets is kept, the next payload is taken, and the
-        first refusal is handed back once the whole page has been preserved, so
-        it is still not silent.
+        **Each payload is offered to the store on its own, whatever refuses
+        another one** (review finding R5; #88 intake; contract 7 P1). A refusal
+        is kept, the next payload is taken, and the first refusal is handed back
+        once the whole page has been offered, so it is still not silent. That
+        recovers every payload behind a refusal **that left its own sequence
+        written**: a payload that contradicts one already preserved at its
+        sequence, a lifecycle transition the store refuses because the wall
+        clock stepped back, and a claim the harness declines after preserving
+        the bytes (an end of stream from a launcher with no stream, or one
+        sourced to the agent). A page `[1, 2, 5, 3]` preserves `[1, 2, 3]`, and
+        a one-shot launcher's `[text@1, stream_end@2, text@3]` preserves all
+        three (the human's decision of 2026-09-15; see
+        `PRESERVE_UNATTRIBUTABLE_STREAM_END`).
 
-        **The seam's own refusals no longer cost the page either** (#88 intake).
-        A sequence gap and an end-of-stream from a launcher with no stream used
-        to raise straight out of this loop, so a page `[1, 2, 5, 3]` preserved
-        `[1, 2]` and lost the honest payload at 3, and a one-shot launcher that
-        typed one payload `stream_end` lost every payload behind it. Each payload
-        is now taken on its own whatever refuses it, and the first refusal is
-        raised once the whole page has been offered to the store.
+        **It does not recover a payload behind a refusal that left a sequence
+        unwritten** (carried finding C2). A store refusal of a sequence not yet
+        stored -- a write the store fails, or a payload whose own sequence is
+        ahead of what is stored -- leaves a gap, and every later payload on the
+        session then fails contiguity: contract P3 says a gap is never closed
+        silently, so they are offered and refused rather than preserved. That
+        is the one payload shape still preserved nowhere; `_preserve_launch_output`
+        has the same residual, and the README names it.
 
-        **No refusal precedes preservation any more.** The last one that did was
-        a payload typed `stream_end` from a launcher declaring `one_shot` -- the
-        single shape where contract 7 P1 and contract 6.1's
-        `STREAM_END_UNSUPPORTED` appeared to disagree. The human answered it on
-        2026-09-15: the bytes are preserved and only the reading is declined, so
-        that page now preserves all three of `[text@1, stream_end@2, text@3]`
-        and leaves no gap behind it. See `PRESERVE_UNATTRIBUTABLE_STREAM_END`.
+        `taken.lost` records whether any payload here is not held by the store
+        exactly as it arrived, which is what decision 0006's notice may not be
+        written over.
         """
-        chat_id = session["chat_id"]
-        session_id = session["session_id"]
         taken = _PageTaken()
         for payload in page.payloads:
             try:
@@ -818,7 +909,33 @@ class SessionManager(object):
             except (StoreError, LaunchBoundaryError) as exc:
                 if taken.refusal is None:
                     taken.refusal = exc
+                if not self._holds_exactly(session, payload):
+                    taken.lost = True
         return taken
+
+    def _holds_exactly(self, session, payload):
+        """Whether the store holds this payload's bytes at its sequence, exactly.
+
+        Asked only after a refusal, to tell a refusal that came after the bytes
+        were preserved (a declined claim, a refused transition) from one that
+        cost them (a gap, a contradicting replay, a failed write). Read back from
+        the store rather than inferred from the kind of refusal, so the answer
+        is the durable fact the notice's words depend on.
+        """
+        try:
+            found = self._store.read_diagnostic_events(
+                session["chat_id"], session["session_id"],
+                sequence_from=payload.sequence, sequence_to=payload.sequence, limit=1)
+        except StoreError:
+            return False
+        if len(found) != 1:
+            return False
+        raw = found[0]["raw"]
+        if raw["encoding"] == "base64":
+            held = base64.b64decode(raw["body"])
+        else:
+            held = raw["body"].encode("utf-8")
+        return held == payload.raw
 
     def _take_payload(self, session, payload, has_stream, taken, agent_messages):
         """Preserve one payload, then act on what the launcher said it was.
@@ -849,6 +966,7 @@ class SessionManager(object):
             return
         if payload.interpreted_type == PAYLOAD_TURN_COMPLETE:
             taken.turn_complete = True
+            taken.turn_end_reported = True
             return
         if payload.interpreted_type == PAYLOAD_STREAM_END and payload.source != SOURCE_LAUNCHER:
             # Preserved above, and still refused as a *reading*: only the
@@ -861,12 +979,17 @@ class SessionManager(object):
         if payload.source != SOURCE_LAUNCHER:
             return
         if payload.interpreted_type == PAYLOAD_SESSION_COMPLETED:
+            taken.turn_end_reported = True
             self._transition(session, "completed", "launcher", "event", event_id)
             taken.reached_terminal = True
         elif payload.interpreted_type == PAYLOAD_SESSION_FAILED:
+            taken.turn_end_reported = True
             self._transition(session, "failed", "launcher", "event", event_id)
             taken.reached_terminal = True
         elif payload.interpreted_type == PAYLOAD_STREAM_END:
+            # Only reachable on a session with a stream: on one without, the
+            # reading was declined when the payload was preserved.
+            taken.turn_end_reported = True
             taken.stream_end_event_id = event_id
 
     def _preserve_declining_what_it_cannot_attribute(self, session, payload, has_stream):
@@ -1306,14 +1429,83 @@ class SessionManager(object):
         This partly satisfies #88's later intake checkpoint (the review's event
         drop 1). A launcher returning something that is not a page is still
         ignored here, as it was: there are no raw bytes to preserve (drop 4).
+
+        **The notice rule is the drain's** (decision 0006): a turn this page
+        shows ended, with nothing lost, gets the notice if it has no reply and
+        no notice yet. Re-attachment observes a turn end when the page reports
+        one, or -- on a session whose launcher declares `one_shot`, which serves
+        only what calls that have already returned produced -- when the page
+        carries anything new at all. An empty page observes nothing, so a turn
+        whose call never returned stays without a notice, exactly as it stays
+        without a reply.
         """
-        taken = self._take_page(session, page, self._session_has_stream(session), [])
-        if (taken.stream_end_event_id is not None and not taken.reached_terminal
-                and session["state"] == "running"):
-            self._transition(session, "unknown", "launcher", "stream_end",
-                             taken.stream_end_event_id)
-        if taken.refusal is not None:
-            raise taken.refusal
+        has_stream = self._session_has_stream(session)
+        taken = self._take_page(session, page, has_stream, [])
+        seen = _TurnSeen()
+        seen.took(taken)
+        if not has_stream and taken.stored_any:
+            seen.ended = True
+        try:
+            if (taken.stream_end_event_id is not None and not taken.reached_terminal
+                    and session["state"] == "running"):
+                self._transition(session, "unknown", "launcher", "stream_end",
+                                 taken.stream_end_event_id)
+            if taken.refusal is not None:
+                raise taken.refusal
+        except (StoreError, LaunchBoundaryError):
+            self._notice_if_seen_unanswered(session, seen, refused=True)
+            raise
+        self._notice_if_seen_unanswered(session, seen)
+
+    def _notice_if_seen_unanswered(self, session, seen, refused=False):
+        """The one notice rule, for every path that reads a turn (decision 0006).
+
+        Nothing is written unless the read observed the turn end and lost
+        nothing. On a read that is about to raise a refusal the notice is still
+        written when both hold -- a declined claim loses no bytes -- but a
+        failure to write it does not replace that refusal, which is what the
+        turn reports.
+        """
+        if not seen.ended or seen.lost:
+            return None
+        if not refused:
+            return self._notice_if_unanswered(session)
+        try:
+            return self._notice_if_unanswered(session)
+        except StoreError:
+            return None
+
+    def _notice_if_unanswered(self, session):
+        """Tell the user that a turn ended with nothing to show, once (decision 0006).
+
+        Called only when the turn was observed to end and everything read was
+        preserved exactly; this decides the rest from the chat's durable
+        messages alone, so the drain, re-attachment and a restart all apply one
+        rule. The turn is the chat's last user message -- a turn is recorded only
+        when it is offered to the chat's one live agent (decision 0003), so the
+        last one is the turn this session was answering -- and it is answered if
+        any agent message follows it. A system message following it is this
+        notice, already written: the harness writes no other (`notices`). Either
+        way nothing is written, so the notice is idempotent across re-attachment
+        and restart, and never shown for a turn that rendered a reply.
+
+        The words are fixed (`notices.NO_SHOWABLE_REPLY`) and carry nothing from
+        the integration: no bytes, types, counts or timing. The message has
+        `author: "system"` and null provenance, which contract 4.2 already
+        permits, and the turn floor ignores it (contract 6.4).
+        """
+        chat_id = session["chat_id"]
+        messages = self._store.read_messages(chat_id)
+        last_user = None
+        for index, message in enumerate(messages):
+            if message["author"] == "user":
+                last_user = index
+        if last_user is None:
+            return None
+        for message in messages[last_user + 1:]:
+            if message["author"] in ("agent", "system"):
+                return None
+        return self._store.append_system_message(chat_id, NO_SHOWABLE_REPLY)["message_id"]
 
     def _resolve_interrupted_launch(self, session):
         """Finish the launch outcome a restart interrupted, from the record of it.

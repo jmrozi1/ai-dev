@@ -21,6 +21,7 @@ from helpers import (
 from dory_wrangler import atomic
 from dory_wrangler import contract
 from dory_wrangler import ids
+from dory_wrangler import notices
 from dory_wrangler.errors import (
     ConcurrencyRefused,
     NotFound,
@@ -3306,10 +3307,25 @@ class TestTheNewGuardsRemoveNoLegalExit(CodeClosureCase):
         sid, _request_id, _user = self.running()
         event = self.agent_event(sid)
         self.store.append_agent_message(self.chat_id, sid, event["event_id"], "one")
-        self.store.append_system_message(self.chat_id, "the agent is still running")
+        self.store.append_system_message(self.chat_id, notices.NO_SHOWABLE_REPLY)
         again = self.agent_event(sid)
         self.store.append_agent_message(self.chat_id, sid, again["event_id"], "two")
         self.assertEqual([], self.store.verify())
+
+    def test_a_system_message_carries_the_harness_s_fixed_words_only(self):
+        """Decision 0006: system text is fixed harness wording. Anything else --
+        including text that looks like the notice but is not it -- is refused
+        before anything is written."""
+        before = self.store.export_records()
+        for text in ("the agent is still running", notices.NO_SHOWABLE_REPLY + " ",
+                     notices.NO_SHOWABLE_REPLY.lower(), "answer to: hello"):
+            with self.assertRaises(ValidationRefused):
+                self.store.append_system_message(self.chat_id, text)
+        self.assertEqual(self.store.export_records(), before)
+        written = self.store.append_system_message(self.chat_id, notices.NO_SHOWABLE_REPLY)
+        self.assertEqual((written["author"], written["content"]["text"],
+                          written["session_id"], written["source_event_id"]),
+                         ("system", notices.NO_SHOWABLE_REPLY, None, None))
 
     def test_a_packet_at_exactly_the_declared_bound_is_written(self):
         """The boundary the bound is stated at, on both packet types."""

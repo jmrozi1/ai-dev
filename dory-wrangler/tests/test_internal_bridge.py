@@ -44,6 +44,7 @@ from support import StoreCheck, expected_transcript, run_three_turns
 from dory_wrangler import launch_boundary as lb
 from dory_wrangler.errors import ConcurrentLaunchRefused
 from dory_wrangler.launchers.registry import UnknownLauncher, build_launcher
+from dory_wrangler.notices import NO_SHOWABLE_REPLY
 from internal_bridge import InternalBridgeLauncher, classify
 from model_launch_agent import RECALL_PROMPT
 
@@ -190,9 +191,11 @@ class TheProductHostsTheJsonlModelUnchanged(unittest.TestCase, StoreCheck, Model
         events = harness.store.read_all_events_of_session(chat_id, session["session_id"])
         self.assertEqual((events[-1]["interpretation"], raw_bytes(events[-1])),
                          ("malformed", b"answer to: second"))
+        # The turn ended (the call returned) with nothing that can be shown, so
+        # it carries decision 0006's fixed notice -- never the unwrapped text.
         self.assertEqual([(a, t) for _, a, t in harness.transcript(chat_id)],
                          [("user", "first"), ("agent", "answer to: first"),
-                          ("user", "second")])
+                          ("user", "second"), ("system", NO_SHOWABLE_REPLY)])
         self.assertEqual(classify(1, b"answer to: second").interpretation,
                          lb.INTERPRETATION_MALFORMED)
         self.assert_store_valid(harness.store, "internal-bridge-jsonl-plain-text-resume")
@@ -456,8 +459,11 @@ class ADeadBridgeIsDiscoverableOnlyByAttemptingATurn(unittest.TestCase, StoreChe
         session_id = support.view(harness).sessions_of(chat_id)[0]["session_id"]
         self.assertEqual([d["acknowledged"] for d in
                           support.view(harness).deliveries_of(session_id)], [False])
-        self.assertEqual([(a, t) for _, a, t in harness.transcript(chat_id)][-1],
-                         ("user", "still there?"))
+        # Nothing from the agent after the turn: the call returned with nothing
+        # to show, so the last rows are the turn and decision 0006's fixed
+        # notice, which carries nothing from the integration.
+        self.assertEqual([(a, t) for _, a, t in harness.transcript(chat_id)][-2:],
+                         [("user", "still there?"), ("system", NO_SHOWABLE_REPLY)])
         self.assert_store_valid(harness.store, "internal-bridge-jsonl-resume-refused")
         support.end_chat(harness, chat_id)
 

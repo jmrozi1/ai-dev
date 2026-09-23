@@ -645,6 +645,64 @@ class TheNoHandleChannelObeysTheSameRulesAsTheDrain(IntakeCase):
                       "and what was lost is named where it happened, rather than "
                       "the loss being reported as the whole set")
 
+    def test_a_returned_mis_packed_failure_keeps_what_the_raised_one_keeps(self):
+        # Carried from the intake check (item D of
+        # `handle-unsupported-and-malformed-events`). A launcher that *returns*
+        # its failure, and then changes the result's payloads after building it,
+        # used to lose the whole set and its category: `_classify_launch`
+        # re-stated the result, the seam refused it, and `_call_launch` made it
+        # `internal_error` with nothing preserved -- measured `[]` and
+        # `internal_error` at `0315019`. Raising and returning are two spellings
+        # of the same report, so they now preserve the same records.
+        payloads = [self.launcher_line(1, "honest launcher line"),
+                    agent_text(2, "an agent nobody launched"),
+                    self.launcher_line(3, "another honest launcher line")]
+
+        class ReturnsMisPacked(PageLauncher):
+            def launch(self, instruction):
+                result = lb.LaunchResult(lb.OUTCOME_FAILED,
+                                         failure_category=lb.FAILURE_UNAVAILABLE,
+                                         detail="no thread was started")
+                result.payloads = tuple(payloads)  # after construction
+                return result
+
+        returned = self.harness(ReturnsMisPacked())
+        returned_chat = returned.create_chat("Returned, mis-packed")
+        returned.send_turn(returned_chat, "hello")
+        raised = self.harness(LauncherFailing(payloads, category=lb.FAILURE_UNAVAILABLE),
+                              root=tempfile.mkdtemp(prefix="dory-intake-raised-"))
+        self.addCleanup(shutil.rmtree, raised.store.root, True)
+        raised_chat = raised.create_chat("Raised, mis-packed")
+        raised.send_turn(raised_chat, "hello")
+
+        self.assertEqual(self.sequences(returned.store, returned_chat), [1])
+        self.assertEqual(self.shape_of(returned.store, returned_chat),
+                         self.shape_of(raised.store, raised_chat))
+        for harness in (returned, raised):
+            result = support.view(harness).all_of("launch_result")[0]
+            self.assertEqual(result["failure_category"], "unavailable")
+            self.assertIn("payloads 2..3 could not cross the seam", result["detail"])
+        self.assert_store_valid(returned.store, "intake-returned-mis-packed-failure")
+
+    def test_a_returned_failure_with_any_other_fault_is_still_internal_error(self):
+        # The new path is for the output alone. A failed result mutated to carry
+        # a handle is refused as it always was, and classified `internal_error`.
+        class ReturnsAHandle(PageLauncher):
+            def launch(self, instruction):
+                result = lb.LaunchResult(lb.OUTCOME_FAILED,
+                                         failure_category=lb.FAILURE_UNAVAILABLE)
+                result.agent_handle = "thread-9"
+                result.payloads = (self_line,)
+                return result
+
+        self_line = self.launcher_line(1, "honest launcher line")
+        harness = self.harness(ReturnsAHandle())
+        chat_id = harness.create_chat("Returned with a handle")
+        harness.send_turn(chat_id, "hello")
+        result = support.view(harness).all_of("launch_result")[0]
+        self.assertEqual(result["failure_category"], "internal_error")
+        self.assertEqual(self.sequences(harness.store, chat_id), [])
+
     def test_what_a_store_refusal_still_costs_is_the_gap_it_would_leave(self):
         # Stated rather than implied, because it is the one thing this rail does
         # not close. A store refusal that leaves a sequence unwritten makes every

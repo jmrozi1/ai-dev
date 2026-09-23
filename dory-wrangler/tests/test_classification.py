@@ -457,20 +457,32 @@ class ClassificationIsAFunctionOfThePreservedBytes(unittest.TestCase, StoreCheck
                     target[name] = value
             return changed
 
+        # Keys name one record (classification check L1): store, session, sequence,
+        # reading and the hash of the body as stored.
+        skey = reclassify_stores.session_keys(records)[unknown["session_id"]]
+        planted_body = reclassify_stores.body_hash('{"type": "turn_complete"}')
         self.assertEqual(run(records), 0)
         not_reproduced = planted(unknown, body='{"type": "turn_complete"}')
         self.assertEqual(run(not_reproduced), 1)
-        self.assertEqual(run(not_reproduced, [("planted.json", unknown["sequence"],
-                                               ("unrecognized", None))]), 0)
-        self.assertEqual(run(not_reproduced, [("planted.json", unknown["sequence"] + 1,
-                                               ("unrecognized", None))]), 1,
+        self.assertEqual(run(not_reproduced, [("planted.json", skey, unknown["sequence"],
+                                               ("unrecognized", None), planted_body)]), 0)
+        self.assertEqual(run(not_reproduced, [("planted.json", skey, unknown["sequence"] + 1,
+                                               ("unrecognized", None), planted_body)]), 1,
                          "a name covers one record, not every record of its reading")
-        self.assertEqual(run(not_reproduced, [("other.json", unknown["sequence"],
-                                               ("unrecognized", None))]), 1)
+        self.assertEqual(run(not_reproduced, [("other.json", skey, unknown["sequence"],
+                                               ("unrecognized", None), planted_body)]), 1)
+        self.assertEqual(run(not_reproduced, [("planted.json", "another/1", unknown["sequence"],
+                                               ("unrecognized", None), planted_body)]), 1)
+        self.assertEqual(run(not_reproduced, [("planted.json", skey, unknown["sequence"],
+                                               ("unrecognized", None),
+                                               reclassify_stores.body_hash(
+                                                   unknown["raw"]["body"]))]), 1)
         inconsistent = planted(lifecycle, interpreted_type="session_failed")
         self.assertEqual(run(inconsistent), 1)
-        self.assertEqual(run(inconsistent, [("planted.json", lifecycle["sequence"],
-                                             ("recognized", "session_failed"))]), 0)
+        self.assertEqual(run(inconsistent, [("planted.json", skey, lifecycle["sequence"],
+                                             ("recognized", "session_failed"),
+                                             reclassify_stores.body_hash(
+                                                 lifecycle["raw"]["body"]))]), 0)
 
     def test_the_codex_model_on_launch_resume_and_a_failed_launch(self):
         self.make_dirs()
