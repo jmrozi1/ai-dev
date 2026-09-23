@@ -394,6 +394,10 @@ class ZeroOrSeveralTextEventsPerTurn(unittest.TestCase, StoreCheck, Rendering, M
                 self.assertEqual(status, 200)
                 self.assertEqual([(m["author"], m["text"])
                                   for m in json.loads(served)["messages"]], self.expected(turns))
+                # The list's preview is the last message's text exactly, too.
+                status, listing = shell.raw("GET", "/api/chats")
+                self.assertEqual(json.loads(listing)[0]["preview"],
+                                 expected_parts(turns[2])[-1])
                 shell.kill()
                 store = ChatStore(root, read_only=True)
                 self.assertEqual(store.verify(), [])
@@ -600,7 +604,7 @@ class TheWholeStoreRenderingGate(unittest.TestCase, ModelDirs):
     by trailing whitespace alone -- and when a text event renders never or twice,
     in both wire formats; unmodified, it exits 0."""
 
-    def run_gate(self, records, adjudicate=()):
+    def run_gate(self, records, adjudicate=(), as_json=False):
         base = tempfile.mkdtemp(prefix="dory-render-gate-")
         self.addCleanup(shutil.rmtree, base, True)
         with open(os.path.join(base, "planted.json"), "w") as out:
@@ -610,7 +614,8 @@ class TheWholeStoreRenderingGate(unittest.TestCase, ModelDirs):
         with mock.patch.dict(reclassify_stores.ADJUDICATED_MESSAGES,
                              dict((key, "planted") for key in adjudicate)), \
                 contextlib.redirect_stdout(output):
-            return reclassify_stores.main([base]), output.getvalue()
+            return (reclassify_stores.main([base] + (["--json"] if as_json else [])),
+                    output.getvalue())
 
     def stores(self):
         dev = support.harness({"launcher": "scripted-stub", "options": {}})
@@ -643,6 +648,11 @@ class TheWholeStoreRenderingGate(unittest.TestCase, ModelDirs):
                 self.assertIn("text differs from its cited event", output)
                 trailing, _ = self.with_text(records, lambda t: t + " ")
                 self.assertEqual(self.run_gate(trailing)[0], 1)
+                # The --json form exits the same way, and names the disagreement.
+                code, output = self.run_gate(trailing, as_json=True)
+                self.assertEqual(code, 1)
+                self.assertEqual(len(json.loads(output)["rendering_unadjudicated"]), 1)
+                self.assertEqual(self.run_gate(records, as_json=True)[0], 0)
                 stripped, _ = self.with_text(records, lambda t: t.strip() or t + "\n")
                 self.assertEqual(self.run_gate(stripped)[0],
                                  0 if name == "development transport" else 1,
