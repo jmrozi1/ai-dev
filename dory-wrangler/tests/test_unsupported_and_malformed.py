@@ -44,6 +44,7 @@ from dory_wrangler.launchers.dev_local import DEV_AGENT
 from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 from dory_wrangler.notices import NO_SHOWABLE_REPLY, SYSTEM_TEXTS
 from dory_wrangler.session_manager import SessionManager
+from dory_wrangler.errors import StoreCorrupt, StoreError
 from dory_wrangler.store import ChatStore
 
 NOTICE = ("system", NO_SHOWABLE_REPLY)
@@ -448,6 +449,121 @@ class TheNoticeOnEveryReadingPath(unittest.TestCase, Checks):
         chat_id = manager.create_chat("Nothing else to report")
         with self.assertRaises(ValidationRefused):
             manager.send_turn(chat_id, "first")
+
+
+class Scripted(ScriptedStubLauncher):
+    """The scripted stub, keeping its id, whose every turn is `script`: a list of
+    `("agent", bytes)` lines read by the development classifier, and
+    `("launcher", type, raw)` records the launcher states itself."""
+
+    script = ()
+
+    def _produce_turn(self, session, instruction_text):
+        for item in self.script:
+            if item[0] == "agent":
+                self._emit_agent_line(session, item[1])
+            else:
+                self._emit(session, lb.SOURCE_LAUNCHER, lb.INTERPRETATION_RECOGNIZED,
+                           item[2], interpreted_type=item[1])
+                if item[1] != lb.PAYLOAD_STREAM_END or self.capabilities.has_stream:
+                    session.stream_ended = True
+
+
+def scripted(script, continuation, shape):
+    launcher = Scripted({"continuation": continuation, "response_shape": shape})
+    launcher.script = script
+    return launcher
+
+
+THINKING = ("agent", b'{"type": "agent_thinking"}')
+
+
+class EachObservedTurnEnd(unittest.TestCase, Checks):
+    """Sweep rows M09, M16, M18, M20-M23: every way a turn is observed to end on a
+    stream writes the notice, a quiet stream does not, and every way a payload is
+    lost or kept is told apart by what the store holds."""
+
+    def turn(self, launcher, store=None, name=None):
+        root = support.scratch_root()
+        manager = SessionManager(store(root) if store else ChatStore(root), launcher)
+        chat_id = manager.create_chat(name or "Turn end")
+        try:
+            manager.send_turn(chat_id, "first")
+            error = None
+        except Exception as exc:  # noqa: BLE001 - returned to the test
+            error = exc
+        return manager, chat_id, error
+
+    def test_a_terminal_lifecycle_event_alone_ends_the_turn(self):
+        for kind in (lb.PAYLOAD_SESSION_COMPLETED, lb.PAYLOAD_SESSION_FAILED):
+            with self.subTest(kind=kind):
+                manager, chat_id, error = self.turn(scripted(
+                    [THINKING, ("launcher", kind, json.dumps({"type": kind}).encode())],
+                    "fresh_binding", "stream"))
+                self.assertIsNone(error)
+                self.assertEqual(transcript(manager.store.export_records()),
+                                 [("user", "first"), NOTICE])
+                self.assert_store_valid(manager.store, "c-terminal-only-%s" % kind)
+
+    def test_an_end_of_stream_alone_ends_the_turn(self):
+        manager, chat_id, error = self.turn(scripted(
+            [THINKING, ("launcher", lb.PAYLOAD_STREAM_END, b'{"type": "stream_end"}')],
+            "persistent", "stream"))
+        self.assertIsNone(error)
+        self.assertEqual(transcript(manager.store.export_records()), [("user", "first"), NOTICE])
+        self.assertEqual([s["state"] for s in support.view(manager).sessions_of(chat_id)],
+                         ["unknown"])
+        self.assert_store_valid(manager.store, "c-stream-end-only")
+
+    def test_a_quiet_stream_is_not_a_turn_end(self):
+        manager, chat_id, error = self.turn(scripted([THINKING], "persistent", "stream"))
+        self.assertIsNone(error)
+        self.assertEqual(transcript(manager.store.export_records()), [("user", "first")])
+        self.assert_store_valid(manager.store, "c-quiet-stream")
+
+    def test_a_contradicting_replay_is_a_loss(self):
+        """The launcher replays sequence 1 with other bytes: the store keeps the
+        first and refuses the second, which was therefore not preserved."""
+        class Replays(Scripted):
+            def events(self, agent_handle, after_sequence):
+                page = ScriptedStubLauncher.events(self, agent_handle, after_sequence)
+                if after_sequence == 0:
+                    return lb.EventsPage(page.payloads[:1])
+                other = lb.EventPayload(1, lb.SOURCE_AGENT, lb.INTERPRETATION_UNRECOGNIZED,
+                                        b'{"type": "agent_thinking", "changed": 1}')
+                return lb.EventsPage([other] + [p for p in page.payloads if p.sequence > 1])
+        launcher = Replays({"continuation": "persistent", "response_shape": "stream"})
+        launcher.script = [THINKING, ("agent", b'{"type": "turn_complete"}')]
+        manager, chat_id, error = self.turn(launcher)
+        self.assertIsInstance(error, StoreError)
+        self.assertEqual(transcript(manager.store.export_records()), [("user", "first")])
+
+    def test_a_declined_claim_in_bytes_that_are_not_utf8_loses_nothing(self):
+        manager, chat_id, error = self.turn(scripted(
+            [("agent", b'{"type": "turn_complete"}'),
+             ("launcher", lb.PAYLOAD_STREAM_END, b'{"type": "stream_end", "x": "\xff"}')],
+            "persistent", "one_shot"))
+        self.assertIsInstance(error, lb.LaunchBoundaryError)
+        records = manager.store.export_records()
+        self.assertEqual(transcript(records), [("user", "first"), NOTICE])
+        self.assertIn("base64", [e["raw"]["encoding"] for e in records
+                                 if e["record_type"] == "diagnostic_event"])
+
+    def test_a_refused_terminal_transition_still_reports_the_turn_end(self):
+        """The launcher said the agent completed; the store refused to record the
+        transition. The bytes are kept, so the turn's notice is written and the
+        store's refusal is what the turn reports."""
+        class RefusesCompletion(ChatStore):
+            def append_transition(self, chat_id, session_id, current, to, *args, **kwargs):
+                if to == "completed":
+                    raise StoreCorrupt("refused for the test: the clock stepped back")
+                return ChatStore.append_transition(self, chat_id, session_id, current, to,
+                                                   *args, **kwargs)
+        manager, chat_id, error = self.turn(scripted(
+            [THINKING, ("launcher", lb.PAYLOAD_SESSION_COMPLETED, b'{"type": "session_completed"}')],
+            "fresh_binding", "stream"), store=RefusesCompletion)
+        self.assertIsInstance(error, StoreCorrupt)
+        self.assertEqual(transcript(manager.store.export_records()), [("user", "first"), NOTICE])
 
 
 # ---------------------------------------------------------------------------
