@@ -62,23 +62,20 @@ from ..launch_boundary import (
     FAILURE_INTERNAL_ERROR,
     FAILURE_NO_ACKNOWLEDGEMENT,
     FAILURE_UNAVAILABLE,
-    INTERPRETATION_MALFORMED,
     INTERPRETATION_RECOGNIZED,
-    INTERPRETATION_UNRECOGNIZED,
     LaunchBoundary,
     LaunchResult,
     LauncherCapabilities,
     LauncherError,
     OUTCOME_ACCEPTED,
-    PAYLOAD_ASSISTANT_TEXT,
     PAYLOAD_SESSION_COMPLETED,
     PAYLOAD_SESSION_FAILED,
     PAYLOAD_STREAM_END,
     PAYLOAD_TURN_COMPLETE,
-    SOURCE_AGENT,
     SOURCE_LAUNCHER,
     StopAck,
 )
+from .dev_transport import classify
 
 DEV_AGENT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dev_agent.py")
 
@@ -87,9 +84,11 @@ PROFILES = {
     "persistent": LauncherCapabilities("persistent", "stream", None),
 }
 
-# Types this build knows how to interpret. Anything else is `unrecognized`,
-# which is a finding and the primary discovery output of v0.1, never an error.
-AGENT_PAYLOAD_TYPES = (PAYLOAD_ASSISTANT_TEXT, PAYLOAD_TURN_COMPLETE)
+# What a line of the agent's transport is, is decided in one place for this wire
+# format -- `dev_transport.RECOGNIZED` and `dev_transport.classify` -- which the
+# scripted stub reads too. This launcher only adds what it observes of its own
+# child process (lifecycle and end of stream), which it synthesises rather than
+# reads.
 
 
 def _release_pipes(process):
@@ -325,21 +324,15 @@ class DevLocalLauncher(LaunchBoundary):
         return session
 
     def _agent_payload(self, session, line):
+        """One line the agent wrote, launch and later turns alike.
+
+        Classified from the bytes that are preserved, through the development
+        transport's one classifier, so what is recorded is reproducible from
+        `raw.body` alone.
+        """
         sequence = session.next_sequence
         session.next_sequence += 1
-        raw = line.rstrip("\n").encode("utf-8")
-        try:
-            parsed = json.loads(line)
-        except ValueError:
-            return EventPayload(sequence, SOURCE_AGENT, INTERPRETATION_MALFORMED, raw)
-        if not isinstance(parsed, dict) or parsed.get("type") not in AGENT_PAYLOAD_TYPES:
-            return EventPayload(sequence, SOURCE_AGENT, INTERPRETATION_UNRECOGNIZED, raw)
-        kind = parsed["type"]
-        text = parsed.get("text") if kind == PAYLOAD_ASSISTANT_TEXT else None
-        if kind == PAYLOAD_ASSISTANT_TEXT and not isinstance(text, str):
-            return EventPayload(sequence, SOURCE_AGENT, INTERPRETATION_MALFORMED, raw)
-        return EventPayload(sequence, SOURCE_AGENT, INTERPRETATION_RECOGNIZED, raw,
-                            interpreted_type=kind, text=text)
+        return classify(sequence, line.rstrip("\n").encode("utf-8"))
 
     def _lifecycle_payload(self, session, returncode):
         sequence = session.next_sequence

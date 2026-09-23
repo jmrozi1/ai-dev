@@ -24,16 +24,13 @@ from ..launch_boundary import (
     EventPayload,
     EventsPage,
     FAILURE_CATEGORIES,
-    INTERPRETATION_MALFORMED,
     INTERPRETATION_RECOGNIZED,
-    INTERPRETATION_UNRECOGNIZED,
     LaunchBoundary,
     LaunchResult,
     LauncherCapabilities,
     LauncherError,
     OUTCOME_ACCEPTED,
     OUTCOME_UNKNOWN,
-    PAYLOAD_ASSISTANT_TEXT,
     PAYLOAD_SESSION_COMPLETED,
     PAYLOAD_SESSION_FAILED,
     PAYLOAD_STREAM_END,
@@ -42,6 +39,7 @@ from ..launch_boundary import (
     SOURCE_LAUNCHER,
     StopAck,
 )
+from .dev_transport import interpret
 
 # What a turn's answer looks like. Identical to the development agent's, so that
 # a transcript produced through this launcher and a transcript produced through
@@ -219,6 +217,14 @@ class ScriptedStubLauncher(LaunchBoundary):
 
     def _emit(self, session, source, interpretation, body, interpreted_type=None,
               text=None):
+        """Number and keep one payload whose reading the caller states.
+
+        The stub itself states a reading only for what it synthesises as the
+        launcher (lifecycle and end of stream); every line of the agent's output
+        goes through `_emit_agent_line`. Tests subclass the stub and call this
+        directly to hand the harness a reading no classifier would produce --
+        that is what makes them probes of the harness rather than of a launcher.
+        """
         payload = EventPayload(session.next_sequence, source, interpretation,
                                body if isinstance(body, bytes) else body.encode("utf-8"),
                                interpreted_type=interpreted_type, text=text)
@@ -226,17 +232,26 @@ class ScriptedStubLauncher(LaunchBoundary):
         session.payloads.append(payload)
         return payload
 
+    def _emit_agent_line(self, session, body):
+        """One line of the agent's output, read by the development transport's
+        one classifier (`dev_transport`), exactly as `dev_local` reads a line
+        from a real process. The stub decides only which bytes the agent says;
+        what those bytes *are* is decided where `dev_local` decides it, so the
+        two launchers cannot disagree about the same line, and every record is
+        reproducible from its `raw.body`. It still goes through `_emit`, the one
+        place a payload is numbered and kept."""
+        raw = body if isinstance(body, bytes) else body.encode("utf-8")
+        interpretation, interpreted_type, text = interpret(raw)
+        return self._emit(session, SOURCE_AGENT, interpretation, raw,
+                          interpreted_type=interpreted_type, text=text)
+
     def _produce_turn(self, session, instruction_text):
         if self._garbage:
-            self._emit(session, SOURCE_AGENT, INTERPRETATION_MALFORMED,
-                       b"this is not json at all {{{")
+            self._emit_agent_line(session, b"this is not json at all {{{")
         if self._unknown_type:
-            self._emit(session, SOURCE_AGENT, INTERPRETATION_UNRECOGNIZED,
-                       json.dumps({"type": "agent_thinking"}).encode("utf-8"))
+            self._emit_agent_line(session, json.dumps({"type": "agent_thinking"}))
         reply = answer(instruction_text)
-        self._emit(session, SOURCE_AGENT, INTERPRETATION_RECOGNIZED,
-                   json.dumps({"type": PAYLOAD_ASSISTANT_TEXT, "text": reply}),
-                   interpreted_type=PAYLOAD_ASSISTANT_TEXT, text=reply)
+        self._emit_agent_line(session, json.dumps({"type": "assistant_text", "text": reply}))
 
         ending = self._end_of_turn
         if ending is None:
@@ -244,9 +259,11 @@ class ScriptedStubLauncher(LaunchBoundary):
                       else PAYLOAD_SESSION_COMPLETED)
 
         # The turn boundary is always delimited, whatever else follows it.
-        self._emit(session, SOURCE_AGENT, INTERPRETATION_RECOGNIZED,
-                   json.dumps({"type": PAYLOAD_TURN_COMPLETE}),
-                   interpreted_type=PAYLOAD_TURN_COMPLETE)
+        self._emit_agent_line(session, json.dumps({"type": "turn_complete"}))
+
+        # What follows is the launcher's own observation of the agent it runs,
+        # sourced to the launcher and synthesised rather than read: it is not a
+        # line of the agent's transport, so it is not classified as one.
 
         if ending == PAYLOAD_TURN_COMPLETE:
             return

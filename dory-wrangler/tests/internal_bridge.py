@@ -43,7 +43,11 @@ and `events` is the only place a line becomes a payload. There is no plain-text
 resume case: a resumed turn that printed something other than JSONL is
 `malformed` exactly as a launch that did would be.
 
-`classify` recognises the two proven event types and nothing else:
+`classify` reads one declaration, `RECOGNIZED`, and recognises the two proven
+event types in it and nothing else. A failed launch's lines go through the same
+`classify`, sourced to the launcher; only the fresh-binding `session_completed`
+line `events` writes is the launcher's own synthesised reading, not a line of
+this format:
 
 * `thread.started` carrying a non-empty string `thread_id` -> `recognized`,
   typed `thread.started`; it carries the handle and nothing for the chat;
@@ -106,6 +110,7 @@ behaviour; concurrency; any payload bound.
 from __future__ import annotations
 
 import base64
+import collections
 import json
 import os
 import subprocess
@@ -120,34 +125,78 @@ TYPE_THREAD_STARTED = "thread.started"
 TYPE_ITEM_COMPLETED = "item.completed"
 ITEM_AGENT_MESSAGE = "agent_message"
 
+# The Codex JSONL wire format's recognized set, declared once. Every line of this
+# format -- launch, resume, and a failed launch's output alike -- is read by
+# `interpret` below against this and nothing else.
+#
+# Key: `(type, sub_type)`. `sub_type` is the value at `SUB_TYPE_FIELD[type]` when
+# the type has one, else None. Reading: what the record is written as, the field
+# the type requires (a string, and non-empty when `non_empty`), and whether that
+# field is the user-visible text. A key that matches but whose required field is
+# not there is `malformed` -- a known type missing what makes it that type.
+#
+# Exactly the two types real internal output has shown (#87/#88, 2026-09-14);
+# nothing here comes from Codex documentation or memory of it. Adding one takes
+# real output carrying it -- `decisions/0004-classifying-event-types.md`.
+SUB_TYPE_FIELD = {TYPE_ITEM_COMPLETED: ("item", "type")}
 
-def classify(sequence, raw):
-    """One raw output line -> one `EventPayload`. The only interpretation there is."""
+
+Recognized = collections.namedtuple("Recognized",
+                                    ("interpreted_type", "field", "non_empty", "is_text"))
+
+
+RECOGNIZED = {
+    (TYPE_THREAD_STARTED, None):
+        Recognized(TYPE_THREAD_STARTED, ("thread_id",), non_empty=True, is_text=False),
+    (TYPE_ITEM_COMPLETED, ITEM_AGENT_MESSAGE):
+        Recognized(lb.PAYLOAD_ASSISTANT_TEXT, ("item", "text"), non_empty=False, is_text=True),
+}
+
+
+def _at(event, path):
+    """The value at `path` in nested objects, or None where any step is not an object."""
+    value = event
+    for name in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(name)
+    return value
+
+
+def interpret(raw):
+    """One raw output line's bytes -> `(interpretation, interpreted_type, text)`.
+
+    The only interpretation there is, and a function of the bytes and of
+    `RECOGNIZED` alone: whether the line came from a launch or a resume, and who
+    it is sourced to, change nothing about what it is.
+    """
     try:
         event = json.loads(raw.decode("utf-8"))
     except ValueError:  # includes UnicodeDecodeError
-        return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_MALFORMED, raw)
+        return lb.INTERPRETATION_MALFORMED, None, None
     kind = event.get("type") if isinstance(event, dict) else None
-    if kind == TYPE_THREAD_STARTED:
-        if thread_id_of(event) is None:
-            return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_MALFORMED,
-                                   raw)
-        return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_RECOGNIZED, raw,
-                               interpreted_type=TYPE_THREAD_STARTED)
-    if kind == TYPE_ITEM_COMPLETED:
-        item = event.get("item")
-        if isinstance(item, dict) and item.get("type") == ITEM_AGENT_MESSAGE:
-            if not isinstance(item.get("text"), str):
-                return lb.EventPayload(sequence, lb.SOURCE_AGENT,
-                                       lb.INTERPRETATION_MALFORMED, raw)
-            return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_RECOGNIZED,
-                                   raw, interpreted_type=lb.PAYLOAD_ASSISTANT_TEXT,
-                                   text=item["text"])
-    return lb.EventPayload(sequence, lb.SOURCE_AGENT, lb.INTERPRETATION_UNRECOGNIZED, raw)
+    if not isinstance(kind, str):
+        return lb.INTERPRETATION_UNRECOGNIZED, None, None
+    sub_type = _at(event, SUB_TYPE_FIELD[kind]) if kind in SUB_TYPE_FIELD else None
+    reading = RECOGNIZED.get((kind, sub_type if isinstance(sub_type, str) else None))
+    if reading is None:
+        return lb.INTERPRETATION_UNRECOGNIZED, None, None
+    value = _at(event, reading.field)
+    if not isinstance(value, str) or (reading.non_empty and value == ""):
+        return lb.INTERPRETATION_MALFORMED, None, None
+    return (lb.INTERPRETATION_RECOGNIZED, reading.interpreted_type,
+            value if reading.is_text else None)
+
+
+def classify(sequence, raw, source=lb.SOURCE_AGENT):
+    """One raw output line -> one `EventPayload`, through `interpret` and nothing else."""
+    interpretation, interpreted_type, text = interpret(raw)
+    return lb.EventPayload(sequence, source, interpretation, raw,
+                           interpreted_type=interpreted_type, text=text)
 
 
 def thread_id_of(event):
-    thread_id = event.get("thread_id")
+    thread_id = _at(event, RECOGNIZED[(TYPE_THREAD_STARTED, None)].field)
     return thread_id if isinstance(thread_id, str) and thread_id != "" else None
 
 
@@ -239,20 +288,15 @@ class InternalBridgeLauncher(lb.LaunchBoundary):
         integration did, so on the one path where nothing else can carry them
         they are preserved as bytes instead.
         """
-        payloads = []
-        for sequence, raw in enumerate(lines, 1):
-            classified = classify(sequence, raw)
-            payloads.append(lb.EventPayload(sequence, lb.SOURCE_LAUNCHER,
-                                            classified.interpretation, raw,
-                                            interpreted_type=classified.interpreted_type))
         observation = json.dumps({
             "model_launcher_observation": "launch_agent.sh started no thread",
             "exit_status": status,
             "stderr_tail": self.last_stderr[-2000:],
         }).encode("utf-8")
-        payloads.append(lb.EventPayload(len(payloads) + 1, lb.SOURCE_LAUNCHER,
-                                        lb.INTERPRETATION_UNRECOGNIZED, observation))
-        return payloads
+        # Every line, the observation included, through the one `classify`:
+        # only the source differs from the resumable path, never the reading.
+        return [classify(sequence, raw, source=lb.SOURCE_LAUNCHER)
+                for sequence, raw in enumerate(list(lines) + [observation], 1)]
 
     def deliver(self, agent_handle, instruction):
         if not self._capabilities.supports_delivery:
