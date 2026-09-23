@@ -783,6 +783,32 @@ class OnceAcrossReattachmentAndRestart(unittest.TestCase, Checks, ModelDirs):
         self.assertEqual(len(manager.send_turn(chat_id, "third").agent_message_ids), 1)
         self.assert_store_valid(manager.store, "c-stream-reattach-observes-end")
 
+    def test_a_turn_end_seen_again_writes_no_second_notice(self):
+        """Sweep row M25. The turn ends and gets its notice; the agent then says
+        more, ending with another `turn_complete`, before any new turn, and a
+        restart's re-attachment reads it. That is a turn end observed again for
+        the same turn, and the notice already there is what stops a second."""
+        root = support.scratch_root()
+        stub = scripted([THINKING, ("agent", b'{"type": "turn_complete"}')],
+                        "persistent", "stream")
+        manager = SessionManager(ChatStore(root), stub)
+        chat_id = manager.create_chat("Seen twice")
+        manager.send_turn(chat_id, "first")
+        self.assertEqual(transcript(manager.store.export_records()),
+                         [("user", "first"), NOTICE])
+        manager.store.close()
+        handle = support.view(ChatStore(root, read_only=True)).sessions_of(chat_id)[0]["agent_handle"]
+        agent = stub._session(handle)
+        stub._emit_agent_line(agent, b'{"type": "agent_thinking", "late": true}')
+        stub._emit_agent_line(agent, b'{"type": "turn_complete"}')
+        manager = SessionManager(ChatStore(root), stub)
+        manager.reattach_on_start()
+        records = manager.store.export_records()
+        self.assertEqual(transcript(records), [("user", "first"), NOTICE])
+        self.assertEqual(len([e for e in records if e["record_type"] == "diagnostic_event"]), 4,
+                         "the late lines were read and preserved")
+        self.assert_store_valid(manager.store, "c-turn-end-seen-twice")
+
     def test_re_attachment_that_observes_no_end_writes_nothing(self):
         """Died *before* the call returned: the spool holds nothing of the turn,
         re-attachment reads an empty page, and nothing is concluded."""
