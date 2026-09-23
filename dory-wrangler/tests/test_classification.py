@@ -180,6 +180,93 @@ class EachWireFormatDeclaresItsSetOnce(unittest.TestCase, ModelDirs):
                          ["malformed", "recognized", "unrecognized"])
 
 
+class TheBoundaryReadsEveryShapeTheSameWayEveryTime(unittest.TestCase):
+    """The `recognized` / `unrecognized` / `malformed` boundary of decision
+    0004, line by line, for both wire formats. Every odd shape a transport could
+    print has a legal reading and none of them raises: a classifier that raised
+    on a line would lose the payload, where P1 requires it preserved."""
+
+    DEV = [
+        (b'{"type": "assistant_text", "text": "caf\xc3\xa9 \xe2\x9c\x93"}',
+         ("recognized", "assistant_text", "caf\u00e9 \u2713")),
+        (b'{"type": "assistant_text", "text": ""}', ("recognized", "assistant_text", "")),
+        (b'{"type": "turn_complete", "text": 7}', ("recognized", "turn_complete", None)),
+        (b'{"type": "assistant_text"}', ("malformed", None, None)),
+        (b'{"type": "assistant_text", "text": null}', ("malformed", None, None)),
+        (b'{"type": "assistant_text", "text": ["x"]}', ("malformed", None, None)),
+        (b'{"type": "assistant_text", "text": 3}', ("malformed", None, None)),
+        (b'{"type": ["assistant_text"], "text": "x"}', ("unrecognized", None, None)),
+        (b'{"type": {"k": 1}}', ("unrecognized", None, None)),
+        (b'{"type": 3}', ("unrecognized", None, None)),
+        (b'{"text": "x"}', ("unrecognized", None, None)),
+        (b'["assistant_text", "x"]', ("unrecognized", None, None)),
+        (b'"assistant_text"', ("unrecognized", None, None)),
+        (b'null', ("unrecognized", None, None)),
+        (b'{"type": "Assistant_Text", "text": "x"}', ("unrecognized", None, None)),
+        (b'not json {{{', ("malformed", None, None)),
+        (b'\xff\xfe{"type": "turn_complete"}', ("malformed", None, None)),
+        (b'{"type": "assistant_text", "text": "\xff"}', ("malformed", None, None)),
+        (b'', ("malformed", None, None)),
+    ]
+
+    CODEX = [
+        (b'{"type": "thread.started", "thread_id": "t1"}', ("recognized", "thread.started", None)),
+        (b'{"type": "thread.started", "thread_id": ""}', ("malformed", None, None)),
+        (b'{"type": "thread.started", "thread_id": 5}', ("malformed", None, None)),
+        (b'{"type": "thread.started"}', ("malformed", None, None)),
+        (b'{"type": "item.completed", "item": {"type": "agent_message", "text": ""}}',
+         ("recognized", "assistant_text", "")),
+        (b'{"type": "item.completed", "item": {"type": "agent_message", "text": "caf\xc3\xa9"}}',
+         ("recognized", "assistant_text", "caf\u00e9")),
+        (b'{"type": "item.completed", "item": {"type": "agent_message"}}', ("malformed", None, None)),
+        (b'{"type": "item.completed", "item": {"type": "agent_message", "text": ["x"]}}',
+         ("malformed", None, None)),
+        (b'{"type": "item.completed", "item": {"type": "reasoning", "text": "x"}}',
+         ("unrecognized", None, None)),
+        (b'{"type": "item.completed", "item": {"type": ["agent_message"], "text": "x"}}',
+         ("unrecognized", None, None)),
+        (b'{"type": "item.completed", "item": {"type": {"k": 1}}}', ("unrecognized", None, None)),
+        (b'{"type": "item.completed", "item": "agent_message"}', ("unrecognized", None, None)),
+        (b'{"type": "item.completed", "item": ["agent_message"]}', ("unrecognized", None, None)),
+        (b'{"type": "item.completed"}', ("unrecognized", None, None)),
+        (b'{"type": "item.completed", "type_": "agent_message", "text": "x"}',
+         ("unrecognized", None, None)),
+        (b'{"type": "agent_message", "text": "x"}', ("unrecognized", None, None)),
+        (b'{"type": ["thread.started"], "thread_id": "t1"}', ("unrecognized", None, None)),
+        (b'{"type": {"k": 1}}', ("unrecognized", None, None)),
+        (b'{"thread_id": "t1"}', ("unrecognized", None, None)),
+        (b'[{"type": "thread.started", "thread_id": "t1"}]', ("unrecognized", None, None)),
+        (b'answer to: plain text', ("malformed", None, None)),
+        (b'\xff{"type": "thread.started", "thread_id": "t1"}', ("malformed", None, None)),
+    ]
+
+    def check(self, classify, table):
+        for raw, expected in table:
+            with self.subTest(raw=raw):
+                payload = classify(4, raw)
+                self.assertEqual(reading(payload), expected)
+                self.assertEqual((payload.sequence, payload.source, payload.raw),
+                                 (4, "agent", raw), "the bytes are the bytes given")
+                self.assertEqual(classify(4, raw, source="launcher").source, "launcher")
+                self.assertEqual(reading(classify(4, raw, source="launcher")), expected,
+                                 "the source changes nothing about the reading")
+
+    def test_the_development_transport(self):
+        self.check(dev_transport.classify, self.DEV)
+
+    def test_the_codex_model(self):
+        self.check(internal_bridge.classify, self.CODEX)
+
+    def test_dev_local_reads_a_line_as_its_bytes_without_the_newline(self):
+        session = type("S", (), {"next_sequence": 3})()
+        payload = DevLocalLauncher._agent_payload(
+            None, session, '{"type": "assistant_text", "text": "caf\u00e9"}\n')
+        self.assertEqual((payload.sequence, payload.raw, reading(payload)),
+                         (3, '{"type": "assistant_text", "text": "caf\u00e9"}'.encode("utf-8"),
+                          ("recognized", "assistant_text", "caf\u00e9")))
+        self.assertEqual(session.next_sequence, 4)
+
+
 class ClassificationIsAFunctionOfThePreservedBytes(unittest.TestCase, StoreCheck, ModelDirs):
     """Every event each launcher in the repository causes to be preserved,
     re-read from `raw.body` by that launcher's classifier, reproduces what was
