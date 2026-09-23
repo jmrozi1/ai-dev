@@ -809,6 +809,35 @@ class OnceAcrossReattachmentAndRestart(unittest.TestCase, Checks, ModelDirs):
                          "the late lines were read and preserved")
         self.assert_store_valid(manager.store, "c-turn-end-seen-twice")
 
+    def test_re_attachment_writes_the_notice_before_raising_a_declined_claim(self):
+        """Sweep row M35. The harness dies after the call returned; the turn's
+        page, read at restart, reports its end and also a claim re-attachment
+        declines (a one-shot launcher's end of stream). Nothing was lost, so the
+        notice is written, and the refusal leaves the chat as it was."""
+        root = support.scratch_root()
+        stub = scripted([("agent", b'{"type": "turn_complete"}'),
+                         ("launcher", lb.PAYLOAD_STREAM_END, b'{"type": "stream_end"}')],
+                        "persistent", "one_shot")
+        manager = SessionManager(ChatStore(root), stub)
+        chat_id = manager.create_chat("Declined at re-attachment")
+        events = stub.events
+
+        def dies(_handle, _after):
+            raise Died()
+        stub.events = dies
+        with self.assertRaises(Died):
+            manager.send_turn(chat_id, "first")
+        manager.store.close()
+        stub.events = events
+        manager = SessionManager(ChatStore(root), stub)
+        manager.reattach_on_start()
+        records = manager.store.export_records()
+        self.assertEqual(transcript(records), [("user", "first"), NOTICE])
+        self.assertEqual(sorted((e["interpretation"], e["interpreted_type"]) for e in records
+                                if e["record_type"] == "diagnostic_event"),
+                         [("recognized", "turn_complete"), ("unrecognized", None)])
+        self.assert_store_valid(manager.store, "c-reattach-declined-claim")
+
     def test_re_attachment_that_observes_no_end_writes_nothing(self):
         """Died *before* the call returned: the spool holds nothing of the turn,
         re-attachment reads an empty page, and nothing is concluded."""
