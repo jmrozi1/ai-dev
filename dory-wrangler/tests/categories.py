@@ -87,11 +87,14 @@ ASSIGNMENTS = {
     "test_turn_floor_regression": P,
     "test_unsupported_and_malformed": P,
 
-    # -- launch-boundary classes in otherwise portable modules --
+    # -- launch-boundary entries more specific than a module --
     # Contract 6.1 / 4.3: a launcher remembers nothing between calls.
     "test_adversarial.TestTheLaunchSeamCarriesTheHandle": LB,
     # Contract 6.1 consequence 3: no harness behaviour rests on launcher state.
     "test_intake.TheHarnessRestsOnNoLauncherDurableState": LB,
+    # The one test of that class that uses no dev-local configuration (measured:
+    # it passes with dev-local unavailable); it drives only scripted-stub.
+    "test_mode_invariance.TheExperimentIsWhatItIsAndNotMore.test_response_shape_is_exercised_where_it_actually_matters": LB,
 
     # -- development-environment: the `dev-local` launcher --
     # Each of these fails when `dev-local` is unavailable (measured: its
@@ -109,7 +112,6 @@ ASSIGNMENTS = {
     "test_classification.DevLocalFramesTheWireBytesTheSameInBothProfiles": DEV,
     "test_classification.UnrecognizedAndMalformedAreNeverChat.test_at_the_store_through_dev_local": DEV,
     "test_classification.UnrecognizedAndMalformedAreNeverChat.test_over_http_with_a_shipped_launcher_chosen_by_configuration": DEV,
-    "test_convergence.ASecondShellAgainstALiveOneChangesNothing": DEV,
     "test_diagnostic_access.TheMinimumFromTheToolAlone.test_the_development_transport_both_profiles": DEV,
     "test_failure_classification.AgentFailureIsNotLaunchFailure.test_a_real_process_exiting_non_zero_is_failed": DEV,
     "test_failure_classification.EveryFailureCategoryIsDurablyRecorded.test_a_process_that_cannot_start_is_unavailable": DEV,
@@ -143,6 +145,8 @@ ASSIGNMENTS = {
     "test_atomicity.TestConcurrentSenders.test_a_second_writing_process_is_refused_and_writes_nothing": DEV,
     "test_atomicity.TestConcurrentSenders.test_threads_racing_for_a_sequence_lose_nothing": DEV,
     "test_convergence.OneServingProcessPerStore": DEV,
+    # Both also race a second serving process for the store; one also uses dev-local.
+    "test_convergence.ASecondShellAgainstALiveOneChangesNothing": DEV,
     "test_convergence.ATurnInFlightRefusesEveryOtherUserAction.test_every_action_in_every_non_terminal_state_is_refused_while_held": DEV,
     "test_convergence.ATurnInFlightRefusesEveryOtherUserAction.test_a_chat_with_no_session_refuses_a_send_while_held": DEV,
     "test_convergence.TheTurnLockGivesBackWhatItTook.test_a_hold_refused_because_another_descriptor_holds_it_takes_nothing": DEV,
