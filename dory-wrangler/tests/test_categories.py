@@ -92,6 +92,48 @@ class TheGuardFailsOnWhatItMustRefuse(unittest.TestCase):
                          .countTestCases(), 1)
 
 
+class TheRunnerChargesASubtestToItsTest(unittest.TestCase):
+
+    def test_a_subtest_skip_failure_and_error_count_in_their_test_s_category(self):
+        """A subtest's outcome is its test's, in the category its test's entry
+        gives -- never the category a key naming the subtest would fall back to
+        (review F2: a skip inside `subTest` was charged to the module default)."""
+        import io
+        import run_tests
+
+        class Plant(unittest.TestCase):
+            def test_skips(self):
+                with self.subTest(i=1):
+                    pass
+                with self.subTest(i=2):
+                    self.skipTest("planted")
+
+            def test_fails(self):
+                with self.subTest(i=1):
+                    self.fail("planted")
+
+            def test_errors(self):
+                with self.subTest(i=1):
+                    raise RuntimeError("planted")
+
+        # Named as a class of this module, whose default is portable, and placed
+        # in development-environment by its own entry.
+        Plant.__qualname__ = Plant.__name__ = "SubtestPlant"
+        entry = "test_categories.SubtestPlant"
+        categories.ASSIGNMENTS[entry] = categories.DEVELOPMENT_ENVIRONMENT
+        self.addCleanup(categories.ASSIGNMENTS.pop, entry)
+        result = run_tests.CategoryResult(
+            unittest.runner._WritelnDecorator(io.StringIO()), False, 0)
+        suite_of(Plant).run(result)
+        self.assertEqual(result.outcomes, {entry + ".test_skips": "skipped",
+                                           entry + ".test_fails": "failed",
+                                           entry + ".test_errors": "error"})
+        report = run_tests.per_category(result.outcomes)
+        self.assertEqual(list(report), [categories.DEVELOPMENT_ENVIRONMENT])
+        self.assertEqual(report[categories.DEVELOPMENT_ENVIRONMENT]["skipped"],
+                         [entry + ".test_skips"])
+
+
 class TheSuiteAsItStands(unittest.TestCase):
 
     def test_every_test_of_the_suite_has_exactly_one_category(self):

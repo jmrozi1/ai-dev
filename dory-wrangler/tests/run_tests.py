@@ -66,8 +66,8 @@ RANK = {"passed": 0, "skipped": 1, "failed": 2, "error": 3}
 class CategoryResult(unittest.TextTestResult):
     """A text result that also records every test's outcome, by test.
 
-    A subtest's failure is its test's failure, and an error in a class or module
-    fixture is recorded against that class or module.
+    A subtest's failure, error or skip is its test's, and an error in a class or
+    module fixture is recorded against that class or module.
     """
 
     def __init__(self, *args, **kwargs):
@@ -75,6 +75,10 @@ class CategoryResult(unittest.TextTestResult):
         self.outcomes = {}
 
     def _mark(self, test, outcome):
+        # A skip inside `subTest` arrives here as the `_SubTest`, whose id names
+        # the subtest's parameters; it is its test's outcome, like a subtest's
+        # failure, so it is keyed -- and so categorised -- by that test.
+        test = getattr(test, "test_case", test)
         key = categories.test_key(test)
         if RANK[outcome] >= RANK[self.outcomes.get(key, "passed")]:
             self.outcomes[key] = outcome
