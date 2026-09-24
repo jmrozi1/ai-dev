@@ -563,19 +563,31 @@ class TheCommandLineRetrieval(unittest.TestCase):
                 ((self.root, self.chat_id, "--limit", "-3"), tool.REFUSED_LIMIT, 2),
                 ((self.root, self.chat_id, "--limit", "2.5"), tool.REFUSED_LIMIT, 2),
                 ((self.root, self.chat_id, "--limit", "ten"), tool.REFUSED_LIMIT, 2),
-                # A digit int() does not read, and one it does that is not ASCII.
+                # A digit int() does not read. One it does read that is not
+                # ASCII is the test below.
                 ((self.root, self.chat_id, "--limit", "\u00b2"), tool.REFUSED_LIMIT, 2),
-                ((self.root, self.chat_id, "--limit", "\uff13"), tool.REFUSED_LIMIT, 2),
                 ((self.root, self.chat_id, "--from", "0"), tool.REFUSED_RANGE, 2),
                 ((self.root, self.chat_id, "--to", "x"), tool.REFUSED_RANGE, 2),
                 ((self.root, self.chat_id, "--records", "counts"), tool.REFUSED_ARGUMENTS, 2),
                 ((self.root, self.chat_id, "--records", "messages", "--session",
                   self.session_id), tool.REFUSED_MESSAGES_BY_SESSION, 2),
                 ((self.root,), tool.REFUSED_ARGUMENTS, 2)):
-            with self.subTest(args=args[1:]):
-                status, out, err = self.unchanged(*args)
-                self.assertEqual((status, out, err), (code, b"", words + "\n"))
-                self.assertNotIn(self.root, err)
+            self.refused(args, words, code)
+
+    def refused(self, args, words, code):
+        with self.subTest(args=args[1:]):
+            status, out, err = self.unchanged(*args)
+            self.assertEqual((status, out, err), (code, b"", words + "\n"))
+            self.assertNotIn(self.root, err)
+
+    def test_a_non_ascii_digit_int_reads_is_refused_as_a_limit(self):
+        """A fullwidth digit, which `int()` reads as 3. Its own test because the
+        argument has to be passed on a command line at all: under a locale that
+        cannot encode it (Latin-1, say) `subprocess` refuses to start the tool,
+        which is the host, not the tool -- so this row is
+        development-environment and the rest of the refusals are portable."""
+        self.refused((self.root, self.chat_id, "--limit", "\uff13"),
+                     _tool_module().REFUSED_LIMIT, 2)
 
     def test_an_unreadable_store_is_refused_without_its_reason(self):
         root = tempfile.mkdtemp(prefix="dory-diag-")

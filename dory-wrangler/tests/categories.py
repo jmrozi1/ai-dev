@@ -167,6 +167,11 @@ ASSIGNMENTS = {
     "test_restart.TestRestartWithNoShellAtAll.test_history_is_readable_with_nothing_running": DEV,
     "test_shell.TestShellBoundaries.test_the_shell_starts_no_process": DEV,
 
+    # -- development-environment: the locale's encoding --
+    # A command-line argument a Latin-1 locale cannot encode (measured: under
+    # LC_ALL=en_US.iso88591 `subprocess` refuses it before the tool runs).
+    "test_diagnostic_access.TheCommandLineRetrieval.test_a_non_ascii_digit_int_reads_is_refused_as_a_limit": DEV,
+
     # -- development-environment: file permission bits --
     "test_adversarial.TestReopenFidelity.test_d2_the_transcript_does_not_read_the_diagnostics_tree": DEV,
     "test_diagnostic_access.TheCommandLineRetrieval.test_an_unreadable_directory_is_refused_without_its_reason": DEV,
