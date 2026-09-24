@@ -41,9 +41,19 @@ also chooses which filesystem the stores live on.
 **The means of settling entries.** These tools already exist. This register
 adds none.
 
-- **The test categories.** `python3 dory-wrangler/tests/run_tests.py --category portable|launch-boundary|development-environment [--json PATH]`. The categories and their dependency groups are declared in `tests/categories.py`. The README section "Test categories, and telling an environmental failure from a product one" says how to read a failure in each.
-- **The end-to-end path.** `python3 dory-wrangler/tests/e2e_loop.py --launcher <id> [--launcher-options <json>] [--work <dir>]` runs create, send, launch, events, render, restart and reopen, a third turn, `validate_store.py` and `diagnostics.py`. It prints PASS or FAIL per step (README "The whole loop, end to end"). `--launcher` takes any launcher registered in `launchers/registry.py`, so it works for #90's internal launcher once that launcher is registered (TA-6).
-- **The store checks.** `python3 dory-wrangler/validate_store.py STORE` checks a store against the contract. `python3 dory-wrangler/diagnostics.py STORE CHAT_ID [...]` prints the preserved raw evidence, verbatim and bounded (decision 0007). The second answers "which event types occurred, what rendered, where the stream stopped" from durable evidence alone.
+- **The test categories.** `python3 dory-wrangler/tests/run_tests.py --category portable|launch-boundary|development-environment [--json PATH]`. `--json` takes a path; given alone it is a usage error. The categories and their dependency groups are declared in `tests/categories.py`. The README section "Test categories, and telling an environmental failure from a product one" says how to read a failure in each. `run_tests.py` deletes its kept-store directory before it starts and checks only the stores its own tests write there, so it cannot check a dogfood store (LO-3).
+- **The end-to-end path.** `python3 dory-wrangler/tests/e2e_loop.py --launcher <id> [--launcher-options <json>] [--work <dir>] [--request-timeout <seconds>]` runs create, send, launch, events, render, restart and reopen, a third turn, `validate_store.py` and `diagnostics.py`. It prints PASS or FAIL per step (README "The whole loop, end to end"). `--launcher` takes any launcher registered in `launchers/registry.py`, so it works for #90's internal launcher once that launcher is registered (TA-6).
+  - Each request waits at most `--request-timeout` seconds, **120 by default**, and a send waits for the whole turn. Against a real launcher, pass a value well above the longest real turn recorded (TR-20), for example `--request-timeout 1800`. A slower turn otherwise fails its step with `the shell gave no answer to POST /api/chats/<chat>/messages within 120s`. That line says nothing about the entry being settled: it is neither held nor failed, so re-run with a larger value.
+  - A PASS line's words matter as well as the PASS. `third-turn` passes both when the agent is re-attached and when the path takes Abandon; TR-9 quotes the two lines.
+- **The store checks.** `python3 dory-wrangler/validate_store.py STORE [--snapshot FILE]` checks a store against the contract, and `--snapshot` also writes the store's export as one JSON document. `python3 dory-wrangler/diagnostics.py STORE CHAT_ID [--records events|lifecycle|messages] [...]` prints the preserved raw evidence, verbatim and bounded (decision 0007). It answers "which event types occurred, what rendered, where the stream stopped" from durable evidence alone. `STORE` and `CHAT_ID` are always required; a chat's id is its directory name under `STORE/chats/`. Where an entry below says `diagnostics.py --records lifecycle`, it means `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records lifecycle`, once for each chat concerned.
+- **The whole-store re-classification.** Take a snapshot with `validate_store.py STORE --snapshot DIR/dogfood.json`, then run `python3 dory-wrangler/tests/reclassify_stores.py DIR` over that snapshot. This is how a dogfood store gets the check that phase 3 of `run_tests.py` gives the suite's own stores (LO-3).
+
+Every command in this register was run once on the external desktop, from a clean archive of the tree it describes, with `python3.11` in place of `python3`. A command that needs a store was run against a store written by `e2e_loop.py`. Some commands could not run there:
+- the internal tools (`codex`, `launch_agent.sh`, a registered internal launcher id) do not exist on the desktop;
+- `ausearch` needs root; its arguments were checked against `ausearch --help`;
+- this host's policy refuses to execute `rpm`.
+
+The log is in the `issue-89-register-procedures-fix` handoff.
 
 **How #90 records a result.** #90's acceptance criteria require every entry to be
 recorded internally as held, failed or untested, with evidence. For each entry
@@ -139,7 +149,7 @@ A failed entry is a successful result for #90 (#90 "Full Description").
   - The internal host's time synchronisation is unknown.
 - **How internal dogfood settles it.** Record the time-sync configuration (`timedatectl`, or `chronyc tracking`).
   - **Held:** no step backwards observed during dogfood. A slewing configuration is supporting evidence.
-  - **Failed:** a turn is refused because the clock went back. Preserve it with `diagnostics.py --records lifecycle`.
+  - **Failed:** a turn is refused because the clock went back. Preserve it with `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records lifecycle`.
 - **Depends on it.** Store ordering checks (contract F10 is carried unresolved; see Appendix B). A refusal costs one turn, not the chat. It is later work unless dogfood shows it happens.
 - **Owner.** #90.
 
@@ -158,12 +168,13 @@ A failed entry is a successful result for #90 (#90 "Full Description").
   Sources: `issue-89/rails/issue-89-portable-labels-check/handoff.md`, and #89 comment 5819502876. External hosts use local filesystems. The internal store's filesystem is unknown.
 - **How internal dogfood settles it.**
   1. `findmnt -T <store path>`, and record `FSTYPE`.
-  2. In a scratch directory on that filesystem, run `python3 -c "import os; open('a','w').close(); os.link('a','b'); os.link('a','b')"`.
+  2. In an empty scratch directory on that filesystem, run `python3 -c "import os; open('a','w').close(); os.link('a','b'); os.link('a','b')"`.
      - **Held:** the second `link` raises `FileExistsError`.
      - **Failed:** it succeeds silently, or the first raises `PermissionError`/`OSError`.
-  3. With `TMPDIR` on that filesystem, run `python3 dory-wrangler/tests/run_tests.py --category portable` under an outer `timeout`, because the suite has no per-test deadline (TA-2).
+     - The directory must be empty. Where `b` is left over from an earlier run, the *first* `link` raises `FileExistsError`, and that proves nothing.
+  3. With `TMPDIR` on that filesystem, run `timeout 1800 python3 dory-wrangler/tests/run_tests.py --category portable`. The outer `timeout` is there because the suite has no per-test deadline (TA-2).
      - **Held:** exit 0.
-     - **Failed:** errors or a hang.
+     - **Failed:** errors, or exit 124, which is a hang.
 - **Depends on it.** Every durable write: record publication, sequence claims and exclusive creation. A failure makes the store unusable on that filesystem. `decisions/0001` names the remedy as placing the store on local disk (`--root`), which is a deployment note and not a redesign. It is a #90 finding either way.
 - **Owner.** #90.
 
@@ -211,7 +222,7 @@ A failed entry is a successful result for #90 (#90 "Full Description").
   - `launch-boundary.md` obligation 4 maps both to `unavailable`.
   - `launchers/dev_local.py`'s `launch` OSError comment claims the same. It was deliberately left unverified (control-plane `issue-88/state.md`, "Carried Cleanups Delivered").
 - **Why external validation cannot settle it.** Neither prerequisite exists externally.
-- **How internal dogfood settles it.** With the real launcher registered, run one turn in each of three states: with the user session inactive; with the bridge not initialised; with both in order. Capture exit status, stdout and stderr, and the stored `launch_result` (`diagnostics.py --records lifecycle`).
+- **How internal dogfood settles it.** With the real launcher registered, run one turn in each of three states: with the user session inactive; with the bridge not initialised; with both in order. Capture exit status, stdout and stderr, and the stored `launch_result` (`python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records lifecycle`).
   - **Held:** both failures return promptly, and are recorded `launch_failed` with category `unavailable`. The next turn, once the prerequisite is fixed, is answered.
   - **Failed:** a hang, an `accepted` result, a category other than `unavailable`, or a lost turn.
 - **Depends on it.** The launch-failure path (contract 5.2). The user learns that the bridge is dead only by attempting a turn; that is a product property (control-plane `issue-87/state.md`, "Review Outcome"). A wrong category is a v0.1 gap.
@@ -263,9 +274,9 @@ A failed entry is a successful result for #90 (#90 "Full Description").
   Sources: #87 comment 5668368252, #89 comment 5668368963 and #90 comment 5668369261; control-plane `issue-85/state.md` "Internal Compatibility Findings". The mapping onto the contract needs no change: the resume ID is `agent_handle`, and `--resumeID` is `deliver`.
 - **History.** The human required this entry as **unproven** on 2026-09-12 (#89 comment 5648269596). The human's comments of 2026-09-14 explicitly supersede that: "This supersedes the 2026-09-12 direction" (#87 comment 5668368252).
 - **Why external validation cannot settle it.** The bridge is not reachable externally.
-- **How internal dogfood settles it.** Re-confirm on the release tree with the real launcher: `python3 dory-wrangler/tests/e2e_loop.py --launcher <internal id>`, and a nonce stored in turn 1 and asked for in turn 2.
-  - **Held:** step 2 passes, the session count stays 1, and the nonce is recalled.
-  - **Failed:** turn 2 is answered by a new thread, or refused.
+- **How internal dogfood settles it.** Re-confirm on the release tree with the real launcher: `python3 dory-wrangler/tests/e2e_loop.py --launcher <internal id> --request-timeout 1800`. The default request timeout is 120 s. A real turn slower than that fails a step for a reason that is neither held nor failed (TR-20). The path's first turn is `hello`, and its second asks `What was the first thing I said in this thread?`. Separately, in a chat of your own, store a nonce in turn 1 and ask for it in turn 2.
+  - **Held:** `PASS continue: the second turn is delivered to the same agent session, as continuation persistent declares`. The answer quoted on that line names `hello`, and the nonce is recalled.
+  - **Failed:** `FAIL continue`, with the second turn answered by a new session or refused, or a second answer that does not know the first turn.
 - **Depends on it.** The internal launcher declares `continuation: persistent`. Fresh binding stays a supported declared capability, but nothing may be designed around it as the normal path. A failure would reopen instruction-packet composition under `fresh_binding`, which is still deliberately undecided (TR-2).
 - **Owner.** #90.
 - **Caveat.** Continuity has been shown by one nonce round-trip only (TR-16).
@@ -348,7 +359,7 @@ A failed entry is a successful result for #90 (#90 "Full Description").
 - **Status.** `held (internal evidence)`.
 - **Evidence.** #89 comments 5668684450 and 5669592360; #87 comments 5668684014 and 5669591294; #90 comments 5668684764 and 5669593061. Launcher-author obligation 6 therefore does not apply to it (`launch-boundary.md`).
 - **Why external validation cannot settle it.** Internal CLI output.
-- **How internal dogfood settles it.** In the capture, and in `diagnostics.py --records lifecycle` for a real session:
+- **How internal dogfood settles it.** In the capture, and in `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records lifecycle` for a real session:
   - **Held:** the session's `agent_handle` equals the captured `thread.started.thread_id`.
   - **Failed:** there is no `thread.started`, or the `thread_id` is elsewhere.
 - **Depends on it.** Every addressing operation (`deliver`, `events`, `stop`) and re-attachment. A failure is a v0.1 gap in the launcher.
@@ -360,7 +371,7 @@ A failed entry is a successful result for #90 (#90 "Full Description").
 - **Status.** `held (internal evidence)`.
 - **Evidence.** #89 comment 5669592360; #87 comment 5669591294; #90 comment 5669593061. The recognized set is declared once in `tests/internal_bridge.RECOGNIZED` (decision 0004).
 - **Why external validation cannot settle it.** Internal CLI output.
-- **How internal dogfood settles it.** After real turns (launch and resume), run the whole-store gate (`run_tests.py` phase 3 covers kept test stores). For the dogfood store, also compare each agent message with its cited event's `item.text` through `diagnostics.py --records messages` and `--records events`.
+- **How internal dogfood settles it.** After real turns (launch and resume), run LO-3's procedure over the dogfood store: snapshot it, then run `reclassify_stores.py`. Phase 3 of `run_tests.py` reads only the suite's own stores. Also compare each agent message with its cited event's `item.text`, using `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records messages` and `... --records events`.
   - **Held:** every rendered message is exactly an `item.text`.
   - **Failed:** the reply text arrives in another event or field. It would then be preserved as `unrecognized` and nothing would render; the no-showable-reply notice would say so (decision 0006).
 - **Depends on it.** Rendering (decision 0005). A failure is a v0.1 gap in the classifier declaration (LO-3).
@@ -393,9 +404,10 @@ A failed entry is a successful result for #90 (#90 "Full Description").
   - TR-8 bears on a Dory-wrangler restart, because each call is its own process, but no restart has been demonstrated.
 - **Why external validation cannot settle it.** The Codex JSONL model re-attaches and resumes after a real shell restart (`tests/test_internal_bridge.ARestartOfTheShellResumesTheSameThread`; the `e2e_loop.py --codex-model` third turn). The model is not the internal CLI.
 - **How internal dogfood settles it.**
-  - **Dory-wrangler restart.** Run `python3 dory-wrangler/tests/e2e_loop.py --launcher <internal id>`.
-    - **Held:** step `third-turn` is answered by the same thread with no Abandon, and a nonce from turn 1 is recalled.
-    - **Failed:** the third turn is refused and needs Abandon, as dev-local `persistent` does by design.
+  - **Dory-wrangler restart.** Run `python3 dory-wrangler/tests/e2e_loop.py --launcher <internal id> --request-timeout 1800`. The default of 120 s can fail a real turn on time alone (TR-20). `third-turn` **passes in both outcomes**, so read its words: PASS alone settles nothing. The path's third turn asks `What was the first thing I said in this thread?`, and its first turn was `hello`.
+    - **Held:** `PASS third-turn: the third turn is answered after the restart: the agent live before the restart was re-attached and answered it, [...]`, and the answer quoted in the brackets names `hello`.
+    - **Failed:** `PASS third-turn: the third turn is answered after the restart: a newly launched agent answered it, [...]; the restart could not re-attach the agent, so the refused turn was sent again after the one action, abandon`. The thread did not survive, and the path took Abandon, as dev-local `persistent` does by design. `FAIL third-turn: continuation is declared persistent, but the agent live before the restart did not answer the third turn` is also failed.
+    - Both lines were seen on this tree. `e2e_loop.py --codex-model` prints the held line. `e2e_loop.py --launcher dev-local --launcher-options '{"profile": "persistent"}'` prints the failed line.
   - **Bridge or VS Code restart, and VM restart.** Store a nonce, restart that component, then send a turn in the same chat.
     - **Held:** the nonce is recalled.
     - **Failed:** refused, `reattach_failed`, or a new thread.
@@ -420,9 +432,9 @@ A failed entry is a successful result for #90 (#90 "Full Description").
 - **Status.** `unproven`.
 - **Sources.** #87 comment 5668684014 ("its uniqueness, lifetime, and survival across restarts are Codex's properties and remain unproven"); #89 comment 5668684450; control-plane `issue-87/state.md` N2.
 - **Why external validation cannot settle it.** Nothing above the seam can detect it. A handle is opaque to the harness and to the validator, so a store in which two live sessions share one address validates (`launch-boundary.md` obligation 6). External N2 evidence concerns synthesised handles only (TA-11).
-- **How internal dogfood settles it.** Over the whole dogfood store, list every `agent_handle` (`diagnostics.py --records lifecycle` per chat).
+- **How internal dogfood settles it.** Over the whole dogfood store, list every `agent_handle`: run `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records lifecycle` for each chat directory under `STORE/chats/`, and read the `agent_handle` of every `agent_session` record.
   - **Held:** no handle appears on two sessions.
-  - **Failed:** any repeat.
+  - **Failed:** any repeat. The procedure catches one: on the store of `e2e_loop.py --launcher dev-local --launcher-options '{"profile": "persistent"}'`, two sessions carry `dev-local-agent-0001` (TA-11).
 - **Depends on it.** Correct addressing of `deliver`, `events` and `stop`. A repeat would route one chat's turn to another's agent: a v0.1 gap.
 - **Owner.** #90.
 
@@ -503,6 +515,7 @@ A failed entry is a successful result for #90 (#90 "Full Description").
 - **Claim.** No per-launch host-specific parameter is needed beyond the instruction text. For resume, the handle is needed too. Provider, model and `--skip-git-repo-check` are launcher configuration, read from the launcher's own environment.
 - **Status.** `held (internal evidence)`.
 - **Evidence.** The launch form is `launch_agent.sh "<message>"`. The resume form is `launch_agent.sh --resumeID=<id> "<message>"`, or `codex exec resume -c "model_provider=..." -c "model=..." --skip-git-repo-check --json "<thread_id>" "<prompt>"`. The human states that the provider, the model and the flag are launcher configuration (#87 comments 5668368252 and 5669591294; #90 comment 5669593061).
+  - What is held rests on two things: the human's statement of that mapping, and the invocation shapes that have been shown to work. Nobody has observed that no other per-launch input is ever needed. The procedure below checks that for the real launcher.
 - **Source.** `facts-and-assumptions.md` A5.
 - **Why external validation cannot settle it.** Internal invocation.
 - **How internal dogfood settles it.** Check that the real launcher builds each call from the packet's text, the handle, and its own configuration only.
@@ -520,6 +533,29 @@ A failed entry is a successful result for #90 (#90 "Full Description").
   - **Held:** none did.
   - **Failed:** a type carried content the user needed.
 - **Depends on it.** `content.content_type` is fixed at `text/plain`. Anything more is later work, decided on captures.
+- **Owner.** #90.
+
+### TR-20 A real internal turn finishes within what a synchronous send will wait for
+
+- **Claim.** A real internal turn, run through the real launcher, finishes before anything that waits for the send gives up. That includes the browser, anything between the browser and the loopback server, and `e2e_loop.py`. So the answer to a long turn is shown where it was asked for.
+- **Status.** `unproven`.
+- **What the source shows.** This part is read from this tree:
+  - The served send is synchronous. `webapp.py`'s `do_POST` calls `service.send_user_message`, which runs the whole turn, launch or deliver and then the drain, before it answers.
+  - The page's `fetch` sets no timeout of its own.
+  - `e2e_loop.py` waits the same way, and bounds each request by `--request-timeout`, 120 s by default. A turn slower than that fails its step with `the shell gave no answer to POST /api/chats/<chat>/messages within 120s`. That line is about waiting, not about the entry under test.
+- **What is inferred.** This is an **inference, not an observation** (checkpoint review F3):
+  - that a real turn can take longer than the browser, a proxy or `e2e_loop.py`'s default will wait;
+  - that a client giving up leaves the turn to finish on the server and be recorded. That is what the source implies, but it has not been measured against a client timeout.
+
+  No real internal turn's duration has been recorded anywhere.
+- **Why external validation cannot settle it.** The in-repo agents answer in well under a second. The internal CLI, the model, and the internal workstation's browser and network policy are not reachable externally.
+- **How internal dogfood settles it.**
+  1. Record every real turn's duration. Either time the send in the browser, or, for each turn, subtract the user message's `created_at` from the answering agent message's `created_at` in `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records messages`.
+  2. In the browser, send a turn that asks for several minutes of work, and watch whether the page shows the answer without a reload.
+  3. Whenever `e2e_loop.py` runs against the real launcher, pass `--request-timeout` well above the longest duration recorded (TR-1, TR-9, LO-6).
+  - **Held:** durations are recorded, and the long turn's answer appears in the page as it would for a short one.
+  - **Failed:** the page shows an error, or no answer, although the store then holds the answer. That means the client or something in between gave up. Record the duration at which it happened, and preserve the chat with `diagnostics.py`.
+- **Depends on it.** Whether a user sees a long turn's answer where they asked for it. A client that gives up does not lose the turn: the server still finishes it and records it, so a reload should show it (inferred, above). The cost is the live display. #90 triages whether that is a v0.1 gap. Stopping or timing out a turn in flight stays out of v0.1 (#81 comment 5687495740; #83).
 - **Owner.** #90.
 
 ## Group 5. Launcher obligations
@@ -569,9 +605,32 @@ modelled transport only.
   - #88 comment 5811719649 ("frame bytes on `\n` only, and register a classifier");
   - #90 comment 5669593061's directive: raw JSONL for both, one path, no plain-text resume case.
 - **Why it matters.** A text-mode pipe or `splitlines()` splits on U+2028 and U+0085, drops `\r`, and loses a whole turn on a non-UTF-8 line. That was measured on `dev-local` before `507f505`.
-- **How internal dogfood settles it.** Run `python3 dory-wrangler/tests/run_tests.py` with a store the real launcher produced among the kept stores. Also run `reclassify_stores.py` over the dogfood store.
-  - **Held:** 0 not reproduced, 0 rendering disagreements.
-  - **Failed:** the gate fails closed on an unread launcher id, or on any disagreement.
+- **How internal dogfood settles it.** Snapshot the dogfood store, then re-classify the snapshot. Take the snapshot with no turn in flight; `validate_store.py` is read-only and may run while the shell serves.
+  1. `mkdir DIR`. Use an empty directory, because `reclassify_stores.py` reads every `*.json` file in it.
+  2. `python3 dory-wrangler/validate_store.py STORE --snapshot DIR/dogfood.json`. This should exit 0 with `the store satisfies contract v0.1`, and write the snapshot.
+  3. `python3 dory-wrangler/tests/reclassify_stores.py DIR`.
+  - **Held.** All of the following:
+    - exit 0;
+    - the first line is `1 store(s) in DIR`, so at least one store was read;
+    - the real launcher's sessions are counted under **its own id**:
+      - a line `<its id>  events N, reclassified N, reproduced N`, with N at least 1;
+      - under "rendering (A6)", a line `<its id>  agent messages M, agent messages exact M`, with M at least 1;
+    - `not reproduced: 0`;
+    - `adjudicated by name: 0; unadjudicated: 0`;
+    - `rendering disagreements: 0; adjudicated by name: 0; unadjudicated: 0`;
+    - `unadjudicated sessions: 0`;
+    - `system messages (decision 0006): disagreements: 0`.
+  - **Failed.** Exit 1, for any of these:
+    - a record not reproduced;
+    - an unadjudicated rendering or system-message disagreement;
+    - `UNREAD LAUNCHER dogfood.json '<id>' session ... carries ...`, which means a session under a launcher id that no classifier in `reclassify_stores.py` reads.
+
+    The gate **fails closed** on that last one. It stays failed until #90 registers the real launcher's classifier in `reclassify_stores.py` (obligation 8). Note that `not reproduced` and `rendering disagreements` both still read 0 in this case, so do not read held from those two lines alone.
+  - **Not evidence.** `0 store(s)` means nothing was read, which is neither held nor failed. It is what `reclassify_stores.py` prints, with exit 0, when pointed at a store directory instead of a directory of snapshots.
+  - **Why not `run_tests.py`.** It cannot check a dogfood store. Before its first phase it deletes its kept-store directory, `support.FIXTURE_OUT`: `$DORY_TEST_STORE_DIR`, or else `$TMPDIR/dory-wrangler-stores` (`run_tests.py`, `shutil.rmtree(support.FIXTURE_OUT)`). Phase 3 then reads only the stores the suite's own tests wrote there. A dogfood store placed there is deleted unread.
+  - **Run on this tree** (`issue-89-register-procedures-fix` handoff):
+    - The `e2e_loop.py --codex-model` store gives `1 store(s)`, `internal-bridge  events 6, reclassified 6, reproduced 6` and `internal-bridge  agent messages 3, agent messages exact 3 ...`, exit 0.
+    - The same store, with its session's `launcher_id` changed to `internal-codex`, a launcher id no classifier reads, still validates. It then gives `internal-codex  events 6, other launcher 6`, `unadjudicated sessions: 1`, `UNREAD LAUNCHER dogfood.json 'internal-codex' session ...`, exit 1.
   - A line of only ASCII whitespace carries no event and is not preserved (decision 0004). If real output ever carries meaning in such a line, report it.
 - **Depends on it.** Preservation (contract 7 P1), classification, and A6 exact-text rendering. A failure is a v0.1 gap.
 - **Owner.** #90.
@@ -611,9 +670,10 @@ modelled transport only.
   - it has one entry in `launchers/registry.py` (12).
 - **Status.** `unproven`.
 - **Sources.** `launch-boundary.md` obligations 9 to 12. #87 F1 (`_drain` spinning against a launcher that ignores `after_sequence`) is closed in the harness. The pre-existing deliver-then-blocking-drain hang needs an inconsistent launcher (control-plane `issue-87/state.md`, "Current Decision").
-- **How internal dogfood settles it.** Run `e2e_loop.py --launcher <internal id>` (every step), plus a provoked launch with no `thread.started` (TR-17).
+- **How internal dogfood settles it.** Run `python3 dory-wrangler/tests/e2e_loop.py --launcher <internal id> --request-timeout 1800` (every step), plus a provoked launch with no `thread.started` (TR-17). With the default of 120 s, a slow real turn fails a step on time alone, and that is neither held nor failed here (TR-20).
   - **Held:** all 11 steps pass, and the no-handle output is preserved against the failed session.
-  - **Failed:** any step, or a lost payload.
+  - **Failed:** any step for a reason other than the request timeout, or a lost payload.
+  - **After any run that was killed or timed out,** look with `ps` for a `codex` process the run left behind, and stop it by its PID. The suite's deadline kills the path's whole process group (`tests/test_end_to_end.run_loop`, `os.killpg`). A launcher that detaches its agent with `setsid`, or into a new session, leaves that group and survives the kill. No shipped launcher does this (`issue-89/state.md`, "End-To-End Path Accepted"). Whether the real launcher does is for code reading.
 
   TA-6 lists what running the launch-boundary tests against it would additionally need.
 - **Depends on it.** Swappability (#87). A failure is a v0.1 gap, and a contract defect if the seam itself cannot host the launcher (#90 "Full Description").
@@ -706,7 +766,7 @@ far the external evidence reaches, and how to read an internal failure.
 - **Two exceptions, stated.**
   - A filesystem without POSIX `link` semantics breaks portable tests. That is a product need (FS-1), not a mislabel.
   - Heavier load than four hogs is untested (TA-10).
-- **How internal dogfood uses it.** Run `run_tests.py --category portable --category launch-boundary --json`. A failure there that reproduces on a named re-run is a product or boundary finding (README "On an internal run", item 1).
+- **How internal dogfood uses it.** Run `python3 dory-wrangler/tests/run_tests.py --category portable --category launch-boundary --json portable.json`. A failure there that reproduces on a named re-run is a product or boundary finding (README "On an internal run", item 1).
 - **Owner.** #89.
 
 ### TA-2 The suite has no per-test deadline
@@ -714,7 +774,7 @@ far the external evidence reaches, and how to read an internal failure.
 - **Claim.** A product hang hangs the suite instead of failing a test.
 - **Status.** `known limitation`.
 - **Evidence.** On a filesystem whose `link` replaces an existing name, `test_diagnostic_access.OneDefinitionOfAOneShotTurnEnd.test_a_page_that_does_not_advance_is_not_a_turn_end` hangs (the portable-labels check; #89 comment 5819502876). Only some store-lock waiters and the end-to-end path carry deadlines (control-plane `issue-88/state.md`, "In-Flight Refusal Fix").
-- **How internal dogfood works around it.** Wrap internal runs in an outer `timeout`, with a generous limit: the suite takes about 9 to 12 minutes on the external desktop. Treat a timeout as a hang to investigate with `faulthandler` or a named re-run. Do not treat it as a pass.
+- **How internal dogfood works around it.** Wrap internal runs in an outer `timeout` with a generous limit, for example `timeout 3600 python3 dory-wrangler/tests/run_tests.py ...`; the suite takes about 9 to 12 minutes on the external desktop. Exit 124 is a timeout. Treat it as a hang to investigate with `faulthandler` or a named re-run. Do not treat it as a pass.
 - **Owner.** #89.
 
 ### TA-3 "No child process" assertions pass vacuously without `/proc` child lists
@@ -795,6 +855,7 @@ far the external evidence reaches, and how to read an internal failure.
 - **Claim.** Two limits on the external evidence.
   - **Route versus response.** The served-boundary tests require the route set to equal the intended routes. They do not inspect every response's content, so agent output behind a query string, or session ids behind a header, would leave the tests green.
   - **Load.** The load perturbation was one level (four hogs on four CPUs). Timing-sensitive development-environment tests may fail under heavier internal load, and this host's sandbox intermittently refuses `exec`.
+    - One named case is `test_end_to_end.AHungRunLeavesNoServer.test_a_run_killed_at_its_deadline_leaves_no_process_behind` (development-environment). It samples the running processes 15 s into a 20 s deadline. Under heavy load the path may not yet have started its shell and agent by then, and the test fails with `the hung run never had a shell and an agent`. It passed 6 of 6 times in the end-to-end check (`issue-89/state.md`, "End-To-End Path Accepted").
 - **Status.** `known limitation`.
 - **Evidence.**
   - The route-versus-response limit was carried from #86's re-review (control-plane `issue-86/state.md`, "Re-review Outcome"), and routed "to #89/#90" by #88 (`issue-88/state.md`, "Carried Findings That Land On #88").
@@ -810,6 +871,7 @@ far the external evidence reaches, and how to read an internal failure.
 - **Status.** `known limitation` of the external development launcher. It is the N2 obligation observed on `dev-local`.
 - **Evidence.** The end-to-end checkpoint review (`issue-89-e2e-checkpoint-review` handoff, item (c)); `issue-89/state.md`, "End-To-End Path Accepted".
 - **Why it does not transfer.** `dev-local`'s agents die with the shell, so it cannot re-attach by design (the orchestrator's ruling on dev-local `persistent` after restart, `issue-89/state.md`). It is not shipped internally.
+  - `dev-local` itself does **not** meet obligation 6, which requires a synthesised handle to be unique across process lifetimes. That is harmless today for one reason only: its agents die with the shell, so re-attachment fails at start-up, before any new launch can reuse a live chat's address.
   - The internal handle is Codex-issued, so obligation 6 does not bind it (TR-11 and LO-1 are the internal questions).
   - The handle reuse is recorded here and not fixed, because #89 changes no product code.
 - **Owner.** #89.
@@ -845,14 +907,14 @@ carried here where it is an assumption. See Appendix A.
 | 1. Runtime and platform (RT) | 1 | 0 | 5 | 0 | 6 |
 | 2. Filesystem and store (FS) | 0 | 0 | 3 | 0 | 3 |
 | 3. Process and launch mechanics (PR) | 0 | 0 | 3 | 0 | 3 |
-| 4. Internal transport and event stream (TR) | 7 | 0 | 12 | 0 | 19 |
+| 4. Internal transport and event stream (TR) | 7 | 0 | 13 | 0 | 20 |
 | 5. Launcher obligations (LO) | 0 | 0 | 6 | 1 | 7 |
 | 6. Served UI (UI) | 1 | 1 | 1 | 0 | 3 |
 | 7. Test apparatus (TA) | 0 | 1 | 0 | 10 | 11 |
-| **Total** | **9** | **2** | **30** | **11** | **52** |
+| **Total** | **9** | **2** | **31** | **11** | **53** |
 
 There are 19 entries marked [human-required]: RT-1, PR-1, PR-2 and TR-1 to
-TR-16. The owners are #90 for the 41 entries in groups 1 to 6, and #89 for the
+TR-16. The owners are #90 for the 42 entries in groups 1 to 6, and #89 for the
 11 in group 7.
 
 ## Appendix A. Traceability
@@ -865,6 +927,7 @@ section.
 
 | Item | Placed |
 | --- | --- |
+| #89 description: timing is among the things external validation cannot prove | TR-20: a real turn's duration against the synchronous send and `e2e_loop.py --request-timeout`. Added after checkpoint review F3 |
 | 5648269596: continuation capability, required unproven | TR-1 (since held; superseded explicitly by 5668368963) |
 | 5648269596: instruction-payload bound, no bound stated | TR-2 |
 | 5648269596: response shape: discrete events, and end distinguishable from quiet | TR-3, TR-5 |
@@ -975,6 +1038,8 @@ section.
 | #89 end-to-end: the stale `test_restart` docstring | not an assumption; fixed at `b216430` (accepted at `48f1412`) |
 | #89 end-to-end: README `python3` is 3.6 on the desktop | not an internal assumption; internally `python3` is 3.9.25 (RT-1); the README's Testing section already says to use `python3.11` on the desktop |
 | #89 end-to-end: browser rendering unverified; Python 3.9 execution unproven | UI-2; RT-2 |
+| #89 end-to-end accepted: a future launcher detaching with `setsid` would escape the group kill | not an assumption about the host. It is a property of #90's launcher under the suite's deadline, which kills the path's process group. LO-6 says to look for a `codex` process left behind after a killed run, and to stop it by PID |
+| #89 end-to-end accepted: the hung-run test samples at 15 s of a 20 s deadline and could flake under heavy load | TA-10 (load), naming `test_end_to_end.AHungRunLeavesNoServer.test_a_run_killed_at_its_deadline_leaves_no_process_behind` |
 | #89 end-to-end: the persistent-restart ruling (dev-local cannot re-attach) | not a portability assumption; a `dev-local` design property ruled as completing the loop; the internal question is TR-9 |
 | #89 portable: locale reaches the test apparatus (argv) | TA-9; the product side is RT-5 |
 | #89 portable: `flock`/exclusive creation isolated to 22 named tests | FS-2 |
