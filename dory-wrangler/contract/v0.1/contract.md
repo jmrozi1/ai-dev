@@ -149,8 +149,10 @@ transcript renders.
 - `sequence` is unique and contiguous from 1 within a chat (`DUPLICATE_SEQUENCE`,
   `SEQUENCE_GAP`). A gap means a turn was lost; it is never closed silently.
 - `author: "agent"` **requires** both `session_id` and `source_event_id`
-  (`FABRICATED_AGENT_MESSAGE`). This is the structural guarantee that agent
-  history is transcribed evidence rather than narration.
+  (`FABRICATED_AGENT_MESSAGE`). With the next rule, this guarantees that agent
+  history is attributed to preserved, recognized, agent-sourced evidence on the
+  same chat and session rather than narrated. It does not check that the
+  message's text is that evidence's text; that is left to implementations.
 - The cited event must be `interpretation: "recognized"`
   (`MALFORMED_EVENT_RENDERED`), must be `source: "agent"`
   (`NON_AGENT_EVENT_RENDERED`), and must belong to the same chat and session
@@ -159,6 +161,21 @@ transcript renders.
 - `author: "user"` and `author: "system"` must carry `null` in both fields
   (`MESSAGE_PROVENANCE_INVALID`). A user turn is not derived from the
   integration.
+
+**Why the guarantee reads attribution, not transcription.** The earlier form
+said `FABRICATED_AGENT_MESSAGE` "is the structural guarantee that agent history
+is transcribed evidence rather than narration", which overstated it. What this
+section's four rules — `FABRICATED_AGENT_MESSAGE`, `MALFORMED_EVENT_RENDERED`,
+`NON_AGENT_EVENT_RENDERED`, `CORRELATION_MISMATCH` — enforce is attribution: an
+agent message cites a preserved, recognized, agent-sourced event of its own chat
+and session. Neither they nor the validator compare the message's text with that
+event's content, and a store-level check cannot without knowing each launcher's
+wire format, which is what locates the text inside `raw.body`. That comparison,
+transcription, is enforced by the implementation: #88's decision 0005 gates
+every agent message on its cited event's exact text. **No rule changes.** No rule
+bullet, violation code, fixture, or validator check moves; only the sentence
+describing what the rules guarantee does. A human-authorized editorial
+correction of 2026-09-24.
 
 `content_type` is fixed at `text/plain` in v0.1. Richer content is an additive
 v0.2 concern; a store using another value fails closed today.
@@ -892,7 +909,8 @@ valid UTF-8.
   but cannot attribute on this session; `interpreted_type` is `null`.
 - `unrecognized` and `malformed` must have `interpreted_type: null`; `recognized`
   must name one (`EVENT_INTERPRETATION_INCONSISTENT`).
-- `malformed` — could not be parsed at all; `interpreted_type` is `null`.
+- `malformed` — could not be parsed at all, or parses as a type this build knows
+  but lacks what that type requires; `interpreted_type` is `null`.
 
 An unrecognized event is a **finding**, not an error. Its accumulation is the
 primary discovery output of v0.1 and the direct input to #89 and #90.
@@ -913,6 +931,17 @@ the same bytes preserved as `unrecognized` with `interpreted_type: null` are
 accepted today. Residual, stated rather than implied: a reader cannot tell a
 genuinely unknown type from a declined one without reading `raw.body`. Reported
 by #88; the widening is a human decision of 2026-09-15.
+
+**Why `malformed` names a second case.** The earlier form read "could not be
+parsed at all", which understated the established reading: a payload that
+parses and is of a type this build knows, but lacks the field that type
+requires — an answer-shaped payload with no string text — is also recorded
+`malformed` (#88 decision 0004). **No rule changes.** Both cases carry
+`interpreted_type: null`, and the consistency rule, `MALFORMED_EVENT_RENDERED`,
+and P4 read only `interpretation` and `interpreted_type`, never why parsing
+failed, so no violation code, fixture, or validator check moves. A
+human-authorized editorial correction of 2026-09-24; #88's classification review
+judged it a #85 wording item, not a conformance defect.
 
 **P2a. An agent's output presupposes an agent.** A `diagnostic_event` with
 `source: "agent"` requires its session to have reached `running`
