@@ -159,6 +159,10 @@ ASSIGNMENTS = {
     "test_convergence.TheStoreLockHasNoGaps.test_closing_the_served_application_gives_the_store_back": DEV,
     "test_convergence.TheStoreLockHasNoGaps.test_a_shell_refused_its_port_re_attaches_nothing_and_holds_nothing": DEV,
     "test_convergence.TheStoreLockHasNoGaps.test_a_shell_that_fails_to_start_gives_back_what_it_took_even_while_its_error_lives": DEV,
+    # Its child decides "held" by taking `flock` on a second descriptor of the
+    # same process (measured: under a `lockf` emulation of flock it reads "b" as
+    # free, and it is the only portable or launch-boundary test that fails so).
+    "test_convergence.TheStoreLockHasNoGaps.test_a_store_collected_while_the_guard_is_held_does_not_deadlock": DEV,
     "test_store.TestGuardedCodes.test_duplicate_sequence": DEV,
     "test_store.TestTheDeliveryAcknowledgementIsWrittenOnce.test_two_concurrent_answers_to_one_delivery_record_exactly_one": DEV,
 
