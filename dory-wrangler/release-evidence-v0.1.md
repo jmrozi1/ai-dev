@@ -227,7 +227,7 @@ From `$DW/tree`:
   python3 -c 'import sys; print(sys.version); print("fsencoding", sys.getfilesystemencoding())'
   locale; nproc; ulimit -n; id -u
   findmnt -T $DW; stat -f -c 'filesystem %T' $DW
-  ls /proc/self/task/*/children
+  ls /proc/$$/task/*/children
   timedatectl
 } > $DW/results/host.txt 2>&1
 ```
@@ -236,8 +236,15 @@ From `$DW/tree`:
   missing or older than 3.9, stop and report `host.txt`: nothing else here can
   run (decision 0001, R1).
 - `findmnt` gives the store filesystem's type for FS-1 and FS-3. `id -u` should
-  not be 0 (TA-4). `ls /proc/self/task/*/children` failing means the "no child
-  process" checks prove nothing on this host (TA-3). A non-UTF-8 `locale`
+  not be 0 (TA-4). `ls /proc/$$/task/*/children` failing means the "no child
+  process" checks prove nothing on this host (TA-3). **Use this form, not the
+  register's.** TA-3 in the register writes `ls /proc/self/task/*/children`,
+  which reports the files absent even where they exist: the shell expands the
+  glob for its own process, and `ls`, a different process, then looks under its
+  own `/proc/self`. On the external desktop that form printed `No such file or
+  directory` while `/proc/$$/task/$$/children` listed the shell's child. The
+  register is part of the tested tree, so it is corrected here rather than
+  edited. A non-UTF-8 `locale`
   explains two development-environment tests (TA-9). A very large `ulimit -n`
   makes two portable tests slow (TA-7).
 
