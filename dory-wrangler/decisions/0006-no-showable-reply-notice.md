@@ -54,7 +54,8 @@ Contract 6.1 supplies the rule: a one-shot launcher "returns the agent's
 response from the call", and `events` serves it resumably by sequence, so the
 end of what the call produced is the read that finds nothing more. On a
 `stream` session re-attachment still reads one page: reading on would block
-start-up on a quiet stream.
+start-up on a quiet stream. What that costs a launcher that pages a stream is
+stated under "Named cases" below; it is carried to #90.
 
 **Not a turn end:** a read that failed on our side (`stream_read_failed`), a
 read that returned something that is not a page, an empty page on a session with
@@ -125,6 +126,26 @@ says when it is written.
   one agent `running`, so the next send is refused with the words that name
   Abandon, the exit decision D2 gives every non-terminal state. The harness does
   not conclude the agent ended; that would be lifecycle inference.
+
+* **A `stream` launcher that serves a turn over several pages, carried to #90**
+  (diagnostic checkpoint review finding G3, measured there with a stream
+  launcher serving an agent's thinking and then its `turn_complete`, one payload
+  per page). Re-attachment at start reads one page and observes no end. The
+  next turn's drain then reads the rest of the earlier turn -- its
+  `turn_complete` -- and takes it as the end of the turn being sent, so it writes
+  a **false** no-showable-reply notice under turn 2 while turn 2's reply is still
+  to come; turn 2's reply then shows only after a later restart. So it is a false
+  notice plus a misplaced reply, not only a reply that renders late. It needs a
+  paging stream launcher, which no in-tree launcher is, and is identical before
+  and after this checkpoint. Reading a stream on at re-attachment would block
+  start-up on a quiet stream, and ending the earlier turn at the next send needs
+  a rule this decision does not have, so #90's real launcher decides it.
+* **A launcher obligation this rule rests on, carried to #90.** Re-attachment
+  takes stored-but-unshown output on a `one_shot` session as proof that the call
+  returned. That holds only if **a one-shot launcher serves output only from
+  calls that have returned**. Contract 6.1 implies it ("returns the agent's
+  response from the call") but does not state it; #90's real launcher must meet
+  it, or say that it does not.
 
 ## Evidence
 
