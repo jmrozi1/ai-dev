@@ -58,11 +58,14 @@ system message carries anything derived from the integration -- and must follow
 a user turn, at most once per turn, in a turn that has no agent message.
 
 **Adjudication keys** (classify check L1) name one record and nothing else: the
-store file, the session -- by its chat's title and the sequence of the user
-message that opened it, which are stable from run to run where ids are not --
-the record's sequence, and a SHA-256 of the record's body (`raw.body` for an
-event, `content.text` for a message). A different record at the same place, or
-the same record with different bytes, is not covered.
+store file, the session -- by its chat's `chat_id` and the sequence of the user
+message that opened it, which is unique within a store (malformed review F2: a
+chat's title is not, so a same-titled twin chat was covered by its twin's
+entry), and which a test that keeps an adjudicated record makes stable from run
+to run by creating that chat under a fixed id -- the record's sequence, and a
+SHA-256 of the record's body (`raw.body` for an event, `content.text` for a
+message). A different record at the same place, or the same record with
+different bytes, is not covered.
 
 **Exit status** is 0 only when every re-classified record reproduced, every
 synthesised record is consistent with its own bytes, every agent message
@@ -102,7 +105,8 @@ def body_hash(text):
 # key (`session_key`), sequence, recorded reading and the hash of its `raw.body`,
 # with the reason. Nothing else may disagree.
 ADJUDICATED = {
-    ("page-preserved-past-a-clock-refusal.json", "Clock refusal mid-page/1", 3, ("unrecognized", None),
+    ("page-preserved-past-a-clock-refusal.json", "cht_c10c4ref05a1m1dpage0001/1", 3,
+     ("unrecognized", None),
      body_hash('{"type": "exit_report"}')):
         "test_convergence.PagedLauncher, a probe that keeps the scripted-stub id, "
         "hands the harness a launcher-sourced {\"type\": \"exit_report\"} stated "
@@ -137,19 +141,19 @@ CHAT_TEXT_READING = ("recognized", "assistant_text")
 
 
 def session_keys(records):
-    """session_id -> "<chat title>/<sequence of the user message that opened it>".
+    """session_id -> "<chat_id>/<sequence of the user message that opened it>".
 
-    Stable from run to run, where the ids themselves are random."""
-    titles = dict((r["chat_id"], r.get("title")) for r in records
-                  if r.get("record_type") == "chat")
+    Unique within a store: a chat id names one chat, and a user message opens at
+    most one session. A chat's title named it before, and two chats may share a
+    title (malformed review F2). A kept store's ids are random from run to run,
+    so a test whose record is adjudicated creates its chat under a fixed id."""
     opened = dict((r["message_id"], r["sequence"]) for r in records
                   if r.get("record_type") == "message")
     keys = {}
     for session in (r for r in records if r.get("record_type") == "agent_session"):
         transitions = session.get("transitions") or [{}]
         ref = (transitions[0].get("evidence") or {}).get("ref")
-        keys[session["session_id"]] = "%s/%s" % (titles.get(session["chat_id"]),
-                                                 opened.get(ref))
+        keys[session["session_id"]] = "%s/%s" % (session["chat_id"], opened.get(ref))
     return keys
 
 

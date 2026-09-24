@@ -2068,7 +2068,10 @@ class APageIsPreservedPastARefusal(unittest.TestCase, StoreCheck):
             [agent_text(1, "first"), launcher_report(2, "session_completed"),
              lb.EventPayload(3, "launcher", "unrecognized", b'{"type": "exit_report"}')],
         ]))
-        chat_id = harness.create_chat("Clock refusal mid-page")
+        # A fixed chat id: `reclassify_stores.ADJUDICATED` names this store's
+        # exit_report record by chat id (malformed review F2).
+        chat_id = harness.store.create_chat(
+            "Clock refusal mid-page", chat_id="cht_c10c4ref05a1m1dpage0001")["chat_id"]
         real = harness.store.append_transition
 
         def clock_steps_back_for_completion(*args, **kwargs):

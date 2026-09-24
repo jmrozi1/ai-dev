@@ -37,7 +37,24 @@ Only on something the launcher reported or the call itself did, never on time
 | --- | --- |
 | drain, `one_shot` session | the launch or delivery call has returned with its whole response, and reading reached a page with nothing more on it; or the launcher reported one of the ends below |
 | drain, `stream` session | a recognized `turn_complete`; a launcher's `session_completed` or `session_failed`; a launcher's `stream_end` |
-| re-attachment at start | the page it read reports one of those ends; or, on a `one_shot` session, the page carries anything not yet stored -- a one-shot launcher serves only what calls that have already returned produced |
+| re-attachment at start, `stream` session | the one page it reads reports one of those ends |
+| re-attachment at start, `one_shot` session | exactly the drain's rule, read on from the page it read with the drain's own loop: a page carrying output not yet stored shows the call returned (a one-shot launcher serves nothing else), and from there a page with nothing more on it is the end; or the launcher reported an end |
+
+**One definition of a `one_shot` turn's end** (malformed review F1):
+`SessionManager._one_shot_turn_ended` -- once the call is known to have
+returned, a page with nothing more on it. The drain and re-attachment both
+decide there. Before this, re-attachment took any new output as the end, so a
+page with a declined `stream_end` claim and no `turn_complete` got the notice at
+re-attachment and none at the drain, and a response served over several pages
+got the notice after its first page while its reply rendered under the next
+turn. Now re-attachment reads such a response to its end, renders it under the
+turn it answers, and refuses what the drain refuses -- a declined claim, a page
+that says a stream ended -- so neither path ends a turn the other would not.
+Contract 6.1 supplies the rule: a one-shot launcher "returns the agent's
+response from the call", and `events` serves it resumably by sequence, so the
+end of what the call produced is the read that finds nothing more. On a
+`stream` session re-attachment still reads one page: reading on would block
+start-up on a quiet stream.
 
 **Not a turn end:** a read that failed on our side (`stream_read_failed`), a
 read that returned something that is not a page, an empty page on a session with
@@ -93,6 +110,15 @@ says when it is written.
 * A harness that dies between preserving a turn's end and writing its notice
   leaves that turn without one: re-attachment then reads an empty page and
   observes nothing. The two writes cannot be one without new store machinery.
+* A harness that dies after preserving an answer's text event and before
+  writing its agent message, where the turn's later payloads -- its
+  `turn_complete`, say -- were not yet read, gets the notice at re-attachment
+  over an answer the store holds but the chat does not show (malformed review
+  residual). The notice's words are literally true -- the reply cannot be shown
+  there -- and what the agent sent is preserved. **Named, not closed:** closing
+  it means rendering a preserved event whose message was never written, from
+  the store, at re-attachment -- a second rendering path, which decision 0005's
+  one rendering rule does not have and this checkpoint may not add.
 * A harness that dies inside the call, before a one-shot launcher returned,
   leaves the turn without a notice after restart: nothing observed its end.
 * Under `fresh_binding`, a launcher that never reports its agent done keeps that

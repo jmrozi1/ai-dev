@@ -752,7 +752,7 @@ class SessionManager(object):
         self._notice_if_seen_unanswered(session, seen)
         return agent_messages
 
-    def _read_turn(self, session, agent_messages, seen):
+    def _read_turn(self, session, agent_messages, seen, page=None, call_returned=True):
         """Read this turn's output through `events` and preserve all of it.
 
         Terminates on what the launcher reported and on nothing else: a turn
@@ -763,10 +763,18 @@ class SessionManager(object):
 
         `seen` records whether the turn was **observed to end** (decision 0006):
         the launcher reported a turn end on a page it read, or -- for a session
-        whose launcher declares `one_shot`, whose call has already returned with
-        its whole response -- the read reached a page with nothing more on it.
-        A read failure, a page that is not a page, and an empty page on a
-        session with a stream are not turn ends: nothing observed the turn end.
+        whose launcher declares `one_shot` -- `_one_shot_turn_ended` holds. A
+        read failure, a page that is not a page, and an empty page on a session
+        with a stream are not turn ends: nothing observed the turn end.
+
+        The drain calls this after the launch or delivery call returned, so
+        `call_returned` is true and `page` is None. Re-attachment on a
+        `one_shot` session calls it with the page it already read and
+        `call_returned` false (review finding F1): it does not know the call
+        returned until a page shows output that call produced, and from there
+        it reads on exactly as the drain does, so a response served over several
+        pages is read to its end, rendered under the turn it answers, and ends
+        by the one rule.
         """
         chat_id = session["chat_id"]
         session_id = session["session_id"]
@@ -775,18 +783,20 @@ class SessionManager(object):
 
         while True:
             after = self._store.next_event_sequence(chat_id, session_id) - 1
-            try:
-                page = self._boundary.events(agent_handle, after)
-            except LauncherError as exc:
-                # A reader-side failure is not an end of stream. It says nothing
-                # about whether the agent is alive (contract 4.7, 6.1).
-                observation_id = self._record_observation(
-                    session, "stream_read_failed",
-                    "%s: %s" % (exc.category, exc.detail))
-                if session["state"] == "running":
-                    self._transition(session, "unknown", "launcher", "observation",
-                                     observation_id)
-                return agent_messages
+            if page is None:
+                try:
+                    page = self._boundary.events(agent_handle, after)
+                except LauncherError as exc:
+                    # A reader-side failure is not an end of stream. It says
+                    # nothing about whether the agent is alive (contract 4.7,
+                    # 6.1).
+                    observation_id = self._record_observation(
+                        session, "stream_read_failed",
+                        "%s: %s" % (exc.category, exc.detail))
+                    if session["state"] == "running":
+                        self._transition(session, "unknown", "launcher", "observation",
+                                         observation_id)
+                    return agent_messages
 
             if not isinstance(page, EventsPage):
                 # Intake drop 4. A non-page carries no payload, so there are no
@@ -840,12 +850,7 @@ class SessionManager(object):
                     self._transition(session, "unknown", "launcher", "stream_end",
                                      stream_end_event_id)
                 return agent_messages
-            if not page.payloads and not has_stream:
-                # A one-shot launcher's call has returned with its whole
-                # response, so a page with nothing more on it is the end of
-                # what that call produced: the turn is observed to have ended.
-                # On a session with a stream an empty page is only a quiet
-                # stream, which is not evidence of anything (contract 5.3).
+            if self._one_shot_turn_ended(has_stream, call_returned, page):
                 seen.ended = True
             if turn_complete or not page.payloads:
                 return agent_messages
@@ -868,6 +873,34 @@ class SessionManager(object):
                     "advance means the launcher ignored after_sequence and reading "
                     "again cannot make progress"
                     % (len(page.payloads), session_id, after))
+            # This page stored output. On a `one_shot` session that output was
+            # produced by a call that has returned -- such a launcher serves
+            # nothing else -- so from here an empty page is that call's end.
+            call_returned = True
+            page = None
+
+    @staticmethod
+    def _one_shot_turn_ended(has_stream, call_returned, page):
+        """The one definition of "a `one_shot` turn has ended" (review finding F1).
+
+        Contract 6.1: a launcher declaring `one_shot` has no stream; it returns
+        the agent's response from the call, and `events` serves that response,
+        resumably, by sequence, possibly over several pages. So once the call is
+        known to have returned, a page with nothing more on it is the end of what
+        it produced. Before that, an empty page is only a read that found
+        nothing, which observes nothing -- the harness may have died inside the
+        call. A launcher's claim that its stream ended is no such end: it has
+        no stream, and the claim is declined wherever it appears.
+
+        The drain knows the call returned, because it reads only after the call
+        does. Re-attachment knows it once a page has stored output that call
+        produced, and then reads on to the empty page like the drain. Both
+        decide here, so neither can end a turn the other would not. The other
+        ends -- a reported `turn_complete`, a terminal lifecycle event, a
+        stream's `stream_end` -- are what the launcher reported and are read
+        from the page (`_PageTaken.turn_end_reported`) the same way on both.
+        """
+        return not has_stream and call_returned and not page.payloads
 
     def _take_page(self, session, page, has_stream, agent_messages):
         """Preserve every payload of one page, and act on what the launcher reported.
@@ -1430,28 +1463,34 @@ class SessionManager(object):
         drop 1). A launcher returning something that is not a page is still
         ignored here, as it was: there are no raw bytes to preserve (drop 4).
 
-        **The notice rule is the drain's** (decision 0006): a turn this page
+        **The notice rule is the drain's** (decision 0006): a turn this read
         shows ended, with nothing lost, gets the notice if it has no reply and
-        no notice yet. Re-attachment observes a turn end when the page reports
-        one, or -- on a session whose launcher declares `one_shot`, which serves
-        only what calls that have already returned produced -- when the page
-        carries anything new at all. An empty page observes nothing, so a turn
+        no notice yet. On a session with a stream, re-attachment reads this one
+        page and observes a turn end only when the page reports one -- reading
+        on would block start-up on a quiet stream. On a session whose launcher
+        declares `one_shot`, it reads on from this page with the drain's own
+        loop (review finding F1), which serves only what calls that returned
+        produced and so cannot block: a response over several pages is read to
+        its end and rendered under the turn it answers, a page the drain would
+        refuse is refused here too, and the turn ends by the one definition,
+        `_one_shot_turn_ended`. An empty first page observes nothing, so a turn
         whose call never returned stays without a notice, exactly as it stays
         without a reply.
         """
         has_stream = self._session_has_stream(session)
-        taken = self._take_page(session, page, has_stream, [])
         seen = _TurnSeen()
-        seen.took(taken)
-        if not has_stream and taken.stored_any:
-            seen.ended = True
         try:
-            if (taken.stream_end_event_id is not None and not taken.reached_terminal
-                    and session["state"] == "running"):
-                self._transition(session, "unknown", "launcher", "stream_end",
-                                 taken.stream_end_event_id)
-            if taken.refusal is not None:
-                raise taken.refusal
+            if not has_stream:
+                self._read_turn(session, [], seen, page=page, call_returned=False)
+            else:
+                taken = self._take_page(session, page, has_stream, [])
+                seen.took(taken)
+                if (taken.stream_end_event_id is not None and not taken.reached_terminal
+                        and session["state"] == "running"):
+                    self._transition(session, "unknown", "launcher", "stream_end",
+                                     taken.stream_end_event_id)
+                if taken.refusal is not None:
+                    raise taken.refusal
         except (StoreError, LaunchBoundaryError):
             self._notice_if_seen_unanswered(session, seen, refused=True)
             raise
