@@ -372,8 +372,8 @@ A failed entry is a successful result for #90 (#90 "Full Description").
 - **Evidence.** #89 comment 5669592360; #87 comment 5669591294; #90 comment 5669593061. The recognized set is declared once in `tests/internal_bridge.RECOGNIZED` (decision 0004).
 - **Why external validation cannot settle it.** Internal CLI output.
 - **How internal dogfood settles it.** After real turns (launch and resume), run LO-3's procedure over the dogfood store: snapshot it, then run `reclassify_stores.py`. Phase 3 of `run_tests.py` reads only the suite's own stores. Also compare each agent message with its cited event's `item.text`, using `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records messages` and `... --records events`.
-  - **Held:** every rendered message is exactly an `item.text`.
-  - **Failed:** the reply text arrives in another event or field. It would then be preserved as `unrecognized` and nothing would render; the no-showable-reply notice would say so (decision 0006).
+  - **Held:** LO-3 reads held on that store, including its step 4 (every sent turn answered by a rendered agent message), and every rendered message is exactly an `item.text`.
+  - **Failed:** the reply text arrives in another event or field, or as a line that is not JSON. It would then be preserved as `unrecognized` or `malformed` and nothing would render; the no-showable-reply notice would say so (decision 0006). LO-3's step 4 is what catches this, because nothing that renders disagrees.
 - **Depends on it.** Rendering (decision 0005). A failure is a v0.1 gap in the classifier declaration (LO-3).
 - **Owner.** #90.
 
@@ -605,32 +605,49 @@ modelled transport only.
   - #88 comment 5811719649 ("frame bytes on `\n` only, and register a classifier");
   - #90 comment 5669593061's directive: raw JSONL for both, one path, no plain-text resume case.
 - **Why it matters.** A text-mode pipe or `splitlines()` splits on U+2028 and U+0085, drops `\r`, and loses a whole turn on a non-UTF-8 line. That was measured on `dev-local` before `507f505`.
-- **How internal dogfood settles it.** Snapshot the dogfood store, then re-classify the snapshot. Take the snapshot with no turn in flight; `validate_store.py` is read-only and may run while the shell serves.
+- **How internal dogfood settles it.** Check the dogfood store against the contract, snapshot it, re-classify the snapshot, and check that every turn was answered. Take the snapshot with no turn in flight; `validate_store.py` is read-only and may run while the shell serves. Run it over a store in which every turn was sent through the real launcher and was expected to answer.
   1. `mkdir DIR`. Use an empty directory, because `reclassify_stores.py` reads every `*.json` file in it.
-  2. `python3 dory-wrangler/validate_store.py STORE --snapshot DIR/dogfood.json`. This should exit 0 with `the store satisfies contract v0.1`, and write the snapshot.
+  2. `python3 dory-wrangler/validate_store.py STORE --snapshot DIR/dogfood.json`, and record its exit status. It writes the snapshot whatever that status is.
   3. `python3 dory-wrangler/tests/reclassify_stores.py DIR`.
+  4. For each chat directory under `STORE/chats/`, run `python3 dory-wrangler/diagnostics.py STORE CHAT_ID --records messages --limit 1000 | grep -o '"author": "[a-z]*"'`. This prints the author of every message of the chat, in order. If standard error says the bound was reached, ask again as it says.
   - **Held.** All of the following:
-    - exit 0;
-    - the first line is `1 store(s) in DIR`, so at least one store was read;
+    - step 2 exits 0 and prints `the store satisfies contract v0.1`;
+    - step 3 exits 0;
+    - its first line is `1 store(s) in DIR`, so a store was read;
     - the real launcher's sessions are counted under **its own id**:
-      - a line `<its id>  events N, reclassified N, reproduced N`, with N at least 1;
+      - a line `<its id>  events N, reclassified R, reproduced R`, with R at least 1. The line may end `, synthesised S`, for records the launcher writes about its agent rather than reads from it (`reclassify_stores.py`, "synthesised"); then N is R + S. Any other word on that line (`not reproduced`, `other launcher`) is not held;
+      - `synthesised and inconsistent with their own bytes: 0`;
       - under "rendering (A6)", a line `<its id>  agent messages M, agent messages exact M`, with M at least 1;
     - `not reproduced: 0`;
     - `adjudicated by name: 0; unadjudicated: 0`;
     - `rendering disagreements: 0; adjudicated by name: 0; unadjudicated: 0`;
     - `unadjudicated sessions: 0`;
-    - `system messages (decision 0006): disagreements: 0`.
-  - **Failed.** Exit 1, for any of these:
-    - a record not reproduced;
-    - an unadjudicated rendering or system-message disagreement;
-    - `UNREAD LAUNCHER dogfood.json '<id>' session ... carries ...`, which means a session under a launcher id that no classifier in `reclassify_stores.py` reads.
+    - `system messages (decision 0006): disagreements: 0`;
+    - in step 4, every `"author": "user"` is followed by at least one `"author": "agent"` before the next user message, and no `"author": "system"` appears. Every sent turn was answered by a rendered agent message.
+  - **Failed.** Any of these:
+    - step 2 exits 1. The store violates the contract, for example with `DUPLICATE_ID`. Keep its output and the snapshot. A contract violation fails LO-3 whatever step 3 says, because step 3 checks classification and rendering only;
+    - step 3 exits 1, for any of these:
+      - a record not reproduced;
+      - an unadjudicated rendering or system-message disagreement;
+      - `UNREAD LAUNCHER dogfood.json '<id>' session ... carries ...`, which means a session under a launcher id that no classifier in `reclassify_stores.py` reads.
 
-    The gate **fails closed** on that last one. It stays failed until #90 registers the real launcher's classifier in `reclassify_stores.py` (obligation 8). Note that `not reproduced` and `rendering disagreements` both still read 0 in this case, so do not read held from those two lines alone.
-  - **Not evidence.** `0 store(s)` means nothing was read, which is neither held nor failed. It is what `reclassify_stores.py` prints, with exit 0, when pointed at a store directory instead of a directory of snapshots.
+      The gate **fails closed** on that last one. It stays failed until #90 registers the real launcher's classifier in `reclassify_stores.py` (obligation 8). Note that `not reproduced` and `rendering disagreements` both still read 0 in this case, so do not read held from those two lines alone;
+    - in step 4, a user turn with no agent message after it, or with the fixed notice (`"author": "system"`, decision 0006), while that turn's preserved events carry the reply. Read them with `python3 dory-wrangler/diagnostics.py STORE CHAT_ID`. A reply preserved as `malformed` or `unrecognized` and never rendered is a failure of the launcher's framing or classifier, and TR-3 or TR-7 has failed with it. Step 3 reads 0 disagreements for such a store, because nothing claimed to render that reply. So do not read held from step 3 alone.
+
+      If the agent really produced no reply in that turn -- its events hold no `agent_message` at all (TR-13) -- that turn is not LO-3 evidence either way. Record it under TR-13, and run LO-3 on a store whose turns all answered.
+  - **Not evidence.** Neither held nor failed:
+    - `0 store(s)` means nothing was read. It is what `reclassify_stores.py` prints, with exit 0, when pointed at a store directory instead of a directory of snapshots;
+    - `1 store(s)` with no line for the real launcher's id means the snapshot holds no session of it: an empty store, a store with no chat, or chats that never launched. `reclassify_stores.py` prints no per-launcher line and exits 0 for a store with no records at all.
   - **Why not `run_tests.py`.** It cannot check a dogfood store. Before its first phase it deletes its kept-store directory, `support.FIXTURE_OUT`: `$DORY_TEST_STORE_DIR`, or else `$TMPDIR/dory-wrangler-stores` (`run_tests.py`, `shutil.rmtree(support.FIXTURE_OUT)`). Phase 3 then reads only the stores the suite's own tests wrote there. A dogfood store placed there is deleted unread.
   - **Run on this tree** (`issue-89-register-procedures-fix` handoff):
     - The `e2e_loop.py --codex-model` store gives `1 store(s)`, `internal-bridge  events 6, reclassified 6, reproduced 6` and `internal-bridge  agent messages 3, agent messages exact 3 ...`, exit 0.
     - The same store, with its session's `launcher_id` changed to `internal-codex`, a launcher id no classifier reads, still validates. It then gives `internal-codex  events 6, other launcher 6`, `unadjudicated sessions: 1`, `UNREAD LAUNCHER dogfood.json 'internal-codex' session ...`, exit 1.
+  - **Run again with steps 2 and 4** (`issue-89-produce-release-evidence` handoff). Each store below gives step 3 exit 0 and every step-3 held line, so each shows why the other steps are there:
+    - an `e2e_loop.py --codex-model` store: step 2 exit 0, step 4 `user agent user agent user agent`. **Held.**
+    - a copy of it with a delivery request and a session observation copied under new file names: step 2 exit 1 with two `DUPLICATE_ID` violations and one `DUPLICATE_SEQUENCE`. **Failed.**
+    - a Codex-model store whose resumed turn printed its answer as plain text (`model_shell.py --behaviour plain-text-on-resume`): step 2 exit 0, step 4 `user agent user system`, and the second turn's reply `you first said: hello` preserved `malformed`. **Failed.**
+    - an `e2e_loop.py --launcher dev-local --launcher-options '{"profile": "one_shot"}'` store gives `dev-local  events 9, reclassified 6, reproduced 6, synthesised 3`, the shape the held line allows.
+    - an empty store gives `1 store(s)`, no per-launcher line, exit 0: not evidence.
   - A line of only ASCII whitespace carries no event and is not preserved (decision 0004). If real output ever carries meaning in such a line, report it.
 - **Depends on it.** Preservation (contract 7 P1), classification, and A6 exact-text rendering. A failure is a v0.1 gap.
 - **Owner.** #90.
@@ -881,8 +898,10 @@ far the external evidence reaches, and how to read an internal failure.
 `contract/v0.1/` is final for v0.1 and is not edited. Where internal evidence
 has overtaken an entry in `contract/v0.1/facts-and-assumptions.md`, the
 correction is made here (#89 comment 5668368963; control-plane
-`issue-85/state.md`). The same applies to two sentences in `launch-boundary.md`
-and one risk in `decisions/0001`. Read them through this table:
+`issue-85/state.md`). The same applies to two risks in `decisions/0001`. Two
+stale sentences in `launch-boundary.md` were also corrected in that file itself,
+in the `produce-mirror-ready-release-evidence` checkpoint, and are listed here
+for the record. Read them through this table:
 
 | Entry | What it says | What now holds | Where |
 | --- | --- | --- | --- |
@@ -893,7 +912,8 @@ and one risk in `decisions/0001`. Read them through this table:
 | `facts-and-assumptions.md` **A3** | a started agent can be stopped through its handle, and the handle survives a restart | the handle survives launcher processes: **held**; stop: **unproven** and assumed absent; restart survival: **unproven** | TR-8, TR-15, TR-9 |
 | `facts-and-assumptions.md` **A5** | instruction text plus correlation is the whole launch input | **held** internally | TR-18 |
 | `facts-and-assumptions.md` **F3** | "this development VM runs Python 3.9.25" | stale: that VM was retired on 2026-09-15; internal Python 3.9.25 is held for #86's tree; the release tree under 3.9 is unproven | RT-1, RT-2 |
-| `launch-boundary.md`, "Choosing a launcher" | "Persistent multi-turn delivery is unproven internally (U1)", and `one_shot` is the default "because it is the shape of the one internal path that is proven" | persistence is proven internally; `dev-local`'s default profile is a development choice, not a claim about the bridge | TR-1 |
+| `launch-boundary.md`, "Choosing a launcher" (corrected in the file) | "Persistent multi-turn delivery is unproven internally (U1)", and `one_shot` is the default "because it is the shape of the one internal path that is proven" | persistence is proven internally; `dev-local`'s default profile is a development choice, not a claim about the bridge | TR-1 |
+| `launch-boundary.md`, the model's product properties (corrected in the file) | "Stop reaching a turn in flight remains the human's decision" | decided by the human on 2026-09-15: Stop does not reach a turn in flight in v0.1; interrupting one is #83's work (#81 comment 5687495740; decision 0003, section 5) | TR-4, TR-15 |
 | `decisions/0001` **R1** | the platform interpreter is present on the internal host (a guess) | **held** (internal evidence) | RT-1 |
 | `decisions/0001` **R2** | loopback HTTP is reachable from a browser (a guess) | **held** for #86's tree | UI-1 |
 

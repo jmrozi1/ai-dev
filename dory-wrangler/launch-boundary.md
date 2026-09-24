@@ -67,12 +67,14 @@ repository has never seen.
 | `dev-local`, profile `persistent` | `persistent` | `stream` | `null` |
 | `scripted-stub` | either, as configured | either, as configured | `null` by default |
 
-The `one_shot` profile is the default because it is the shape of the one
-internal path that is proven: `~/scripts/launch_agent.sh` takes instruction text
-and returns the agent's response (facts-and-assumptions F10). Persistent
-multi-turn delivery is unproven internally (U1); `dev-local`'s persistent profile
-declares it because *that launcher* can genuinely do it, which is not a claim
-about the bridge.
+The `one_shot` profile is the default. It was chosen as the shape of the first
+internal path proven, `~/scripts/launch_agent.sh` taking instruction text and
+returning the agent's response (facts-and-assumptions F10); it is a development
+choice, not a claim about the bridge. Persistent multi-turn delivery has since
+been proven internally: the script resumes an agent by its ID, and the internal
+launcher declares `continuation: persistent` (assumption register TR-1, which
+supersedes facts-and-assumptions U1 and F10; TR-8). `dev-local`'s persistent
+profile declares it because *that launcher* can genuinely do it.
 
 `instruction_bound_bytes` is `null` everywhere. No bound has been measured, here
 or internally. The enforcement mechanism is live and tested; the value is #90's
@@ -234,5 +236,7 @@ has been shown for the script, so a stop is recorded unconfirmed and the one
 lifecycle action, `abandon`, is the exit; a dead bridge is discoverable only by
 attempting a turn; and a restart that finds no output of the thread ends in
 `unknown`, whose exit is the same action. Each has a named test in
-`tests/test_internal_bridge.py`. Stop reaching a turn in flight remains the
-human's decision.
+`tests/test_internal_bridge.py`. Stop reaching a turn in flight was decided by
+the human on 2026-09-15: in v0.1 it does not, and interrupting a turn in flight
+is later supervision work (#83) (#81 comment 5687495740; decision 0003;
+assumption register TR-4 and TR-15).
