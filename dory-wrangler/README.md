@@ -308,13 +308,14 @@ with every failed test's name, to `PATH`, whatever the outcome.
 
 1. A failure under `portable` or `launch-boundary` is a product or boundary
    failure on that host. These pass with `dev-local` made unavailable, under
-   Python 3.11 and 3.12, and under a non-UTF-8 locale; none of them depends on
+   Python 3.11 and 3.12, under a non-UTF-8 locale, and with `flock` emulated by
+   POSIX record locks (`lockf`, as an NFS client does); none of them depends on
    the development launcher. Treat it as a defect and report it with the test's
    name.
 2. A failure under `development-environment` may be environmental. Find which
    dependency the test rests on (its entry in `tests/categories.py` is grouped
    by dependency: the `dev-local` launcher; `flock` or exclusive creation between
-   processes; process mechanics; the locale's encoding; permission bits),
+   descriptors or processes; process mechanics; the locale's encoding; permission bits),
    confirm the host differs
    there -- no `dev-local` agent program, a filesystem where `flock` is emulated
    or absent (decisions/0001 risk R3), running as root, a non-UTF-8 locale
@@ -325,7 +326,8 @@ with every failed test's name, to `PATH`, whatever the outcome.
    sandbox intermittently refuses `exec` and heavy parallel load fakes timing
    failures.
 4. Run from a directory with a fresh `TMPDIR`; the suite needs no network, no
-   fixed port and nothing under `HOME`, and leaves no process running.
+   fixed port and nothing under `HOME`, and leaves no process running -- also
+   when a shell it starts fails to come up.
 
 ### Running the launch-boundary tests against a new launcher
 

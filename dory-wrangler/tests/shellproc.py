@@ -31,6 +31,10 @@ class ShellProcess(object):
         self.port = None
 
     def start(self, timeout=20.0):
+        """Launch the shell and wait until it serves `/healthz`. A start that
+        fails for any reason stops the process it launched before raising, so
+        a host where startup fails (loopback down, say) is left with nothing
+        running: the caller registers `kill` only after this returns."""
         if os.path.exists(self.port_file):
             os.unlink(self.port_file)
         self.process = subprocess.Popen(
@@ -41,24 +45,38 @@ class ShellProcess(object):
                if self.launcher_options is not None else []),
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if os.path.exists(self.port_file):
-                with open(self.port_file) as handle:
-                    text = handle.read().strip()
-                if text:
-                    self.port = int(text)
-                    break
-            if self.process.poll() is not None:
-                _out, err = self.process.communicate()
-                raise RuntimeError(
-                    "shell exited immediately: %s" % err.decode("utf-8", "replace")
-                )
-            time.sleep(0.05)
-        else:
-            raise RuntimeError("shell did not start within %.1fs" % timeout)
-        self.get("/healthz")
+        try:
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                if os.path.exists(self.port_file):
+                    with open(self.port_file) as handle:
+                        text = handle.read().strip()
+                    if text:
+                        self.port = int(text)
+                        break
+                if self.process.poll() is not None:
+                    _out, err = self.process.communicate()
+                    raise RuntimeError(
+                        "shell exited immediately: %s" % err.decode("utf-8", "replace")
+                    )
+                time.sleep(0.05)
+            else:
+                raise RuntimeError("shell did not start within %.1fs" % timeout)
+            self.get("/healthz")
+        except BaseException:
+            self._stop_after_failed_start()
+            raise
         return self
+
+    def _stop_after_failed_start(self):
+        """SIGKILL the shell this start launched, by its pid, and reap it."""
+        process, self.process, self.port = self.process, None, None
+        if process.poll() is None:
+            try:
+                os.kill(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.communicate()
 
     def kill(self):
         """SIGKILL: no shutdown hook, no flush, no chance to write anything."""
