@@ -689,6 +689,24 @@ def walk(root, chat_id, args, limit, most):
         ask = err.split("ask again with ", 1)[1].split(";")[0].split()
 
 
+SESSION_COMPLETED = ("launcher", lb.PAYLOAD_SESSION_COMPLETED, b'{"type": "session_completed"}')
+
+
+class ThreeLengths(Scripted):
+    """A `fresh_binding` scripted stub -- one session per turn, as the review's
+    dev-local chat -- whose turns preserve 5, 2 and 7 events in turn."""
+
+    scripts = ([THINKING] * 3 + [TURN_COMPLETE, SESSION_COMPLETED],
+               [TURN_COMPLETE, SESSION_COMPLETED],
+               [THINKING] * 5 + [TURN_COMPLETE, SESSION_COMPLETED])
+    turns = 0
+
+    def _produce_turn(self, session, instruction_text):
+        self.script = self.scripts[self.turns % len(self.scripts)]
+        self.turns += 1
+        Scripted._produce_turn(self, session, instruction_text)
+
+
 class AChatWideRetrievalFollowedToItsEnd(unittest.TestCase):
     """Review finding G1. A chat-wide `events` retrieval that the bound cut is
     followed, by its own statements alone, to its end: every preserved record
@@ -696,22 +714,26 @@ class AChatWideRetrievalFollowedToItsEnd(unittest.TestCase):
     every bound, including bounds that cut inside a session and bounds that
     fall exactly on a session boundary. The chat is chosen so that its sessions'
     id order differs from their creation order, the order `--records lifecycle`
-    lists them in, which is how the review lost a whole session."""
+    lists them in, which is how the review lost a whole session; and so that
+    the middle session in id order is the shortest, so that a `--from` past its
+    end leaves a session with nothing in range between two that have some."""
 
     @classmethod
     def setUpClass(cls):
-        harness = support.harness({"launcher": "scripted-stub",
-                                   "options": {"garbage": True, "unknown_type": True}})
-        for _attempt in range(40):
-            chat_id = harness.create_chat("Three sessions")
+        root = support.scratch_root()
+        manager = SessionManager(ChatStore(root), ThreeLengths(
+            {"continuation": "fresh_binding", "response_shape": "one_shot"}))
+        for _attempt in range(60):
+            chat_id = manager.create_chat("Three sessions")
             for text in ("one", "two", "three"):
-                harness.send_turn(chat_id, text)
-            created = [s["session_id"] for s, _b in harness.store.list_sessions(chat_id)]
-            if created != sorted(created):
+                manager.send_turn(chat_id, text)
+            created = [s["session_id"] for s, _b in manager.store.list_sessions(chat_id)]
+            lengths = [len(manager.store.read_diagnostic_events(chat_id, session_id=sid))
+                       for sid in sorted(created)]
+            if created != sorted(created) and lengths[1] == min(lengths):
                 break
-        cls.root = harness.store.root
-        harness.store.close()
-        cls.chat_id, cls.created = chat_id, created
+        manager.store.close()
+        cls.root, cls.chat_id, cls.created = root, chat_id, created
         store = ChatStore(cls.root, read_only=True)
         cls.everything = store.read_diagnostic_events(cls.chat_id, limit=DIAGNOSTIC_PAGE_MAX)
         cls.by_session = [[e for e in cls.everything if e["session_id"] == sid]
@@ -721,7 +743,9 @@ class AChatWideRetrievalFollowedToItsEnd(unittest.TestCase):
         self.assertEqual(len(self.created), 3)
         self.assertNotEqual(self.created, sorted(self.created),
                             "creation order and id order differ")
-        self.assertTrue(all(len(events) > 1 for events in self.by_session))
+        lengths = [len(events) for events in self.by_session]
+        self.assertEqual(sorted(lengths), [2, 5, 7])
+        self.assertEqual(lengths[1], 2, "the middle session in id order is the shortest")
         self.assertEqual(sum(self.by_session, []), self.everything)
 
     def test_following_the_statements_reaches_every_record_once(self):
@@ -752,17 +776,27 @@ class AChatWideRetrievalFollowedToItsEnd(unittest.TestCase):
         self.assertEqual((status, records_of(out), err), (0, third, ""))
 
     def test_a_sequence_range_is_kept_in_every_session(self):
+        # `--from 3` leaves the middle session with nothing in range: a resumed
+        # page that fills exactly at the end of the first session must look
+        # past it to the third, not stop.
         for args, low, high in ((("--from", 2), 2, None), (("--to", 3), None, 3),
-                                (("--from", 2, "--to", 3), 2, 3)):
+                                (("--from", 2, "--to", 3), 2, 3), (("--from", 3), 3, None),
+                                (("--from", 3, "--to", 4), 3, 4)):
             expected = [e for e in self.everything
                         if (low is None or e["sequence"] >= low)
                         and (high is None or e["sequence"] <= high)]
             self.assertGreater(len(set(e["session_id"] for e in expected)), 1)
-            for limit in (1, 2, 3):
+            for limit in range(1, len(expected) + 1):
                 with self.subTest(args=args, limit=limit):
                     collected, _statements = walk(self.root, self.chat_id, args, limit,
                                                   len(expected))
                     self.assertEqual(collected, expected)
+        # A position typed by hand before the range's start still honours it.
+        first = self.by_session[0]
+        status, out, err = run_tool(self.root, self.chat_id, "--resume-at",
+                                    "%s:1" % first[0]["session_id"], "--from", 3)
+        self.assertEqual((status, records_of(out), err),
+                         (0, [e for e in self.everything if e["sequence"] >= 3], ""))
 
     def test_resume_at_is_refused_unless_it_continues_a_chat_wide_retrieval(self):
         tool = _tool_module()
