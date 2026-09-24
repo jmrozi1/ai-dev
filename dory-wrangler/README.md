@@ -108,6 +108,7 @@ outside the chat (contract P4). One read-only command prints it, bounded:
 ```
 python3 dory-wrangler/diagnostics.py STORE CHAT_ID [--session SESSION_ID]
     [--from N] [--to N] [--limit N] [--records events|lifecycle|messages]
+    [--resume-at SESSION_ID:N]
 ```
 
 `events` (the default) prints the chat's `diagnostic_event` records, optionally
@@ -118,7 +119,11 @@ stored -- bytes that were not UTF-8 stay base64 and nothing raw reaches the
 terminal -- at most `--limit` of them (100 by default, 1000 at most). It derives
 nothing: no counts, grouping, joins or interpretation (that is #82). It takes no
 lock and writes nothing, so it runs while `run_shell.py` serves the same store.
-Refusals are fixed words with exit `2`; an unreadable store exits `3`.
+Refusals are fixed words with exit `2`; an unreadable store exits `3`. When the
+bound holds records back, a line on standard error names the next record and the
+arguments that ask for it; asking again with exactly those, while there is such
+a line, returns every record once, in one order -- a chat-wide retrieval goes on
+with `--resume-at` into the next session by itself.
 
 A worked example, for a chat whose turn carried a line that is not JSON, one of
 a type the development transport does not know, and an answer:
@@ -127,7 +132,7 @@ a type the development transport does not know, and an answer:
 $ python3 dory-wrangler/diagnostics.py ./dory-store cht_cbf52131823100ae8a470826 --limit 2
 {"chat_id": "cht_cbf52131823100ae8a470826", "event_id": "evt_49baeb03dc4629d5e2998818", "interpretation": "malformed", "interpreted_type": null, "raw": {"body": "this is not json at all {{{", "encoding": "utf-8"}, "received_at": "2026-09-24T01:11:22.160853Z", "record_type": "diagnostic_event", "record_version": 1, "sequence": 1, "session_id": "ses_411c1409936c235e4d9a1e32", "source": "agent"}
 {"chat_id": "cht_cbf52131823100ae8a470826", "event_id": "evt_b3872e2f6493b82fdff8dcca", "interpretation": "unrecognized", "interpreted_type": null, "raw": {"body": "{\"type\": \"agent_thinking\"}", "encoding": "utf-8"}, "received_at": "2026-09-24T01:11:22.166243Z", "record_type": "diagnostic_event", "record_version": 1, "sequence": 2, "session_id": "ses_411c1409936c235e4d9a1e32", "source": "agent"}
-truncated: the bound of 2 record(s) was reached and more are preserved; the next is session ses_411c1409936c235e4d9a1e32 sequence 3; ask again with --session ses_411c1409936c235e4d9a1e32 --from 3; the sessions after it in this order are asked for the same way, by --session (--records lifecycle lists every session)
+truncated: the bound of 2 record(s) was reached and more are preserved; the next is session ses_411c1409936c235e4d9a1e32 sequence 3; ask again with --resume-at ses_411c1409936c235e4d9a1e32:3
 ```
 
 The truncation line is on standard error. Which event was rendered is the

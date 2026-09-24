@@ -21,6 +21,7 @@ stopped -- had no answer a person could get without writing code.
 ```
 python3 dory-wrangler/diagnostics.py STORE CHAT_ID [--session SESSION_ID]
     [--from N] [--to N] [--limit N] [--records events|lifecycle|messages]
+    [--resume-at SESSION_ID:N]
 ```
 
 It prints preserved records, one JSON object per line on standard output, each
@@ -70,8 +71,38 @@ a feed. When the bound held records back, one line on standard error says so,
 names the address of the next record, and gives the arguments that ask for it:
 
 ```
-truncated: the bound of 100 record(s) was reached and more are preserved; the next is session ses_... sequence 101; ask again with --session ses_... --from 101
+truncated: the bound of 100 record(s) was reached and more are preserved; the next is session ses_... sequence 101; ask again with --resume-at ses_...:101
 ```
+
+**One order, followed literally** (checkpoint review finding G1). Asking again
+with exactly the arguments a statement gives, and repeating while there is one,
+returns every preserved record the first retrieval addressed, once each, in that
+retrieval's order -- and nothing else needs to be read to do it:
+
+| Retrieval | The statement's arguments |
+| --- | --- |
+| `events` of one `--session` | `--session S --from N` (`--to` kept) |
+| `events` of the whole chat | `--resume-at S:N` (`--from` and `--to` kept): the same chat-wide retrieval, continued at session `S` sequence `N` and on into the sessions after `S` in session-id order, the chat-wide order |
+| `lifecycle` | `--from L` (`--to` kept), a line of this listing |
+| `messages` | `--from N` (`--to` kept), a message sequence |
+
+The chat-wide statement used to say `--session S --from N` and that "the
+sessions after it in this order are asked for the same way, by --session
+(--records lifecycle lists every session)". `lifecycle` lists sessions by
+creation time, while the retrieval orders them by id, so following those words
+on a three-session `fresh_binding` chat skipped a whole session without a sign.
+Naming the next session instead is not enough on its own: a one-session
+retrieval that the bound did not cut prints no statement, so after the second
+session nothing would name the third. `--resume-at` keeps the continuation a
+chat-wide retrieval, whose statement always names the next record in its own
+order. It is a position, never a count or summary (contract P4); the tool reads
+each session through the store's own bounded retrieval, so the bound, the
+addressing and the temp-file filter are still the store's.
+`tests/test_diagnostic_access.py` (`AChatWideRetrievalFollowedToItsEnd`) runs
+the tool as its own process and follows its statements to the end across three
+sessions whose id order differs from their creation order, at every bound --
+bounds that cut inside a session and bounds that fall exactly on a session
+boundary -- and with `--from`/`--to`, and gets every record once.
 
 The statement is on standard error so that standard output stays records only.
 The library and the tool share one implementation: `read_diagnostic_events` is
@@ -95,9 +126,24 @@ In fixed words on standard error, exit `2`, never carrying a path, a record or
 an exception's text (the served boundary's rule, review finding R3): not a store
 directory; not a chat identifier; no such chat; not a session identifier; no
 such session; a `--limit` that is not a whole number of at least 1; a
-`--from`/`--to` that is not; `--session` with `messages`; any other argument
-error. A store that cannot be read exits `3`, saying so and that
-`validate_store.py` gives the reason.
+`--from`/`--to` that is not; `--session` with `messages`; a `--resume-at` that
+is not a session identifier, a colon and a whole number of at least 1; a
+`--resume-at` with `--session` or with `--records` other than `events`; any
+other argument error. A store that cannot be read exits `3`, saying so and that
+`validate_store.py` gives the reason -- a record that does not parse, and a
+directory the tool must list and may not (review finding G2: that listing raises
+`OSError`, not `StoreError`, and only the tool's own `except` keeps its path and
+traceback off the terminal; pinned by
+`test_an_unreadable_directory_is_refused_without_its_reason`).
+
+**Observed, not changed (review observation O1).** A chat directory the tool may
+not read is refused as `refused: that store holds no such chat`, exit `2`, not as
+unreadable, exit `3`: the store's existence check cannot see through the
+directory, so it reports the chat absent. A session addressed by `--session` or
+`--resume-at` whose `sessions` directory may not be read is likewise refused as
+no such session. The words are wrong about the cause; nothing leaks, nothing is
+printed, and the exit is non-zero. Changing it is more than one line, so it is
+left as observed.
 
 ## Alternatives rejected
 
@@ -111,10 +157,15 @@ error. A store that cannot be read exits `3`, saying so and that
 
 ## Residuals, named
 
-* A chat-wide `events` retrieval orders sessions by session id, not by time, and
-  continues one session at a time: the statement names the next session and
-  sequence, and the sessions after it are asked for by `--session`; `lifecycle`
-  lists every session id.
+* A chat-wide `events` retrieval orders sessions by session id, not by time,
+  while `lifecycle` lists them by creation time. Its continuation, `--resume-at`,
+  never consults `lifecycle`, so the two orders no longer meet; a reader who
+  wants sessions in time order reads `lifecycle` for that.
+* `--resume-at` walks the chat's sessions from its session records. A store in
+  which an events directory has no session record is not one the validator
+  accepts (every `diagnostic_event` must reference an `agent_session`); on such a
+  store the first chat-wide page would include that directory's events and a
+  resumed page would not.
 * `lifecycle` lines are positions in the store's order of the moment. A record
   written between two invocations -- or one dated earlier by a clock that stepped
   back -- moves the lines after it.
@@ -124,5 +175,6 @@ error. A store that cannot be read exits `3`, saying so and that
 ## Evidence
 
 `tests/test_diagnostic_access.py`: B (`TheCommandLineRetrieval`,
-`WhileTheShellServesTheStore`, `NotReachableFromTheServedApplication`), C
+`AChatWideRetrievalFollowedToItsEnd`, `WhileTheShellServesTheStore`,
+`NotReachableFromTheServedApplication`), C
 (`TheMinimumFromTheToolAlone`), D6 (`AStagedDirectoryIsNeverReturned`).

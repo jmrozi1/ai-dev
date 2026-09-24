@@ -538,9 +538,14 @@ class TheCommandLineRetrieval(unittest.TestCase):
                 status, out, err = run_tool(root, chat_id, "--limit", limit)
                 self.assertEqual((status, records_of(out)), (0, everything[:limit]))
                 held = everything[limit]
-                self.assertIn("the next is session %s sequence %d; ask again with --session "
-                              "%s --from %d;" % (held["session_id"], held["sequence"],
-                                                 held["session_id"], held["sequence"]), err)
+                # Changed expectation (review finding G1): the chat-wide
+                # continuation is now `--resume-at`, which carries on across
+                # sessions in this retrieval's own order; it was `--session S
+                # --from N` plus a pointer to a differently ordered listing.
+                self.assertIn("the next is session %s sequence %d; ask again with "
+                              "--resume-at %s:%d\n" % (
+                                  held["session_id"], held["sequence"],
+                                  held["session_id"], held["sequence"]), err)
         status, out, err = run_tool(root, chat_id, "--limit", len(everything))
         self.assertEqual((status, records_of(out), err), (0, everything, ""))
 
@@ -584,6 +589,38 @@ class TheCommandLineRetrieval(unittest.TestCase):
         status, out, err = run_tool(root, self.chat_id)
         self.assertEqual((status, out, err), (3, b"", _tool_module().UNREADABLE + "\n"))
         self.assertEqual(tree_hash(root), before)
+
+    def test_an_unreadable_directory_is_refused_without_its_reason(self):
+        """Review finding G2 (its mutation R26): a directory the tool must list
+        and cannot raises `OSError` from the listing itself, not `StoreError`,
+        so only the tool's own `except` keeps its path and traceback off the
+        terminal."""
+        if os.geteuid() == 0:
+            self.skipTest("running as root, so a mode of 0 does not stop a read")
+        cases = (
+            (("chats", self.chat_id, "sessions"), ("--records", "lifecycle")),
+            (("chats", self.chat_id, "messages"), ("--records", "messages")),
+            (("diagnostics", self.chat_id), ()),
+        )
+        for parts, args in cases:
+            with self.subTest(directory="/".join(parts[:1] + parts[2:]), args=args):
+                root = tempfile.mkdtemp(prefix="dory-diag-")
+                self.addCleanup(shutil.rmtree, root, True)
+                shutil.rmtree(root)
+                shutil.copytree(self.root, root)
+                directory = os.path.join(root, *parts)
+                before = tree_hash(root)
+                os.chmod(directory, 0)
+                self.addCleanup(os.chmod, directory, 0o700)
+                with self.assertRaises(PermissionError):
+                    os.listdir(directory)
+                status, out, err = run_tool(root, self.chat_id, *args)
+                self.assertEqual((status, out, err),
+                                 (3, b"", _tool_module().UNREADABLE + "\n"))
+                self.assertNotIn(root, err)
+                self.assertNotIn("Traceback", err)
+                os.chmod(directory, 0o700)
+                self.assertEqual(tree_hash(root), before)
 
     def test_the_tool_opens_the_store_read_only(self):
         """Its reads never reach a gated write, so a writable store would change
@@ -630,6 +667,123 @@ class TheCommandLineRetrieval(unittest.TestCase):
         self.assertEqual((status, len(records_of(out))), (0, DIAGNOSTIC_PAGE_MAX))
         self.assertIn("the next is session %s sequence %d"
                       % (records_of(out)[0]["session_id"], DIAGNOSTIC_PAGE_MAX + 1), err)
+
+
+def walk(root, chat_id, args, limit, most):
+    """Every record reached by running the tool as its own process and then,
+    while it says it truncated, running it again with exactly the arguments its
+    statement gives -- nothing else carried over. Returns the records and the
+    statements, and fails if a walk runs past `most` statements."""
+    collected, statements = [], []
+    ask = [str(a) for a in args]
+    while True:
+        status, out, err = run_tool(root, chat_id, *(ask + ["--limit", str(limit)]))
+        assert status == 0, (status, ask, err)
+        page = records_of(out)
+        assert len(page) <= limit, (ask, len(page))
+        collected.extend(page)
+        if not err:
+            return collected, statements
+        statements.append(err)
+        assert len(statements) <= most, statements
+        ask = err.split("ask again with ", 1)[1].split(";")[0].split()
+
+
+class AChatWideRetrievalFollowedToItsEnd(unittest.TestCase):
+    """Review finding G1. A chat-wide `events` retrieval that the bound cut is
+    followed, by its own statements alone, to its end: every preserved record
+    of the chat, once, in the chat-wide order -- across three sessions, at
+    every bound, including bounds that cut inside a session and bounds that
+    fall exactly on a session boundary. The chat is chosen so that its sessions'
+    id order differs from their creation order, the order `--records lifecycle`
+    lists them in, which is how the review lost a whole session."""
+
+    @classmethod
+    def setUpClass(cls):
+        harness = support.harness({"launcher": "scripted-stub",
+                                   "options": {"garbage": True, "unknown_type": True}})
+        for _attempt in range(40):
+            chat_id = harness.create_chat("Three sessions")
+            for text in ("one", "two", "three"):
+                harness.send_turn(chat_id, text)
+            created = [s["session_id"] for s, _b in harness.store.list_sessions(chat_id)]
+            if created != sorted(created):
+                break
+        cls.root = harness.store.root
+        harness.store.close()
+        cls.chat_id, cls.created = chat_id, created
+        store = ChatStore(cls.root, read_only=True)
+        cls.everything = store.read_diagnostic_events(cls.chat_id, limit=DIAGNOSTIC_PAGE_MAX)
+        cls.by_session = [[e for e in cls.everything if e["session_id"] == sid]
+                          for sid in sorted(created)]
+
+    def test_the_chat_is_the_review_s_shape(self):
+        self.assertEqual(len(self.created), 3)
+        self.assertNotEqual(self.created, sorted(self.created),
+                            "creation order and id order differ")
+        self.assertTrue(all(len(events) > 1 for events in self.by_session))
+        self.assertEqual(sum(self.by_session, []), self.everything)
+
+    def test_following_the_statements_reaches_every_record_once(self):
+        total = len(self.everything)
+        for limit in range(1, total + 2):
+            with self.subTest(limit=limit):
+                collected, statements = walk(self.root, self.chat_id, (), limit, total)
+                self.assertEqual(collected, self.everything)
+                self.assertEqual(len(statements), (total - 1) // limit)
+
+    def test_at_a_session_boundary_the_statement_names_the_next_session(self):
+        first, second, third = self.by_session
+        for limit, held in ((len(first), second[0]),
+                            (len(first) + len(second), third[0]),
+                            (len(first) - 1, first[-1]),
+                            (len(first) + 1, second[1])):
+            with self.subTest(limit=limit):
+                status, out, err = run_tool(self.root, self.chat_id, "--limit", limit)
+                self.assertEqual((status, records_of(out)), (0, self.everything[:limit]))
+                self.assertEqual(err, (
+                    "truncated: the bound of %d record(s) was reached and more are "
+                    "preserved; the next is session %s sequence %d; ask again with "
+                    "--resume-at %s:%d\n" % (limit, held["session_id"], held["sequence"],
+                                             held["session_id"], held["sequence"])))
+        # Resumed at the start of the last session, the retrieval ends there.
+        status, out, err = run_tool(self.root, self.chat_id, "--resume-at",
+                                    "%s:1" % third[0]["session_id"])
+        self.assertEqual((status, records_of(out), err), (0, third, ""))
+
+    def test_a_sequence_range_is_kept_in_every_session(self):
+        for args, low, high in ((("--from", 2), 2, None), (("--to", 3), None, 3),
+                                (("--from", 2, "--to", 3), 2, 3)):
+            expected = [e for e in self.everything
+                        if (low is None or e["sequence"] >= low)
+                        and (high is None or e["sequence"] <= high)]
+            self.assertGreater(len(set(e["session_id"] for e in expected)), 1)
+            for limit in (1, 2, 3):
+                with self.subTest(args=args, limit=limit):
+                    collected, _statements = walk(self.root, self.chat_id, args, limit,
+                                                  len(expected))
+                    self.assertEqual(collected, expected)
+
+    def test_resume_at_is_refused_unless_it_continues_a_chat_wide_retrieval(self):
+        tool = _tool_module()
+        sid = self.created[0]
+        for args, words in (
+                (("--resume-at", sid), tool.REFUSED_RESUME),
+                (("--resume-at", sid + ":0"), tool.REFUSED_RESUME),
+                (("--resume-at", sid + ":x"), tool.REFUSED_RESUME),
+                (("--resume-at", ":1"), tool.REFUSED_RESUME),
+                (("--resume-at", "../x:1"), tool.REFUSED_RESUME),
+                (("--resume-at", "ses_" + "0" * 24 + ":1"), tool.REFUSED_NO_SESSION),
+                (("--resume-at", sid + ":1", "--session", sid), tool.REFUSED_RESUME_SCOPE),
+                (("--resume-at", sid + ":1", "--records", "lifecycle"),
+                 tool.REFUSED_RESUME_SCOPE),
+                (("--resume-at", sid + ":1", "--records", "messages"),
+                 tool.REFUSED_RESUME_SCOPE)):
+            with self.subTest(args=args):
+                before = tree_hash(self.root)
+                status, out, err = run_tool(self.root, self.chat_id, *args)
+                self.assertEqual((status, out, err), (2, b"", words + "\n"))
+                self.assertEqual(tree_hash(self.root), before)
 
 
 def _tool_module():

@@ -3,6 +3,7 @@
 
     python3 dory-wrangler/diagnostics.py STORE CHAT_ID [--session SESSION_ID]
         [--from N] [--to N] [--limit N] [--records events|lifecycle|messages]
+        [--resume-at SESSION_ID:N]
 
 The bounded out-of-band diagnostic retrieval of contract P4 and 8.5, as a
 command. It prints preserved records exactly as the store holds them, one JSON
@@ -16,9 +17,12 @@ What it prints, chosen by `--records`:
 ``events`` (the default)
     the chat's `diagnostic_event` records -- addressed by `CHAT_ID`, optionally
     narrowed by `--session` and a `sequence` range `--from`/`--to` -- in the
-    store's order (session, then sequence). `raw.body` is printed as stored, so
-    bytes that were not UTF-8 stay base64, and every character outside printable
-    ASCII is a JSON escape: nothing raw reaches the terminal.
+    store's order (session id, then sequence). `raw.body` is printed as stored,
+    so bytes that were not UTF-8 stay base64, and every character outside
+    printable ASCII is a JSON escape: nothing raw reaches the terminal.
+    `--resume-at SESSION_ID:N` continues a chat-wide retrieval at that record:
+    the records at and after it in that same order, `--from`/`--to` still
+    applying in every session.
 ``lifecycle``
     the preserved `agent_session`, `launch_result` and `session_observation`
     records -- of `--session`, or of every session of the chat -- each session's
@@ -29,8 +33,11 @@ What it prints, chosen by `--records`:
 
 Every mode returns at most `--limit` records (default 100, at most 1000: the
 store's own `DIAGNOSTIC_PAGE_DEFAULT` and `DIAGNOSTIC_PAGE_MAX`). When the bound
-held records back, a line on standard error says so and gives the arguments that
-ask for the rest.
+held records back, a line on standard error says so, names the next record's
+address, and gives the arguments that ask for the rest. Followed literally and
+repeatedly, those arguments return every preserved record once, in one order: a
+chat-wide `events` retrieval continues by `--resume-at`, never by a listing
+ordered some other way (checkpoint review finding G1).
 
 It opens the store **read-only** (decision 0002, D1): it takes no lock, sweeps
 nothing, creates nothing and writes nothing, so it can run while `run_shell.py`
@@ -62,7 +69,7 @@ from dory_wrangler.store import (  # noqa: E402
 
 USAGE = (
     "diagnostics.py STORE CHAT_ID [--session SESSION_ID] [--from N] [--to N] "
-    "[--limit N] [--records events|lifecycle|messages]"
+    "[--limit N] [--records events|lifecycle|messages] [--resume-at SESSION_ID:N]"
 )
 
 # Fixed words. Nothing a refusal prints comes from the store, the filesystem or
@@ -77,6 +84,12 @@ REFUSED_LIMIT = "refused: --limit must be a whole number of at least 1"
 REFUSED_RANGE = "refused: --from and --to must be whole numbers of at least 1"
 REFUSED_MESSAGES_BY_SESSION = (
     "refused: messages are addressed by chat and sequence only, not by --session")
+REFUSED_RESUME = (
+    "refused: --resume-at must be a session identifier, a colon and a whole number "
+    "of at least 1")
+REFUSED_RESUME_SCOPE = (
+    "refused: --resume-at continues a chat-wide events retrieval, so it takes no "
+    "--session and no other --records")
 UNREADABLE = (
     "error: the store could not be read, so nothing was printed; nothing was "
     "changed. validate_store.py says why.")
@@ -118,20 +131,62 @@ def _line(record):
     return json.dumps(record, sort_keys=True, ensure_ascii=True)
 
 
-def _events(store, chat_id, session_id, first, last, limit):
-    records, following = store.read_diagnostic_page(
-        chat_id, session_id=session_id, sequence_from=first, sequence_to=last,
-        limit=limit)
+def _resumption(text):
+    """`SESSION_ID:N` -> (session id, N), or a refusal."""
+    session_id, colon, sequence = text.partition(":")
+    if not (colon and ids.is_id(session_id, "ses")):
+        raise Refused(REFUSED_RESUME)
+    return session_id, _whole(sequence, REFUSED_RESUME)
+
+
+def _resumed(store, chat_id, position, first, last, limit):
+    """A chat-wide retrieval continued at `position`: the preserved records at
+    and after it in the order the chat-wide retrieval itself uses -- session id,
+    then sequence -- at most `limit`, and the address of the first the bound
+    held back. Each session is read through the store's own bounded retrieval,
+    so addressing, the cap and the temp-file filter are the store's."""
+    at_session, at_sequence = position
+    later = sorted(session["session_id"] for session, _binding in
+                   store.list_sessions(chat_id) if session["session_id"] > at_session)
+    records = []
+    at_lower = at_sequence if first is None else max(at_sequence, first)
+    for session_id, lower in [(at_session, at_lower)] + [(s, first) for s in later]:
+        room = limit - len(records)
+        page, following = store.read_diagnostic_page(
+            chat_id, session_id=session_id, sequence_from=lower, sequence_to=last,
+            limit=max(room, 1))
+        if room == 0:
+            if page:
+                return records, {"session_id": session_id, "sequence": page[0]["sequence"]}
+            continue
+        records.extend(page)
+        if following is not None:
+            return records, following
+    return records, None
+
+
+def _events(store, chat_id, session_id, first, last, limit, resume_at):
+    if resume_at is None:
+        records, following = store.read_diagnostic_page(
+            chat_id, session_id=session_id, sequence_from=first, sequence_to=last,
+            limit=limit)
+    else:
+        records, following = _resumed(store, chat_id, resume_at, first, last, limit)
     more = None
     if following is not None:
-        more = ("the next is session %s sequence %d; ask again with --session %s "
-                "--from %d%s%s" % (
-                    following["session_id"], following["sequence"],
-                    following["session_id"], following["sequence"],
-                    "" if last is None else " --to %d" % last,
-                    "" if session_id is not None else
-                    "; the sessions after it in this order are asked for the same "
-                    "way, by --session (--records lifecycle lists every session)"))
+        # One address, in one order. Within a session it is that session's next
+        # sequence; for the whole chat it is the position to resume the same
+        # chat-wide retrieval from, which crosses into the next session by
+        # itself (checkpoint review finding G1).
+        if session_id is not None:
+            ask = "--session %s --from %d" % (following["session_id"], following["sequence"])
+        else:
+            ask = "--resume-at %s:%d%s" % (
+                following["session_id"], following["sequence"],
+                "" if first is None else " --from %d" % first)
+        more = "the next is session %s sequence %d; ask again with %s%s" % (
+            following["session_id"], following["sequence"], ask,
+            "" if last is None else " --to %d" % last)
     return records, more
 
 
@@ -185,6 +240,7 @@ def retrieve(argv):
     parser.add_argument("--to", dest="last", default=None)
     parser.add_argument("--limit", default=None)
     parser.add_argument("--records", default="events")
+    parser.add_argument("--resume-at", dest="resume_at", default=None)
     args = parser.parse_args(argv)
 
     if args.records not in MODES:
@@ -199,6 +255,11 @@ def retrieve(argv):
         raise Refused(REFUSED_SESSION_ID)
     if args.records == "messages" and args.session_id is not None:
         raise Refused(REFUSED_MESSAGES_BY_SESSION)
+    resume_at = None
+    if args.resume_at is not None:
+        if args.session_id is not None or args.records != "events":
+            raise Refused(REFUSED_RESUME_SCOPE)
+        resume_at = _resumption(args.resume_at)
     if not os.path.isdir(args.store):
         raise Refused(REFUSED_STORE)
 
@@ -209,13 +270,16 @@ def retrieve(argv):
             store.read_chat(args.chat_id)
         except NotFound:
             raise Refused(REFUSED_NO_CHAT)
-        if args.session_id is not None:
+        # A session is addressed by --session or by --resume-at, never both.
+        addressed = args.session_id if resume_at is None else resume_at[0]
+        if addressed is not None:
             try:
-                store.read_session(args.chat_id, args.session_id)
+                store.read_session(args.chat_id, addressed)
             except NotFound:
                 raise Refused(REFUSED_NO_SESSION)
         if args.records == "events":
-            return _events(store, args.chat_id, args.session_id, first, last, limit)
+            return _events(store, args.chat_id, args.session_id, first, last, limit,
+                           resume_at)
         if args.records == "lifecycle":
             return _lifecycle(store, args.chat_id, args.session_id, first, last, limit)
         return _messages(store, args.chat_id, first, last, limit)
