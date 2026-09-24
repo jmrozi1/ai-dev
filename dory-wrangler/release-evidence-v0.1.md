@@ -202,8 +202,9 @@ git cat-file -t $RC                                  >> $DW/results/mirror.txt 2
 - **Not present.** It is **not established** that the nightly mirror carries
   branches other than `main`. #85 to #89 are deliberately unmerged, and no
   record says outright that their branches are mirrored. If `mirror.txt` has no
-  `dory-wrangler/issue-89` line, or `git cat-file -t` says the object is not
-  valid, **stop here**. (If you are reading this document from the mirrored
+  `dory-wrangler/issue-89` line, or its last line is anything other than
+  `commit` (git 2.x prints, for example,
+  `fatal: git cat-file: could not get object info`), **stop here**. (If you are reading this document from the mirrored
   tree, the branch has arrived. This case matters when these instructions
   reached you another way, or when the head or the hashes differ.)
   - **The one fact to report back:** whether `refs/heads/dory-wrangler/issue-89`
