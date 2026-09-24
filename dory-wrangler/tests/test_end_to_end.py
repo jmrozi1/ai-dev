@@ -19,13 +19,21 @@ Two things are held here:
   must apply exactly once, is read back, and must compile, or the row is an
   error and proves nothing; the copy is restored and checked after every row,
   and an unfaulted run of the same copy is the control.
+
+A run that outlives its deadline is killed with its whole process group -- the
+path, the shell it started, and any agent that shell started -- so a hung run
+cannot leave a server running (a SIGKILL of the path alone runs none of its
+own clean-up).
 """
 
 import json
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import threading
+import time
 import unittest
 
 import support
@@ -53,15 +61,86 @@ RUN_DEADLINE = 900
 FAULT_DEADLINE = 600
 
 
-def run_loop(product_dir, config, work, extra=()):
-    """Run `e2e_loop.py` from `product_dir` as its own process: (status, lines)."""
-    done = subprocess.run(
+class LoopDeadline(AssertionError):
+    """A run did not finish within its deadline; its process group was killed."""
+
+    def __init__(self, deadline, group):
+        AssertionError.__init__(
+            self, "e2e_loop.py did not finish within %ds; its process group %d was killed"
+            % (deadline, group))
+        self.group = group
+
+
+def run_loop(product_dir, config, work, extra=(), deadline=RUN_DEADLINE):
+    """Run `e2e_loop.py` from `product_dir` as its own process: (status, lines).
+
+    The path is the leader of a process group of its own, which the shell it
+    starts, and every agent the shell starts, inherit. If the run outlives
+    `deadline`, or the wait is interrupted, the whole group is killed by its id,
+    not the path alone, and a deadline raises `LoopDeadline`.
+    """
+    process = subprocess.Popen(
         [sys.executable, os.path.join(product_dir, E2E_LOOP)] + list(config)
         + ["--work", work] + list(extra),
         stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        timeout=RUN_DEADLINE)
-    return (done.returncode, done.stdout.decode("utf-8").splitlines(),
-            done.stderr.decode("utf-8", "replace"))
+        start_new_session=True)
+    try:
+        out, err = process.communicate(timeout=deadline)
+    except subprocess.TimeoutExpired:
+        kill_group(process)
+        raise LoopDeadline(deadline, process.pid)
+    except BaseException:
+        kill_group(process)
+        raise
+    return (process.returncode, out.decode("utf-8").splitlines(),
+            err.decode("utf-8", "replace"))
+
+
+def kill_group(process):
+    """SIGKILL the process group `process` leads, and the leader itself, and reap it.
+
+    The pipes are closed rather than drained: a process that left the group
+    could hold them open, and the wait must not outlive the kill.
+    """
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    process.kill()
+    process.wait()
+    for pipe in (process.stdout, process.stderr):
+        pipe.close()
+
+
+def processes_naming(text):
+    """PIDs of processes, not yet exited, whose argv names `text`, from /proc."""
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == os.getpid():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % name, "rb") as handle:
+                argv = handle.read().decode("utf-8", "replace")
+            with open("/proc/%s/stat" % name) as handle:
+                state = handle.read().rsplit(")", 1)[-1].split()[0]
+        except (IOError, OSError, IndexError):
+            continue
+        if text in argv and state != "Z":
+            found.append(int(name))
+    return found
+
+
+def silent_launcher(product_dir, marker=None):
+    """The development agent told to stay silent, chosen by configuration alone.
+
+    `marker`, if given, is carried in the agent's own argv as an interpreter
+    `-X` option the agent never reads, so the agent can be found by it.
+    """
+    agent = os.path.join(product_dir, "src", "dory_wrangler", "launchers", "dev_agent.py")
+    tag = ["-X", "dory_e2e_run=" + marker] if marker else []
+    return ["--launcher", "dev-local", "--launcher-options", json.dumps(
+        {"profile": "persistent",
+         "command": [sys.executable] + tag + [agent, "--profile", "persistent", "--silent"]})]
 
 
 def verdicts(lines):
@@ -120,6 +199,41 @@ class TheLoopRunsEndToEnd(unittest.TestCase):
                                "the agent live before the restart was re-attached")
 
 
+class AHungRunLeavesNoServer(unittest.TestCase):
+    """A run killed at its deadline takes the shell and its agents with it."""
+
+    def test_a_run_killed_at_its_deadline_leaves_no_process_behind(self):
+        # The silent agent never answers, so the path waits on its first send
+        # for far longer than this deadline, with a shell and an agent running.
+        # Every process of this run names `work` in its argv: the path and the
+        # shell by their own arguments, the agent by its marker.
+        work = os.path.join(support.scratch_root("e2e-hung-"), "work")
+        deadline = 20
+        seen = []
+        watch = threading.Timer(deadline - 5, lambda: seen.extend(processes_naming(work)))
+        watch.start()
+        started = time.time()
+        try:
+            with self.assertRaises(LoopDeadline):
+                run_loop(PRODUCT_DIR, silent_launcher(PRODUCT_DIR, marker=work), work,
+                         ("--request-timeout", "300"), deadline=deadline)
+        finally:
+            watch.cancel()
+        # The deadline ended the run; it did not wait for the run to end itself.
+        self.assertLess(time.time() - started, deadline + 60)
+        # Before the deadline the path, its shell and the shell's agent ran.
+        self.assertGreaterEqual(len(seen), 3, "the hung run never had a shell and an agent")
+        left = processes_naming(work)
+        for _ in range(100):
+            if not left:
+                break
+            time.sleep(0.1)
+            left = processes_naming(work)
+        for pid in left:
+            os.kill(pid, signal.SIGKILL)  # never leave one running, even on failure
+        self.assertEqual(left, [], "a process of the killed run is still running")
+
+
 # ---------------------------------------------------------------------------
 # One fault per step, in a copy of the product tree
 # ---------------------------------------------------------------------------
@@ -166,6 +280,12 @@ FAULTS = {
                SERVE_ARGS_PARSED
                + "    if os.path.isdir(os.path.join(args.root, \"chats\")):\n"
                + "        args.root = args.root + \"-lost\"\n"),
+    # A served chat that has lost turns: every read of a chat serves only its
+    # first two messages, while the sends still return the whole chat.
+    "reopen-lost-turns": ("reopen", ONE_SHOT, (), "src/dory_wrangler/webapp.py",
+                          "return self._respond(200, self.service.open_chat(chat_id))",
+                          "return self._respond(200, dict(self.service.open_chat(chat_id), "
+                          "messages=self.service.open_chat(chat_id)[\"messages\"][:2]))"),
     # A render that labels the agent's answer as the user's.
     "render-label": ("render", ONE_SHOT, (), "src/dory_wrangler/webapp.py",
                      'agent: "AGENT"', 'agent: "YOU"'),
@@ -213,7 +333,7 @@ class EachStepFailsAtItsStep(unittest.TestCase):
     def run_copy(self, config, extra=()):
         work = os.path.join(support.scratch_root("e2e-fault-"), "work")
         return run_loop(self.copy, config, work,
-                        ("--start-timeout", "30") + tuple(extra))
+                        ("--start-timeout", "30") + tuple(extra), deadline=FAULT_DEADLINE)
 
     def apply(self, relative, old, new):
         path = os.path.join(self.copy, relative)
@@ -242,11 +362,7 @@ class EachStepFailsAtItsStep(unittest.TestCase):
     def assert_fails_at(self, fault):
         step, config, extra, relative, old, new = FAULTS[fault]
         if "SILENT" in config:
-            agent = os.path.join(self.copy, "src", "dory_wrangler", "launchers", "dev_agent.py")
-            config = [c if c != "SILENT" else json.dumps(
-                {"profile": "persistent",
-                 "command": [sys.executable, agent, "--profile", "persistent", "--silent"]})
-                for c in config]
+            config = silent_launcher(self.copy)
         if relative is not None:
             self.apply(relative, old, new)
         status, lines, err = self.run_copy(config, extra)
@@ -298,6 +414,9 @@ class EachStepFailsAtItsStep(unittest.TestCase):
 
     def test_a_restarted_shell_that_loses_the_store_fails_at_reopen(self):
         self.assert_fails_at("reopen")
+
+    def test_a_served_chat_that_has_lost_turns_fails_at_reopen(self):
+        self.assert_fails_at("reopen-lost-turns")
 
     def test_a_reopened_transcript_that_is_not_byte_identical_fails_at_reopen(self):
         self.assert_fails_at("reopen-bytes")

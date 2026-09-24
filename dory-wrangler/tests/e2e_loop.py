@@ -38,11 +38,19 @@ hold:
     continue     a second turn is answered as the declared continuation says:
                  `persistent` by the same agent, `fresh_binding` by a new one
     reopen       the shell is stopped by its PID and started again on the same
-                 store; the reopened transcript is byte-identical to before
-    third-turn   a third turn is answered after the restart
+                 store; the reopened transcript is byte-identical to before, and
+                 both are the whole conversation so far
+    third-turn   a third turn is answered after the restart, and the chat then
+                 served is the whole conversation, all three turns
     validate     `validate_store.py`, a separate program, accepts the store
     diagnostics  `diagnostics.py`, followed through its own bound, returns every
                  preserved event of the chat, and every agent message cites one
+
+The conversation the path expects is built only from what the served application
+returned after each send: every send's answer must carry the whole conversation
+held so far, unchanged, followed by the new user turn and its answer. Every step
+that reads the served chat back requires it to be that whole conversation, so no
+step can pass on a chat that has lost turns.
 
 Exit 0 only if every step held; 1 at the first that did not, naming it and why;
 2 for arguments it cannot use. The lines say what was checked about the product
@@ -307,7 +315,10 @@ class Loop(object):
                 command += ["--launcher-options", args.launcher_options]
         self.shell = Shell(work, command, args.start_timeout, args.request_timeout)
         self.chat_id = None
-        self.transcript = None
+        # The whole conversation so far, as the sends returned it: every user
+        # turn and every agent message, in order.
+        self.conversation = []
+        self.turns = 0
 
     # -- helpers ------------------------------------------------------------
 
@@ -341,6 +352,27 @@ class Loop(object):
             raise StepFailed("the %s has no answer from the agent in the served transcript"
                              % what)
         return replies
+
+    def hold(self, chat, what):
+        """Take a send's answer as the conversation so far, if it extends the last.
+
+        The messages the send returned must begin with the whole conversation
+        held before it, unchanged, and must carry one user turn per turn sent.
+        """
+        messages = chat["messages"]
+        held = len(self.conversation)
+        if messages[:held] != self.conversation or len(messages) <= held:
+            raise StepFailed("the %s's answer does not carry the whole conversation so far"
+                             % what)
+        self.turns += 1
+        if len([m for m in messages if m.get("author") == "user"]) != self.turns:
+            raise StepFailed("the %s's answer does not carry every user turn sent" % what)
+        self.conversation = list(messages)
+
+    def whole(self, chat):
+        """Whether a served chat is this chat with the whole conversation so far."""
+        return isinstance(chat, dict) and chat.get("chat_id") == self.chat_id and \
+            chat.get("messages") == self.conversation
 
     def answering_session(self, message_id):
         for record in self.message_records():
@@ -421,8 +453,9 @@ class Loop(object):
 
     def step_render(self):
         replies = self.answered(self.sent, FIRST_TURN, "first turn")
+        self.hold(self.sent, "first turn")
         status, body = self.shell.request("GET", "/api/chats/%s" % self.chat_id)
-        if status != 200 or _json(body) != self.sent:
+        if status != 200 or _json(body) != self.sent or not self.whole(_json(body)):
             raise StepFailed("the chat read back from disk is not what the send returned")
         status, page = self.shell.request("GET", "/")
         if status != 200:
@@ -446,6 +479,7 @@ class Loop(object):
         if status != 201:
             raise StepFailed("the second turn was not answered (HTTP %s)" % status)
         replies = self.answered(chat, RECALL_TURN, "second turn")
+        self.hold(chat, "second turn")
         answering = self.answering_session(replies[-1]["message_id"])
         sessions = self.sessions()
         first = self.first_session["session_id"]
@@ -464,7 +498,6 @@ class Loop(object):
                 before[0]["state"])
         else:
             raise StepFailed("the launcher declared a continuation this path does not know")
-        self.transcript = chat
         return "the second turn is %s, as continuation %s declares; it answered %s" % (
             how, self.declared, json.dumps([r["text"] for r in replies]))
 
@@ -472,6 +505,9 @@ class Loop(object):
         status, before = self.shell.request("GET", "/api/chats/%s" % self.chat_id)
         if status != 200:
             raise StepFailed("the chat could not be read before the restart (HTTP %s)" % status)
+        if not self.whole(_json(before)):
+            raise StepFailed("the chat served before the restart is not the whole "
+                             "conversation so far")
         old_pid = self.shell.pid
         agents = children_of(old_pid)
         self.shell.stop()
@@ -488,14 +524,17 @@ class Loop(object):
         if status != 200:
             raise StepFailed("the chat could not be reopened after the restart (HTTP %s)"
                              % status)
+        if not self.whole(_json(after)):
+            raise StepFailed("the reopened chat is not the whole conversation so far")
         if after != before:
             raise StepFailed("the reopened transcript is not byte-identical to the one "
                              "served before the restart")
         self.reopened = before
         return ("the shell was stopped by its PID (SIGKILL; %d agent process(es) it had "
                 "started exited with it) and started again on the same store; the "
-                "reopened transcript is byte-identical (%d bytes)"
-                % (len(agents), len(before)))
+                "reopened transcript is byte-identical (%d bytes) and is the whole "
+                "conversation so far, %d message(s) of %d turn(s)"
+                % (len(agents), len(before), len(self.conversation), self.turns))
 
     def step_third_turn(self):
         existing = self.sessions()
@@ -528,6 +567,7 @@ class Loop(object):
         if status != 201:
             raise StepFailed("the third turn was not answered (HTTP %s)" % status)
         replies = self.answered(chat, RECALL_TURN, "third turn")
+        self.hold(chat, "third turn")
         answering = self.answering_session(replies[-1]["message_id"])
         if not taken and self.declared == "persistent":
             if live != [answering]:
@@ -538,7 +578,10 @@ class Loop(object):
             if answering in before:
                 raise StepFailed("the third turn was not answered by a newly launched agent")
             how = "a newly launched agent answered it"
-        self.transcript = chat
+        status, body = self.shell.request("GET", "/api/chats/%s" % self.chat_id)
+        if status != 200 or not self.whole(_json(body)):
+            raise StepFailed("the chat read back after the third turn is not the whole "
+                             "conversation")
         return "the third turn is answered after the restart: %s, %s%s" % (
             how, json.dumps([r["text"] for r in replies]), taken)
 
@@ -579,7 +622,7 @@ class Loop(object):
                                  "from 1")
         by_id = dict((r["event_id"], r) for r in retrieved)
         messages = self.message_records()
-        served = self.transcript["messages"]
+        served = self.conversation
         if [(m.get("message_id"), m.get("author"), (m.get("content") or {}).get("text"))
                 for m in messages] != [(m["message_id"], m["author"], m["text"])
                                         for m in served]:

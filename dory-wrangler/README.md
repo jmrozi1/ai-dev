@@ -109,19 +109,23 @@ the product's own `build_server` -- and then, over HTTP only:
 | `events` | that session's events were preserved, gap-free, with a recognized agent-sourced one |
 | `render` | the answer is in the served transcript read back from disk, and the served page renders it as the agent's text (derived from the page by `tests/pagemodel.py`) |
 | `continue` | a second turn is answered as the declared continuation says: `persistent` by the same agent, `fresh_binding` by a newly launched one |
-| `reopen` | the shell is stopped by its PID (SIGKILL) and started again on the same store; the reopened transcript is byte-identical |
-| `third-turn` | a third turn is answered after the restart |
+| `reopen` | the shell is stopped by its PID (SIGKILL) and started again on the same store; the reopened transcript is byte-identical, and before and after the restart it is the whole conversation so far |
+| `third-turn` | a third turn is answered after the restart, and the chat then served is the whole conversation |
 | `validate` | `validate_store.py`, as a separate program, accepts the store |
 | `diagnostics` | `diagnostics.py`, followed through its own bound, returns every preserved event of the chat, and every agent message cites one |
 
 It prints `PASS <step>: ...` per step and stops at the first `FAIL <step>: ...`,
 exiting `0` only if all eleven held. The lines never carry a path or an
-exception's text; the work directory is named on standard error and kept, so
-the commands below can be run over its `store/`. Its deadlines are its own
+exception's text; the conversation it expects is built only from what each send
+returned, and every step that reads the chat back requires all of it, so no step
+passes on a chat that has lost turns. The work directory is named on standard
+error and kept, so the commands below can be run over its `store/`. Its
+deadlines are its own
 (`--start-timeout`, `--request-timeout`, `--program-timeout`); the product gets
 no timer. `tests/test_end_to_end.py` runs it for all three configurations in the
 suite, and injects one fault per step into a copy of this tree to show the path
-fails at the step it claims to check.
+fails at the step it claims to check. A suite run that outlives its deadline is
+killed with its whole process group, so it leaves no shell or agent running.
 
 What differs between the configurations is what their launchers declare, and
 it shows:
@@ -143,7 +147,8 @@ the model launcher itself (the model is registered nowhere), always binds
 rename, prints no listening line, has no `--launcher` or `--launcher-options`
 (the model always declares `persistent` / `one_shot`), and does not turn a second
 shell on the same store into the fixed refusal with exit `3` -- that refusal
-surfaces as a traceback instead.
+surfaces as a traceback instead -- nor Ctrl-C into a quiet exit: it stops with a
+`KeyboardInterrupt` traceback.
 
 ### By hand
 
@@ -166,8 +171,10 @@ store directory is created if it does not exist.
 1. Open the address. Choose **+ New chat**, send `hello`, and see the agent's
    answer. Send `What was the first thing I said in this thread?`.
 2. Stop the shell with Ctrl-C (or `kill` its PID) and start it again with the
-   same command. Reload the page: the chat is listed and opens with the same
-   messages. Send the question again. Under `dev-local` `persistent` the send is
+   same command. `run_shell.py` exits quietly; `model_shell.py`, a test harness,
+   prints a `KeyboardInterrupt` traceback as it exits, which is expected and
+   leaves the store as it was. Reload the page: the chat is listed and opens
+   with the same messages. Send the question again. Under `dev-local` `persistent` the send is
    refused with the words "If the agent cannot be reached, abandon it and send
    again"; choose **Abandon the agent** and send it again.
 3. Check the store, with the shell running or not:
@@ -175,6 +182,7 @@ store directory is created if it does not exist.
    ```
    python3 dory-wrangler/validate_store.py ./dory-store
    curl -s http://127.0.0.1:8765/api/chats          # the chat's id is its chat_id
+   curl -s http://127.0.0.1:$(cat ./dory-port)/api/chats   # the same, for model_shell.py
    python3 dory-wrangler/diagnostics.py ./dory-store CHAT_ID --records lifecycle
    python3 dory-wrangler/diagnostics.py ./dory-store CHAT_ID
    python3 dory-wrangler/diagnostics.py ./dory-store CHAT_ID --records messages
