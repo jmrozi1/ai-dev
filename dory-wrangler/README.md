@@ -33,6 +33,7 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | --- | --- |
 | `contract/v0.1/contract.md` | the normative v0.1 chat, session, agent-binding, launch-boundary, and diagnostic contract |
 | `contract/v0.1/facts-and-assumptions.md` | what is proven about the integration today versus what is assumed, as claims internal dogfood can settle |
+| `assumption-register.md` | the v0.1 portability assumption register (#89): every assumption external validation cannot prove, each with its status, its evidence, and the command or procedure internal dogfood (#90) uses to mark it held or failed; it records which `facts-and-assumptions.md` entries internal evidence has since superseded |
 | `fixtures/v0.1/valid/` | store snapshots the contract must accept, including both continuation modes and both restart outcomes |
 | `fixtures/v0.1/invalid/` | store snapshots the contract must reject, each naming the rule it violates |
 | `validator/validate_contract.py` | the executable form of the contract |
@@ -328,6 +329,11 @@ with every failed test's name, to `PATH`, whatever the outcome.
 4. Run from a directory with a fresh `TMPDIR`; the suite needs no network, no
    fixed port and nothing under `HOME`, and leaves no process running -- also
    when a shell it starts fails to come up.
+
+What an internal run can and cannot conclude from these categories, and every
+assumption about the internal host, filesystem, transport and browser that no
+test here can settle, is in [`assumption-register.md`](assumption-register.md).
+Record each internal result against its entry there.
 
 ### Running the launch-boundary tests against a new launcher
 
