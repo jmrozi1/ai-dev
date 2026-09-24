@@ -34,6 +34,7 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | `contract/v0.1/contract.md` | the normative v0.1 chat, session, agent-binding, launch-boundary, and diagnostic contract |
 | `contract/v0.1/facts-and-assumptions.md` | what is proven about the integration today versus what is assumed, as claims internal dogfood can settle |
 | `assumption-register.md` | the v0.1 portability assumption register (#89): every assumption external validation cannot prove, each with its status, its evidence, and the command or procedure internal dogfood (#90) uses to mark it held or failed; it records which `facts-and-assumptions.md` entries internal evidence has since superseded |
+| `release-evidence-v0.1.md` | the v0.1 release evidence (#89): the exact commit tested, every command run on it with its result, and the morning procedure internal dogfood (#90) follows on the internal network |
 | `fixtures/v0.1/valid/` | store snapshots the contract must accept, including both continuation modes and both restart outcomes |
 | `fixtures/v0.1/invalid/` | store snapshots the contract must reject, each naming the rule it violates |
 | `validator/validate_contract.py` | the executable form of the contract |
