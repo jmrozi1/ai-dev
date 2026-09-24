@@ -469,6 +469,10 @@ class TheCommandLineRetrieval(unittest.TestCase):
             if not err:
                 return collected, statements
             statements.append(err)
+            # Sweep row T28: a statement naming a record already printed would
+            # never finish; following one must never print a record twice.
+            printed = [json.dumps(r, sort_keys=True) for r in collected]
+            self.assertEqual(len(printed), len(set(printed)), err)
             self.assertTrue(err.startswith("truncated: the bound of %d record(s) was "
                                            "reached and more are preserved; the next is "
                                            % limit), err)
@@ -484,10 +488,16 @@ class TheCommandLineRetrieval(unittest.TestCase):
                 (["--records", "messages"], self.messages),
                 (["--records", "messages", "--from", "2", "--to", "5"], self.messages[1:5]),
                 (["--records", "lifecycle"], self.lifecycle),
-                (["--records", "lifecycle", "--from", "2"], self.lifecycle[1:])):
+                (["--records", "lifecycle", "--from", "2"], self.lifecycle[1:]),
+                (["--records", "lifecycle", "--from", "1", "--to", "2"], self.lifecycle[:2]),
+                (["--records", "lifecycle", "--to", "1"], self.lifecycle[:1])):
             for limit in (1, 2):
                 with self.subTest(args=args, limit=limit):
                     self.assertEqual(self.follow(args, limit)[0], expected)
+            with self.subTest(args=args, limit="exactly what there is"):
+                # Sweep row T17: a bound the result only meets holds nothing back.
+                collected, statements = self.follow(args, len(expected))
+                self.assertEqual((collected, statements), (expected, []))
         status, out, err = self.unchanged(self.root, self.chat_id, "--records", "messages",
                                           "--limit", "4")
         self.assertEqual(err, "truncated: the bound of 4 record(s) was reached and more are "
@@ -498,6 +508,41 @@ class TheCommandLineRetrieval(unittest.TestCase):
         self.assertEqual(err, "truncated: the bound of 1 record(s) was reached and more are "
                               "preserved; the next is line 2; ask again with --from 2\n")
         self.assertEqual(records_of(out), self.lifecycle[:1])
+
+    def test_a_chat_with_nothing_preserved_prints_nothing_and_holds_nothing_back(self):
+        """Sweep row S05: a chat no agent ever spoke on has no events directory."""
+        root = support.scratch_root()
+        store = ChatStore(root)
+        chat_id = store.create_chat("Nothing yet")["chat_id"]
+        store.close()
+        self.assertEqual(ChatStore(root, read_only=True).read_diagnostic_page(chat_id),
+                         ([], None))
+        for mode in ("events", "lifecycle", "messages"):
+            with self.subTest(mode=mode):
+                self.assertEqual(run_tool(root, chat_id, "--records", mode), (0, b"", ""))
+
+    def test_a_chat_wide_bound_names_the_record_it_held_back(self):
+        """Sweep row S04. Across sessions the next record is in another session
+        than the first one printed, and the statement names that one."""
+        harness = support.harness({"launcher": "scripted-stub",
+                                   "options": {"garbage": True, "unknown_type": True}})
+        chat_id = harness.create_chat("Several sessions")
+        for text in ("one", "two", "three"):
+            harness.send_turn(chat_id, text)
+        root = harness.store.root
+        harness.store.close()
+        everything = ChatStore(root, read_only=True).read_diagnostic_events(chat_id)
+        self.assertEqual(len(set(e["session_id"] for e in everything)), 3)
+        for limit in range(1, len(everything)):
+            with self.subTest(limit=limit):
+                status, out, err = run_tool(root, chat_id, "--limit", limit)
+                self.assertEqual((status, records_of(out)), (0, everything[:limit]))
+                held = everything[limit]
+                self.assertIn("the next is session %s sequence %d; ask again with --session "
+                              "%s --from %d;" % (held["session_id"], held["sequence"],
+                                                 held["session_id"], held["sequence"]), err)
+        status, out, err = run_tool(root, chat_id, "--limit", len(everything))
+        self.assertEqual((status, records_of(out), err), (0, everything, ""))
 
     def test_refusals_are_fixed_words_with_a_non_zero_exit(self):
         tool = _tool_module()
@@ -570,6 +615,14 @@ class TheCommandLineRetrieval(unittest.TestCase):
     def test_the_default_bound_and_the_cap_are_the_store_s(self):
         root, chat_id, _manager = stub_chat(
             [THINKING] * (DIAGNOSTIC_PAGE_MAX + 1) + [TURN_COMPLETE], turns=("one",))
+        store = ChatStore(root, read_only=True)
+        # Sweep row S08: the library caps a caller's bound itself, whatever the
+        # tool does.
+        records, following = store.read_diagnostic_page(chat_id, limit=DIAGNOSTIC_PAGE_MAX * 5)
+        self.assertEqual(len(records), DIAGNOSTIC_PAGE_MAX)
+        self.assertEqual(following["sequence"], DIAGNOSTIC_PAGE_MAX + 1)
+        self.assertEqual(len(store.read_diagnostic_events(chat_id, limit=DIAGNOSTIC_PAGE_MAX * 5)),
+                         DIAGNOSTIC_PAGE_MAX)
         status, out, err = run_tool(root, chat_id)
         self.assertEqual((status, len(records_of(out))), (0, DIAGNOSTIC_PAGE_DEFAULT))
         self.assertIn("the bound of %d record(s)" % DIAGNOSTIC_PAGE_DEFAULT, err)
