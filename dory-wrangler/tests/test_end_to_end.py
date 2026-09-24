@@ -289,6 +289,15 @@ FAULTS = {
     # A render that labels the agent's answer as the user's.
     "render-label": ("render", ONE_SHOT, (), "src/dory_wrangler/webapp.py",
                      'agent: "AGENT"', 'agent: "YOU"'),
+    # A served chat that loses its last turn only once it has three: every read
+    # after the third turn serves one message short, while the send's own
+    # response is whole. Only the read-back after the third turn can see it
+    # (check-review L1).
+    "third-turn-lost-turn": ("third-turn", ONE_SHOT, (), "src/dory_wrangler/webapp.py",
+                             "return self._respond(200, self.service.open_chat(chat_id))",
+                             "return self._respond(200, (lambda c: dict(c, messages=c["
+                             "\"messages\"][:-1]) if len(c[\"messages\"]) > 4 else c)("
+                             "self.service.open_chat(chat_id)))"),
     # A reopened transcript that differs from the one served before the restart.
     "reopen-bytes": ("reopen", ONE_SHOT, (), "src/dory_wrangler/service.py",
                      '"state": chat["state"],',
@@ -423,6 +432,9 @@ class EachStepFailsAtItsStep(unittest.TestCase):
 
     def test_an_agent_that_cannot_start_after_the_restart_fails_at_third_turn(self):
         self.assert_fails_at("third-turn")
+
+    def test_a_served_chat_that_loses_the_third_turn_fails_at_third_turn(self):
+        self.assert_fails_at("third-turn-lost-turn")
 
     def test_a_store_left_out_of_sequence_fails_at_validate(self):
         self.assert_fails_at("validate")
