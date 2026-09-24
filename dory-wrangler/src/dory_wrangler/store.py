@@ -1741,6 +1741,24 @@ class ChatStore(object):
         `sequence` range, returning a bounded number of preserved records. It
         derives nothing: no counting, no grouping, no interpretation, no
         ranking. A view that did any of those would be #82.
+
+        The records of `read_diagnostic_page`, which this is: one addressing,
+        one bound and one temp filter for the library and the command-line
+        retrieval (`dory-wrangler/diagnostics.py`, decision 0007).
+        """
+        return self.read_diagnostic_page(chat_id, session_id, sequence_from,
+                                         sequence_to, limit)[0]
+
+    def read_diagnostic_page(self, chat_id, session_id=None, sequence_from=None,
+                             sequence_to=None, limit=DIAGNOSTIC_PAGE_DEFAULT):
+        """`(records, following)`: the bounded retrieval, and where it stopped.
+
+        `records` is exactly what `read_diagnostic_events` returns. `following`
+        is None when the bound held nothing back, and otherwise the address --
+        `{"session_id": ..., "sequence": ...}` -- of the first preserved record
+        the bound held back, so a caller can say that the result was truncated
+        and ask for the rest by the same addressing (contract P4). It is a
+        position in the store's own order, not a count or a summary.
         """
         if not isinstance(limit, int) or limit < 1:
             raise ValidationRefused("limit must be a positive integer")
@@ -1757,7 +1775,7 @@ class ChatStore(object):
         self.read_chat(chat_id)
         base = self._chat_events_dir(chat_id)
         if not os.path.isdir(base):
-            return []
+            return [], None
         session_ids = sorted(os.listdir(base)) if session_id is None else [session_id]
         out = []
         for sid in session_ids:
@@ -1777,7 +1795,11 @@ class ChatStore(object):
                     continue
                 out.append(record)
         out.sort(key=lambda e: (e["session_id"], e["sequence"]))
-        return out[:limit]
+        following = None
+        if len(out) > limit:
+            following = {"session_id": out[limit]["session_id"],
+                         "sequence": out[limit]["sequence"]}
+        return out[:limit], following
 
     def read_all_events_of_session(self, chat_id, session_id):
         """Every preserved event on a session, contiguity enforced.

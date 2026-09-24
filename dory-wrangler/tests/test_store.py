@@ -1506,6 +1506,9 @@ class TestNoPublicSequenceProducesARejectedStore(unittest.TestCase):
         "list_sessions", "chat_agent_status", "read_launch_requests",
         "read_launch_results", "read_delivery_requests", "read_session_observations",
         "next_event_sequence", "read_diagnostic_event", "read_diagnostic_events",
+        # Decision 0007: the retrieval with the address of what its bound held
+        # back, which `read_diagnostic_events` returns the records of.
+        "read_diagnostic_page",
         "read_all_events_of_session", "export_records", "snapshot", "verify",
         "rejected_content_types", "root", "chats_dir", "diagnostics_dir",
         # Review finding R4: the pre-flights compose would-be records and put

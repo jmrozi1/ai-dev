@@ -43,10 +43,12 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | `decisions/0004-classifying-event-types.md` | the recognized event types per wire format, declared once, where classification happens, the `unrecognized`/`malformed` boundary, and the rule for adding a type |
 | `decisions/0005-rendering-useful-events.md` | what the conversation renders -- one agent message per recognized agent text event, its text exactly, in event order, nothing else -- and the exact-text gate over every kept store |
 | `decisions/0006-no-showable-reply-notice.md` | the one notice a turn gets when it ends with nothing that can be shown, when it is and is not written, and the rule that system text is the harness's fixed words only |
+| `decisions/0007-bounded-diagnostic-retrieval.md` | the one read-only command that prints a chat's preserved evidence verbatim and bounded, and the rule that it derives nothing |
 | `src/dory_wrangler/` | the one product package: the durable store (`store.py`), the chat loop (`session_manager.py`), the launch seam (`launch_boundary.py`), the launchers (`launchers/`), and the served shell (`webapp.py`) |
 | `skills/adversarial-guard-verification/SKILL.md` | how this product checks that a diff's guards are really pinned: the mutation-runner contract, how to enumerate and adjudicate rows, and the decision-conformance pass |
 | `run_shell.py` | run the shell |
 | `validate_store.py` | check a live store against the contract |
+| `diagnostics.py` | print a chat's preserved raw evidence, verbatim and bounded (contract P4) |
 | `tests/` | the one test suite for all of it, including both sides' adversarial probes |
 
 ## Running the shell
@@ -98,6 +100,42 @@ python3 dory-wrangler/validate_store.py ./dory-store
 Exit `0` when the store satisfies contract v0.1, `1` when it does not, `2` when
 it could not be read at all.
 
+## Diagnostic evidence
+
+Everything the integration handed the harness is preserved raw and correlated,
+outside the chat (contract P4). One read-only command prints it, bounded:
+
+```
+python3 dory-wrangler/diagnostics.py STORE CHAT_ID [--session SESSION_ID]
+    [--from N] [--to N] [--limit N] [--records events|lifecycle|messages]
+```
+
+`events` (the default) prints the chat's `diagnostic_event` records, optionally
+one session's and a `sequence` range; `lifecycle` each session's
+`agent_session`, `launch_result` and `session_observation` records; `messages`
+the chat's `message` records. One stored record per line, as JSON, exactly as
+stored -- bytes that were not UTF-8 stay base64 and nothing raw reaches the
+terminal -- at most `--limit` of them (100 by default, 1000 at most). It derives
+nothing: no counts, grouping, joins or interpretation (that is #82). It takes no
+lock and writes nothing, so it runs while `run_shell.py` serves the same store.
+Refusals are fixed words with exit `2`; an unreadable store exits `3`.
+
+A worked example, for a chat whose turn carried a line that is not JSON, one of
+a type the development transport does not know, and an answer:
+
+```
+$ python3 dory-wrangler/diagnostics.py ./dory-store cht_cbf52131823100ae8a470826 --limit 2
+{"chat_id": "cht_cbf52131823100ae8a470826", "event_id": "evt_49baeb03dc4629d5e2998818", "interpretation": "malformed", "interpreted_type": null, "raw": {"body": "this is not json at all {{{", "encoding": "utf-8"}, "received_at": "2026-09-24T01:11:22.160853Z", "record_type": "diagnostic_event", "record_version": 1, "sequence": 1, "session_id": "ses_411c1409936c235e4d9a1e32", "source": "agent"}
+{"chat_id": "cht_cbf52131823100ae8a470826", "event_id": "evt_b3872e2f6493b82fdff8dcca", "interpretation": "unrecognized", "interpreted_type": null, "raw": {"body": "{\"type\": \"agent_thinking\"}", "encoding": "utf-8"}, "received_at": "2026-09-24T01:11:22.166243Z", "record_type": "diagnostic_event", "record_version": 1, "sequence": 2, "session_id": "ses_411c1409936c235e4d9a1e32", "source": "agent"}
+truncated: the bound of 2 record(s) was reached and more are preserved; the next is session ses_411c1409936c235e4d9a1e32 sequence 3; ask again with --session ses_411c1409936c235e4d9a1e32 --from 3; the sessions after it in this order are asked for the same way, by --session (--records lifecycle lists every session)
+```
+
+The truncation line is on standard error. Which event was rendered is the
+`source_event_id` of an agent message in `--records messages`; where the stream
+stopped is the last event's `sequence` together with the session's `state` and
+observations in `--records lifecycle`. Putting those together is the reader's
+work, deliberately (decision 0007).
+
 ## Testing
 
 ```
@@ -130,8 +168,9 @@ integration hands it raw and correlated before anything reads it, with the
 exceptions named below (#88), and event classification from a recognized set
 declared once per wire format (#88, decision 0004), and rendering of the useful
 subset (#88, decision 0005), and handling of what cannot be shown -- the chat
-survives every such turn and says so once, in fixed words (#88, decision 0006).
-Bounded diagnostic access is #88's remaining checkpoint. No observability (#82),
+survives every such turn and says so once, in fixed words (#88, decision 0006),
+and bounded diagnostic access: one read-only command that prints preserved
+evidence verbatim and derives nothing (#88, decision 0007). No observability (#82),
 supervision (#83), or multi-agent (#84) behavior is in scope.
 
 The last payload shape that was refused before it was preserved is preserved

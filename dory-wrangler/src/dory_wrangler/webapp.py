@@ -13,8 +13,11 @@ pixel for a session, a binding, a transition, a launch result, an observation,
 or a diagnostic event. The JSON the browser receives contains chat metadata and
 message text and nothing else, so the shell could not display worker internals
 even if its markup tried to. The bounded out-of-band diagnostic retrieval
-required by contract 8.5 exists on `ChatStore`, reachable by a program, and is
-not wired to a route.
+required by contract 8.5 exists on `ChatStore` (`read_diagnostic_events`) and as
+one read-only command beside `run_shell.py`,
+`python3 dory-wrangler/diagnostics.py STORE CHAT_ID ...` (decision 0007), which
+prints preserved records verbatim and bounded and derives nothing. It is not
+wired to a route, and this module does not import it.
 
 There are no agent-launch mechanics here either. A sent turn goes to the chat
 loop (`session_manager`), which reaches an agent only through the configured
