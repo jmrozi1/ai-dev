@@ -120,9 +120,8 @@ exception's text; the conversation it expects is built only from what each send
 returned, and every step that reads the chat back requires all of it, so no step
 passes on a chat that has lost turns. The work directory is named on standard
 error and kept, so the commands below can be run over its `store/`. Its
-deadlines are its own
-(`--start-timeout`, `--request-timeout`, `--program-timeout`); the product gets
-no timer. `tests/test_end_to_end.py` runs it for all three configurations in the
+deadlines are its own (`--start-timeout`, `--request-timeout`,
+`--program-timeout`); the product gets no timer. `tests/test_end_to_end.py` runs it for all three configurations in the
 suite, and injects one fault per step into a copy of this tree to show the path
 fails at the step it claims to check. A suite run that outlives its deadline is
 killed with its whole process group, so it leaves no shell or agent running.
