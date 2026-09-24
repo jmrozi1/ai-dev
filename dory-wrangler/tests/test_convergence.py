@@ -1171,13 +1171,45 @@ def completes_in_another_thread(test, action, seconds=20):
     return result.get("value")
 
 
+def open_descriptors(on=None):
+    """The descriptors this process has open, found with `os.fstat` over its
+    whole descriptor table -- POSIX, where `/proc/self/fd` is Linux only (the
+    portable category's host needs name no `/proc`). With `on`, a list of paths,
+    only the descriptors open on one of those files, matched by device and inode.
+    """
+    import resource
+    limit = resource.getrlimit(resource.RLIMIT_NOFILE)[0]
+    if limit == resource.RLIM_INFINITY:
+        limit = os.sysconf("SC_OPEN_MAX")
+    files = None
+    if on is not None:
+        files = set()
+        for path in on:
+            status = os.stat(path)
+            files.add((status.st_dev, status.st_ino))
+    found = []
+    for fd in range(limit):
+        try:
+            status = os.fstat(fd)
+        except OSError:
+            continue
+        if files is None or (status.st_dev, status.st_ino) in files:
+            found.append(fd)
+    return found
+
+
 class TheTurnLockGivesBackWhatItTook(unittest.TestCase, StoreCheck):
     """Review finding R6, and the lock's own paths the review's mutations left
     unpinned (M01, M02, M06)."""
 
-    def open_descriptors_on(self, name):
-        return sum(1 for fd in os.listdir("/proc/self/fd")
-                   if os.path.realpath("/proc/self/fd/" + fd).endswith(name))
+    def open_descriptors_on(self, root, name):
+        """Descriptors open on any file called `name` under the store at `root`."""
+        paths = [os.path.join(where, name) for where, _dirs, files in os.walk(root)
+                 if name in files]
+        # The failed acquisition created the file before its `flock` failed, so
+        # a count over no file at all would say nothing.
+        self.assertTrue(paths, "no %s under %s to count descriptors on" % (name, root))
+        return len(open_descriptors(on=paths))
 
     def test_a_failed_open_of_the_lock_file_leaves_nothing_held(self):
         import errno
@@ -1210,6 +1242,7 @@ class TheTurnLockGivesBackWhatItTook(unittest.TestCase, StoreCheck):
         harness = support.harness({"launcher": "scripted-stub"})
         chat_id = harness.create_chat("flock fails")
         real_flock = session_manager.fcntl.flock
+        lock_name = session_manager.TURN_LOCK_NAME
         armed = [True]
 
         def fails_once(fd, operation):
@@ -1224,10 +1257,10 @@ class TheTurnLockGivesBackWhatItTook(unittest.TestCase, StoreCheck):
                 harness.send_turn(chat_id, "one")
         finally:
             session_manager.fcntl.flock = real_flock
-        self.assertEqual(self.open_descriptors_on(session_manager.TURN_LOCK_NAME), 0)
+        self.assertEqual(self.open_descriptors_on(harness.store.root, lock_name), 0)
         outcome = completes_in_another_thread(self, lambda: harness.send_turn(chat_id, "two"))
         self.assertEqual(outcome.session_state, "completed")
-        self.assertEqual(self.open_descriptors_on(session_manager.TURN_LOCK_NAME), 0)
+        self.assertEqual(self.open_descriptors_on(harness.store.root, lock_name), 0)
 
     def test_a_hold_refused_because_another_descriptor_holds_it_takes_nothing(self):
         """M01. Two chat loops over one store in one process: the second's
@@ -1630,7 +1663,7 @@ class TheStoreLockHasNoGaps(unittest.TestCase, StoreCheck):
 
     @staticmethod
     def descriptors():
-        return len(os.listdir("/proc/self/fd"))
+        return len(open_descriptors())
 
     def test_a_refused_acquisition_leaks_no_descriptor(self):
         from dory_wrangler.errors import StoreInUse
