@@ -50,6 +50,7 @@ canonical copy. Two earlier locations still exist and neither is authoritative:
 | `validate_store.py` | check a live store against the contract |
 | `diagnostics.py` | print a chat's preserved raw evidence, verbatim and bounded (contract P4) |
 | `tests/` | the one test suite for all of it, including both sides' adversarial probes |
+| `tests/e2e_loop.py` | the whole single-agent chat loop -- create, send, launch, events, render, reopen -- as one runnable path against the served shell (#89) |
 
 ## Running the shell
 
@@ -82,6 +83,111 @@ shell has: abandon that agent.
 > shown as `terminated`. A turn that never returns holds its chat until the shell
 > process exits; after a restart the one action is the exit. Interrupting an
 > active turn is later supervision work (#83). See decision 0003, section 5.
+
+## The whole loop, end to end
+
+One command runs the complete single-agent chat loop against the served
+application, started as a separate process, and says step by step what held:
+
+```
+python3 dory-wrangler/tests/e2e_loop.py --launcher dev-local --launcher-options '{"profile": "one_shot"}'
+python3 dory-wrangler/tests/e2e_loop.py --launcher dev-local --launcher-options '{"profile": "persistent"}'
+python3 dory-wrangler/tests/e2e_loop.py --codex-model
+```
+
+It creates a work directory (or uses `--work DIR`, which must be empty or
+absent), starts `run_shell.py` on a fresh store in it -- or, for `--codex-model`,
+`tests/model_shell.py`, which serves the internal-shape Codex JSONL model through
+the product's own `build_server` -- and then, over HTTP only:
+
+| Step | What it shows |
+| --- | --- |
+| `start` | the shell is served by a process of its own |
+| `create` | a new chat is created and is the one chat listed |
+| `send` | a user turn is accepted and recorded |
+| `launch` | an agent session opened on that turn, by the configured launcher, with an accepted launch |
+| `events` | that session's events were preserved, gap-free, with a recognized agent-sourced one |
+| `render` | the answer is in the served transcript read back from disk, and the served page renders it as the agent's text (derived from the page by `tests/pagemodel.py`) |
+| `continue` | a second turn is answered as the declared continuation says: `persistent` by the same agent, `fresh_binding` by a newly launched one |
+| `reopen` | the shell is stopped by its PID (SIGKILL) and started again on the same store; the reopened transcript is byte-identical |
+| `third-turn` | a third turn is answered after the restart |
+| `validate` | `validate_store.py`, as a separate program, accepts the store |
+| `diagnostics` | `diagnostics.py`, followed through its own bound, returns every preserved event of the chat, and every agent message cites one |
+
+It prints `PASS <step>: ...` per step and stops at the first `FAIL <step>: ...`,
+exiting `0` only if all eleven held. The lines never carry a path or an
+exception's text; the work directory is named on standard error and kept, so
+the commands below can be run over its `store/`. Its deadlines are its own
+(`--start-timeout`, `--request-timeout`, `--program-timeout`); the product gets
+no timer. `tests/test_end_to_end.py` runs it for all three configurations in the
+suite, and injects one fault per step into a copy of this tree to show the path
+fails at the step it claims to check.
+
+What differs between the configurations is what their launchers declare, and
+it shows:
+
+* `dev-local`, `one_shot` -- `fresh_binding`: every turn, including the one after
+  the restart, is answered by a newly launched agent.
+* `dev-local`, `persistent` -- the second turn is delivered to the same agent. Its
+  process does not survive the shell that started it, so after the restart the
+  third turn is **refused, with nothing recorded**, re-attachment having failed;
+  the path takes the shell's one lifecycle action, Abandon, and the turn sent
+  again is answered by a new agent (contract 5.4, decision 0003).
+* the Codex model -- `persistent`: the second turn and the one after the restart
+  both resume the same thread (`--resumeID`), and its answer, "you first said:
+  hello", shows it.
+
+`model_shell.py` differs from `run_shell.py` only around `build_server`: it builds
+the model launcher itself (the model is registered nowhere), always binds
+`127.0.0.1` on a free port and is always quiet, writes its port file by atomic
+rename, prints no listening line, has no `--launcher` or `--launcher-options`
+(the model always declares `persistent` / `one_shot`), and does not turn a second
+shell on the same store into the fixed refusal with exit `3` -- that refusal
+surfaces as a traceback instead.
+
+### By hand
+
+The same loop, for a person at a terminal. Pick one way to start the shell:
+
+```
+python3 dory-wrangler/run_shell.py --root ./dory-store
+python3 dory-wrangler/run_shell.py --root ./dory-store --launcher dev-local \
+    --launcher-options '{"profile": "persistent"}'
+python3 dory-wrangler/tests/model_shell.py --root ./dory-store --port-file ./dory-port \
+    --codex-home ./codex-home --spool ./codex-spool
+```
+
+The first is `dev-local` on `one_shot`, the default. `run_shell.py` prints the
+address, `http://127.0.0.1:8765` unless `--port` says otherwise;
+`model_shell.py` prints nothing and writes its port to `./dory-port`, and keeps
+the model's thread state in `./codex-home` and its output in `./codex-spool`. The
+store directory is created if it does not exist.
+
+1. Open the address. Choose **+ New chat**, send `hello`, and see the agent's
+   answer. Send `What was the first thing I said in this thread?`.
+2. Stop the shell with Ctrl-C (or `kill` its PID) and start it again with the
+   same command. Reload the page: the chat is listed and opens with the same
+   messages. Send the question again. Under `dev-local` `persistent` the send is
+   refused with the words "If the agent cannot be reached, abandon it and send
+   again"; choose **Abandon the agent** and send it again.
+3. Check the store, with the shell running or not:
+
+   ```
+   python3 dory-wrangler/validate_store.py ./dory-store
+   curl -s http://127.0.0.1:8765/api/chats          # the chat's id is its chat_id
+   python3 dory-wrangler/diagnostics.py ./dory-store CHAT_ID --records lifecycle
+   python3 dory-wrangler/diagnostics.py ./dory-store CHAT_ID
+   python3 dory-wrangler/diagnostics.py ./dory-store CHAT_ID --records messages
+   ```
+
+   The chat's id is also the name of its directory under `./dory-store/chats/`.
+
+**Browser rendering is not verified on the development host.** It has no
+browser, and headless Chrome is disallowed there by host policy. What the
+automated path checks is the transcript the page is served and the rendering
+`tests/pagemodel.py` derives from the served page's own stylesheet, label map
+and `renderChat`; that the page draws it in a real browser is for the person
+following these steps to see.
 
 ## Validating
 
