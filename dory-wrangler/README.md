@@ -261,8 +261,10 @@ python3 dory-wrangler/tests/run_tests.py
 python3 dory-wrangler/tests/test_adversarial.py --report
 ```
 
-Stdlib `unittest`; no pytest and no test framework required. The runner has four
-phases: the unit suite; every store the suite kept, handed to the contract
+Stdlib `unittest`; no pytest and no test framework required. (`python3` here
+means the platform's Python 3.9 or later; on the Linux development desktop it is
+3.6, so run `python3.11` there.) The runner has five phases: the category guard
+(below); the unit suite; every store the suite kept, handed to the contract
 validator as a separate program; every event in those stores re-classified from
 its bytes, every agent message checked against its cited event's text, every
 system message checked to be the harness's fixed words in its place, and any
@@ -271,6 +273,98 @@ is named with a reason (`tests/reclassify_stores.py`); and the contract's own
 fixtures. The second
 command prints #86's adversarial probe table: every guarantee the store claims,
 the attack made on it, and what the attack found.
+
+### Test categories, and telling an environmental failure from a product one
+
+Every test is in exactly one of three categories. The criteria are stated in
+full in `tests/categories.py`, which also holds the assignment of every module,
+class or test:
+
+| Category | What it asserts | A failure there means |
+| --- | --- | --- |
+| `portable` | v0.1 behaviour that must hold wherever the product runs: contract and validator, the store, the chat loop through `scripted-stub` and in-process launchers, classification, rendering, the notice, the served boundary over HTTP, diagnostics retrieval | the product is wrong on that host |
+| `launch-boundary` | the launch-boundary contract (contract 6, `launch-boundary.md`) as a launcher honours it and the harness uses it, including the internal-shape Codex JSONL model | the boundary is wrong on that host |
+| `development-environment` | anything resting on this development host: the `dev-local` launcher and its processes and pipes, process liveness and `/proc`, signals at a moment or to a group, `flock` or exclusive creation between processes or store objects, permission bits, locale, timing | possibly the host -- see below |
+
+```
+python3 dory-wrangler/tests/run_tests.py                                   # everything
+python3 dory-wrangler/tests/run_tests.py --category portable
+python3 dory-wrangler/tests/run_tests.py --category launch-boundary
+python3 dory-wrangler/tests/run_tests.py --category development-environment
+python3 dory-wrangler/tests/run_tests.py --category portable --category launch-boundary \
+    --json ./run.json
+```
+
+The default run is the whole suite. Phase 0 fails the run before anything else
+runs if any test is not assigned a category, or an assignment names a test that
+no longer exists, and prints how many tests each category has. Phase 1 ends
+with a line per category -- tests, passed, failed, errors, skipped -- and names
+every failed test under its category. `--category` (repeatable) runs only that
+category; phases 2 and 3 then check the stores those tests kept, and phase 4
+still runs. `--json PATH` writes the same result, per phase and per category
+with every failed test's name, to `PATH`, whatever the outcome.
+
+**On an internal run**, read the per-category lines, not only the exit status:
+
+1. A failure under `portable` or `launch-boundary` is a product or boundary
+   failure on that host. These pass with `dev-local` made unavailable, under
+   Python 3.11 and 3.12, and under a non-UTF-8 locale; none of them depends on
+   the development launcher. Treat it as a defect and report it with the test's
+   name.
+2. A failure under `development-environment` may be environmental. Find which
+   dependency the test rests on (its entry in `tests/categories.py` is grouped
+   by dependency: the `dev-local` launcher; `flock` or exclusive creation between
+   processes; process mechanics; the locale's encoding; permission bits),
+   confirm the host differs
+   there -- no `dev-local` agent program, a filesystem where `flock` is emulated
+   or absent (decisions/0001 risk R3), running as root, a non-UTF-8 locale
+   (L4), heavy load -- and only then call it environmental. A difference that
+   the product itself relies on, such as `flock` on the store's filesystem, is
+   still a finding about that host.
+3. Run the named test again before calling anything a failure: this host's
+   sandbox intermittently refuses `exec` and heavy parallel load fakes timing
+   failures.
+4. Run from a directory with a fresh `TMPDIR`; the suite needs no network, no
+   fixed port and nothing under `HOME`, and leaves no process running.
+
+### Running the launch-boundary tests against a new launcher
+
+The `launch-boundary` category is what a launcher must honour, but its tests
+are written against the launchers in this repository -- `scripted-stub`
+variants, launchers defined in the test files, and the Codex JSONL model -- and
+the ones that loop over configurations compare answers with the in-repo
+agents' fixed `answer to: <text>`. Registering #90's internal launcher in
+`launchers/registry.py` therefore makes none of them run against it, and no
+test-harness parameter alone would: adding its configuration to
+`tests/support.CONFIGURATIONS` would fail those comparisons for reasons that
+have nothing to do with the boundary. What running them by configuration alone
+would need, and what is deliberately not built here:
+
+1. a configuration input to the suite -- the dictionary `build_launcher` takes,
+   given for example as `DORY_TEST_LAUNCHER='{"launcher": "...", "options": {...}}'`;
+2. a launcher-generic conformance module in the `launch-boundary` category that
+   asserts only contract 6 obligations of that configuration and never an
+   answer's text: it builds through the registry into a `LaunchBoundary` whose
+   `launcher_id` and capabilities are well-formed; one turn through
+   `open_harness` yields an accepted launch with a handle, a store the validator
+   accepts, at least one recognized agent-sourced event and every agent message
+   exactly its cited event's text; the declared continuation is what crossed
+   the boundary (one launch then deliveries, or one launch per turn, read with
+   `test_mode_invariance._CallLog`); a new launcher instance serves
+   `events(handle, 0)` from sequence 1 and `stop(handle)` with nothing
+   remembered; `events` resumes by `after_sequence`; and a restarted harness
+   re-attaches a live session;
+3. the new launcher's classifier known to phase 3 (`reclassify_stores.py`), or
+   the launcher named there with a reason, or every store it leaves fails
+   phase 3 closed;
+4. launcher-specific fixtures, supplied with the launcher, for its failure
+   categories -- no configuration makes a real bridge `unavailable` or
+   `rejected` on demand;
+5. the internal prerequisites the launcher needs to run at all.
+
+Until then the internal launcher is exercised by `tests/e2e_loop.py` pointed at
+it through `--launcher`, and the shape it must match is the one
+`tests/test_internal_bridge.py` holds for the model.
 
 A green suite is not evidence that a guard is pinned. When a change adds,
 removes, relocates or generalises one, check it by mutation under

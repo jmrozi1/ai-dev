@@ -238,11 +238,18 @@ class TestARestartWithALiveAgentLeavesTheUserAWayOut(RestartCase):
     """Contract 5.4 through the served application: the Abandon affordance.
 
     A chat whose agent was live when the shell died is re-attached once at start.
-    A launcher that cannot resume it -- which is every launcher in this
-    repository and the modelled internal bridge -- leaves the session `unknown`,
-    and `unknown` refuses every new turn. Without a user action that exits it,
-    the chat is stranded for the life of the store: that is the release's reopen
-    requirement failing, so it is proven here over HTTP, across a real SIGKILL.
+    A launcher that cannot resume it -- `dev-local`, whose agent exits with the
+    shell that started it, and `scripted-stub` as this test configures it, with
+    no handle to resume -- leaves the session `unknown`, and `unknown` refuses
+    every new turn. Without a user action that exits it, the chat is stranded for
+    the life of the store: that is the release's reopen requirement failing, so it
+    is proven here over HTTP, across a real SIGKILL.
+
+    The modelled internal bridge is not such a launcher: it resumes the same
+    thread from its handle after a restart
+    (`test_internal_bridge.ARestartOfTheShellResumesTheSameThread`), and it
+    reaches `unknown` only when a restart finds no output of the thread
+    (`test_internal_bridge.TheOneActionIsTheExitOnThisPath`).
     """
 
     PERSISTENT = {"continuation": "persistent", "response_shape": "stream",
