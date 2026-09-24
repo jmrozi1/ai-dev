@@ -51,9 +51,9 @@ from dory_wrangler.launchers.scripted_stub import ScriptedStubLauncher
 
 class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreCheck):
 
-    def test_every_configuration_produces_the_same_three_turn_transcript(self):
+    def same_three_turn_transcript_under(self, configurations):
         transcripts = {}
-        for name, config in CONFIGURATIONS:
+        for name, config in configurations:
             harness = support.harness(config)
             self.addCleanup(support.release, harness)
             chat_id = run_three_turns(harness, "Mode invariance")
@@ -61,11 +61,20 @@ class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreChec
             support.end_chat(harness, chat_id)
             self.assert_store_valid(harness.store, "mode-invariance-%s" % name)
 
-        self.assertEqual(len(transcripts), len(CONFIGURATIONS))
+        self.assertEqual(len(transcripts), len(configurations))
         self.assertEqual(len(expected_transcript()), 6,
                          "three user turns and three agent answers")
         for name, rows in transcripts.items():
             self.assertEqual(rows, expected_transcript(), name)
+
+    # Every configuration, as two tests: the stub half is portable, the
+    # `dev-local` half needs the development host (`tests/categories.py`);
+    # `test_chat_loop` holds that the halves are every configuration.
+    def test_every_stub_configuration_produces_the_same_three_turn_transcript(self):
+        self.same_three_turn_transcript_under(support.STUB_CONFIGURATIONS)
+
+    def test_every_dev_local_configuration_produces_the_same_three_turn_transcript(self):
+        self.same_three_turn_transcript_under(support.DEV_LOCAL_CONFIGURATIONS)
 
     def test_the_chat_and_message_records_are_the_same_shape(self):
         """Sessions, bindings and packets differ between modes -- they are the
@@ -86,11 +95,11 @@ class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreChec
         for name, shape in shapes.items():
             self.assertEqual(shape, reference, name)
 
-    def test_reopen_behaviour_is_identical_under_every_combination(self):
+    def reopen_behaviour_under(self, configurations):
         import os
         import shutil
         import tempfile
-        for name, config in CONFIGURATIONS:
+        for name, config in configurations:
             with self.subTest(configuration=name):
                 directory = tempfile.mkdtemp(prefix="dory-mode-")
                 self.addCleanup(shutil.rmtree, directory, True)
@@ -102,6 +111,12 @@ class TheTranscriptIsIdenticalUnderEveryCombination(unittest.TestCase, StoreChec
                 reopened = support.harness(config, store_path=path)
                 self.addCleanup(support.release, reopened)
                 self.assertEqual(reopened.transcript(chat_id), expected_transcript())
+
+    def test_reopen_behaviour_is_identical_under_every_stub_combination(self):
+        self.reopen_behaviour_under(support.STUB_CONFIGURATIONS)
+
+    def test_reopen_behaviour_is_identical_under_every_dev_local_combination(self):
+        self.reopen_behaviour_under(support.DEV_LOCAL_CONFIGURATIONS)
 
 
 class TheModeIsWhatTheLauncherWasActuallyAskedToDo(unittest.TestCase, StoreCheck):

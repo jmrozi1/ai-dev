@@ -19,9 +19,19 @@ from dory_wrangler.errors import NotPermitted
 
 
 class FullLoopAgainstEveryLauncher(unittest.TestCase, StoreCheck):
+    """Every configuration, run as two tests: the `scripted-stub` half is
+    portable and the `dev-local` half needs the development host
+    (`tests/categories.py`). Together they are every configuration, which the
+    first test holds."""
 
-    def test_three_turns_under_every_configuration(self):
-        for name, config in CONFIGURATIONS:
+    def test_the_two_halves_are_every_configuration(self):
+        self.assertEqual(sorted(support.STUB_CONFIGURATIONS + support.DEV_LOCAL_CONFIGURATIONS),
+                         sorted(CONFIGURATIONS))
+        self.assertEqual(len(support.STUB_CONFIGURATIONS), 4)
+        self.assertEqual(len(support.DEV_LOCAL_CONFIGURATIONS), 2)
+
+    def three_turns_under(self, configurations):
+        for name, config in configurations:
             with self.subTest(configuration=name):
                 harness = support.harness(config)
                 self.addCleanup(support.release, harness)
@@ -33,10 +43,16 @@ class FullLoopAgainstEveryLauncher(unittest.TestCase, StoreCheck):
                     "Three turns through the %s configuration, produced by the "
                     "harness rather than written by hand." % name)
 
-    def test_every_configuration_records_the_capabilities_it_declared(self):
+    def test_three_turns_under_every_stub_configuration(self):
+        self.three_turns_under(support.STUB_CONFIGURATIONS)
+
+    def test_three_turns_under_every_dev_local_configuration(self):
+        self.three_turns_under(support.DEV_LOCAL_CONFIGURATIONS)
+
+    def capabilities_recorded_under(self, configurations):
         """The store records what the launcher declared, and the declaration is
         the launcher's, not the contract's."""
-        for name, config in CONFIGURATIONS:
+        for name, config in configurations:
             with self.subTest(configuration=name):
                 harness = support.harness(config)
                 self.addCleanup(support.release, harness)
@@ -49,6 +65,12 @@ class FullLoopAgainstEveryLauncher(unittest.TestCase, StoreCheck):
                     session["launcher_capabilities"]["instruction_bound_bytes"],
                     "no instruction-payload bound has been measured anywhere")
                 end_chat(harness, chat_id)
+
+    def test_every_stub_configuration_records_the_capabilities_it_declared(self):
+        self.capabilities_recorded_under(support.STUB_CONFIGURATIONS)
+
+    def test_every_dev_local_configuration_records_the_capabilities_it_declared(self):
+        self.capabilities_recorded_under(support.DEV_LOCAL_CONFIGURATIONS)
 
 
 class DurableRecordsAreCanonical(unittest.TestCase, StoreCheck):

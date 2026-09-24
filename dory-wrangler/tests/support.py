@@ -332,6 +332,16 @@ CONFIGURATIONS = [
 ]
 
 
+# The same configurations, split by whether they need the development host's
+# `dev-local` launcher (`tests/categories.py`): a test that runs a loop over
+# every configuration runs it as two tests, one per half, so the portable half
+# is a portable test. `test_chat_loop` holds that the halves are the whole.
+STUB_CONFIGURATIONS = [(name, config) for name, config in CONFIGURATIONS
+                       if config["launcher"] == "scripted-stub"]
+DEV_LOCAL_CONFIGURATIONS = [(name, config) for name, config in CONFIGURATIONS
+                            if config["launcher"] == "dev-local"]
+
+
 def expected_transcript():
     rows = []
     for i, text in enumerate(THREE_TURNS):
