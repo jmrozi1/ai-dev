@@ -82,6 +82,18 @@ entry. If the canonical file is not yet available, treat this section only as a
 discovery hint rather than a substitute instruction set. Do not activate these
 skills for unrelated repositories.
 
+### Coxswain / Kilnstead release planning
+
+Canonical owner: `jmrozi1/coxswain`. This shared methodology applies to releases
+of any managed project, not only changes to Coxswain itself. Fetch the canonical
+skill when defining/resuming a release, assessing phase readiness, or handling
+material changes to an executing plan. Do not invoke the full lifecycle for an
+isolated coding task, factual question, or routine execution status check.
+
+| Skill | Use when | Canonical source |
+| --- | --- | --- |
+| `release-planning` | Guide the human through Gather materials, Shape, Refine, Prepare for the kiln, Cook, and Maintain. | [Coxswain release-planning](https://github.com/jmrozi1/coxswain/blob/main/skills/release-planning/SKILL.md) |
+
 ### `family-dragonflight-server`
 
 Code repository: `jeffmrozinski-cell/family-dragonflight-server`
