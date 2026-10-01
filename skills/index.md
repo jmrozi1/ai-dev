@@ -92,7 +92,7 @@ isolated coding task, factual question, or routine execution status check.
 
 | Skill | Use when | Canonical source |
 | --- | --- | --- |
-| `release-planning` | Guide the human through Gather materials, Shape, Refine, Prepare for the kiln, Cook, and Maintain. | [Coxswain release-planning](https://github.com/jmrozi1/coxswain/blob/main/skills/release-planning/SKILL.md) |
+| `release-planning` | Guide the human through Gather materials, Shape, Prepare for the kiln, Cook, and Maintain. | [Coxswain release-planning](https://github.com/jmrozi1/coxswain/blob/main/skills/release-planning/SKILL.md) |
 
 ### `family-dragonflight-server`
 
