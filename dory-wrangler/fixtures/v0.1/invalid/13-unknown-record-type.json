@@ -1,0 +1,45 @@
+{
+  "fixture": {
+    "name": "unknown-record-type",
+    "expect": "reject",
+    "reason_code": "UNKNOWN_RECORD_TYPE",
+    "description": "The store contains a record type the v0.1 contract does not define. Unrecognized record types fail closed; v0.1 has no team, reviewer, or supervisor records."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_badtype000001",
+      "title": "Scope creep",
+      "created_at": "2026-09-13T02:00:00Z",
+      "updated_at": "2026-09-13T02:00:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_badtype000001",
+      "chat_id": "cht_badtype000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-13T02:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Go."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_team",
+      "record_version": 1,
+      "team_id": "tea_badtype000001",
+      "chat_id": "cht_badtype000001",
+      "members": [
+        "ses_a",
+        "ses_b"
+      ]
+    }
+  ]
+}

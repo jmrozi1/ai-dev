@@ -1,0 +1,272 @@
+{
+  "fixture": {
+    "name": "failed-launch-then-later-turn",
+    "expect": "accept",
+    "description": "The first turn's launch fails, so that turn reached no agent and its packet correctly does not count toward the floor. The user sends a second turn, the launch succeeds, and the agent answers it. Two user messages, one answer, one packet that reached an agent -- an accurate history of a failed launch followed by a successful turn."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_retry00000001",
+      "title": "Draft the release note",
+      "created_at": "2026-09-12T12:00:00Z",
+      "updated_at": "2026-09-12T12:02:10Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_retry00000001",
+      "chat_id": "cht_retry00000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T12:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Draft the v0.1 release note."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_retry00000001",
+      "chat_id": "cht_retry00000001",
+      "created_at": "2026-09-12T12:00:02Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "launch_failed",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T12:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_retry00000001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T12:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_retry00000001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "launch_failed",
+          "owner": "launcher",
+          "at": "2026-09-12T12:00:11Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_retry00000001"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_retry00000001",
+      "chat_id": "cht_retry00000001",
+      "session_id": "ses_retry00000001",
+      "bound_at": "2026-09-12T12:00:02Z",
+      "released_at": "2026-09-12T12:00:11Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_retry00000001",
+      "chat_id": "cht_retry00000001",
+      "session_id": "ses_retry00000001",
+      "created_at": "2026-09-12T12:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Draft the v0.1 release note."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_retry00000001",
+      "session_id": "ses_retry00000001",
+      "observed_at": "2026-09-12T12:00:11Z",
+      "outcome": "failed",
+      "failure_category": "unavailable",
+      "detail": "launch prerequisite not satisfied"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_retry00000001",
+      "chat_id": "cht_retry00000001",
+      "session_id": "ses_retry00000001",
+      "sequence": 1,
+      "received_at": "2026-09-12T12:00:11Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "launch_failed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"launch_failed\",\"category\":\"unavailable\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_retry00000002",
+      "chat_id": "cht_retry00000001",
+      "sequence": 2,
+      "author": "user",
+      "created_at": "2026-09-12T12:01:30Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Draft the v0.1 release note, please try again."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_retry00000002",
+      "chat_id": "cht_retry00000001",
+      "created_at": "2026-09-12T12:01:31Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "agent-9c04",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T12:01:31Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_retry00000002"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T12:01:32Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_retry00000002"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T12:01:35Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_retry00000002"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T12:02:09Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_retry00000003"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_retry00000002",
+      "chat_id": "cht_retry00000001",
+      "session_id": "ses_retry00000002",
+      "bound_at": "2026-09-12T12:01:31Z",
+      "released_at": "2026-09-12T12:02:09Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_retry00000002",
+      "chat_id": "cht_retry00000001",
+      "session_id": "ses_retry00000002",
+      "created_at": "2026-09-12T12:01:32Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Draft the v0.1 release note, please try again."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_retry00000002",
+      "session_id": "ses_retry00000002",
+      "observed_at": "2026-09-12T12:01:35Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-9c04"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_retry00000002",
+      "chat_id": "cht_retry00000001",
+      "session_id": "ses_retry00000002",
+      "sequence": 1,
+      "received_at": "2026-09-12T12:02:05Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"v0.1 adds a single-agent chat over a swappable launch boundary.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_retry00000003",
+      "chat_id": "cht_retry00000001",
+      "sequence": 3,
+      "author": "agent",
+      "created_at": "2026-09-12T12:02:05Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "v0.1 adds a single-agent chat over a swappable launch boundary."
+      },
+      "session_id": "ses_retry00000002",
+      "source_event_id": "evt_retry00000002"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_retry00000003",
+      "chat_id": "cht_retry00000001",
+      "session_id": "ses_retry00000002",
+      "sequence": 2,
+      "received_at": "2026-09-12T12:02:09Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    }
+  ]
+}

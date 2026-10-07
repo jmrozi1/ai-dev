@@ -1,0 +1,282 @@
+{
+  "fixture": {
+    "name": "continuation-persistent",
+    "expect": "accept",
+    "description": "A launcher that declares continuation 'persistent'. One agent serves all three turns; every turn after the first is a delivery_request, so the exact text sent to the agent is preserved for turn two and turn three exactly as it is for turn one."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_persist000001",
+      "title": "Continuation: persistent",
+      "created_at": "2026-09-12T10:00:00Z",
+      "updated_at": "2026-09-12T10:02:25Z",
+      "state": "open"
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_persist000001",
+      "chat_id": "cht_persist000001",
+      "created_at": "2026-09-12T10:00:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "agent-p001",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T10:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_persist0001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T10:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_persist000001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T10:00:06Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_persist000001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T10:02:30Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_persist000004"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_persist000001",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "bound_at": "2026-09-12T10:00:03Z",
+      "released_at": "2026-09-12T10:02:30Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_persist000001",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "created_at": "2026-09-12T10:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What does the launch boundary do?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_persist000001",
+      "session_id": "ses_persist000001",
+      "observed_at": "2026-09-12T10:00:06Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-p001"
+    },
+    {
+      "record_type": "delivery_request",
+      "record_version": 1,
+      "delivery_id": "dlv_persist000001",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "sequence": 1,
+      "created_at": "2026-09-12T10:01:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "And what does it deliberately not do?",
+      "acknowledged": true
+    },
+    {
+      "record_type": "delivery_request",
+      "record_version": 1,
+      "delivery_id": "dlv_persist000002",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "sequence": 2,
+      "created_at": "2026-09-12T10:02:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Who may stop a running agent in v0.1?",
+      "acknowledged": true
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_persist000001",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "sequence": 1,
+      "received_at": "2026-09-12T10:00:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It hides how an agent is started.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_persist000002",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "sequence": 2,
+      "received_at": "2026-09-12T10:01:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It has no status, health, or poll operation.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_persist000003",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "sequence": 3,
+      "received_at": "2026-09-12T10:02:25Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Only the user. The harness has no such authority.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_persist000004",
+      "chat_id": "cht_persist000001",
+      "session_id": "ses_persist000001",
+      "sequence": 4,
+      "received_at": "2026-09-12T10:02:30Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_persist0001",
+      "chat_id": "cht_persist000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T10:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What does the launch boundary do?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_persist0002",
+      "chat_id": "cht_persist000001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T10:00:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "It hides how an agent is started."
+      },
+      "session_id": "ses_persist000001",
+      "source_event_id": "evt_persist000001"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_persist0003",
+      "chat_id": "cht_persist000001",
+      "sequence": 3,
+      "author": "user",
+      "created_at": "2026-09-12T10:01:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "And what does it deliberately not do?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_persist0004",
+      "chat_id": "cht_persist000001",
+      "sequence": 4,
+      "author": "agent",
+      "created_at": "2026-09-12T10:01:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "It has no status, health, or poll operation."
+      },
+      "session_id": "ses_persist000001",
+      "source_event_id": "evt_persist000002"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_persist0005",
+      "chat_id": "cht_persist000001",
+      "sequence": 5,
+      "author": "user",
+      "created_at": "2026-09-12T10:02:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Who may stop a running agent in v0.1?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_persist0006",
+      "chat_id": "cht_persist000001",
+      "sequence": 6,
+      "author": "agent",
+      "created_at": "2026-09-12T10:02:25Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Only the user. The harness has no such authority."
+      },
+      "session_id": "ses_persist000001",
+      "source_event_id": "evt_persist000003"
+    }
+  ]
+}

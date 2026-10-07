@@ -1,0 +1,409 @@
+{
+  "fixture": {
+    "name": "turn-floor-padded-with-decoy-launches",
+    "expect": "reject",
+    "reason_code": "TURN_INSTRUCTION_MISSING",
+    "description": "Three answered turns served by one persistent agent, with one real launch packet and no deliveries -- turns two and three are integration-blind. The floor is padded by two decoy sessions that each hold a launch_request and terminate in launch_failed. They are terminal so no cardinality rule sees them and they never ran so TURN_ALREADY_SERVED does not either. Only a packet on a session that reached 'running' can have reached an agent."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_r4decoy00001",
+      "title": "Three questions",
+      "created_at": "2026-09-12T14:00:00Z",
+      "updated_at": "2026-09-12T14:09:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_r4decoy001",
+      "chat_id": "cht_r4decoy00001",
+      "created_at": "2026-09-12T14:00:02Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "persist-b2d0",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T14:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_r4decoy001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T14:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_r4decoy001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T14:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_r4decoy001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T14:09:00Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_r4decoy004"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_r4decoy001",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy001",
+      "bound_at": "2026-09-12T14:00:02Z",
+      "released_at": "2026-09-12T14:09:00Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_r4decoy001",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy001",
+      "created_at": "2026-09-12T14:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What is the first question?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_r4decoy001",
+      "session_id": "ses_r4decoy001",
+      "observed_at": "2026-09-12T14:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "persist-b2d0"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4decoy001",
+      "chat_id": "cht_r4decoy00001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T14:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What is the first question?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r4decoy001",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy001",
+      "sequence": 1,
+      "received_at": "2026-09-12T14:01:00Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"The first answer.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4decoy002",
+      "chat_id": "cht_r4decoy00001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T14:01:00Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "The first answer."
+      },
+      "session_id": "ses_r4decoy001",
+      "source_event_id": "evt_r4decoy001"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4decoy003",
+      "chat_id": "cht_r4decoy00001",
+      "sequence": 3,
+      "author": "user",
+      "created_at": "2026-09-12T14:03:00Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "And the second?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r4decoy002",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy001",
+      "sequence": 2,
+      "received_at": "2026-09-12T14:04:00Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"The second answer.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4decoy004",
+      "chat_id": "cht_r4decoy00001",
+      "sequence": 4,
+      "author": "agent",
+      "created_at": "2026-09-12T14:04:00Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "The second answer."
+      },
+      "session_id": "ses_r4decoy001",
+      "source_event_id": "evt_r4decoy002"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4decoy005",
+      "chat_id": "cht_r4decoy00001",
+      "sequence": 5,
+      "author": "user",
+      "created_at": "2026-09-12T14:06:00Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "And the third?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r4decoy003",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy001",
+      "sequence": 3,
+      "received_at": "2026-09-12T14:07:00Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"The third answer.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r4decoy006",
+      "chat_id": "cht_r4decoy00001",
+      "sequence": 6,
+      "author": "agent",
+      "created_at": "2026-09-12T14:07:00Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "The third answer."
+      },
+      "session_id": "ses_r4decoy001",
+      "source_event_id": "evt_r4decoy003"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r4decoy004",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy001",
+      "sequence": 4,
+      "received_at": "2026-09-12T14:09:00Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "agent_exit",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"agent_exit\",\"code\":0}"
+      }
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_r4decoy002",
+      "chat_id": "cht_r4decoy00001",
+      "created_at": "2026-09-12T14:03:10Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "launch_failed",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T14:03:10Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_r4decoy003"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T14:03:11Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_r4decoy002"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "launch_failed",
+          "owner": "launcher",
+          "at": "2026-09-12T14:03:12Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_r4decoy002"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_r4decoy002",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy002",
+      "bound_at": "2026-09-12T14:03:10Z",
+      "released_at": "2026-09-12T14:03:12Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_r4decoy002",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy002",
+      "created_at": "2026-09-12T14:03:11Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "(never sent)"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_r4decoy002",
+      "session_id": "ses_r4decoy002",
+      "observed_at": "2026-09-12T14:03:12Z",
+      "outcome": "failed",
+      "failure_category": "unavailable",
+      "detail": "launcher was not reachable"
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_r4decoy003",
+      "chat_id": "cht_r4decoy00001",
+      "created_at": "2026-09-12T14:06:10Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "launch_failed",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T14:06:10Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_r4decoy005"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T14:06:11Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_r4decoy003"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "launch_failed",
+          "owner": "launcher",
+          "at": "2026-09-12T14:06:12Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_r4decoy003"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_r4decoy003",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy003",
+      "bound_at": "2026-09-12T14:06:10Z",
+      "released_at": "2026-09-12T14:06:12Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_r4decoy003",
+      "chat_id": "cht_r4decoy00001",
+      "session_id": "ses_r4decoy003",
+      "created_at": "2026-09-12T14:06:11Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "(never sent)"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_r4decoy003",
+      "session_id": "ses_r4decoy003",
+      "observed_at": "2026-09-12T14:06:12Z",
+      "outcome": "failed",
+      "failure_category": "unavailable",
+      "detail": "launcher was not reachable"
+    }
+  ]
+}

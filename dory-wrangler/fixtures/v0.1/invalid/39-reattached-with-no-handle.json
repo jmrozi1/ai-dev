@@ -1,0 +1,129 @@
+{
+  "fixture": {
+    "name": "reattached-with-no-handle",
+    "expect": "reject",
+    "reason_code": "ADDRESSED_WITHOUT_HANDLE",
+    "description": "The mirror of fixture 38 on the re-attachment side, and the one that is never cited by a transition. A launch outcome of 'unknown' issued no handle, yet after a restart the store records a successful re-attachment to this session's agent and then the user abandons it. A successful re-attachment to an agent whose handle was never returned can only have come from the launcher resolving the session id out of its own memory (contract 5.4, 6.1). The observation authorizes no transition, so no precondition rule looks at it; the record itself is the claim, and the record itself is what is rejected. 'reattach_failed' in the same position is accepted -- and is fixture valid/19's first restart -- because having no handle is precisely why a re-attachment fails."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_nohandleatt1",
+      "title": "Re-attach to something we cannot name",
+      "created_at": "2026-09-12T13:00:00Z",
+      "updated_at": "2026-09-13T07:30:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_nohandleatt1",
+      "chat_id": "cht_nohandleatt1",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T13:00:02Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Start an agent and keep it for tomorrow."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_nohandleatt1",
+      "chat_id": "cht_nohandleatt1",
+      "created_at": "2026-09-12T13:00:03Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "abandoned",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T13:00:03Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_nohandleatt1"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T13:00:04Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_nohandleatt1"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T13:00:09Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_nohandleatt1"
+          }
+        },
+        {
+          "from": "unknown",
+          "to": "abandoned",
+          "owner": "user",
+          "at": "2026-09-13T07:30:00Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": null
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_nohandleatt1",
+      "chat_id": "cht_nohandleatt1",
+      "session_id": "ses_nohandleatt1",
+      "bound_at": "2026-09-12T13:00:03Z",
+      "released_at": "2026-09-13T07:30:00Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_nohandleatt1",
+      "chat_id": "cht_nohandleatt1",
+      "session_id": "ses_nohandleatt1",
+      "created_at": "2026-09-12T13:00:04Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Start an agent and keep it for tomorrow."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_nohandleatt1",
+      "session_id": "ses_nohandleatt1",
+      "observed_at": "2026-09-12T13:00:09Z",
+      "outcome": "unknown",
+      "detail": "the bridge call did not come back with an acknowledgement"
+    },
+    {
+      "record_type": "session_observation",
+      "record_version": 1,
+      "observation_id": "obs_nohandleatt1",
+      "chat_id": "cht_nohandleatt1",
+      "session_id": "ses_nohandleatt1",
+      "observed_at": "2026-09-13T07:00:00Z",
+      "kind": "reattached",
+      "detail": "after restart the launcher found the agent for this session"
+    }
+  ]
+}

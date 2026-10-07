@@ -1,0 +1,136 @@
+{
+  "fixture": {
+    "name": "running-without-an-accepted-launch",
+    "expect": "reject",
+    "reason_code": "SESSION_HANDLE_NOT_ISSUED",
+    "description": "The worse form of the same escape: pending -> launching -> unknown -> running, where the launch outcome was 'unknown' so no handle was ever returned, a recognized agent event carries the session to running, and the session simply declares a handle. #87's stop and 5.4's re-attachment would both target a string nobody issued."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_r2nohandle01",
+      "title": "Tail the log",
+      "created_at": "2026-09-12T11:00:00Z",
+      "updated_at": "2026-09-12T11:00:30Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r2nohandle01",
+      "chat_id": "cht_r2nohandle01",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T11:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Tail the deploy log."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_r2nohandle01",
+      "chat_id": "cht_r2nohandle01",
+      "created_at": "2026-09-12T11:00:02Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "running",
+      "agent_handle": "handle-nobody-issued",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T11:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_r2nohandle01"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T11:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_r2nohandle01"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T11:00:09Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_r2nohandle01"
+          }
+        },
+        {
+          "from": "unknown",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T11:00:20Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_r2nohandle01"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_r2nohandle01",
+      "chat_id": "cht_r2nohandle01",
+      "session_id": "ses_r2nohandle01",
+      "bound_at": "2026-09-12T11:00:02Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_r2nohandle01",
+      "chat_id": "cht_r2nohandle01",
+      "session_id": "ses_r2nohandle01",
+      "created_at": "2026-09-12T11:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Tail the deploy log."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_r2nohandle01",
+      "session_id": "ses_r2nohandle01",
+      "observed_at": "2026-09-12T11:00:09Z",
+      "outcome": "unknown",
+      "detail": "no acknowledgement was received from the bridge"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r2nohandle01",
+      "chat_id": "cht_r2nohandle01",
+      "session_id": "ses_r2nohandle01",
+      "sequence": 1,
+      "received_at": "2026-09-12T11:00:20Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Tailing.\"}"
+      }
+    }
+  ]
+}

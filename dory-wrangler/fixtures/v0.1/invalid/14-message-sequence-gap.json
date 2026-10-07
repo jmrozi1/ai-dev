@@ -1,0 +1,50 @@
+{
+  "fixture": {
+    "name": "message-sequence-gap",
+    "expect": "reject",
+    "reason_code": "SEQUENCE_GAP",
+    "description": "Chat history skips an ordinal. Ordered user-visible history must be contiguous, so a lost message is detected rather than silently closing the gap."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_seqgap000001",
+      "title": "Missing turn",
+      "created_at": "2026-09-13T03:00:00Z",
+      "updated_at": "2026-09-13T03:00:10Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_seqgap000001",
+      "chat_id": "cht_seqgap000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-13T03:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "First."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_seqgap000002",
+      "chat_id": "cht_seqgap000001",
+      "sequence": 3,
+      "author": "user",
+      "created_at": "2026-09-13T03:00:09Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Third."
+      },
+      "session_id": null,
+      "source_event_id": null
+    }
+  ]
+}

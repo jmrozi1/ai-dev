@@ -1,0 +1,35 @@
+{
+  "fixture": {
+    "name": "unknown-record-version",
+    "expect": "reject",
+    "reason_code": "UNKNOWN_RECORD_VERSION",
+    "description": "A message record declares a record_version the contract does not define. Unknown versions fail closed instead of being read on a best-effort basis."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_badversion001",
+      "title": "Version drift",
+      "created_at": "2026-09-12T09:00:00Z",
+      "updated_at": "2026-09-12T09:00:00Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 2,
+      "message_id": "msg_badversion001",
+      "chat_id": "cht_badversion001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T09:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "hello"
+      },
+      "session_id": null,
+      "source_event_id": null
+    }
+  ]
+}

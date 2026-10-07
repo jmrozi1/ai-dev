@@ -1,0 +1,136 @@
+{
+  "fixture": {
+    "name": "stream-end-event-typed-on-one-shot-launcher",
+    "expect": "reject",
+    "reason_code": "STREAM_END_UNSUPPORTED",
+    "description": "Fixture 25 blocks the citation channel: evidence.kind 'stream_end' on a one_shot session. This store asserts the same fact through the ordinary 'event' channel instead, carrying a launcher-sourced recognized event typed 'stream_end'. A launcher that returns the agent's response from the call has no stream, so no record in its session may claim one ended."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_r3oneshot001",
+      "title": "One-shot question",
+      "created_at": "2026-09-12T13:00:00Z",
+      "updated_at": "2026-09-12T13:00:20Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_r3oneshot01",
+      "chat_id": "cht_r3oneshot001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T13:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What changed in the config?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_r3oneshot01",
+      "chat_id": "cht_r3oneshot001",
+      "created_at": "2026-09-12T13:00:02Z",
+      "launcher_id": "dev-local",
+      "launcher_capabilities": {
+        "continuation": "fresh_binding",
+        "response_shape": "one_shot",
+        "instruction_bound_bytes": null
+      },
+      "state": "unknown",
+      "agent_handle": "oneshot-a19c",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T13:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_r3oneshot01"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T13:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_r3oneshot01"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T13:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_r3oneshot01"
+          }
+        },
+        {
+          "from": "running",
+          "to": "unknown",
+          "owner": "launcher",
+          "at": "2026-09-12T13:00:18Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_r3oneshot01"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_r3oneshot01",
+      "chat_id": "cht_r3oneshot001",
+      "session_id": "ses_r3oneshot01",
+      "bound_at": "2026-09-12T13:00:02Z",
+      "released_at": null
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_r3oneshot01",
+      "chat_id": "cht_r3oneshot001",
+      "session_id": "ses_r3oneshot01",
+      "created_at": "2026-09-12T13:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What changed in the config?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_r3oneshot01",
+      "session_id": "ses_r3oneshot01",
+      "observed_at": "2026-09-12T13:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "oneshot-a19c"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_r3oneshot01",
+      "chat_id": "cht_r3oneshot001",
+      "session_id": "ses_r3oneshot01",
+      "sequence": 1,
+      "received_at": "2026-09-12T13:00:18Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "stream_end",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"stream_end\"}"
+      }
+    }
+  ]
+}

@@ -1,0 +1,181 @@
+{
+  "fixture": {
+    "name": "turn-that-reached-no-agent",
+    "expect": "accept",
+    "description": "The user sends a turn and immediately supersedes it, before any session is opened. No agent_session, no launcher call and no packet exists for the first turn because nothing was ever sent for it. The harness launches once, for the corrected turn, and the agent answers that. A turn that reached no agent at all is not a missing instruction packet."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_noagent000001",
+      "title": "Rocky 9 check",
+      "created_at": "2026-09-12T14:00:00Z",
+      "updated_at": "2026-09-12T14:00:48Z",
+      "state": "open"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_noagent000001",
+      "chat_id": "cht_noagent000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T14:00:03Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Check the store on Rocky"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_noagent000002",
+      "chat_id": "cht_noagent000001",
+      "sequence": 2,
+      "author": "user",
+      "created_at": "2026-09-12T14:00:05Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Ignore that -- check which filesystem the store is on, on Rocky 9."
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_noagent000001",
+      "chat_id": "cht_noagent000001",
+      "created_at": "2026-09-12T14:00:06Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "agent-5d77",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T14:00:06Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_noagent000002"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T14:00:07Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_noagent000001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T14:00:09Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_noagent000001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T14:00:47Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_noagent000002"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_noagent000001",
+      "chat_id": "cht_noagent000001",
+      "session_id": "ses_noagent000001",
+      "bound_at": "2026-09-12T14:00:06Z",
+      "released_at": "2026-09-12T14:00:47Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_noagent000001",
+      "chat_id": "cht_noagent000001",
+      "session_id": "ses_noagent000001",
+      "created_at": "2026-09-12T14:00:07Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "Ignore that -- check which filesystem the store is on, on Rocky 9."
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_noagent000001",
+      "session_id": "ses_noagent000001",
+      "observed_at": "2026-09-12T14:00:09Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-5d77"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_noagent000001",
+      "chat_id": "cht_noagent000001",
+      "session_id": "ses_noagent000001",
+      "sequence": 1,
+      "received_at": "2026-09-12T14:00:42Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"findmnt reports xfs for the store path.\"}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_noagent000003",
+      "chat_id": "cht_noagent000001",
+      "sequence": 3,
+      "author": "agent",
+      "created_at": "2026-09-12T14:00:42Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "findmnt reports xfs for the store path."
+      },
+      "session_id": "ses_noagent000001",
+      "source_event_id": "evt_noagent000001"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_noagent000002",
+      "chat_id": "cht_noagent000001",
+      "session_id": "ses_noagent000001",
+      "sequence": 2,
+      "received_at": "2026-09-12T14:00:47Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    }
+  ]
+}

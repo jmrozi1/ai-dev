@@ -1,0 +1,228 @@
+{
+  "fixture": {
+    "name": "turn-floor-padded-with-extra-user-turns",
+    "expect": "reject",
+    "reason_code": "TURN_INSTRUCTION_MISSING",
+    "description": "One persistent agent answers on two separate occasions with a single launch packet and no delivery record, so the second occasion is integration-blind. Extra user messages are interleaved to make the history look like the honest 'user sent twice before an answer' shape. Padding the user side does not lower the floor, because the floor counts the occasions on which the agent answered, not the messages the user typed."
+  },
+  "contract_version": "0.1",
+  "records": [
+    {
+      "record_type": "chat",
+      "record_version": 1,
+      "chat_id": "cht_padturn000001",
+      "title": "Pad the floor",
+      "created_at": "2026-09-12T16:00:00Z",
+      "updated_at": "2026-09-12T16:03:20Z",
+      "state": "open"
+    },
+    {
+      "record_type": "agent_session",
+      "record_version": 1,
+      "session_id": "ses_padturn000001",
+      "chat_id": "cht_padturn000001",
+      "created_at": "2026-09-12T16:00:02Z",
+      "launcher_id": "internal-bridge",
+      "launcher_capabilities": {
+        "continuation": "persistent",
+        "response_shape": "stream",
+        "instruction_bound_bytes": null
+      },
+      "state": "completed",
+      "agent_handle": "agent-1a44",
+      "transitions": [
+        {
+          "from": null,
+          "to": "pending",
+          "owner": "user",
+          "at": "2026-09-12T16:00:02Z",
+          "evidence": {
+            "kind": "user_action",
+            "ref": "msg_padturn000001"
+          }
+        },
+        {
+          "from": "pending",
+          "to": "launching",
+          "owner": "harness",
+          "at": "2026-09-12T16:00:03Z",
+          "evidence": {
+            "kind": "harness_action",
+            "ref": "req_padturn000001"
+          }
+        },
+        {
+          "from": "launching",
+          "to": "running",
+          "owner": "launcher",
+          "at": "2026-09-12T16:00:05Z",
+          "evidence": {
+            "kind": "launch_result",
+            "ref": "req_padturn000001"
+          }
+        },
+        {
+          "from": "running",
+          "to": "completed",
+          "owner": "launcher",
+          "at": "2026-09-12T16:03:19Z",
+          "evidence": {
+            "kind": "event",
+            "ref": "evt_padturn000003"
+          }
+        }
+      ]
+    },
+    {
+      "record_type": "agent_binding",
+      "record_version": 1,
+      "binding_id": "bnd_padturn000001",
+      "chat_id": "cht_padturn000001",
+      "session_id": "ses_padturn000001",
+      "bound_at": "2026-09-12T16:00:02Z",
+      "released_at": "2026-09-12T16:03:19Z"
+    },
+    {
+      "record_type": "launch_request",
+      "record_version": 1,
+      "request_id": "req_padturn000001",
+      "chat_id": "cht_padturn000001",
+      "session_id": "ses_padturn000001",
+      "created_at": "2026-09-12T16:00:03Z",
+      "instruction_encoding": "utf-8",
+      "instruction_text": "What does the launch boundary hide?"
+    },
+    {
+      "record_type": "launch_result",
+      "record_version": 1,
+      "request_id": "req_padturn000001",
+      "session_id": "ses_padturn000001",
+      "observed_at": "2026-09-12T16:00:05Z",
+      "outcome": "accepted",
+      "agent_handle": "agent-1a44"
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_padturn000001",
+      "chat_id": "cht_padturn000001",
+      "session_id": "ses_padturn000001",
+      "sequence": 1,
+      "received_at": "2026-09-12T16:00:40Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"It hides how an agent is started.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_padturn000002",
+      "chat_id": "cht_padturn000001",
+      "session_id": "ses_padturn000001",
+      "sequence": 2,
+      "received_at": "2026-09-12T16:02:50Z",
+      "source": "agent",
+      "interpretation": "recognized",
+      "interpreted_type": "assistant_text",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"assistant_text\",\"text\":\"Yes: stop and re-attach both go through the same handle.\"}"
+      }
+    },
+    {
+      "record_type": "diagnostic_event",
+      "record_version": 1,
+      "event_id": "evt_padturn000003",
+      "chat_id": "cht_padturn000001",
+      "session_id": "ses_padturn000001",
+      "sequence": 3,
+      "received_at": "2026-09-12T16:03:19Z",
+      "source": "launcher",
+      "interpretation": "recognized",
+      "interpreted_type": "session_completed",
+      "raw": {
+        "encoding": "utf-8",
+        "body": "{\"type\":\"session_completed\",\"exit\":0}"
+      }
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_padturn000001",
+      "chat_id": "cht_padturn000001",
+      "sequence": 1,
+      "author": "user",
+      "created_at": "2026-09-12T16:00:01Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "What does the launch boundary hide?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_padturn000002",
+      "chat_id": "cht_padturn000001",
+      "sequence": 2,
+      "author": "agent",
+      "created_at": "2026-09-12T16:00:40Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "It hides how an agent is started."
+      },
+      "session_id": "ses_padturn000001",
+      "source_event_id": "evt_padturn000001"
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_padturn000003",
+      "chat_id": "cht_padturn000001",
+      "sequence": 3,
+      "author": "user",
+      "created_at": "2026-09-12T16:02:10Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Does that cover stopping it too?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_padturn000004",
+      "chat_id": "cht_padturn000001",
+      "sequence": 4,
+      "author": "user",
+      "created_at": "2026-09-12T16:02:12Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "And re-attaching after a restart?"
+      },
+      "session_id": null,
+      "source_event_id": null
+    },
+    {
+      "record_type": "message",
+      "record_version": 1,
+      "message_id": "msg_padturn000005",
+      "chat_id": "cht_padturn000001",
+      "sequence": 5,
+      "author": "agent",
+      "created_at": "2026-09-12T16:02:50Z",
+      "content": {
+        "content_type": "text/plain",
+        "text": "Yes: stop and re-attach both go through the same handle."
+      },
+      "session_id": "ses_padturn000001",
+      "source_event_id": "evt_padturn000002"
+    }
+  ]
+}
