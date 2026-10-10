@@ -223,6 +223,14 @@ class IntegrationSignalSkillTests(unittest.TestCase):
             "validate the resolution",
         )
         self.assert_covers("never overwriting concurrent commits", "non-force", "never overwrite")
+        self.assert_covers(
+            "publishing without waiting on another track's queue",
+            "publishes its own work",
+        )
+        self.assert_covers(
+            "serializing only the publication transaction",
+            "serialize only the publication",
+        )
         self.assert_covers("reporting the honest state", "merged, integration pending")
         self.assert_covers(
             "not reopening a completed track",
@@ -236,6 +244,15 @@ class IntegrationSignalSkillTests(unittest.TestCase):
         self.assert_covers(
             "handing back an unfinished run",
             "incomplete",
+        )
+        self.assert_covers(
+            "running it where it outlives the publishing session",
+            "specialized job",
+            "coxswain.integration.v1",
+        )
+        self.assert_covers(
+            "keeping environment and incomplete runs from reading as green",
+            "never green",
         )
 
     def test_failures_are_attributed_from_the_last_green_to_red_range(self) -> None:

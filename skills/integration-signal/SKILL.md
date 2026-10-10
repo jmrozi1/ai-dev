@@ -70,6 +70,16 @@ being asked about.
 
 ## Publish Through A Moving Main Without Restarting The Finish Line
 
+**The finished track publishes its own work.** Once a candidate's review and
+selected validation pass, the track that produced it, or the one publication owner
+it names, publishes it through the supported route. Publication is not a task
+queued behind another track's development: a release owner's queue allocates
+development effort, not access to main. Serialize only the publication
+transaction itself -- Flow's promotion lock or one conditional push -- and never
+development, review or a test run. Real dependencies, unresolved conflicts and
+missing permissions stay blockers; name the blocker and its owner, not "waiting
+for promotion".
+
 A track validates against a measured main revision. When main advances while
 that validation or its review runs, the track does not start over:
 
@@ -105,6 +115,26 @@ run binds to that exact commit and is coalesced like any other candidate.
 - On failure, the publishing track coordinates attribution from the change range
   below. That does not decide which author repairs the root cause, but someone is
   named before the track moves on.
+
+In a Coxswain-managed lane the run is a specialized job, so it survives the
+session that published the commit:
+
+- The lane's orchestrator keeps one integration rail: `Role: specialized`,
+  operation `coxswain.integration.v1`, `input.projectRevision` the exact published
+  commit and `input.testFiles` the selected `tests/test_*.py` modules. It publishes
+  or advances that rail in the same pass that reconciles a handoff reporting
+  `integration: pending at <sha>`.
+- The controller publishes exactly one job per `attempt`, a subscriber runs it,
+  and the terminal result wakes that orchestrator. Read it with
+  `ai-dev specialized show`.
+- Coalesce by moving the rail to the newest published commit, incrementing
+  `attempt`, only once the current attempt's job has started or finished. The
+  commits in between are superseded, not individually tested.
+- Read the result by its class. `succeeded` is a green for that exact commit.
+  `failed` with primary `failed` is a product failure: attribute it, open repair or
+  a revert, and block dependent rails. `not-attempted` is an environment failure,
+  and `timed-out` or `ambiguous` is an incomplete run: repair the environment or
+  re-run with a new `attempt`. Until then the commit stays pending, never green.
 
 ## Decide What A Red Run Actually Blocks
 

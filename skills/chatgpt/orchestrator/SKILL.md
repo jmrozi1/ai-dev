@@ -80,7 +80,12 @@ prescribing module internals in the rail. Where integration validation is
 asynchronous, apply `integration-signal`: do not serialize rails behind it, keep
 at most the active run plus the newest pending candidate, let a conflict-free
 merge with a newer main publish as merged, integration pending without another
-synchronous pass, and name the owner of each pending run. Require a green on the
+synchronous pass, and name the owner of each pending run. In a Coxswain-managed
+lane that owner is you: publish or advance the lane's `coxswain.integration.v1`
+integration rail in the pass that reconciles a handoff reporting
+`integration: pending at <sha>`. Do not queue another track's reviewed candidate
+behind your rails for promotion: that track publishes its own work. Release
+acceptance and deployment keep their own gates. Require a green on the
 exact commit — never an ancestor's green — before authorizing deployment or
 release acceptance. When an integration run is red, state whether it blocks
 acceptance of the attributed change, blocks a dependent rail, or blocks nothing
