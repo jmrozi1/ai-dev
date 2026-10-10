@@ -199,17 +199,60 @@ class IntegrationSignalSkillTests(unittest.TestCase):
         )
 
     def test_a_red_run_blocks_acceptance_and_dependents_but_not_unrelated_work(self) -> None:
+        self.assert_covers("requiring repair or revert", "repair or a supported revert", "revert")
         self.assert_covers(
-            "blocking named-checkpoint acceptance",
-            "named-checkpoint acceptance",
-            "checkpoint acceptance",
+            "blocking acceptance of the attributed change",
+            "release acceptance",
+            "deployment",
         )
-        self.assert_covers("blocking promotion", "promotion")
         self.assert_covers("blocking dependent work", "dependent work")
         self.assert_covers(
             "not stopping unrelated development",
             "does not stop unrelated development",
             "unrelated development",
+        )
+
+    def test_a_moving_main_does_not_restart_the_finish_line(self) -> None:
+        self.assert_covers(
+            "publishing a conflict-free merge without another synchronous pass",
+            "conflict-free",
+        )
+        self.assert_covers(
+            "validating a conflicted resolution proportionately",
+            "conflicted boundary",
+            "validate the resolution",
+        )
+        self.assert_covers("never overwriting concurrent commits", "non-force", "never overwrite")
+        self.assert_covers(
+            "publishing without waiting on another track's queue",
+            "publishes its own work",
+        )
+        self.assert_covers(
+            "serializing only the publication transaction",
+            "serialize only the publication",
+        )
+        self.assert_covers("reporting the honest state", "merged, integration pending")
+        self.assert_covers(
+            "not reopening a completed track",
+            "does not reopen",
+            "not reopen",
+        )
+
+    def test_every_pending_run_has_an_owner_and_a_durable_result(self) -> None:
+        self.assert_covers("naming the owning track", "owns its integration run")
+        self.assert_covers("recording on a durable surface", "durable ticket surface", "durable")
+        self.assert_covers(
+            "handing back an unfinished run",
+            "incomplete",
+        )
+        self.assert_covers(
+            "running it where it outlives the publishing session",
+            "specialized job",
+            "coxswain.integration.v1",
+        )
+        self.assert_covers(
+            "keeping environment and incomplete runs from reading as green",
+            "never green",
         )
 
     def test_failures_are_attributed_from_the_last_green_to_red_range(self) -> None:
@@ -229,14 +272,18 @@ class IntegrationSignalSkillTests(unittest.TestCase):
     def test_acceptance_requires_a_green_on_the_latest_relevant_candidate(self) -> None:
         self.assert_covers(
             "the acceptance precondition",
+            "green on the exact commit being deployed or accepted",
             "latest relevant candidate",
-            "latest candidate",
         )
         self.assert_covers(
-            "binding it to acceptance or promotion",
-            "before a named checkpoint is accepted",
-            "before accepting",
-            "named checkpoint is accepted",
+            "binding it to deployment and release acceptance",
+            "deployment authorization and final release",
+            "release acceptance",
+        )
+        self.assert_covers(
+            "not holding development promotion on it",
+            "do not wait on the asynchronous run",
+            "does not wait",
         )
 
     def test_routing_to_change_validation_resolves_and_does_not_duplicate_it(self) -> None:

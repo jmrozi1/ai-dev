@@ -22,10 +22,12 @@ a material uncertainty.
 4. **Full or live regression:** the whole product, real environment, or
    end-to-end path.
 
-Full or live regression is warranted at a named-checkpoint, promotion, or
-release boundary; for an explicitly cross-cutting/high-risk change; when a
-shared foundation changed with no narrower contract surface; or when targeted
-evidence reveals a failure outside the expected boundary. A numeric checkpoint,
+Full or live regression is warranted as a synchronous gate at a deployment or
+release-acceptance boundary; for an explicitly cross-cutting/high-risk change;
+when a shared foundation changed with no narrower contract surface; or when
+targeted evidence reveals a failure outside the expected boundary. At an ordinary
+promotion or named checkpoint it runs as the asynchronous integration signal on
+the published commit instead of holding the track. A numeric checkpoint,
 fresh reviewer, large existing suite, or prior use of full discovery is not by
 itself a reason to run it again.
 
@@ -51,6 +53,22 @@ new test whose sensitivity is uncertain, or a focused reviewer hypothesis. It
 is not a default certification layer. An executor-authored control and an
 independent reviewer control should not both be required without distinct
 questions.
+
+## Revalidate Only What A Refresh Or Revision Changed
+
+A new SHA alone does not justify repeating every proof. When main moves under a
+validated change, or a review asks for a revision:
+
+- A conflict-free merge with the newer main, or a rebase whose range-diff shows
+  the change patch-identical, needs no synchronous rerun. Run the changed track's tests that overlap the main delta
+  only where the two touch the same modules or contracts; otherwise leave it to
+  the asynchronous integration run on the published commit.
+- A conflict resolution is validated at the conflicted boundary.
+- Review remediation is validated at the remediated boundary, not by the whole
+  original certification.
+- A prose, labelling, provenance, or instrumentation revision does not trigger
+  product revalidation or another full review unless it changes the underlying
+  claim. Check the changed text, not the unchanged design.
 
 ## Review The Novel Claim
 

@@ -78,11 +78,18 @@ Size a development rail to one coherent requirement slice, and let
 `module-development` own how that slice is refined and constructed rather than
 prescribing module internals in the rail. Where integration validation is
 asynchronous, apply `integration-signal`: do not serialize rails behind it, keep
-at most the active run plus the newest pending candidate, and require a green on
-the exact commit being accepted — never an ancestor's green — before accepting a
-named checkpoint or promoting. When an integration run is red, state whether it
-blocks acceptance, blocks a dependent rail, or blocks nothing else, instead of
-pausing unrelated rails.
+at most the active run plus the newest pending candidate, let a conflict-free
+merge with a newer main publish as merged, integration pending without another
+synchronous pass, and name the owner of each pending run. In a lane developing
+Coxswain itself that owner is you: publish or advance the lane's `coxswain.integration.v1`
+integration rail in the pass that reconciles a handoff reporting
+`integration: pending at <sha>`. Do not queue another track's reviewed candidate
+behind your rails for promotion: that track publishes its own work. Release
+acceptance and deployment keep their own gates. Require a green on the
+exact commit — never an ancestor's green — before authorizing deployment or
+release acceptance. When an integration run is red, state whether it blocks
+acceptance of the attributed change, blocks a dependent rail, or blocks nothing
+else, instead of pausing unrelated rails.
 
 A tasking file is current state, not history. Keep it as simple Markdown and
 include only what a fresh executor needs:
