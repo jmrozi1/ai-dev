@@ -80,8 +80,8 @@ prescribing module internals in the rail. Where integration validation is
 asynchronous, apply `integration-signal`: do not serialize rails behind it, keep
 at most the active run plus the newest pending candidate, let a conflict-free
 merge with a newer main publish as merged, integration pending without another
-synchronous pass, and name the owner of each pending run. In a Coxswain-managed
-lane that owner is you: publish or advance the lane's `coxswain.integration.v1`
+synchronous pass, and name the owner of each pending run. In a lane developing
+Coxswain itself that owner is you: publish or advance the lane's `coxswain.integration.v1`
 integration rail in the pass that reconciles a handoff reporting
 `integration: pending at <sha>`. Do not queue another track's reviewed candidate
 behind your rails for promotion: that track publishes its own work. Release

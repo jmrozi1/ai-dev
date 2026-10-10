@@ -116,8 +116,10 @@ run binds to that exact commit and is coalesced like any other candidate.
   below. That does not decide which author repairs the root cause, but someone is
   named before the track moves on.
 
-In a Coxswain-managed lane the run is a specialized job, so it survives the
-session that published the commit:
+In a lane developing Coxswain itself, the run is a specialized job, so it
+survives the session that published the commit. Other projects use their own
+exact-revision operation (for example `wow.windows-validation.v1`) or their
+ticket surface.
 
 - The lane's orchestrator keeps one integration rail: `Role: specialized`,
   operation `coxswain.integration.v1`, `input.projectRevision` the exact published
@@ -127,14 +129,19 @@ session that published the commit:
 - The controller publishes exactly one job per `attempt`, a subscriber runs it,
   and the terminal result wakes that orchestrator. Read it with
   `ai-dev specialized show`.
-- Coalesce by moving the rail to the newest published commit, incrementing
-  `attempt`, only once the current attempt's job has started or finished. The
-  commits in between are superseded, not individually tested.
+- The controller wakes you only for the rail's current `attempt`. So advance
+  the rail to the newest published commit, incrementing `attempt`, only after the
+  current attempt's job is terminal **and** its result is reconciled into the
+  rail or ticket evidence. While it runs, record the newest pending commit in the
+  rail's notes. That keeps the active run plus the newest pending candidate, and
+  never loses a result. The commits in between are superseded, not individually
+  tested.
 - Read the result by its class. `succeeded` is a green for that exact commit.
-  `failed` with primary `failed` is a product failure: attribute it, open repair or
-  a revert, and block dependent rails. `not-attempted` is an environment failure,
-  and `timed-out` or `ambiguous` is an incomplete run: repair the environment or
-  re-run with a new `attempt`. Until then the commit stays pending, never green.
+  `failed` with primary `failed` is a product failure, including a module that
+  cannot be imported: attribute it, open repair or a revert, and block dependent
+  rails. `not-attempted` is an environment failure, and `timed-out` or
+  `ambiguous` is an incomplete run: repair the environment or re-run with a new
+  `attempt`. Until then the commit stays pending, never green.
 
 ## Decide What A Red Run Actually Blocks
 
@@ -179,8 +186,8 @@ commit; accepting it does not claim that the later merged main commit is green.
 
 Deployment authorization and final release or product acceptance are the
 durable claims. Before either, require an integration run that is **green on the
-exact commit being deployed or accepted**, or on a descendant-free equivalent
-whose change range covers it. This is where waiting on the asynchronous signal is
+exact commit being deployed or accepted**, or on a commit with an identical
+tree. This is where waiting on the asynchronous signal is
 correct, and those gates keep their own explicit evidence and permission
 requirements.
 

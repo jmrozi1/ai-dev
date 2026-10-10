@@ -59,8 +59,8 @@ questions.
 A new SHA alone does not justify repeating every proof. When main moves under a
 validated change, or a review asks for a revision:
 
-- A conflict-free refresh whose range-diff shows the change patch-identical needs
-  no synchronous rerun. Run the changed track's tests that overlap the main delta
+- A conflict-free merge with the newer main, or a rebase whose range-diff shows
+  the change patch-identical, needs no synchronous rerun. Run the changed track's tests that overlap the main delta
   only where the two touch the same modules or contracts; otherwise leave it to
   the asynchronous integration run on the published commit.
 - A conflict resolution is validated at the conflicted boundary.
