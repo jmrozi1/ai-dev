@@ -120,8 +120,9 @@ submit one coherent requirement slice rather than every intermediate edit.
 
 When integration validation is asynchronous, use `integration-signal`. Submit
 the slice once its module and affected-contract tests pass and continue
-independent work rather than waiting; report the exact SHA any integration
-result was produced against, and never report a checkpoint as green from a run
+independent work rather than waiting; report a published commit as merged,
+integration pending until its own run finishes, hand back an unfinished run as
+incomplete with its exact SHA, and never report a checkpoint as green from a run
 that predates the commit being accepted.
 
 Verify work with appropriate commands, tests, or diagnostics. Return a concise
