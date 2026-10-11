@@ -129,6 +129,34 @@ Once submitted, integration validation is asynchronous and belongs to
 `integration-signal`; continue independent development rather than waiting on
 it.
 
+## Keep Integration At Coherent Seams
+
+When independently built slices share a producer/consumer contract, name the
+producer, consumer, contract owner and earliest **coherent** joining point during
+planning. Integrate the smallest completed behavior that exercises the seam;
+do not defer several unrelated, completed seams to one final release merge.
+Do not publish partial slices or invent mock-only intermediate products to
+manufacture earlier integration.
+
+A repeatedly expanding integration task, or one running across days, is a
+signal to examine the boundary before adding another sweep. Pin the actual
+branch and main revisions, separate textual conflicts from contract,
+lifecycle, environmental and review/process failures, and identify which
+specific seam each useful failure crosses. For a reproducible defect, choose
+the cheapest faithful producer/consumer, transition or import-level evidence
+that would prevent that class again. If the task spans independent seams,
+give each a coherent owner and convergence point instead of accumulating
+them in a single integration rail. Keep genuinely emergent behavior —
+deployment, real Git/OS semantics, services and concurrent runtime effects —
+for integrated validation.
+
+Judge a changed approach by accepted end-to-end delivery latency and repeated
+work, not by the number of integration tests removed or by making the same
+large suite synchronous earlier. Use `change-validation` for proportionate
+evidence and `integration-signal` for exact-commit asynchronous validation.
+A multi-day task is diagnostic evidence, not an automatic failure threshold,
+and splitting work must not evade final release-acceptance evidence.
+
 ## ChatGPT Interaction
 
 When ChatGPT intentionally activates this shared skill, announce
