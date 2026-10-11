@@ -12,15 +12,16 @@ Do not activate merely because a ticket is mentioned, for ordinary implementatio
 ## Establish the Observation
 
 - Every review must state the **current observation timestamp**, with date, clock time, and time zone. Use a trusted clock when available and the user's time zone (America/New_York by default); handle daylight saving time correctly. If the current time cannot be verified, say so instead of inventing a timestamp.
-- Identify the ticket, current named checkpoint or objective, latest confirmed event and its timestamp, and the **previous observation** when available. Compare their times and evidence. Distinguish the time a log was generated, the time it was pasted, and the time this review was made.
+- Identify the ticket, current named checkpoint or objective, and latest confirmed event and its timestamp. For each ticket, the progress-reporting window begins when the user **last requested a progress review of that ticket**, not at an arbitrary earlier observation, log, or checkpoint. Compare against the state reported at that previous review. Distinguish request time, event/log time, and this review's time. If the previous request time is unavailable, clearly label any comparison based on a known prior review timestamp; if there is no reliable baseline, say that progress *since the last request* cannot be established.
 - Prefer the smallest fresh authoritative evidence surface available: ticket roadmap and acceptance state, current orchestration/rail handoff, commit or promotion refs, validation evidence, and relevant linked blockers. Treat pasted logs and agent claims as reported evidence until corroborated. If fresh access is unavailable, assess the supplied transcript and mark uncertainty explicitly.
+- Consult earlier history when needed to understand dependencies or diagnose recurring problems, but never count achievements from before the previous status request as new progress. A newly discovered old event is context, not progress during this reporting window.
 - Do not infer zero progress from missing logs, treat unavailable evidence as a failure, fabricate elapsed durations, or treat elapsed time and token usage as proof of progress or stagnation. Avoid broad transcript/repository archaeology unless a concrete anomaly warrants it.
 
 ## Answer the Executive Questions
 
 1. **Human action now:** Is a decision, permission, resource, intervention, or handoff actually required to keep the current work moving? State **none** when appropriate. Identify the exact action and why it is blocking; do not pass ordinary agent decisions to the human.
 2. **Human action ahead:** Surface known future human dependencies even if they are not yet blocking. Distinguish *prepare now*, *later at a named trigger/checkpoint*, and *no preparation needed*. Explain the benefit or cost of acting early; do not make speculative prerequisites sound mandatory.
-3. **Meaningful progress:** Answer **yes**, **no**, or **not established** and cite the concrete delta since the last known observation: requirement or defect resolved, valid new proof, uncertainty narrowed, named checkpoint accepted, change promoted, integration/deployment accepted, or other movement toward ticket completion. Keep implemented, tested, reviewed, merged, accepted, and deployed separate. Commands executed, text written, retries, and time consumed do not themselves count as progress.
+3. **Meaningful progress:** Answer **yes**, **no**, or **not established** and cite only the concrete delta within the reporting window since the last progress-review request: requirement or defect resolved, valid new proof, uncertainty narrowed, named checkpoint accepted, change promoted, integration/deployment accepted, or other movement toward ticket completion. Keep implemented, tested, reviewed, merged, accepted, and deployed separate. Commands executed, text written, retries, and time consumed do not themselves count as progress.
 4. **Process health:** Decide whether work is converging, legitimately waiting on a dependency, cycling without new evidence, or unclear. Watch for repeated verification of verification, oversized validation for small changes, repeated invalid probes/fixtures, integration serialization, stale evidence, accumulating state-file/context bloat, permission friction, resource contention, and ostensibly active but idle orchestration. Judge whether the same unresolved obligation keeps recurring for the same reason, not by fixed time or retry thresholds.
 
 A long difficult checkpoint that steadily retires real obligations is progressing. Do not demand more testing merely to move integration friction earlier in the pipeline, and do not mistake legitimate correctness gates for defects.
@@ -41,10 +42,10 @@ When the evidence indicates a preventable stall or systemic drag, do not stop at
 
 Lead with a brief, human-readable executive summary rather than a log retelling. Include:
 
-- **As of:** current verified timestamp and time zone; previous observation and elapsed interval when known.
+- **As of:** current verified timestamp and time zone; prior progress-review request and elapsed interval when known (otherwise label the available baseline or its absence).
 - **You now:** exact required action, or none.
 - **Ahead:** useful preparation, its urgency/trigger, or none.
-- **Progress:** yes/no/not established; latest accepted checkpoint and current work, with timestamps and the evidence-backed delta since last observation.
+- **Progress:** yes/no/not established; latest accepted checkpoint and current work, with timestamps and only the evidence-backed delta since the previous request. Keep older accomplishments out of the new-progress summary.
 - **Process / intervention:** health judgment and concrete next intervention only if warranted; otherwise say continue without interference.
 
 Prefer a few short paragraphs or compact bullets. Expand only when investigating a stall or conveying a necessary handoff. Name the **next observable signal** that would demonstrate renewed progress when intervention is underway. Keep speculation and unverified agent claims distinguishable from confirmed facts.
