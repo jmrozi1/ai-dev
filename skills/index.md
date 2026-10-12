@@ -56,6 +56,7 @@ remain in the applicable canonical `SKILL.md` files.
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, ticket-owned skill investment state, and evidence-based decisions. | `skills/chatgpt/orchestrator/SKILL.md` |
 | `skill-authoring` | Creating/refining AI Dev skills or adjudicating ticket skill candidates as keep/no-skill/refine/create, with immediate dogfood for accepted investments. | `skills/chatgpt/skill-authoring/SKILL.md` |
 | `ticket-creation` | Creating task records using the canonical ticket schema, including `Skill Candidates` and `Skills` accounting sections, and repository ticket-provider contract. | `skills/chatgpt/ticket-creation/SKILL.md` |
+| `release-progress-review` | Recurring executive portfolio progress: accepted major/minor checkpoint percentages, expandable bars, new-progress deltas, and sustained-stall signals. | `skills/chatgpt/release-progress-review/SKILL.md` |
 | `ticket-progress-review` | Timestamped executive progress checks for active tickets: immediate and upcoming human actions, evidence of meaningful progress, and investigation of preventable stalls. | `skills/chatgpt/ticket-progress-review/SKILL.md` |
 | `work-skill-refinement` | Designing and refining work-side AI skills and capability boundaries from observed work-agent behavior, including deciding when a task should not be delegated to the work AI. | `skills/chatgpt/work-skill-refinement/SKILL.md` |
 
