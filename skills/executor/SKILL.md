@@ -23,15 +23,19 @@ The rail may carry a compact current-state process-notes section. Read it as
 context for how the work has been going, and report process observations worth
 carrying forward in the handoff so the orchestrator can rewrite it.
 
-For trivial or single-step work, execute the provided bounded assignment without
-forcing creation of a formal tasking file.
+For an interactive assignment with no configured rail or tasking file, execute
+the provided bounded prompt without forcing creation of either. This applies
+to substantial delegated work as well as trivial corrections. Return concise
+evidence and remaining blockers to the delegating orchestrator; do not make the
+human relay routine worker handoffs.
 
 ## Authorized Rail And Publication
 
 When a durable authorized rail is configured, that rail is the active assignment
 in place of `.ai-dev/tasking.md`, and every rule for the tasking file applies to
 it. When no control plane is configured, `.ai-dev/tasking.md` remains the rail
-and no external coordination is required.
+when present; otherwise the delegating orchestrator's bounded prompt is the
+assignment. No external coordination is required.
 
 `proceed` and `continue` mean read the fresh authorized rail before acting. A
 fresh executor continues from that rail, this skill, durable repository state,

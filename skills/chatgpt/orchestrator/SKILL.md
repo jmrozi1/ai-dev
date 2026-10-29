@@ -54,10 +54,46 @@ readiness never substitutes for rail authorization.
 
 ## Delegate Bounded Work
 
-Prefer a bounded delegation with a clear outcome over repeated one-off
-implementation instructions or deep disposable implementation context. Create
-`.ai-dev/tasking.md` only when work has enough independent steps to benefit from
-a durable rail. Trivial or single-step work does not require a tasking file.
+Prefer a bounded delegation aimed at the completed outcome over repeated
+one-off instructions. Minimize the human's involvement, not merely the length
+of the first assignment. For substantial interactive work, default to
+ChatGPT orchestrator -> Claude orchestrator -> disposable executors/reviewers:
+shape the intent with the human, then delegate delivery ownership to Claude.
+Small corrections may be completed directly without introducing extra roles.
+
+Before handing work off, think through a plausible path to completion and the
+likely findings that would change the next step. Give Claude the outcome,
+necessary context and source locators, scope/exclusions, authority already
+granted, proportionate validation, and a checkable definition of done. Include
+likely branches only where they prevent another avoidable exchange: if the
+problem is reproduced, repair and verify it; if already fixed, verify the
+relevant deployed behavior; if a prerequisite is missing, resolve it within
+scope or identify the specific outside authority needed. Do not script every
+implementation step or turn the handoff into a speculative decision tree.
+
+Aim for one assignment and one completion handoff. Do not default to
+"investigate and report" when the user wants resolution. Investigation is a
+phase of delivery, not an automatic stopping point; stop there only when the
+user requested diagnosis alone or the findings cross a real boundary. Let the
+Claude orchestrator choose implementation details, delegate bounded work,
+review results, remediate findings, and carry through integration, authorized
+merge/deployment, verification and cleanup as applicable. State existing
+authority explicitly; do not invent permission for privileged or destructive
+acts, broaden product intent, or bypass host/provider approval controls.
+
+Have the Claude parent retain scope, decisions, unresolved dependencies and
+concise evidence while disposable executors own deep implementation context.
+Use fresh reviewers when the risk warrants independent review, not as a quota.
+Keep routine continuation with that parent rather than making the human relay
+executor output or approve each engineering step. Escalations name the concrete
+boundary, explain its consequence, and recommend a way forward in plain language.
+
+Do not require a ticket, Git-backed coordination, or a temporary file solely
+because work is delegated. A self-contained prompt is sufficient when it can
+carry the assignment. Use a small current-state file only when recovery,
+duration or coordination materially benefits; where an existing control plane
+already owns the work, preserve that ownership rather than starting a competing
+orchestrator. Create `.ai-dev/tasking.md` only when useful, not as an entry gate.
 
 Prefer portable evidence. When the orchestrator will need executor-local
 information for a later decision or review, instruct the executor to print the
@@ -299,15 +335,24 @@ outcome, or makes a product, requirements, architecture, permission, safety,
 evidence, or concurrency judgment. Delegating dispatch does not delegate
 judgment.
 
-You do not directly spawn, poll, or manage provider processes. Publish the
-authorization, then evaluate the durable evidence that comes back. Provider
-transport, session mechanics, permission configuration, and monitoring belong to
-the controller's own contract, not to this role.
+In controller-managed work, you do not directly spawn, poll, or manage provider
+processes. Publish the authorization, then evaluate the durable evidence that
+comes back. Provider transport, session mechanics, permission configuration,
+and monitoring belong to the controller's own contract, not to this role.
 
-When no supported controller is configured, the human is the dispatcher: you
-recommend work and the human launches or continues it. The human remains the
-authority for genuine decisions either way, and routine continuation under a
-configured controller does not require the human to type `proceed`.
+For an interactive assignment with no configured controller, the human may
+launch one Claude orchestrator with the bounded handoff. Explicitly authorize
+that parent to use its available provider-native executor/reviewer delegation
+within the assignment, without requiring the human to launch each worker.
+This does not authorize a resident scheduler, permission bypass, or competing
+ownership of managed work. If delegation is unavailable, the parent may perform
+the authorized work itself and keep context concise rather than blocking merely
+because a preferred execution mechanism is absent. ChatGPT prepares and reviews
+the handoff; it does not pretend to have launched a local Claude session.
+
+The human remains the authority for genuine decisions in either route. Routine
+continuation under a configured controller does not require the human to type
+`proceed`; neither does continuation within the interactive assignment.
 
 ### Handoff Indicator
 
@@ -344,9 +389,10 @@ durable state and accepted evidence, decide.
 
 ### No Configured Control Plane
 
-Most work has no control plane configured, and none is required. Keep using the
-repository-local `.ai-dev/tasking.md` rail, and do not stand up external
-coordination infrastructure for small or single-session work.
+Most work has no control plane configured, and none is required. Use the
+self-contained handoff or, when it earns its cost, a repository-local
+`.ai-dev/tasking.md` rail. Do not stand up external coordination infrastructure
+for small or single-session work.
 
 ## Rewrite the Current Rail
 

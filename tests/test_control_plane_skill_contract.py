@@ -77,7 +77,7 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
 
     def test_orchestrator_preserves_repository_local_rail_when_unconfigured(self) -> None:
         self.assertIn("most work has no control plane configured, and none is required", self.orchestrator)
-        self.assertIn("keep using the repository-local `.ai-dev/tasking.md` rail", self.orchestrator)
+        self.assertIn("use the self-contained handoff or, when it earns its cost, a repository-local `.ai-dev/tasking.md` rail", self.orchestrator)
         self.assertIn("do not stand up external coordination infrastructure for small or single-session work", self.orchestrator)
 
     def test_executor_preserves_repository_local_rail_when_unconfigured(self) -> None:
@@ -196,10 +196,12 @@ class ControlPlaneSkillContractTests(unittest.TestCase):
             with self.subTest(mechanic=mechanic):
                 self.assertNotIn(mechanic, self.orchestrator)
 
-    def test_human_remains_the_dispatch_fallback(self) -> None:
-        self.assertIn("when no supported controller is configured, the human is the dispatcher", self.orchestrator)
-        self.assertIn("you recommend work and the human launches or continues it", self.orchestrator)
-        self.assertIn("the human remains the authority for genuine decisions either way", self.orchestrator)
+    def test_interactive_parent_can_delegate_without_repeated_human_dispatch(self) -> None:
+        self.assertIn("the human may launch one claude orchestrator with the bounded handoff", self.orchestrator)
+        self.assertIn("explicitly authorize that parent to use its available provider-native executor/reviewer delegation", self.orchestrator)
+        self.assertIn("without requiring the human to launch each worker", self.orchestrator)
+        self.assertIn("the human remains the authority for genuine decisions in either route", self.orchestrator)
+        self.assertIn("this does not authorize a resident scheduler, permission bypass, or competing ownership", self.orchestrator)
 
     def test_routine_continuation_needs_no_human_proceed(self) -> None:
         self.assertIn(
