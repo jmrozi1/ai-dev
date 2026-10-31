@@ -1,5 +1,12 @@
 # AI Dev Skill Catalog
 
+> **Retired. Coxswain is the canonical owner of every AI Dev skill.** Use
+> [`jmrozi1/coxswain/skills/index.md`](https://github.com/jmrozi1/coxswain/blob/main/skills/index.md)
+> and the canonical `SKILL.md` files it names. The copies below are historical,
+> are not maintained, and may be older than Coxswain's; do not load them.
+> `ticket-progress-review`, `release-progress-review` and `privileged-operations`
+> were migrated in jmrozi1/coxswain#325 and removed here; git history keeps them.
+
 This catalog is a lightweight discovery surface and derivative catalog.
 
 Canonical instructions always live in each skill's `SKILL.md`. Use this file
@@ -41,7 +48,6 @@ remain in the applicable canonical `SKILL.md` files.
 | `executor` | Executing a bounded development assignment deeply and narrowly, continuing independent work, and returning concise evidence for durable tasking state. | `skills/executor/SKILL.md` |
 | `feedback-loop-design` | Designing discovery, prototyping, implementation, or validation loops when builds, live environments, screenshots, human relay, or other feedback are materially slow or costly. | `skills/feedback-loop-design/SKILL.md` |
 | `integration-signal` | Running integration validation as an asynchronous signal bound to an exact candidate commit: queueing and coalescing runs, recording tested/last-green SHAs, refusing stale greens, attributing failures from the green-to-red range, and deciding what a red run blocks; not for choosing which tests a change needs. | `skills/integration-signal/SKILL.md` |
-| `privileged-operations` | Short-lived, manually launched Claude executor for one authorized sudo/admin host task; native approvals, bounded verification, concise handoff and exit. Not a privileged resident orchestrator. | `skills/privileged-operations/SKILL.md` |
 | `investigation-synthesis` | Preserving the durable results of substantial research, debugging, reverse engineering, or source comparison without turning the investigation into transcript documentation; route accepted findings to the smallest correct durable home and discard the rest. | `skills/investigation-synthesis/SKILL.md` |
 | `frontend-design-review` | Reviewing screenshots, implemented UI, mockups, or proposed front-end designs for unnecessary cognitive load, weak action hierarchy, redundant visual containment, or failure to prioritize the normal happy path. | `skills/frontend-design-review/SKILL.md` |
 | `module-development` | Refining a coherent requirement slice into independently constructible modules with narrow contracts and injected clocks, filesystems, repositories, process control, and networks; separating domain decisions from adapters; and developing module behavior with its local tests in a fast inner loop; not for edits with no module boundary. | `skills/module-development/SKILL.md` |
@@ -57,8 +63,6 @@ remain in the applicable canonical `SKILL.md` files.
 | `orchestrator` | Coordinating bounded development work through durable intent, scope, delegation, tasking-file state, ticket-owned skill investment state, and evidence-based decisions. | `skills/chatgpt/orchestrator/SKILL.md` |
 | `skill-authoring` | Creating/refining AI Dev skills or adjudicating ticket skill candidates as keep/no-skill/refine/create, with immediate dogfood for accepted investments. | `skills/chatgpt/skill-authoring/SKILL.md` |
 | `ticket-creation` | Creating task records using the canonical ticket schema, including `Skill Candidates` and `Skills` accounting sections, and repository ticket-provider contract. | `skills/chatgpt/ticket-creation/SKILL.md` |
-| `release-progress-review` | Recurring executive portfolio progress: accepted major/minor checkpoint percentages, expandable bars, new-progress deltas, and sustained-stall signals. | `skills/chatgpt/release-progress-review/SKILL.md` |
-| `ticket-progress-review` | Timestamped executive progress checks for active tickets: immediate and upcoming human actions, evidence of meaningful progress, and investigation of preventable stalls. | `skills/chatgpt/ticket-progress-review/SKILL.md` |
 | `work-skill-refinement` | Designing and refining work-side AI skills and capability boundaries from observed work-agent behavior, including deciding when a task should not be delegated to the work AI. | `skills/chatgpt/work-skill-refinement/SKILL.md` |
 
 ## Claude

@@ -33,6 +33,10 @@ commands are retired; ticket creation and refinement belong to ChatGPT.
 
 ## Skills
 
+> **Retired.** Coxswain is the canonical owner of every AI Dev skill: use
+> [`jmrozi1/coxswain/skills/index.md`](https://github.com/jmrozi1/coxswain/blob/main/skills/index.md).
+> The skill copies and catalog in this repository are historical.
+
 Canonical skills live at `skills/<skill-name>/SKILL.md`. Providers with native
 skill discovery should use their native mechanism. Providers without native
 discovery can inspect [`skills/index.md`](skills/index.md) when a task may match
