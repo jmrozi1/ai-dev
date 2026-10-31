@@ -1,6 +1,6 @@
 ---
 name: ticket-progress-review
-description: Review progress on an active development ticket from Claude logs, prior observations, and available ticket or rail evidence; deliver a timestamped executive summary of human actions, upcoming dependencies, meaningful progress, and suspected stalls requiring investigation.
+description: Review progress on an active development ticket from Claude logs, prior observations, and available ticket or rail evidence; deliver a timestamped executive summary of every outstanding request for the user's input (blocking, waiting, and upcoming), meaningful progress, and suspected stalls requiring investigation.
 ---
 
 # Ticket Progress Review
@@ -18,10 +18,35 @@ Do not activate merely because a ticket is mentioned, for ordinary implementatio
 - Consult earlier history when needed to understand dependencies or diagnose recurring problems, but never count achievements from before the previous status request as new progress. A newly discovered old event is context, not progress during this reporting window.
 - Do not infer zero progress from missing logs, treat unavailable evidence as a failure, fabricate elapsed durations, or treat elapsed time and token usage as proof of progress or stagnation. Avoid broad transcript/repository archaeology unless a concrete anomaly warrants it.
 
+## Inventory Human Attention
+
+Every review inventories **all outstanding requests for the user's input**, not only what blocks execution. A ticket can advance well while approvals, decisions, and handoffs accumulate unanswered; surface those even when the primary objective is converging.
+
+**Where to look.** Inspect the active ticket and its **directly relevant dependencies**: work the ticket names as gating its own objective, PRs and tickets that carry its deliverables, and active remediation it owns, even when the primary ticket is advancing. Within that boundary check:
+
+- formal pending decisions and interaction rails awaiting an answer;
+- the ticket body and its comments since the previous review, plus any earlier request not yet resolved; linked PRs and their comments requesting review, merge, or approval;
+- permission refusals reported by an agent, and host-configuration decisions;
+- requests for human verification, credentials or tokens, resource or package authorization, and handoffs to a host or person the agents cannot reach.
+
+**Reconcile before listing.** Read each request against newer evidence, including later comments by the same or another agent. Do not repeat a question that has been answered, withdrawn, superseded, made moot, or made obsolete as though it remained valid. When a question's substance is settled but a stale formal decision or rail still waits in durable state, surface the **administrative action that retires it** (withdraw, archive, or answer it with the settled result) instead of the original question. Mention a withdrawn request only briefly, as withdrawn, when the user might otherwise still act on it.
+
+**Report actual readiness.** For an approval or merge request, state what the evidence shows: the exact head under request, independent review outcome, checks the requester says are still running, and whether a request has actually been made. Never present a PR as approved, accepted, or ready to merge because its tests are green, its author is iterating, or the ticket is advancing. A PR whose author is still running review rounds is not an ask to the user, and saying so is part of the inventory.
+
+**Classify each item once:**
+
+- **Needs action now** — a genuine blocker: the current rail or objective cannot move until the user acts.
+- **Waiting for your input** — an explicit outstanding request that is not currently blocking; work proceeds, but something is held, degraded, or accumulating cost.
+- **Coming later** — a known verification or approval gate with a named trigger (e.g. after a merge, after a review round, at a checkpoint).
+
+**For each item give:** the precise question or action; its source (link, comment, rail, or decision); the responsible owner (who asked, and who acts once it is answered); current status; the consequence of waiting; and whether it blocks, and what. Label each item an **explicit request** (someone asked the user) or an **inferred recommendation** (your judgment that the user should act); never present an inference as a request.
+
+**Boundaries.** Do not turn ordinary agent responsibilities into questions for the user. Merge duplicate asks for the same decision into one item that cites every source. Do not invent speculative future approvals, and do not dig through unrelated or historical issues beyond the direct dependencies. Write **none** for a category only after inspecting the sources above; if a source could not be read, name it and say the inventory is incomplete rather than claiming the user has nothing pending.
+
 ## Answer the Executive Questions
 
-1. **Human action now:** Is a decision, permission, resource, intervention, or handoff actually required to keep the current work moving? State **none** when appropriate. Identify the exact action and why it is blocking; do not pass ordinary agent decisions to the human.
-2. **Human action ahead:** Surface known future human dependencies even if they are not yet blocking. Distinguish *prepare now*, *later at a named trigger/checkpoint*, and *no preparation needed*. Explain the benefit or cost of acting early; do not make speculative prerequisites sound mandatory.
+1. **Human action now:** Is a decision, permission, resource, intervention, or handoff actually required to keep the current work moving? Answer from the full **Human Attention** inventory below, not only from execution blockers. State **none** only when that inventory supports it; do not pass ordinary agent decisions to the human.
+2. **Human input waiting and ahead:** Which outstanding requests for the user's input are not blocking now, and which known verification or approval gates come later at a named trigger? Explain the benefit or cost of acting early; do not make speculative prerequisites sound mandatory.
 3. **Meaningful progress:** Answer **yes**, **no**, or **not established** and cite only the concrete delta within the reporting window since the last progress-review request: requirement or defect resolved, valid new proof, uncertainty narrowed, named checkpoint accepted, change promoted, integration/deployment accepted, or other movement toward ticket completion. Keep implemented, tested, reviewed, merged, accepted, and deployed separate. Commands executed, text written, retries, and time consumed do not themselves count as progress.
 4. **Process health and continuation:** Decide whether work is converging, legitimately waiting on a dependency, cycling without new evidence, or unclear. At a **reporting boundary**, unfinished executable checkpoints plus a completed agent report and no verified continuation are a **possible continuation stall** regardless of elapsed time. If evidence establishes that no agent is executing, call it a stall even when nothing is technically blocked. If live execution state is unavailable, say **execution unconfirmed** rather than asserting either ongoing work or confirmed idleness; inspect the narrowest live owner/rail signal where possible. Distinguish a stopped interactive session from an autonomous controller that may still be running. Watch for repeated verification of verification, oversized validation for small changes, repeated invalid probes/fixtures, integration serialization, stale evidence, accumulating state-file/context bloat, permission friction, resource contention, and ostensibly active but idle orchestration. Judge whether the same unresolved obligation keeps recurring for the same reason, not by fixed time or retry thresholds.
 
@@ -44,8 +69,7 @@ When the evidence indicates a preventable stall or systemic drag, do not stop at
 Lead with a brief, human-readable executive summary rather than a log retelling. Include:
 
 - **As of:** current verified timestamp and time zone; prior progress-review request and elapsed interval when known (otherwise label the available baseline or its absence).
-- **You now:** exact required action, or none.
-- **Ahead:** useful preparation, its urgency/trigger, or none.
+- **Human Attention:** a distinct section with three labeled parts — **Needs action now**, **Waiting for your input**, and **Coming later** — each listing its items with the fields above, or *none* when the inventory supports it. Briefly note retired questions (answered, withdrawn, moot) only where the user might otherwise act on them.
 - **Progress:** yes/no/not established; latest accepted checkpoint and current work, with timestamps and only the evidence-backed delta since the previous request. Keep older accomplishments out of the new-progress summary.
 - **Execution / process / intervention:** identify the next-action owner and whether execution is confirmed active, confirmed stopped, or unconfirmed. Flag a reporting-boundary continuation risk where unfinished actionable work has no verified successor, and give the smallest useful continuation instruction when warranted. Say "continue without interference" only when work is completed, legitimately waiting, or positive evidence shows an owner is carrying it forward.
 
